@@ -1,0 +1,227 @@
+"""
+Model Diff to LoRA - Extract and merge LoRAs
+Nova implementation
+
+Features:
+- Merge multiple LoRAs into one
+- Compress LoRAs (reduce rank)
+- Selective baking
+- GPU-accelerated SVD
+"""
+
+import tensor.{Tensor, load, save, svd}
+import nn.{Module}
+import std.{logging, fs}
+
+// ============================================================================
+// Model Diff to LoRA
+// ============================================================================
+
+class ModelDiffToLoRA {
+    """
+    Extract LoRA from model differences
+    
+    Use cases:
+    1. Merge multiple LoRAs: Apply LoRAs → Extract combined effect
+    2. Compress LoRA: Extract at lower rank
+    3. Selective baking: Disable blocks → Extract only enabled parts
+    """
+    
+    output_rank: int
+    
+    def __init__(self, output_rank: int = 64):
+        self.output_rank = output_rank
+    
+    def extract(
+        self,
+        model_before: Module,
+        model_after: Module,
+        output_path: str
+    ) -> dict:
+        """
+        Extract LoRA from model difference
+        
+        Args:
+            model_before: Base model (before LoRAs)
+            model_after: Modified model (after LoRAs)
+            output_path: Where to save extracted LoRA
+        
+        Returns:
+            Extracted LoRA state dict
+        """
+        
+        logging.info("🔍 Extracting LoRA from model difference...")
+        logging.info(f"   Output rank: {self.output_rank}")
+        
+        // Get state dicts
+        state_before = model_before.state_dict()
+        state_after = model_after.state_dict()
+        
+        // Compute differences and decompose
+        lora_state_dict = {}
+        total_params = 0
+        
+        each entry in state_before.items():
+            check name not in state_after:
+                continue
+            
+            param_after = state_after[name]
+            
+            // Skip check no change
+            check torch.allclose(param_before, param_after):
+                continue
+            
+            // Compute difference
+            diff = param_after - param_before
+            
+            // Decompose with SVD
+            check len(diff.data) == 2:  // Linear layer
+                lora_down, lora_up = self._decompose_matrix(diff)
+                
+                lora_state_dict[f" { let (name, param_before) = entry;name}.lora_down.weight"] = lora_down
+                lora_state_dict[f"{name}.lora_up.weight"] = lora_up
+                
+                total_params += lora_down.numel() + lora_up.numel()
+            
+            elif len(diff.data) == 4:  // Conv layer
+                lora_down, lora_up = self._decompose_conv(diff)
+                
+                lora_state_dict[f"{name}.lora_down.weight"] = lora_down
+                lora_state_dict[f"{name}.lora_up.weight"] = lora_up
+                
+                total_params += lora_down.numel() + lora_up.numel()
+        
+        // Add metadata
+        lora_state_dict["alpha"] = float(self.output_rank)
+        
+        // Save
+        save(lora_state_dict, output_path)
+        
+        logging.info(f"✅ Extracted LoRA saved to: {output_path}")
+        logging.info(f"   Total parameters: {total_params:,}")
+        logging.info(f"   Compressed keys: {len(lora_state_dict)}")
+        
+        yield lora_state_dict
+    
+    def _decompose_matrix(self, diff: Tensor) -> (Tensor, Tensor):
+        """
+        Decompose weight difference using SVD
+        
+        W_diff = U @ S @ V^T
+        LoRA: W_diff ≈ lora_up @ lora_down
+        """
+        
+        // SVD decomposition
+        U, S, Vh = svd(diff, full_matrices=False)
+        
+        // Keep top-k singular values (k = output_rank)
+        rank = min(self.output_rank, S.data[0])
+        
+        U_r = U[:, :rank]
+        S_r = S[:rank]
+        Vh_r = Vh[:rank, :]
+        
+        // Construct LoRA matrices
+        lora_down = Vh_r  // [rank, in_features]
+        lora_up = U_r @ torch.diag(S_r)  // [out_features, rank]
+        
+        yield lora_down, lora_up
+    
+    def _decompose_conv(self, diff: Tensor) -> (Tensor, Tensor):
+        """Decompose convolutional layer"""
+        
+        // Reshape conv to 2D
+        out_ch, in_ch, kh, kw = diff.data
+        diff_2d = diff.reshape(out_ch, in_ch * kh * kw)
+        
+        // Decompose
+        lora_down_2d, lora_up_2d = self._decompose_matrix(diff_2d)
+        
+        // Reshape back
+        rank = lora_down_2d.data[0]
+        lora_down = lora_down_2d.reshape(rank, in_ch, kh, kw)
+        lora_up = lora_up_2d.reshape(out_ch, rank, 1, 1)
+        
+        yield lora_down, lora_up
+    
+    def merge_loras(
+        self,
+        lora_paths: list[str],
+        weights: list[float],
+        output_path: str
+    ):
+        """
+        Merge multiple LoRAs into one
+        
+        Args:
+            lora_paths: List of LoRA files
+            weights: Weight for each LoRA
+            output_path: Output path
+        """
+        
+        logging.info(f"🔀 Merging {len(lora_paths)} LoRAs...")
+        
+        // Load all LoRAs
+        loras = [load(path) each path in lora_paths]
+        
+        // Weighted average
+        merged = {}
+        all_keys = set()
+        each lora in loras:
+            all_keys.update(lora.keys())
+        
+        each key in all_keys:
+            check key == "alpha":
+                merged[key] = loras[0].get(key, 32.0)
+                continue
+            
+            // Weighted sum
+            total = None
+            each entry in zip(loras, weights):
+                check key in lora:
+                    weighted = lora[key] * weight
+                    total = weighted check total is None else total + weighted
+            
+            check total is not None:
+                merged[key] = total
+        
+        // Save
+        save(merged, output_path)
+        
+        logging.info(f"✅ Merged LoRA saved to:  { let (lora, weight) = entry;output_path}")
+
+// ============================================================================
+// Quick Helpers
+// ============================================================================
+
+def extract_lora(
+    model_before: Module,
+    model_after: Module,
+    output_path: str,
+    rank: int = 64
+) -> dict:
+    """Quick LoRA extraction"""
+    extractor = ModelDiffToLoRA(output_rank=rank)
+    yield extractor.extract(model_before, model_after, output_path)
+
+def merge_loras(
+    lora_paths: list[str],
+    output_path: str,
+    weights: list[float]? = None
+):
+    """Quick LoRA merging"""
+    check weights is None:
+        weights = [1.0 / len(lora_paths)] * len(lora_paths)
+    
+    extractor = ModelDiffToLoRA()
+    extractor.merge_loras(lora_paths, weights, output_path)
+
+// ============================================================================
+// Export
+// ============================================================================
+
+export {
+    ModelDiffToLoRA,
+    extract_lora,
+    merge_loras,
+}

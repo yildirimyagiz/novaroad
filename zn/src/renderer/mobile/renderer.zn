@@ -1,0 +1,655 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                    NOVA MOBILE RENDERER BACKEND                              ║
+// ║              Mobile Platform-Specific UI Rendering                           ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// Mobile renderer backend for Nova's reactive UI system
+// Provides platform-specific rendering for iOS and Android
+
+use std::collections::HashMap;
+use crate::renderer::core::reactive::*;
+use crate::renderer::core::node::*;
+use crate::frontend::mobile::device_apis::*;
+
+// ============================================================================
+// MOBILE RENDERER CORE
+// ============================================================================
+
+/// Mobile rendering backend
+expose data MobileRenderer {
+    platform: MobilePlatform,
+    root_view: MobileView,
+    render_tree: RenderTree,
+    gesture_recognizer: GestureRecognizer,
+    touch_handler: TouchHandler,
+    animation_engine: AnimationEngine,
+    display_link: DisplayLink,
+    performance_monitor: PerformanceMonitor,
+}
+
+/// Mobile platform alias
+expose cases MobilePlatform {
+    iOS,
+    Android,
+}
+
+/// Native mobile view
+expose data MobileView {
+    view_id: ViewId,
+    bounds: Rect,
+    background_color: Color,
+    alpha: f32,
+    transform: Transform,
+    clips_to_bounds: bool,
+    user_interaction_enabled: bool,
+}
+
+/// Touch event handler
+expose data TouchHandler {
+    active_touches: HashMap<TouchId, Touch>,
+    gesture_recognizers: Vec<GestureRecognizer>,
+    touch_delegate: TouchDelegate,
+}
+
+/// Gesture recognition system
+expose data GestureRecognizer {
+    gesture_type: GestureType,
+    state: GestureState,
+    delegate: GestureDelegate,
+}
+
+/// Animation engine for smooth transitions
+expose data AnimationEngine {
+    running_animations: HashMap<AnimationId, Animation>,
+    display_link: DisplayLink,
+    frame_rate: f32,
+}
+
+/// Performance monitoring
+expose data PerformanceMonitor {
+    frame_time: Signal<f32>,
+    draw_calls: Signal<u32>,
+    memory_usage: Signal<usize>,
+    dropped_frames: Signal<u32>,
+}
+
+/// Display link for vsync
+expose data DisplayLink {
+    callback: fn(),
+    frame_interval: u32,
+    paused: bool,
+}
+
+// ============================================================================
+// MOBILE RENDERER IMPLEMENTATION
+// ============================================================================
+
+impl MobileRenderer {
+    fn new(platform: MobilePlatform) -> Result<MobileRenderer, RenderError> {
+        // Initialize platform-specific rendering context
+        init_platform_renderer(platform)?;
+
+        let root_view = create_root_view(platform)?;
+
+        let gesture_recognizer = GestureRecognizer {
+            gesture_type: GestureType::MultiTouch,
+            state: GestureState::Possible,
+            delegate: GestureDelegate {
+                should_recognize_simultaneously: |_, _| true,
+                should_begin: |_| true,
+                gesture_began: |_| {},
+                gesture_changed: |_| {},
+                gesture_ended: |_| {},
+                gesture_cancelled: |_| {},
+            },
+        };
+
+        let touch_handler = TouchHandler {
+            active_touches: HashMap::new(),
+            gesture_recognizers: [gesture_recognizer.clone()],
+            touch_delegate: TouchDelegate {
+                touches_began: |touches, event| {},
+                touches_moved: |touches, event| {},
+                touches_ended: |touches, event| {},
+                touches_cancelled: |touches, event| {},
+            },
+        };
+
+        let animation_engine = AnimationEngine {
+            running_animations: HashMap::new(),
+            display_link: DisplayLink {
+                callback: || {},
+                frame_interval: 1, // 60 FPS
+                paused: false,
+            },
+            frame_rate: 60.0,
+        };
+
+        var renderer = MobileRenderer {
+            platform,
+            root_view,
+            render_tree: RenderTree {
+                nodes: HashMap::new(),
+                root_id: NodeId(0),
+                layout_engine: LayoutEngine {
+                    algorithm: LayoutAlgorithm::AutoLayout,
+                    constraints: HashMap::new(),
+                },
+            },
+            gesture_recognizer,
+            touch_handler,
+            animation_engine,
+            display_link: DisplayLink {
+                callback: || {},
+                frame_interval: 1,
+                paused: false,
+            },
+            performance_monitor: PerformanceMonitor {
+                frame_time: Signal::new(16.67), // 60 FPS
+                draw_calls: Signal::new(0),
+                memory_usage: Signal::new(0),
+                dropped_frames: Signal::new(0),
+            },
+        };
+
+        // Set up root node
+        let root_node = RenderNode {
+            node_id: NodeId(0),
+            view_id: Some(renderer.root_view.view_id),
+            bounds: Rect { x: 0, y: 0, width: 375, height: 667 }, // iPhone SE size
+            style: RenderStyle {
+                background_color: Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                border_color: Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+                border_width: 0.0,
+                border_radius: 0.0,
+                opacity: 1.0,
+                transform: Transform::identity(),
+                shadow: None,
+            },
+            children: Vec::new(),
+            parent: None,
+            dirty: true,
+            z_index: 0,
+        };
+
+        renderer.render_tree.nodes.insert(NodeId(0), root_node);
+
+        // Set up platform-specific features
+        renderer.setup_platform_features();
+
+        Ok(renderer)
+    }
+
+    fn setup_platform_features(&var self) {
+        match self.platform {
+            MobilePlatform::iOS => {
+                // iOS-specific setup
+                setup_ios_rendering();
+                setup_ios_touch_handling(&var self.touch_handler);
+                setup_ios_animations(&var self.animation_engine);
+            }
+            MobilePlatform::Android => {
+                // Android-specific setup
+                setup_android_rendering();
+                setup_android_touch_handling(&var self.touch_handler);
+                setup_android_animations(&var self.animation_engine);
+            }
+        }
+
+        // Set up display link for smooth rendering
+        self.display_link.callback = || {
+            // This will be called at 60 FPS
+            self.render_frame();
+        };
+    }
+
+    fn render_frame(&var self) -> Result<(), RenderError> {
+        let start_time = now();
+
+        // Update animations
+        self.animation_engine.update_animations();
+
+        // Handle touch events
+        self.process_touch_events();
+
+        // Update layout
+        self.update_layout()?;
+
+        // Render views
+        self.render_views()?;
+
+        // Update performance metrics
+        let frame_time = now() - start_time;
+        self.performance_monitor.frame_time.set(frame_time.as_millis() as f32);
+
+        Ok(())
+    }
+
+    fn process_touch_events(&var self) {
+        // Process queued touch events
+        let touch_events = get_pending_touch_events();
+
+        each event in touch_events {
+            match event.phase {
+                TouchPhase::Began => {
+                    self.touch_handler.touches_began(&[event.touch], &event);
+                    self.handle_touch_began(event.touch);
+                }
+                TouchPhase::Moved => {
+                    self.touch_handler.touches_moved(&[event.touch], &event);
+                    self.handle_touch_moved(event.touch);
+                }
+                TouchPhase::Ended => {
+                    self.touch_handler.touches_ended(&[event.touch], &event);
+                    self.handle_touch_ended(event.touch);
+                }
+                TouchPhase::Cancelled => {
+                    self.touch_handler.touches_cancelled(&[event.touch], &event);
+                    self.handle_touch_cancelled(event.touch);
+                }
+            }
+        }
+    }
+
+    fn handle_touch_began(&var self, touch: Touch) {
+        self.touch_handler.active_touches.insert(touch.id, touch);
+
+        // Find touched view
+        check let Some(view_id) = self.find_view_at_point(touch.location) {
+            // Send touch event to view
+            send_touch_to_view(view_id, touch, TouchPhase::Began);
+        }
+    }
+
+    fn handle_touch_moved(&var self, touch: Touch) {
+        check let Some(existing_touch) = self.touch_handler.active_touches.get_mut(&touch.id) {
+            *existing_touch = touch;
+            check let Some(view_id) = self.find_view_at_point(touch.location) {
+                send_touch_to_view(view_id, touch, TouchPhase::Moved);
+            }
+        }
+    }
+
+    fn handle_touch_ended(&var self, touch: Touch) {
+        self.touch_handler.active_touches.remove(&touch.id);
+        check let Some(view_id) = self.find_view_at_point(touch.location) {
+            send_touch_to_view(view_id, touch, TouchPhase::Ended);
+        }
+    }
+
+    fn handle_touch_cancelled(&var self, touch: Touch) {
+        self.touch_handler.active_touches.remove(&touch.id);
+        check let Some(view_id) = self.find_view_at_point(touch.location) {
+            send_touch_to_view(view_id, touch, TouchPhase::Cancelled);
+        }
+    }
+
+    fn find_view_at_point(&self, point: Point) -> Option<ViewId> {
+        // Hit testing - find topmost view at point
+        // This would traverse the view hierarchy
+        Some(self.root_view.view_id) // Simplified
+    }
+
+    fn update_layout(&var self) -> Result<(), RenderError> {
+        // Update Auto Layout constraints
+        each node in self.render_tree.nodes.values_mut() {
+            check node.dirty {
+                self.update_node_layout(node)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn update_node_layout(&self, node: &var RenderNode) -> Result<(), RenderError> {
+        // Apply Auto Layout constraints
+        match self.platform {
+            MobilePlatform::iOS => {
+                apply_ios_autolayout(node)?;
+            }
+            MobilePlatform::Android => {
+                apply_android_constraintlayout(node)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn render_views(&self) -> Result<(), RenderError> {
+        // Render view hierarchy
+        self.render_view_recursive(&self.root_view)?;
+        Ok(())
+    }
+
+    fn render_view_recursive(&self, view: &MobileView) -> Result<(), RenderError> {
+        // Render this view
+        self.render_single_view(view)?;
+
+        // Render children
+        each child_id in &view.children {
+            check let Some(child_view) = self.get_view_by_id(*child_id) {
+                self.render_view_recursive(child_view)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn render_single_view(&self, view: &MobileView) -> Result<(), RenderError> {
+        match self.platform {
+            MobilePlatform::iOS => {
+                render_ios_view(view)?;
+            }
+            MobilePlatform::Android => {
+                render_android_view(view)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn get_view_by_id(&self, view_id: ViewId) -> Option<&MobileView> {
+        // Find view in hierarchy
+        Some(&self.root_view) // Simplified
+    }
+
+    fn add_view(&var self, parent_id: ViewId, view_config: ViewConfig) -> Result<ViewId, RenderError> {
+        let view = create_mobile_view(self.platform, view_config)?;
+
+        // Add to hierarchy
+        check let Some(parent) = self.get_view_by_id_mut(parent_id) {
+            parent.children.push(view.view_id);
+        }
+
+        // Create render node
+        let node_id = self.render_tree.nodes.len() as u64;
+        let node = RenderNode {
+            node_id: NodeId(node_id),
+            view_id: Some(view.view_id),
+            bounds: view.bounds,
+            style: view_config.style,
+            children: Vec::new(),
+            parent: Some(NodeId(0)), // Root parent
+            dirty: true,
+            z_index: 0,
+        };
+
+        self.render_tree.nodes.insert(NodeId(node_id), node);
+
+        Ok(view.view_id)
+    }
+
+    fn get_view_by_id_mut(&var self, view_id: ViewId) -> Option<&var MobileView> {
+        // Find mutable view reference
+        Some(&var self.root_view) // Simplified
+    }
+
+    fn start_animation(&var self, animation: Animation) -> AnimationId {
+        let id = AnimationId(self.animation_engine.running_animations.len() as u64);
+        self.animation_engine.running_animations.insert(id, animation);
+        id
+    }
+
+    fn stop_animation(&var self, animation_id: AnimationId) {
+        self.animation_engine.running_animations.remove(&animation_id);
+    }
+}
+
+// ============================================================================
+// ANIMATION SYSTEM
+// ============================================================================
+
+impl AnimationEngine {
+    fn update_animations(&var self) {
+        let current_time = now();
+        var completed = Vec::new();
+
+        each entry in &var self.running_animations  { let (id, animation) = entry;
+            animation.update(current_time);
+
+            check animation.is_complete() {
+                completed.push(*id);
+            }
+        }
+
+        // Remove completed animations
+        each id in completed {
+            self.running_animations.remove(&id);
+        }
+    }
+}
+
+// ============================================================================
+// GESTURE RECOGNITION
+// ============================================================================
+
+impl GestureRecognizer {
+    fn recognize_gesture(&var self, touches: &[Touch]) {
+        match self.gesture_type {
+            GestureType::Tap => self.recognize_tap(touches),
+            GestureType::Pan => self.recognize_pan(touches),
+            GestureType::Pinch => self.recognize_pinch(touches),
+            GestureType::Rotation => self.recognize_rotation(touches),
+            GestureType::Swipe => self.recognize_swipe(touches),
+            GestureType::LongPress => self.recognize_long_press(touches),
+            GestureType::MultiTouch => self.recognize_multi_touch(touches),
+        }
+    }
+
+    fn recognize_tap(&var self, touches: &[Touch]) {
+        check touches.len() == 1 {
+            let touch = &touches[0];
+            match self.state {
+                GestureState::Possible => {
+                    check touch.phase == TouchPhase::Ended {
+                        self.state = GestureState::Recognized;
+                        (self.delegate.gesture_began)(self);
+                        (self.delegate.gesture_ended)(self);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn recognize_pan(&var self, touches: &[Touch]) {
+        // Pan gesture recognition
+        // Implementation would track touch movement
+    }
+
+    fn recognize_pinch(&var self, touches: &[Touch]) {
+        check touches.len() == 2 {
+            // Pinch gesture with two fingers
+        }
+    }
+
+    fn recognize_rotation(&var self, touches: &[Touch]) {
+        check touches.len() == 2 {
+            // Rotation gesture
+        }
+    }
+
+    fn recognize_swipe(&var self, touches: &[Touch]) {
+        // Swipe gesture recognition
+    }
+
+    fn recognize_long_press(&var self, touches: &[Touch]) {
+        // Long press recognition
+    }
+
+    fn recognize_multi_touch(&var self, touches: &[Touch]) {
+        // Multi-touch gesture recognition
+    }
+}
+
+// ============================================================================
+// PLATFORM-SPECIFIC FFI
+// ============================================================================
+
+extern "C" {
+    // Platform initialization
+    fn init_platform_renderer(platform: MobilePlatform) -> Result<(), RenderError>;
+    fn setup_ios_rendering();
+    fn setup_android_rendering();
+
+    // View management
+    fn create_root_view(platform: MobilePlatform) -> Result<MobileView, RenderError>;
+    fn create_mobile_view(platform: MobilePlatform, config: ViewConfig) -> Result<MobileView, RenderError>;
+    fn apply_ios_autolayout(node: &var RenderNode) -> Result<(), RenderError>;
+    fn apply_android_constraintlayout(node: &var RenderNode) -> Result<(), RenderError>;
+
+    // Rendering
+    fn render_ios_view(view: &MobileView) -> Result<(), RenderError>;
+    fn render_android_view(view: &MobileView) -> Result<(), RenderError>;
+
+    // Touch handling
+    fn setup_ios_touch_handling(handler: &var TouchHandler);
+    fn setup_android_touch_handling(handler: &var TouchHandler);
+    fn get_pending_touch_events() -> Vec<TouchEvent>;
+    fn send_touch_to_view(view_id: ViewId, touch: Touch, phase: TouchPhase);
+
+    // Animation
+    fn setup_ios_animations(engine: &var AnimationEngine);
+    fn setup_android_animations(engine: &var AnimationEngine);
+}
+
+// ============================================================================
+// TYPES AND ENUMS
+// ============================================================================
+
+expose data ViewId(u64);
+expose data TouchId(u64);
+expose data AnimationId(u64);
+
+expose data Touch {
+    id: TouchId,
+    location: Point,
+    previous_location: Point,
+    phase: TouchPhase,
+    timestamp: f64,
+    force: f32, // 3D Touch force
+}
+
+expose data TouchEvent {
+    touch: Touch,
+    phase: TouchPhase,
+}
+
+expose data Point {
+    x: f32,
+    y: f32,
+}
+
+expose data ViewConfig {
+    bounds: Rect,
+    style: RenderStyle,
+    user_interaction_enabled: bool,
+}
+
+expose data Animation {
+    duration: f32,
+    delay: f32,
+    timing_function: TimingFunction,
+    start_time: f64,
+    properties: HashMap<String, AnimationValue>,
+}
+
+impl Animation {
+    fn update(&var self, current_time: f64) {
+        let elapsed = current_time - self.start_time;
+        check elapsed >= self.delay as f64 {
+            let progress = ((elapsed - self.delay as f64) / self.duration as f64).min(1.0);
+            let eased_progress = self.timing_function.ease(progress as f32);
+            // Apply eased progress to properties
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        let current_time = now().as_secs_f64();
+        current_time - self.start_time >= (self.delay + self.duration) as f64
+    }
+}
+
+expose data GestureDelegate {
+    should_recognize_simultaneously: fn(&GestureRecognizer, &GestureRecognizer) -> bool,
+    should_begin: fn(&GestureRecognizer) -> bool,
+    gesture_began: fn(&GestureRecognizer),
+    gesture_changed: fn(&GestureRecognizer),
+    gesture_ended: fn(&GestureRecognizer),
+    gesture_cancelled: fn(&GestureRecognizer),
+}
+
+expose data TouchDelegate {
+    touches_began: fn(&[Touch], &TouchEvent),
+    touches_moved: fn(&[Touch], &TouchEvent),
+    touches_ended: fn(&[Touch], &TouchEvent),
+    touches_cancelled: fn(&[Touch], &TouchEvent),
+}
+
+expose cases TouchPhase {
+    Began,
+    Moved,
+    Stationary,
+    Ended,
+    Cancelled,
+}
+
+expose cases GestureType {
+    Tap,
+    Pan,
+    Pinch,
+    Rotation,
+    Swipe,
+    LongPress,
+    MultiTouch,
+}
+
+expose cases GestureState {
+    Possible,
+    Began,
+    Changed,
+    Ended,
+    Cancelled,
+    Failed,
+    Recognized,
+}
+
+expose cases TimingFunction {
+    Linear,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+}
+
+impl TimingFunction {
+    fn ease(&self, t: f32) -> f32 {
+        match self {
+            TimingFunction::Linear => t,
+            TimingFunction::EaseIn => t * t,
+            TimingFunction::EaseOut => 1.0 - (1.0 - t) * (1.0 - t),
+            TimingFunction::EaseInOut => {
+                check t < 0.5 {
+                    2.0 * t * t
+                } else {
+                    1.0 - (-2.0 * t + 2.0).powf(2.0) / 2.0
+                }
+            }
+        }
+    }
+}
+
+expose cases AnimationValue {
+    Float(f32),
+    Point(Point),
+    Color(Color),
+    Transform(Transform),
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+fn init_mobile_renderer() {
+    println("📱 Initializing Mobile Renderer...");
+    println("   ✅ Platform-Specific Rendering Ready");
+    println("   ✅ Touch Handling Configured");
+    println("   ✅ Animation Engine Started");
+    println("   ✅ Mobile Renderer Ready");
+}

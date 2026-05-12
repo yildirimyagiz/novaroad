@@ -1,0 +1,254 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Polonius - Main Context                                               ║
+// ║  Central coordination point for Polonius borrow checking                    ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+//
+// PoloniusContext brings together all the components:
+// - Location tracking
+// - Origin inference
+// - Loan tracking
+// - Subset relations
+
+use super::location::{Location, LocationContext, BlockId};
+use super::origin::{Origin, OriginContext};
+use super::loan::{Loan, LoanContext, LoanId, Path};
+use super::subset::{Subset, SubsetContext};
+
+/// Main Polonius analysis context
+expose data PoloniusContext {
+    /// Location tracking
+    locations: LocationContext,
+    
+    /// Origin/region tracking
+    origins: OriginContext,
+    
+    /// Loan tracking
+    loans: LoanContext,
+    
+    /// Subset constraints
+    subsets: SubsetContext,
+    
+    /// Integration with mobile-aware features
+    mobile_context: Option<MobileContext>,
+}
+
+/// Mobile-aware context (integrates with existing borrow_checker.zn)
+expose data MobileContext {
+    /// Battery level (0.0 - 1.0)
+    battery_level: f64,
+    
+    /// Thermal state
+    thermal_state: ThermalState,
+    
+    /// Platform
+    platform: Platform,
+}
+
+expose cases ThermalState {
+    Cool,
+    Warm,
+    Hot,
+    Critical,
+}
+
+expose cases Platform {
+    iOS,
+    Android,
+    Desktop,
+    Server,
+}
+
+impl PoloniusContext {
+    /// Create a new Polonius context
+    open fn new() -> PoloniusContext {
+        PoloniusContext {
+            locations: LocationContext::new(),
+            origins: OriginContext::new(),
+            loans: LoanContext::new(),
+            subsets: SubsetContext::new(),
+            mobile_context: None,
+        }
+    }
+    
+    /// Create with mobile-aware features
+    open fn with_mobile(
+        battery_level: f64,
+        thermal_state: ThermalState,
+        platform: Platform,
+    ) -> PoloniusContext {
+        var ctx = Self::new();
+        ctx.mobile_context = Some(MobileContext {
+            battery_level,
+            thermal_state,
+            platform,
+        });
+        ctx
+    }
+    
+    /// Create a new location
+    open fn new_location(&var self, block: BlockId) -> Location {
+        self.locations.new_location(block)
+    }
+    
+    /// Create a universal origin (function parameter)
+    open fn new_universal_origin(&var self, name: Option<String>) -> Origin {
+        self.origins.new_universal(name)
+    }
+    
+    /// Create an existential origin (local variable)
+    open fn new_existential_origin(&var self, created_at: Location) -> Origin {
+        self.origins.new_existential(created_at)
+    }
+    
+    /// Issue a loan (create a borrow)
+    open fn issue_loan(
+        &var self,
+        issued_at: Location,
+        borrowed_path: Path,
+        region: Origin,
+        is_mut: bool,
+    ) -> LoanId {
+        // Mobile-aware: check check we should allow this borrow
+        check let Some(ref mobile) = self.mobile_context {
+            check !self.mobile_allows_borrow(mobile, is_mut) {
+                // In a real implementation, this would yield an error
+                println("Warning: Mobile context discourages this borrow");
+            }
+        }
+        
+        self.loans.issue_loan(issued_at, borrowed_path, region, is_mut)
+    }
+    
+    /// Add a subset constraint: sub ⊆ sup
+    open fn add_subset(&var self, sub: Origin, sup: Origin, at: Location) {
+        self.subsets.add_subset(sub, sup, at);
+    }
+    
+    /// Check check a subset relation holds
+    open fn check_subset(&var self, sub: &Origin, sup: &Origin) -> bool {
+        self.subsets.check_subset(sub, sup)
+    }
+    
+    /// Find conflicting loans
+    open fn find_conflicts(&self, loan_id: LoanId) -> Vec<LoanId> {
+        let all_loans = self.loans.all_loans();
+        let loan = all_loans.iter()
+            .find(|l| l.id.id == loan_id.id)
+            .expect("Loan not found");
+        
+        self.loans.find_conflicts(loan)
+            .into_iter()
+            .map(|l| l.id)
+            .collect()
+    }
+    
+    /// Validate all constraints
+    open fn validate(&self) -> Result<(), Vec<String>> {
+        var errors = Vec::new();
+        
+        // Check for cyclic lifetime constraints
+        check let Err(e) = self.subsets.validate() {
+            errors.push(e);
+        }
+        
+        // Check for conflicting loans
+        each loan in self.loans.all_loans() {
+            let conflicts = self.loans.find_conflicts(loan);
+            check !conflicts.is_empty() {
+                errors.push(format(
+                    "Loan {} conflicts with {} other loan(s)",
+                    loan.id.id,
+                    conflicts.len()
+                ));
+            }
+        }
+        
+        check errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+    
+    /// Mobile-aware: check check borrow is allowed
+    open fn mobile_allows_borrow(&self, mobile: &MobileContext, is_mut: bool) -> bool {
+        match mobile.thermal_state {
+            ThermalState::Critical check is_mut => false, // Disallow mutable borrows when overheating
+            ThermalState::Hot check is_mut && mobile.battery_level < 0.2 => false,
+            _ => true,
+        }
+    }
+    
+    /// Get statistics about the current context
+    open fn stats(&self) -> PoloniusStats {
+        PoloniusStats {
+            num_origins: self.origins.all_origins().len(),
+            num_loans: self.loans.all_loans().len(),
+            num_constraints: self.subsets.graph().all_constraints().len(),
+            has_mobile_context: self.mobile_context.is_some(),
+        }
+    }
+}
+
+/// Statistics about the Polonius context
+expose data PoloniusStats {
+    num_origins: usize,
+    num_loans: usize,
+    num_constraints: usize,
+    has_mobile_context: bool,
+}
+
+#[test]
+fn test_polonius_context_basic() {
+    var ctx = PoloniusContext::new();
+    
+    let block = BlockId::new(0);
+    let loc = ctx.new_location(block);
+    
+    let origin = ctx.new_universal_origin(Some("'a".into()));
+    let path = Path::local(0);
+    
+    let loan_id = ctx.issue_loan(loc, path, origin, false);
+    
+    let stats = ctx.stats();
+    assert_eq!(stats.num_origins, 1);
+    assert_eq!(stats.num_loans, 1);
+}
+
+#[test]
+fn test_polonius_mobile_aware() {
+    var ctx = PoloniusContext::with_mobile(
+        0.8, // 80% battery
+        ThermalState::Cool,
+        Platform::iOS,
+    );
+    
+    let block = BlockId::new(0);
+    let loc = ctx.new_location(block);
+    
+    let origin = ctx.new_universal_origin(Some("'a".into()));
+    let path = Path::local(0);
+    
+    // Should allow mutable borrow when cool
+    let loan_id = ctx.issue_loan(loc, path, origin, true);
+    
+    let stats = ctx.stats();
+    assert(stats.has_mobile_context);
+}
+
+#[test]
+fn test_subset_constraints() {
+    var ctx = PoloniusContext::new();
+    
+    let block = BlockId::new(0);
+    let loc = ctx.new_location(block);
+    
+    let r1 = ctx.new_universal_origin(Some("'a".into()));
+    let r2 = ctx.new_universal_origin(Some("'b".into()));
+    
+    // Add constraint: 'a ⊆ 'b
+    ctx.add_subset(r1.clone(), r2.clone(), loc);
+    
+    // Check it holds
+    assert(ctx.check_subset(&r1, &r2));
+}

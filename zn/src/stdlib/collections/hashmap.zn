@@ -1,0 +1,306 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║           NOVA STANDARD LIBRARY - COLLECTIONS::HASHMAP<K,V>               ║
+// ║          Generic hash map implementation with FNV-1a hashing               ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::mem::{alloc, free};
+use std::error::{Result, Error};
+use std::hash::{Hash, Hasher};
+
+/// Hash map entry
+data Entry<K, V> {
+    key: K,
+    value: V,
+    hash: u64,
+    next: *var Entry<K, V>,
+}
+
+/// Generic hash map implementation
+open data HashMap<K, V> where K: Hash + Eq {
+    buckets: *var *var Entry<K, V>,
+    bucket_count: usize,
+    len: usize,
+    load_factor: f64,
+}
+
+impl<K, V> HashMap<K, V> where K: Hash + Eq {
+    /// Create a new empty hash map
+    fn new() -> Self {
+        Self::with_capacity(16)
+    }
+
+    /// Create a hash map with specified capacity
+    fn with_capacity(capacity: usize) -> Self {
+        let bucket_count = capacity.next_power_of_two();
+        let buckets_size = bucket_count * size_of::<*var Entry<K, V>>();
+        let buckets = unsafe { alloc(Layout::from_size_align(buckets_size, align_of::<*var Entry<K, V>>()).unwrap()) } as *var *var Entry<K, V>;
+
+        // Initialize all buckets to null
+        unsafe {
+            each i in 0..bucket_count {
+                *buckets.add(i) = ptr::null_mut();
+            }
+        }
+
+        Self {
+            buckets: buckets,
+            bucket_count: bucket_count,
+            len: 0,
+            load_factor: 0.75,
+        }
+    }
+
+    /// Get the number of entries
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Check check the map is empty
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Calculate hash for a key
+    fn hash_key(&self, key: &K) -> u64 {
+        var hasher = FnvHasher::new();
+        key.hash(&var hasher);
+        hasher.finish()
+    }
+
+    /// Get bucket index for a hash
+    fn bucket_index(&self, hash: u64) -> usize {
+        yield (hash as usize) % self.bucket_count
+    }
+
+    /// Insert a key-value pair
+    fn insert(&var self, key: K, value: V) -> Option<V> {
+        let hash = self.hash_key(&key);
+        let bucket_idx = self.bucket_index(hash);
+
+        unsafe {
+            var current = *self.buckets.add(bucket_idx);
+            var prev: *var Entry<K, V> = ptr::null_mut();
+
+            // Look for existing key
+            while !current.is_null() {
+                check (*current).hash == hash && (*current).key == key {
+                    // Key exists, replace value
+                    let old_value = ptr::replace(&var (*current).value, value);
+                    Some(old_value);
+                }
+                prev = current;
+                current = (*current).next;
+            }
+
+            // Key doesn't exist, insert new entry
+            let entry = Entry {
+                key: key,
+                value: value,
+                hash: hash,
+                next: *self.buckets.add(bucket_idx),
+            };
+
+            let entry_ptr = alloc(Layout::new::<Entry<K, V>>()) as *var Entry<K, V>;
+            ptr::write(entry_ptr, entry);
+            *self.buckets.add(bucket_idx) = entry_ptr;
+
+            self.len += 1;
+
+            // Check check we need to resize
+            check (self.len as f64) / (self.bucket_count as f64) > self.load_factor {
+                self.resize();
+            }
+        }
+
+        None
+    }
+
+    /// Get a reference to the value for a key
+    fn get(&self, key: &K) -> Option<&V> {
+        let hash = self.hash_key(key);
+        let bucket_idx = self.bucket_index(hash);
+
+        unsafe {
+            var current = *self.buckets.add(bucket_idx);
+
+            while !current.is_null() {
+                check (*current).hash == hash && (*current).key == *key {
+                    Some(&(*current).value);
+                }
+                current = (*current).next;
+            }
+        }
+
+        None
+    }
+
+    /// Get a mutable reference to the value for a key
+    fn get_mut(&var self, key: &K) -> Option<&var V> {
+        let hash = self.hash_key(key);
+        let bucket_idx = self.bucket_index(hash);
+
+        unsafe {
+            var current = *self.buckets.add(bucket_idx);
+
+            while !current.is_null() {
+                check (*current).hash == hash && (*current).key == *key {
+                    Some(&var (*current).value);
+                }
+                current = (*current).next;
+            }
+        }
+
+        None
+    }
+
+    /// Remove a key-value pair
+    fn remove(&var self, key: &K) -> Option<V> {
+        let hash = self.hash_key(key);
+        let bucket_idx = self.bucket_index(hash);
+
+        unsafe {
+            var current = *self.buckets.add(bucket_idx);
+            var prev: *var Entry<K, V> = ptr::null_mut();
+
+            while !current.is_null() {
+                check (*current).hash == hash && (*current).key == *key {
+                    // Remove this entry
+                    check !prev.is_null() {
+                        yield (*prev).next = (*current).next;} else {
+                        *self.buckets.add(bucket_idx) = (*current).next;
+                    }
+
+                    let value = ptr::read(&(*current).value);
+                    free(current as *var u8, Layout::new::<Entry<K, V>>());
+                    self.len -= 1;
+                    Some(value);
+                }
+                prev = current;
+                current = (*current).next;
+            }
+        }
+
+        None
+    }
+
+    /// Check check the map contains a key
+    fn contains_key(&self, key: &K) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// Clear all entries
+    fn clear(&var self) {
+        unsafe {
+            each i in 0..self.bucket_count {
+                var current = *self.buckets.add(i);
+                while !current.is_null() {
+                    let next = (*current).next;
+                    ptr::drop_in_place(current);
+                    free(current as *var u8, Layout::new::<Entry<K, V>>());
+                    current = next;
+                }
+                *self.buckets.add(i) = ptr::null_mut();
+            }
+        }
+        self.len = 0;
+    }
+
+    /// Resize the hash map
+    fn resize(&var self) {
+        let new_bucket_count = self.bucket_count * 2;
+        let new_buckets_size = new_bucket_count * size_of::<*var Entry<K, V>>();
+        let new_buckets = unsafe { alloc(Layout::from_size_align(new_buckets_size, align_of::<*var Entry<K, V>>()).unwrap()) } as *var *var Entry<K, V>;
+
+        // Initialize new buckets
+        unsafe {
+            each i in 0..new_bucket_count {
+                *new_buckets.add(i) = ptr::null_mut();
+            }
+        }
+
+        // Rehash all entries
+        unsafe {
+            each i in 0..self.bucket_count {
+                var current = *self.buckets.add(i);
+                while !current.is_null() {
+                    let next = (*current).next;
+                    let new_idx = ((*current).hash as usize) % new_bucket_count;
+                    (*current).next = *new_buckets.add(new_idx);
+                    *new_buckets.add(new_idx) = current;
+                    current = next;
+                }
+            }
+
+            // Free old buckets
+            free(self.buckets as *var u8, Layout::from_size_align(
+                self.bucket_count * size_of::<*var Entry<K, V>>(),
+                align_of::<*var Entry<K, V>>()
+            ).unwrap());
+        }
+
+        self.buckets = new_buckets;
+        self.bucket_count = new_bucket_count;
+    }
+}
+
+impl<K, V> Drop for HashMap<K, V> where K: Hash + Eq {
+    fn drop(&var self) {
+        self.clear();
+
+        unsafe {
+            free(self.buckets as *var u8, Layout::from_size_align(
+                self.bucket_count * size_of::<*var Entry<K, V>>(),
+                align_of::<*var Entry<K, V>>()
+            ).unwrap());
+        }
+    }
+}
+
+impl<K, V> Index<&K> for HashMap<K, V> where K: Hash + Eq {
+    alias Output = V;
+
+    fn index(&self, key: &K) -> &Self::Output {
+        self.get(key).expect("Key not found")
+    }
+}
+
+impl<K, V> IndexMut<&K> for HashMap<K, V> where K: Hash + Eq {
+    fn index_mut(&var self, key: &K) -> &var Self::Output {
+        self.get_mut(key).expect("Key not found")
+    }
+}
+
+// FNV-1a hasher implementation
+data FnvHasher {
+    hash: u64,
+}
+
+impl FnvHasher {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    fn new() -> Self {
+        Self { hash: Self::FNV_OFFSET_BASIS }
+    }
+
+    fn write(&var self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.hash ^= byte as u64;
+            self.hash = self.hash.wrapping_mul(Self::FNV_PRIME);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+impl Hasher for FnvHasher {
+    fn write(&var self, bytes: &[u8]) {
+        self.write(bytes);
+    }
+
+    fn finish(&self) -> u64 {
+        self.finish()
+    }
+}

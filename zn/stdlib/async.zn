@@ -1,0 +1,125 @@
+// ⚡ Nova Async Runtime — v10.0
+// Powered by Intent-First Parallelism & Flow Types
+//
+// Syntax: flow / spawn / yield / check / data / cases / chan
+
+use std::collections::{Vec, Queue};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  CORE FLOW TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Task represents an asynchronous unit of work.
+/// Defined natively as Task<T>.
+open flow AsyncTask<T> = Task<T>;
+
+/// Stream represents a reactive sequence of values.
+open flow AsyncStream<T> = Stream<T>;
+
+/// Signal represents a stateful reactive value.
+open flow AsyncSignal<T> = Signal<T>;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  PRIMITIVES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Pause execution for a specified duration
+open fn sleep(ms: i64) -> Task<()> {
+    // Implement via runtime syscall
+    yield @extern("nova_async_sleep", ms);
+}
+
+/// Yield current task to the scheduler
+open fn yield_now() -> Task<()> {
+    yield @extern("nova_async_yield");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  SPAWNING & CONCURRENCY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Spawn a new task on the runtime
+open fn spawn<T>(f: fn() -> Task<T>) -> Task<T> {
+    yield spawn f();
+}
+
+/// Run multiple tasks in parallel and wait for all
+open fn parallel<T>(tasks: Vec<Task<T>>) -> Task<Vec<T>> {
+    var results = [];
+    each t in tasks {
+        results.push(await t);
+    }
+    yield results;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  COMMUNICATION (Channels)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data Channel<T> {
+    open tx: Sender<T>,
+    open rx: Receiver<T>,
+}
+
+data Sender<T> {
+    id: i64,
+}
+
+data Receiver<T> {
+    id: i64,
+}
+
+impl<T> Channel<T> {
+    open fn new() -> Channel<T> {
+        let (tx_id, rx_id) = @extern("nova_chan_create");
+        Channel {
+            tx: Sender { id: tx_id },
+            rx: Receiver { id: rx_id },
+        };
+    }
+}
+
+impl<T> Sender<T> {
+    open fn send(&self, val: T) -> Task<bool> {
+        yield send(self.id, val);
+    }
+}
+
+impl<T> Receiver<T> {
+    open fn recv(&self) -> Task<Option<T>> {
+        yield recv(self.id);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §5  MUTEX & HYPER-LOCKS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data Mutex<T> {
+    open data: T,
+    lock_id:   i64,
+}
+
+impl<T> Mutex<T> {
+    open fn new(val: T) -> Mutex<T> {
+        Mutex {
+            data:    val,
+            lock_id: @extern("nova_mutex_create"),
+        };
+    }
+
+    open fn lock(&self) -> Task<MutexGuard<T>> {
+        @extern("nova_mutex_lock", self.lock_id);
+        MutexGuard { parent: self };
+    }
+}
+
+data MutexGuard<'a, T> {
+    parent: &'a Mutex<T>,
+}
+
+impl<'a, T> MutexGuard<'a, T> {
+    open fn drop(&var self) {
+        @extern("nova_mutex_unlock", self.parent.lock_id);
+    }
+}

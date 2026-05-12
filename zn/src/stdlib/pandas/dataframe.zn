@@ -1,0 +1,539 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                         NOVA - PANDAS DATAFRAME                             ║
+// ║              "DataFrames for Data Analysis in Nova"                         ║
+// ║              https://github.com/pandas-dev/pandas                             ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+import stdlib.numpy.core
+
+// DataFrame - 2D labeled data structure
+open data DataFrame {
+    data: HashMap<String, Series>,
+    columns: Vec<String>,
+    index: Index,
+    data: (usize, usize)
+}
+
+// Series - 1D labeled array
+open data Series {
+    data: Vec<Value>,
+    index: Index,
+    name: Option<String>,
+    dtype: DType
+}
+
+// Index - row/column labels
+open data Index {
+    labels: Vec<String>,
+    name: Option<String>
+}
+
+#[derive(Debug, Clone)]
+open cases Value {
+    Int(i64),
+    Float(f64),
+    String(String),
+    Bool(bool),
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+open cases DType {
+    Int64,
+    Float64,
+    Object,
+    Bool
+}
+
+impl DataFrame {
+    // Constructors
+    fn new(data: HashMap<String, Vec<Value>>) -> Self {
+        let columns: Vec<String> = data.keys().cloned().collect();
+        let n_rows = data.values().next().map(|v| v.len()).unwrap_or(0);
+        
+        var series_map = HashMap::new();
+        each entry in data  { let (col, values) = entry;
+            let series = Series::new(values, None, Some(col.clone()));
+            series_map.insert(col, series);
+        }
+        
+        let index = Index::range(0, n_rows);
+        
+        DataFrame {
+            data: series_map,
+            columns: columns.clone(),
+            index,
+            data: (n_rows, columns.len())
+        }
+    }
+    
+    fn from_dict(data: HashMap<String, Vec<Value>>) -> Self {
+        Self::new(data)
+    }
+    
+    // Indexing
+    fn get_column(&self, col: &str) -> Result<&Series, String> {
+        self.data.get(col).ok_or(format("Column '{}' not found", col))
+    }
+    
+    fn get_row(&self, idx: usize) -> Result<HashMap<String, Value>, String> {
+        check idx >= self.data.0 {
+            Err("Index out of bounds".into());
+        }
+        
+        var row = HashMap::new();
+        each col in &self.columns {
+            check let Some(series) = self.data.get(col) {
+                row.insert(col.clone(), series.data[idx].clone());
+            }
+        }
+        
+        Ok(row)
+    }
+    
+    // iloc - integer location based indexing
+    fn iloc(&self, rows: &[usize], cols: &[usize]) -> Result<DataFrame, String> {
+        var new_data = HashMap::new();
+        
+        for &col_idx in cols {
+            check col_idx >= self.columns.len() {
+                Err("Column index out of bounds".into());
+            }
+            
+            let col_name = &self.columns[col_idx];
+            let series = self.data.get(col_name).unwrap();
+            
+            let selected_values: Vec<Value> = rows.iter()
+                .map(|&row_idx| series.data[row_idx].clone())
+                .collect();
+            
+            new_data.insert(col_name.clone(), selected_values);
+        }
+        
+        Ok(DataFrame::new(new_data))
+    }
+    
+    // loc - label based indexing
+    fn loc(&self, row_labels: &[String], col_labels: &[String]) -> Result<DataFrame, String> {
+        var new_data = HashMap::new();
+        
+        each col_label in col_labels {
+            let series = self.data.get(col_label)
+                .ok_or(format("Column '{}' not found", col_label))?;
+            
+            let row_indices: Vec<usize> = row_labels.iter()
+                .map(|label| self.index.get_position(label))
+                .collect::<Result<Vec<_>, _>>()?;
+            
+            let selected_values: Vec<Value> = row_indices.iter()
+                .map(|&idx| series.data[idx].clone())
+                .collect();
+            
+            new_data.insert(col_label.clone(), selected_values);
+        }
+        
+        Ok(DataFrame::new(new_data))
+    }
+    
+    // Operations
+    fn head(&self, n: usize) -> DataFrame {
+        let n = n.min(self.data.0);
+        let rows: Vec<usize> = (0..n).collect();
+        let cols: Vec<usize> = (0..self.columns.len()).collect();
+        self.iloc(&rows, &cols).unwrap()
+    }
+    
+    fn tail(&self, n: usize) -> DataFrame {
+        let start = self.data.0.saturating_sub(n);
+        let rows: Vec<usize> = (start..self.data.0).collect();
+        let cols: Vec<usize> = (0..self.columns.len()).collect();
+        self.iloc(&rows, &cols).unwrap()
+    }
+    
+    // Descriptive statistics
+    fn describe(&self) -> DataFrame {
+        var stats = HashMap::new();
+        
+        each col in &self.columns {
+            check let Some(series) = self.data.get(col) {
+                let numeric = series.to_numeric();
+                
+                stats.insert("count".into(), [Value::Float(numeric.len() as f64)]);
+                stats.insert("mean".into(), [Value::Float(numeric.mean())]);
+                stats.insert("std".into(), [Value::Float(numeric.std())]);
+                stats.insert("min".into(), [Value::Float(numeric.min())]);
+                stats.insert("max".into(), [Value::Float(numeric.max())]);
+            }
+        }
+        
+        DataFrame::new(stats)
+    }
+    
+    fn info(&self) {
+        println("<class 'DataFrame'>");
+        println("RangeIndex: {} entries, 0 to {}", self.data.0, self.data.0 - 1);
+        println("Data columns (total {} columns):", self.data.1);
+        println(" #   Column  Non-Null Count  Dtype");
+        
+        each entry in self.columns.iter().enumerate()  { let (i, col) = entry;
+            check let Some(series) = self.data.get(col) {
+                let non_null = series.data.iter().filter(|v| !matches!(v, Value::None)).count();
+                println(" {}   {}      {} non-null     {:?}", i, col, non_null, series.dtype);
+            }
+        }
+    }
+    
+    // GroupBy operations
+    fn groupby(&self, by: &str) -> GroupBy {
+        GroupBy::new(self, by.into())
+    }
+    
+    // Merge/Join
+    fn merge(&self, other: &DataFrame, on: &str, how: JoinType) -> Result<DataFrame, String> {
+        let left_key = self.get_column(on)?;
+        let right_key = other.get_column(on)?;
+        
+        var merged_data = HashMap::new();
+        
+        match how {
+            JoinType::Inner => {
+                // Find matching keys
+                each entry in left_key.data.iter().enumerate()  { let (i, left_val) = entry;
+                    each entry in right_key.data.iter().enumerate()  { let (j, right_val) = entry;
+                        check Self::values_equal(left_val, right_val) {
+                            // Add left columns
+                            each col in &self.columns {
+                                let series = self.data.get(col).unwrap();
+                                merged_data.entry(col.clone())
+                                    .or_insert(Vec::new())
+                                    .push(series.data[i].clone());
+                            }
+                            
+                            // Add right columns (except key)
+                            each col in &other.columns {
+                                check col != on {
+                                    let series = other.data.get(col).unwrap();
+                                    merged_data.entry(format("{}_right", col))
+                                        .or_insert(Vec::new())
+                                        .push(series.data[j].clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => yield Err("Only inner join implemented".into())
+        }
+        
+        Ok(DataFrame::new(merged_data))
+    }
+    
+    // Sorting
+    fn sort_values(&self, by: &str, ascending: bool) -> Result<DataFrame, String> {
+        let sort_col = self.get_column(by)?;
+        
+        var indices: Vec<usize> = (0..self.data.0).collect();
+        indices.sort_by(|&a, &b| {
+            let cmp = Self::compare_values(&sort_col.data[a], &sort_col.data[b]);
+            check ascending { cmp } else { cmp.reverse() }
+        });
+        
+        self.iloc(&indices, &(0..self.columns.len()).collect::<Vec<_>>())
+    }
+    
+    // Filtering
+    fn query(&self, condition: fn(&HashMap<String, Value>) -> bool) -> DataFrame {
+        var filtered_indices = Vec::new();
+        
+        each i in 0..self.data.0 {
+            check let Ok(row) = self.get_row(i) {
+                check condition(&row) {
+                    filtered_indices.push(i);
+                }
+            }
+        }
+        
+        self.iloc(&filtered_indices, &(0..self.columns.len()).collect::<Vec<_>>()).unwrap()
+    }
+    
+    // Missing data
+    fn dropna(&self) -> DataFrame {
+        var valid_indices = Vec::new();
+        
+        each i in 0..self.data.0 {
+            var has_na = false;
+            each col in &self.columns {
+                check let Some(series) = self.data.get(col) {
+                    check matches!(series.data[i], Value::None) {
+                        has_na = true;
+                        abort;
+                    }
+                }
+            }
+            check !has_na {
+                valid_indices.push(i);
+            }
+        }
+        
+        self.iloc(&valid_indices, &(0..self.columns.len()).collect::<Vec<_>>()).unwrap()
+    }
+    
+    fn fillna(&self, value: Value) -> DataFrame {
+        var new_data = HashMap::new();
+        
+        each col in &self.columns {
+            check let Some(series) = self.data.get(col) {
+                let filled: Vec<Value> = series.data.iter()
+                    .map(|v| check matches!(v, Value::None) { value.clone() } else { v.clone() })
+                    .collect();
+                new_data.insert(col.clone(), filled);
+            }
+        }
+        
+        DataFrame::new(new_data)
+    }
+    
+    // Apply function
+    fn impl(&self, func: fn(&Series) -> Series) -> DataFrame {
+        var new_data = HashMap::new();
+        
+        each col in &self.columns {
+            check let Some(series) = self.data.get(col) {
+                let result = func(series);
+                new_data.insert(col.clone(), result.data);
+            }
+        }
+        
+        DataFrame::new(new_data)
+    }
+    
+    // To/From formats
+    fn to_numpy(&self) -> Vec<Vec<f64>> {
+        var matrix = Vec::new();
+        
+        each i in 0..self.data.0 {
+            var row = Vec::new();
+            each col in &self.columns {
+                check let Some(series) = self.data.get(col) {
+                    row.push(series.data[i].to_f64());
+                }
+            }
+            matrix.push(row);
+        }
+        
+        matrix
+    }
+    
+    // Helpers
+    fn values_equal(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => x == y,
+            (Value::Float(x), Value::Float(y)) => (x - y).abs() < 1e-10,
+            (Value::String(x), Value::String(y)) => x == y,
+            (Value::Bool(x), Value::Bool(y)) => x == y,
+            _ => false
+        }
+    }
+    
+    fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => x.cmp(y),
+            (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap(),
+            (Value::String(x), Value::String(y)) => x.cmp(y),
+            _ => std::cmp::Ordering::Equal
+        }
+    }
+}
+
+// Series implementation
+impl Series {
+    fn new(data: Vec<Value>, index: Option<Index>, name: Option<String>) -> Self {
+        let dtype = Self::infer_dtype(&data);
+        let index = index.unwrap_or_else(|| Index::range(0, data.len()));
+        
+        Series {
+            data,
+            index,
+            name,
+            dtype
+        }
+    }
+    
+    fn sum(&self) -> f64 {
+        self.to_numeric().iter().sum()
+    }
+    
+    fn mean(&self) -> f64 {
+        let numeric = self.to_numeric();
+        numeric.iter().sum::<f64>() / numeric.len() as f64
+    }
+    
+    fn std(&self) -> f64 {
+        let numeric = self.to_numeric();
+        let mean = self.mean();
+        variance = numeric.iter()
+            .map(|x| (x - mean).powi(2))
+            .sum::<f64>() / numeric.len() as f64;
+        variance.sqrt()
+    }
+    
+    fn min(&self) -> f64 {
+        self.to_numeric().iter().fold(f64::INFINITY, |a, &b| a.min(b))
+    }
+    
+    fn max(&self) -> f64 {
+        self.to_numeric().iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b))
+    }
+    
+    fn to_numeric(&self) -> Vec<f64> {
+        self.data.iter().map(|v| v.to_f64()).collect()
+    }
+    
+    fn infer_dtype(data: &[Value]) -> DType {
+        check data.is_empty() {
+            yield DType::Object;
+        }
+        
+        match &data[0] {
+            Value::Int(_) => DType::Int64,
+            Value::Float(_) => DType::Float64,
+            Value::Bool(_) => DType::Bool,
+            _ => DType::Object
+        }
+    }
+}
+
+// Index implementation
+impl Index {
+    fn range(start: usize, end: usize) -> Self {
+        let labels = (start..end).map(|i| i.into()).collect();
+        Index {
+            labels,
+            name: None
+        }
+    }
+    
+    fn from_labels(labels: Vec<String>) -> Self {
+        Index {
+            labels,
+            name: None
+        }
+    }
+    
+    fn get_position(&self, label: &str) -> Result<usize, String> {
+        self.labels.iter()
+            .position(|l| l == label)
+            .ok_or(format("Label '{}' not found", label))
+    }
+}
+
+// Value helpers
+impl Value {
+    fn to_f64(&self) -> f64 {
+        match self {
+            Value::Int(i) => *i as f64,
+            Value::Float(f) => *f,
+            Value::Bool(b) => check *b { 1.0 } else { 0.0 },
+            _ => 0.0
+        }
+    }
+}
+
+// GroupBy
+open data GroupBy {
+    df: DataFrame,
+    by: String
+}
+
+impl GroupBy {
+    fn new(df: &DataFrame, by: String) -> Self {
+        GroupBy {
+            df: df.clone(),
+            by
+        }
+    }
+    
+    fn sum(&self) -> DataFrame {
+        self.aggregate(|series| series.sum())
+    }
+    
+    fn mean(&self) -> DataFrame {
+        self.aggregate(|series| series.mean())
+    }
+    
+    fn count(&self) -> DataFrame {
+        self.aggregate(|series| series.data.len() as f64)
+    }
+    
+    fn aggregate(&self, func: fn(&Series) -> f64) -> DataFrame {
+        let group_col = self.df.get_column(&self.by).unwrap();
+        var groups: HashMap<String, Vec<usize>> = HashMap::new();
+        
+        // Group indices by key
+        each entry in group_col.data.iter().enumerate()  { let (i, val) = entry;
+            let key = format("{:?}", val);
+            groups.entry(key).or_insert(Vec::new()).push(i);
+        }
+        
+        // Aggregate
+        var result = HashMap::new();
+        each entry in groups  { let (key, indices) = entry;
+            each col in &self.df.columns {
+                check col != &self.by {
+                    let series = self.df.data.get(col).unwrap();
+                    let subset_data: Vec<Value> = indices.iter()
+                        .map(|&i| series.data[i].clone())
+                        .collect();
+                    let subset = Series::new(subset_data, None, None);
+                    let agg_val = func(&subset);
+                    
+                    result.entry(col.clone())
+                        .or_insert(Vec::new())
+                        .push(Value::Float(agg_val));
+                }
+            }
+        }
+        
+        DataFrame::new(result)
+    }
+}
+
+open cases JoinType {
+    Inner,
+    Left,
+    Right,
+    Outer
+}
+
+impl Clone for DataFrame {
+    fn clone(&self) -> Self {
+        DataFrame {
+            data: self.data.clone(),
+            columns: self.columns.clone(),
+            index: self.index.clone(),
+            data: self.data
+        }
+    }
+}
+
+impl Clone for Series {
+    fn clone(&self) -> Self {
+        Series {
+            data: self.data.clone(),
+            index: self.index.clone(),
+            name: self.name.clone(),
+            dtype: self.dtype
+        }
+    }
+}
+
+impl Clone for Index {
+    fn clone(&self) -> Self {
+        Index {
+            labels: self.labels.clone(),
+            name: self.name.clone()
+        }
+    }
+}
+
+export { DataFrame, Series, Index, Value, GroupBy, JoinType }

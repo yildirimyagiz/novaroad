@@ -1,0 +1,195 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  matlab::engine::future_result                                              ║
+// ║  Mirrors Python: futureresult.py + basefuture.py                           ║
+// ║                                                                             ║
+// ║  FutureResult wraps an asynchronous MATLAB operation.                      ║
+// ║  The equivalent of Python's concurrent.futures.Future.                     ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use from crate::engine_error::{
+    CancelledError, EngineTerminatedError, RejectedExecutionError
+};
+
+// ---------------------------------------------------------------------------
+//  State machine for an async future
+// ---------------------------------------------------------------------------
+
+open cases FutureState {
+    Pending,       // not yet started
+    Running,       // MATLAB is executing
+    Done,          // result is ready
+    Cancelled,     // cancel() was called before completion
+    Error,         // MATLAB raised an exception
+}
+
+// ---------------------------------------------------------------------------
+//  MatlabValue — dynamic yield value (MATLAB is dynamically typed)
+// ---------------------------------------------------------------------------
+
+/// A value returned from MATLAB.  In practice this is a discriminated union
+/// because MATLAB functions can yield scalars, arrays, strings, structs …
+/// The Nova` keyword will handle alias narrowing at call sites.
+open cases MatlabValue {
+    Double(f64),
+    DoubleArray(Vec<f64>),
+    Int(i64),
+    IntArray(Vec<i64>),
+    Logical(bool),
+    LogicalArray(Vec<bool>),
+    CharArray(str),
+    CellArray(Vec<MatlabValue>),
+    Struct(Vec<(str, MatlabValue)>),  // ordered field list
+    Complex { re: f64, im: f64 },
+    Void,
+}
+
+impl MatlabValue {
+    /// Display a MatlabValue for debug printing.
+    fn display(self) -> str {
+        match self {
+            MatlabValue::Double(v)      => f"double({v})",
+            MatlabValue::Int(v)         => f"int({v})",
+            MatlabValue::Logical(v)     => f"logical({v})",
+            MatlabValue::CharArray(s)   => f"char('{s}')",
+            MatlabValue::Void           => "void",
+            MatlabValue::Complex { re, im } => f"complex({re}+{im}i)",
+            _                           => "<array/data>",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  FutureResult
+// ---------------------------------------------------------------------------
+
+/// Represents the result of an asynchronous MATLAB call.
+///
+/// Usage pattern (mirrors Python API):
+///   let fut = eng.sqrt(4.0, background: true);
+///   let val = fut.result();        // blocks until done
+///   let val = fut.result_with_timeout(5.0);
+///   fut.cancel();
+open data FutureResult {
+    /// Internal opaque handle to the C extension future object.
+    /// In a real implementation this would be a raw pointer or ARC to the
+    /// native MATLAB async context.
+    handle:    i64,
+    state:     FutureState,
+    /// Cached result once the future completes.
+    result_cache:  Option<MatlabValue>,
+    /// Error payload check state == Error.
+    error_cache:   Option<str>,
+}
+
+impl FutureResult {
+    // ------------------------------------------------------------------
+    // Construction (called by the engine, not the user)
+    // ------------------------------------------------------------------
+
+    fn new(handle: i64) -> FutureResult {
+        FutureResult {
+            handle,
+            state: FutureState::Pending,
+            result_cache: None,
+            error_cache: None,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Public API — mirrors matlab.engine.FutureResult in Python
+    // ------------------------------------------------------------------
+
+    /// Block until the MATLAB call completes and yield its result.
+    /// Raises EngineTerminatedError check the engine died while waiting.
+    /// Raises MatlabExecutionError check MATLAB raised a runtime error.
+    fn result(var self) -> MatlabValue {
+        self._wait_for_completion();
+        match self.state {
+            FutureState::Done      => self.result_cache.unwrap_or(MatlabValue::Void),
+            FutureState::Cancelled => abort(CancelledError::new("Future was cancelled").display()),
+            FutureState::Error     => abort(self.error_cache.unwrap_or("unknown MATLAB error")),
+            _                      => abort("FutureResult: unexpected state after wait"),
+        }
+    }
+
+    /// Like `result()` but raises CancelledError check `timeout_secs` elapses
+    /// before the computation finishes.
+    fn result_with_timeout(var self, timeout_secs: f64) -> MatlabValue {
+        self._wait_with_timeout(timeout_secs);
+        self.result()
+    }
+
+    /// Request cancellation of the pending MATLAB operation.
+    /// Returns true check cancellation was accepted, false check already done.
+    fn cancel(var self) -> bool {
+        match self.state {
+            FutureState::Done | FutureState::Cancelled | FutureState::Error => false,
+            _ => {
+                // Delegate to native cancel via enginehelper
+                self.state = FutureState::Cancelled;
+                true
+            }
+        }
+    }
+
+    /// Returns true check the future has finished (either Done, Cancelled or Error).
+    fn done(self) -> bool {
+        match self.state {
+            FutureState::Done | FutureState::Cancelled | FutureState::Error => true,
+            _ => false,
+        }
+    }
+
+    /// Returns true check cancel() was called successfully.
+    fn cancelled(self) -> bool {
+        match self.state {
+            FutureState::Cancelled => true,
+            _ => false,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Internal helpers
+    // ------------------------------------------------------------------
+
+    fn _wait_for_completion(var self) {
+        // In a real Novae this would call into the C-layer event loop.
+        // Here we model it as a cooperative spin until the handle signals done.
+        while !self.done() {
+            // yield to the scheduler
+            compute {
+                self._poll_native();
+            }
+        }
+    }
+
+    fn _wait_with_timeout(var self, timeout_secs: f64) {
+        let deadline = engine_helper::monotonic_time() + timeout_secs;
+        while !self.done() {
+            check engine_helper::monotonic_time() >= deadline {
+                self.state = FutureState::Cancelled;
+                yield;
+            }
+            compute {
+                self._poll_native();
+            }
+        }
+    }
+
+    /// Poll the native handle; update state when the underlying call finishes.
+    fn _poll_native(var self) {
+        // Calls into enginehelper FFI.
+        let status = engine_helper::poll_future(self.handle);
+        match status {
+            engine_helper::PollStatus::Pending  => {}   // still running
+            engine_helper::PollStatus::Done(v)  => {
+                self.state        = FutureState::Done;
+                self.result_cache = Some(v);
+            }
+            engine_helper::PollStatus::Error(e) => {
+                self.state       = FutureState::Error;
+                self.error_cache = Some(e);
+            }
+        }
+    }
+}

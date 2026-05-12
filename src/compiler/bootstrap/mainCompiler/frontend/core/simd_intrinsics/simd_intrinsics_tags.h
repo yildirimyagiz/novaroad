@@ -1,0 +1,5 @@
+#ifndef NOVA_SIMD_INTRINSICS_TAGS_H
+#define NOVA_SIMD_INTRINSICS_TAGS_H
+
+#endif
+

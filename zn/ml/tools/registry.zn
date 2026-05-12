@@ -1,0 +1,96 @@
+// Nova Model Registry
+// System for managing, versioning, and deploying trained models
+
+// module nova.ml.tools.registry;
+
+use nova.io.fs;
+use nova.io.json;
+use nova.time;
+
+/// Model Metadata
+open data ModelMetadata {
+    name: string,
+    version: string,
+    algorithm: string,
+    trained_at: string,
+    dataset_hash: string,
+    metrics: Map<string, f64>,
+    params: Map<string, string>,
+}
+
+/// Model Registry Manager
+open data ModelRegistry {
+    base_path: string,
+}
+
+impl ModelRegistry {
+    fn new(base_path: string) -> Self {
+        check !fs::exists(base_path) {
+            fs::create_dir_all(base_path).unwrap();
+        }
+        Self { base_path }
+    }
+
+    /// Register a new model version
+    fn register_model(&self, model: &dyn Any, meta: ModelMetadata) -> Result<string, Error> {
+        let model_id = format("{}_{}", meta.name, meta.version);
+        let model_dir = format("{}/{}", self.base_path, model_id);
+        
+        fs::create_dir_all(&model_dir)?;
+        
+        // 1. Save artifact (model weights)
+        let artifact_path = format("{}/model.weights", model_dir);
+        fs::write(artifact_path, model.serialize()?)?;
+        
+        // 2. Save metadata
+        let meta_path = format("{}/metadata.json", model_dir);
+        let meta_json = json::encode(meta)?;
+        fs::write(meta_path, meta_json)?;
+        
+        println("Model {} registered successfully at {}", model_id, model_dir);
+        Ok(model_id)
+    }
+
+    /// Retrieve a model by ID
+    fn get_model(&self, model_id: string) -> Result<(Box<dyn Any>, ModelMetadata), Error> {
+        let model_dir = format("{}/{}", self.base_path, model_id);
+        
+        check !fs::exists(&model_dir) {
+            Err(Error::NotFound(format("Model {} not found", model_id)));
+        }
+        
+        // Load metadata
+        let meta_path = format("{}/metadata.json", model_dir);
+        let meta_json = fs::read_to_string(meta_path)?;
+        let meta: ModelMetadata = json::decode(meta_json)?;
+        
+        // Load weights
+        let artifact_path = format("{}/model.weights", model_dir);
+        let weights = fs::read(artifact_path)?;
+        
+        // Here we would use a factory to reconstruct the model based on meta.algorithm
+        // For simplicity, returning the raw weights/meta
+        Ok((weights, meta))
+    }
+
+    /// List all registered models
+    fn list_models(&self) -> Result<[]string, Error> {
+        Ok(fs::read_dir(self.base_path)?.map(|e| e.name()))
+    }
+
+    /// Cleanup old versions (keep only latest N)
+    fn prune_versions(&self, model_name: string, keep_latest: int) -> Result<(), Error> {
+        var versions = self.list_models()?
+            .filter(|v| v.starts_with(model_name))
+            .collect();
+            
+        versions.sort_desc(); // Assumes semver or timestamp
+        
+        each i in keep_latest..versions.len() {
+            let path = format("{}/{}", self.base_path, versions[i]);
+            fs::remove_dir_all(path)?;
+        }
+        
+        Ok(())
+    }
+}

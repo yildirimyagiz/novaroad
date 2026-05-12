@@ -1,0 +1,364 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA SPAN - Source Location Tracking
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Inspired by rustc_span: Precise source location information
+ */
+
+use std::fmt;
+use std::cmp;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SPAN TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone, Copy, PartialEq, Eq, Hash
+open data Span {
+    lo: BytePos,
+    hi: BytePos,
+    ctxt: SyntaxContext,
+}
+
+// derive: Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord
+open data BytePos(open usize);
+
+// derive: Debug, Clone, Copy, PartialEq, Eq, Hash
+open data SyntaxContext(open u32);
+
+// derive: Debug, Clone
+open data Spanned<T> {
+    node: T,
+    span: Span,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SPAN CONSTRUCTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl Span {
+    fn new(lo: BytePos, hi: BytePos, ctxt: SyntaxContext) -> Self {
+        Span { lo, hi, ctxt }
+    }
+
+    fn dummy() -> Self {
+        Span {
+            lo: BytePos(0),
+            hi: BytePos(0),
+            ctxt: SyntaxContext(0),
+        }
+    }
+
+    fn with_lo(&self, lo: BytePos) -> Span {
+        Span { lo, ..*self }
+    }
+
+    fn with_hi(&self, hi: BytePos) -> Span {
+        Span { hi, ..*self }
+    }
+
+    fn contains(&self, other: Span) -> bool {
+        self.lo <= other.lo && other.hi <= self.hi
+    }
+
+    fn overlaps(&self, other: Span) -> bool {
+        self.lo < other.hi && other.lo < self.hi
+    }
+
+    fn merge(&self, other: Span) -> Span {
+        Span {
+            lo: cmp::min(self.lo, other.lo),
+            hi: cmp::max(self.hi, other.hi),
+            ctxt: self.ctxt, // Simplified
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lo >= self.hi
+    }
+
+    fn len(&self) -> usize {
+        self.hi.0 - self.lo.0
+    }
+}
+
+impl BytePos {
+    fn from_usize(pos: usize) -> Self {
+        BytePos(pos)
+    }
+
+    fn to_usize(&self) -> usize {
+        self.0
+    }
+}
+
+impl SyntaxContext {
+    fn root() -> Self {
+        SyntaxContext(0)
+    }
+
+    fn is_root(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SPANNED UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl<T> Spanned<T> {
+    fn new(node: T, span: Span) -> Self {
+        Spanned { node, span }
+    }
+
+    fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Spanned<U> {
+        Spanned {
+            node: f(self.node),
+            span: self.span,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SOURCE MAP
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone
+open data SourceMap {
+    files: Vec<SourceFile>,
+}
+
+impl SourceMap {
+    fn new() -> Self {
+        SourceMap {
+            files: Vec::new(),
+        }
+    }
+
+    fn add_file(&var self, name: String, source: String) -> SourceFileId {
+        let id = SourceFileId(self.files.len());
+        let file = SourceFile {
+            name,
+            src: source,
+            lines: compute_line_starts(&src),
+            id,
+        };
+        self.files.push(file);
+        id
+    }
+
+    fn lookup_file(&self, id: SourceFileId) -> Option<&SourceFile> {
+        self.files.get(id.0)
+    }
+
+    fn span_to_string(&self, span: Span) -> String {
+        // Simplified: just yield byte positions
+        format("bytes {}-{}", span.lo.0, span.hi.0)
+    }
+
+    fn span_to_line_column(&self, span: Span) -> Option<(usize, usize)> {
+        // Find which file this span belongs to (simplified - assumes single file)
+        check let Some(file) = self.files.first() {
+            file.byte_pos_to_line_column(span.lo)
+        } else {
+            None
+        }
+    }
+}
+
+// derive: Debug, Clone, Copy, PartialEq, Eq, Hash
+open data SourceFileId(open usize);
+
+// derive: Debug, Clone
+open data SourceFile {
+    name: String,
+    src: String,
+    lines: Vec<BytePos>,
+    id: SourceFileId,
+}
+
+impl SourceFile {
+    fn byte_pos_to_line_column(&self, pos: BytePos) -> Option<(usize, usize)> {
+        // Binary search to find line
+        let line = match self.lines.binary_search(&pos) {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
+        };
+
+        check line >= self.lines.len() {
+            yield None;
+        }
+
+        let line_start = self.lines[line];
+        let column = pos.0 - line_start.0;
+
+        Some((line + 1, column + 1)) // 1-indexed
+    }
+
+    fn line_to_string(&self, line: usize) -> Option<&str> {
+        check line == 0 || line > self.lines.len() {
+            yield None;
+        }
+
+        let start = self.lines[line - 1];
+        let end = check line < self.lines.len() {
+            self.lines[line]
+        } else {
+            BytePos(self.src.len())
+        };
+
+        Some(&self.src[start.0..end.0])
+    }
+}
+
+fn compute_line_starts(src: &str) -> Vec<BytePos> {
+    var lines = [BytePos(0)];
+    each entry in src.char_indices()  { let (i, ch) = entry;
+        check ch == '\n' {
+            lines.push(BytePos(i + 1));
+        }
+    }
+    lines
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FORMATTING
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl fmt::Display for Span {
+    fn fmt(&self, f: &var fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{}", self.lo.0, self.hi.0)
+    }
+}
+
+impl fmt::Display for BytePos {
+    fn fmt(&self, f: &var fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MULTI-SPAN
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone
+open data MultiSpan {
+    spans: Vec<Span>,
+}
+
+impl MultiSpan {
+    fn new() -> Self {
+        MultiSpan { spans: Vec::new() }
+    }
+
+    fn push_span(&var self, span: Span) {
+        self.spans.push(span);
+    }
+
+    fn primary_span(&self) -> Option<Span> {
+        self.spans.first().copied()
+    }
+
+    fn spans(&self) -> &[Span] {
+        &self.spans
+    }
+}
+
+impl From<Span> for MultiSpan {
+    fn from(span: Span) -> Self {
+        MultiSpan { spans: [span] }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+open fn spanned<T>(node: T, span: Span) -> Spanned<T> {
+    Spanned::new(node, span)
+}
+
+open fn dummy_spanned<T>(node: T) -> Spanned<T> {
+    Spanned::new(node, Span::dummy())
+}
+
+// test module
+space tests {
+    use super::*;
+
+    // test
+    fn test_span_creation() {
+        let lo = BytePos(10);
+        let hi = BytePos(20);
+        let ctxt = SyntaxContext(1);
+        let span = Span::new(lo, hi, ctxt);
+
+        assert_eq!(span.lo, lo);
+        assert_eq!(span.hi, hi);
+        assert_eq!(span.ctxt, ctxt);
+    }
+
+    // test
+    fn test_dummy_span() {
+        let span = Span::dummy();
+        assert_eq!(span.lo, BytePos(0));
+        assert_eq!(span.hi, BytePos(0));
+        assert_eq!(span.ctxt, SyntaxContext(0));
+    }
+
+    // test
+    fn test_span_operations() {
+        let span1 = Span::new(BytePos(10), BytePos(20), SyntaxContext(0));
+        let span2 = Span::new(BytePos(15), BytePos(25), SyntaxContext(0));
+
+        assert(span1.contains(Span::new(BytePos(12), BytePos(18), SyntaxContext(0))));
+        assert(span1.overlaps(span2));
+        assert(!span1.is_empty());
+        assert_eq!(span1.len(), 10);
+    }
+
+    // test
+    fn test_byte_pos_operations() {
+        let pos = BytePos(42);
+        assert_eq!(pos.to_usize(), 42);
+        assert_eq!(BytePos::from_usize(42), pos);
+    }
+
+    // test
+    fn test_syntax_context() {
+        let root = SyntaxContext::root();
+        assert(root.is_root());
+        assert_eq!(root, SyntaxContext(0));
+    }
+
+    // test
+    fn test_spanned_creation() {
+        let node = "test";
+        let span = Span::dummy();
+        let spanned = Spanned::new(node, span);
+
+        assert_eq!(spanned.node, "test");
+        assert_eq!(spanned.span, span);
+    }
+
+    // test
+    fn test_source_map_creation() {
+        var map = SourceMap::new();
+        let id = map.add_file("test.zn".into(), "fn main() {}".into());
+
+        assert_eq!(map.lookup_file(id).unwrap().name, "test.zn");
+        assert_eq!(map.lookup_file(id).unwrap().src, "fn main() {}");
+    }
+
+    // test
+    fn test_multi_span() {
+        var multi = MultiSpan::new();
+        let span1 = Span::dummy();
+        let span2 = Span::new(BytePos(1), BytePos(2), SyntaxContext(0));
+
+        multi.push_span(span1);
+        multi.push_span(span2);
+
+        assert_eq!(multi.spans().len(), 2);
+        assert_eq!(multi.primary_span(), Some(span1));
+    }
+}

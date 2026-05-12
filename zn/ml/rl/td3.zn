@@ -1,0 +1,273 @@
+"""
+TD3 - Twin Delayed Deep Deterministic Policy Gradient
+Modern algorithm for continuous control
+
+From stable-baselines3 / DLR-RM
+Reference: "Addressing Function Approximation Error in Actor-Critic Methods" (Fujimoto et al., 2018)
+
+Improvements over DDPG:
+    - Twin Q-networks (reduces overestimation)
+    - Delayed policy updates (stability)
+    - Target policy smoothing (regularization)
+"""
+
+use ml.tensor as zt
+from ml.nn import Linear, Sequential, ReLU, Tanh
+from ml.optim import Adam
+from .sac import ReplayBuffer
+use std.collections.HashMap
+
+class TD3:
+    """
+    Twin Delayed DDPG (TD3)
+    
+    Deterministic policy gradient with twin critics.
+    More stable than DDPG, simpler than SAC.
+    
+    Key features:
+        - Deterministic policy (vs stochastic SAC)
+        - Twin critics (like SAC)
+        - Delayed updates (unique to TD3)
+        - Target smoothing (unique to TD3)
+    
+    Example:
+        ```nova
+        td3 = TD3(state_dim=8, action_dim=2)
+        
+        each episode in 0..1000 {
+            state = env.reset()
+            while !done {
+                // Add exploration noise
+                action = td3.select_action(state, add_noise=true)
+                next_state, reward, done = env.step(action)
+                
+                td3.replay_buffer.add(state, action, reward, next_state, done)
+                
+                check td3.replay_buffer.size() > 1000 {
+                    td3.train_step()
+                }
+                
+                state = next_state
+            }
+        }
+        ```
+    """
+    
+    // Networks
+    actor: Sequential
+    critic_1: Sequential
+    critic_2: Sequential
+    target_actor: Sequential
+    target_critic_1: Sequential
+    target_critic_2: Sequential
+    
+    // Optimizers
+    actor_optimizer: Adam
+    critic_optimizer: Adam
+    
+    // Hyperparameters
+    state_dim: int
+    action_dim: int
+    gamma: f32
+    tau: f32
+    policy_noise: f32
+    noise_clip: f32
+    policy_delay: int
+    
+    // State
+    total_it: int  // Total iterations (for delayed updates)
+    replay_buffer: ReplayBuffer
+    
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int = 256,
+        lr: f32 = 0.0003,
+        gamma: f32 = 0.99,
+        tau: f32 = 0.005,
+        policy_noise: f32 = 0.2,
+        noise_clip: f32 = 0.5,
+        policy_delay: int = 2,  // Update actor every 2 critic updates
+        buffer_size: int = 1000000,
+    ):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.gamma = gamma
+        self.tau = tau
+        self.policy_noise = policy_noise
+        self.noise_clip = noise_clip
+        self.policy_delay = policy_delay
+        self.total_it = 0
+        
+        // Build actor (deterministic policy)
+        self.actor = Sequential([
+            Linear(state_dim, hidden_dim),
+            ReLU(),
+            Linear(hidden_dim, hidden_dim),
+            ReLU(),
+            Linear(hidden_dim, action_dim),
+            Tanh(),  // Output in [-1, 1]
+        ])
+        
+        // Build twin critics
+        self.critic_1 = Sequential([
+            Linear(state_dim + action_dim, hidden_dim),
+            ReLU(),
+            Linear(hidden_dim, hidden_dim),
+            ReLU(),
+            Linear(hidden_dim, 1),
+        ])
+        
+        self.critic_2 = self.critic_1.clone()
+        
+        // Target networks
+        self.target_actor = self.actor.clone()
+        self.target_critic_1 = self.critic_1.clone()
+        self.target_critic_2 = self.critic_2.clone()
+        
+        // Optimizers
+        self.actor_optimizer = Adam(self.actor.parameters(), lr=lr)
+        
+        let critic_params = self.critic_1.parameters() + self.critic_2.parameters()
+        self.critic_optimizer = Adam(critic_params, lr=lr)
+        
+        // Replay buffer
+        self.replay_buffer = ReplayBuffer(buffer_size)
+    
+    def select_action(self, state: Tensor, add_noise: bool = false) -> Tensor:
+        """
+        Select action from policy
+        
+        Args:
+            state: Current state
+            add_noise: Add exploration noise (for training)
+        
+        Returns:
+            Action tensor
+        """
+        action = self.actor.forward(state)
+        
+        check add_noise:
+            // Add Gaussian noise for exploration
+            noise = zt.randn_like(action) * 0.1
+            action = action + noise
+            action = action.clamp(-1.0, 1.0)
+        }
+        
+        yield action
+    }
+    
+    def train_step(self, batch_size: int = 256) -> HashMap[str, f32]:
+        """
+        Perform one training step
+        
+        TD3 updates critics every step, but actor only every `policy_delay` steps.
+        
+        Returns:
+            Training metrics
+        """
+        self.total_it += 1
+        
+        // Sample batch
+        let (states, actions, rewards, next_states, dones) = self.replay_buffer.sample(batch_size)
+        
+        // ═══════════════════════════════════════════════════════════════
+        // UPDATE CRITICS
+        // ═══════════════════════════════════════════════════════════════
+        
+        // Target policy smoothing: add clipped noise to target actions
+        let noise = zt.randn_like(actions) * self.policy_noise
+        noise = noise.clamp(-self.noise_clip, self.noise_clip)
+        
+        let next_actions = self.target_actor.forward(next_states) + noise
+        next_actions = next_actions.clamp(-1.0, 1.0)
+        
+        // Compute target Q-values (twin critics)
+        let target_q1 = self.target_critic_1.forward(zt.cat([next_states, next_actions], dim=1))
+        let target_q2 = self.target_critic_2.forward(zt.cat([next_states, next_actions], dim=1))
+        
+        // Take minimum (reduces overestimation)
+        let target_q = zt.minimum(target_q1, target_q2)
+        let target_q = rewards + (1 - dones) * self.gamma * target_q
+        
+        // Current Q estimates
+        let current_q1 = self.critic_1.forward(zt.cat([states, actions], dim=1))
+        let current_q2 = self.critic_2.forward(zt.cat([states, actions], dim=1))
+        
+        // Critic loss
+        let critic_loss = (current_q1 - target_q).pow(2).mean() + 
+                          (current_q2 - target_q).pow(2).mean()
+        
+        // Update critics
+        critic_loss.backward()
+        self.critic_optimizer.step()
+        self.critic_optimizer.zero_grad()
+        
+        var metrics = HashMap::new()
+        metrics["critic_loss"] = critic_loss.item()
+        metrics["q_mean"] = current_q1.mean().item()
+        
+        // ═══════════════════════════════════════════════════════════════
+        // DELAYED ACTOR UPDATE
+        // ═══════════════════════════════════════════════════════════════
+        
+        check self.total_it % self.policy_delay == 0:
+            // Compute actor loss (maximize Q)
+            let actor_actions = self.actor.forward(states)
+            let actor_loss = -self.critic_1.forward(zt.cat([states, actor_actions], dim=1)).mean()
+            
+            // Update actor
+            actor_loss.backward()
+            self.actor_optimizer.step()
+            self.actor_optimizer.zero_grad()
+            
+            // Soft update target networks
+            self._soft_update(self.actor, self.target_actor)
+            self._soft_update(self.critic_1, self.target_critic_1)
+            self._soft_update(self.critic_2, self.target_critic_2)
+            
+            metrics["actor_loss"] = actor_loss.item()
+        }
+        
+        yield metrics
+    }
+    
+    def _soft_update(&self, source: Sequential, target: Sequential):
+        """Soft update: target = τ * source + (1-τ) * target"""
+        for (param, target_param) in zip(source.parameters(), target.parameters()):
+            target_param.data = self.tau * param.data + (1 - self.tau) * target_param.data
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// COMPARISON: SAC vs TD3
+// ═══════════════════════════════════════════════════════════════════════
+
+/*
+SAC vs TD3:
+
+SAC (Soft Actor-Critic):
+  ✅ Stochastic policy (explores naturally)
+  ✅ Automatic entropy tuning
+  ✅ Better sample efficiency
+  ✅ More robust to hyperparameters
+  ❌ Slightly more complex
+  
+  Use for: General robotics, sim-to-real
+
+TD3 (Twin Delayed DDPG):
+  ✅ Deterministic policy (simpler)
+  ✅ Faster training (fewer networks)
+  ✅ More stable than DDPG
+  ❌ Needs manual noise tuning
+  
+  Use for: When you need deterministic policy, speed
+
+Both:
+  ✅ Twin critics (stable)
+  ✅ Off-policy (sample efficient)
+  ✅ Continuous actions
+  ✅ State-of-the-art performance
+*/

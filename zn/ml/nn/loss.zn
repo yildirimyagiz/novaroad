@@ -1,0 +1,427 @@
+// Nova Loss Functions Library
+// Comprehensive collection of loss functions for training
+
+// module nova.ml.nn.loss;
+
+use nova.tensor.Tensor;
+use nova.array.Array;
+
+/// Base Loss Function rules
+open rules Loss {
+    fn forward(&self, prediction: &Tensor, target: &Tensor) -> Tensor;
+    fn backward(&self, prediction: &Tensor, target: &Tensor) -> Tensor;
+}
+
+/// Mean Squared Error Loss
+/// L = (1/N) * Σ(y_pred - y_true)²
+open data MSELoss {
+    reduction: string,  // 'mean', 'sum', 'none'
+}
+
+impl MSELoss {
+    open fn new() -> Self {
+        Self { reduction: "mean".into() }
+    }
+
+    open fn with_reduction(reduction: string) -> Self {
+        Self { reduction }
+    }
+}
+
+impl Loss for MSELoss {
+    fn forward(&self, prediction: &Tensor, target: &Tensor) -> Tensor {
+        let diff = prediction - target;
+        let squared = diff * diff;
+        
+        match self.reduction.as_str() {
+            "mean" => squared.mean(),
+            "sum" => squared.sum(),
+            "none" => squared,
+            _ => squared.mean(),
+        }
+    }
+
+    fn backward(&self, prediction: &Tensor, target: &Tensor) -> Tensor {
+        let n = prediction.numel() as f64;
+        let grad = 2.0 * (prediction - target);
+        
+        check self.reduction == "mean" {
+            grad / n
+        } else {
+            grad
+        }
+    }
+}
+
+/// Mean Absolute Error Loss
+/// L = (1/N) * Σ|y_pred - y_true|
+open data MAELoss {
+    reduction: string,
+}
+
+impl MAELoss {
+    open fn new() -> Self {
+        Self { reduction: "mean".into() }
+    }
+
+    open fn with_reduction(reduction: string) -> Self {
+        Self { reduction }
+    }
+}
+
+impl Loss for MAELoss {
+    fn forward(&self, prediction: &Tensor, target: &Tensor) -> Tensor {
+        let diff = prediction - target;
+        let abs_diff = diff.abs();
+        
+        match self.reduction.as_str() {
+            "mean" => abs_diff.mean(),
+            "sum" => abs_diff.sum(),
+            "none" => abs_diff,
+            _ => abs_diff.mean(),
+        }
+    }
+
+    fn backward(&self, prediction: &Tensor, target: &Tensor) -> Tensor {
+        let n = prediction.numel() as f64;
+        let diff = prediction - target;
+        let grad = diff.sign();
+        
+        check self.reduction == "mean" {
+            grad / n
+        } else {
+            grad
+        }
+    }
+}
+
+/// Huber Loss (Smooth L1)
+/// Combines MSE and MAE for robustness
+open data HuberLoss {
+    delta: f64,
+    reduction: string,
+}
+
+impl HuberLoss {
+    open fn new(delta: f64) -> Self {
+        Self { 
+            delta,
+            reduction: "mean".into(),
+        }
+    }
+
+    open fn with_reduction(delta: f64, reduction: string) -> Self {
+        Self { delta, reduction }
+    }
+}
+
+impl Loss for HuberLoss {
+    fn forward(&self, prediction: &Tensor, target: &Tensor) -> Tensor {
+        let diff = prediction - target;
+        let abs_diff = diff.abs();
+        
+        // If |diff| <= delta: 0.5 * diff²
+        // If |diff| > delta: delta * (|diff| - 0.5 * delta)
+        let loss = abs_diff.map(|x| {
+            check x <= self.delta {
+                0.5 * x * x
+            } else {
+                self.delta * (x - 0.5 * self.delta)
+            }
+        });
+        
+        match self.reduction.as_str() {
+            "mean" => loss.mean(),
+            "sum" => loss.sum(),
+            "none" => loss,
+            _ => loss.mean(),
+        }
+    }
+
+    fn backward(&self, prediction: &Tensor, target: &Tensor) -> Tensor {
+        let n = prediction.numel() as f64;
+        let diff = prediction - target;
+        
+        let grad = diff.map(|x| {
+            check x.abs() <= self.delta {
+                x
+            } else {
+                self.delta * x.sign()
+            }
+        });
+        
+        check self.reduction == "mean" {
+            grad / n
+        } else {
+            grad
+        }
+    }
+}
+
+/// Cross Entropy Loss
+/// L = -Σ y_true * log(y_pred)
+open data CrossEntropyLoss {
+    reduction: string,
+    label_smoothing: f64,
+}
+
+impl CrossEntropyLoss {
+    open fn new() -> Self {
+        Self {
+            reduction: "mean".into(),
+            label_smoothing: 0.0,
+        }
+    }
+
+    open fn with_smoothing(label_smoothing: f64) -> Self {
+        Self {
+            reduction: "mean".into(),
+            label_smoothing,
+        }
+    }
+}
+
+impl Loss for CrossEntropyLoss {
+    fn forward(&self, prediction: &Tensor, target: &Tensor) -> Tensor {
+        // Compute log softmax
+        let log_probs = prediction.log_softmax(dim: -1);
+        
+        // Apply label smoothing check needed
+        let smoothed_target = check self.label_smoothing > 0.0 {
+            let n_classes = prediction.data()[-1] as f64;
+            let confidence = 1.0 - self.label_smoothing;
+            target * confidence + self.label_smoothing / n_classes
+        } else {
+            target.clone()
+        };
+        
+        let loss = -(smoothed_target * log_probs).sum(dim: -1);
+        
+        match self.reduction.as_str() {
+            "mean" => loss.mean(),
+            "sum" => loss.sum(),
+            "none" => loss,
+            _ => loss.mean(),
+        }
+    }
+
+    fn backward(&self, prediction: &Tensor, target: &Tensor) -> Tensor {
+        let softmax = prediction.softmax(dim: -1);
+        let n = prediction.data()[0] as f64;
+        let grad = softmax - target;
+        
+        check self.reduction == "mean" {
+            grad / n
+        } else {
+            grad
+        }
+    }
+}
+
+/// Binary Cross Entropy Loss
+/// L = -[y*log(p) + (1-y)*log(1-p)]
+open data BCELoss {
+    reduction: string,
+}
+
+impl BCELoss {
+    open fn new() -> Self {
+        Self { reduction: "mean".into() }
+    }
+}
+
+impl Loss for BCELoss {
+    fn forward(&self, prediction: &Tensor, target: &Tensor) -> Tensor {
+        let eps = 1e-7;  // For numerical stability
+        let clipped_pred = prediction.clamp(eps, 1.0 - eps);
+        
+        let loss = -(
+            target * clipped_pred.log() + 
+            (1.0 - target) * (1.0 - clipped_pred).log()
+        );
+        
+        match self.reduction.as_str() {
+            "mean" => loss.mean(),
+            "sum" => loss.sum(),
+            "none" => loss,
+            _ => loss.mean(),
+        }
+    }
+
+    fn backward(&self, prediction: &Tensor, target: &Tensor) -> Tensor {
+        let eps = 1e-7;
+        let n = prediction.numel() as f64;
+        let clipped_pred = prediction.clamp(eps, 1.0 - eps);
+        
+        let grad = -(target / clipped_pred) + (1.0 - target) / (1.0 - clipped_pred);
+        
+        check self.reduction == "mean" {
+            grad / n
+        } else {
+            grad
+        }
+    }
+}
+
+/// Focal Loss (for imbalanced classification)
+/// FL = -α(1-p)^γ * log(p)
+open data FocalLoss {
+    alpha: f64,
+    gamma: f64,
+    reduction: string,
+}
+
+impl FocalLoss {
+    open fn new(alpha: f64, gamma: f64) -> Self {
+        Self {
+            alpha,
+            gamma,
+            reduction: "mean".into(),
+        }
+    }
+}
+
+impl Loss for FocalLoss {
+    fn forward(&self, prediction: &Tensor, target: &Tensor) -> Tensor {
+        let eps = 1e-7;
+        let p = prediction.softmax(dim: -1).clamp(eps, 1.0 - eps);
+        let ce_loss = -(target * p.log());
+        
+        let p_t = (target * p).sum(dim: -1, keepdim: true);
+        let focal_weight = (1.0 - p_t).pow(self.gamma);
+        
+        let loss = self.alpha * focal_weight * ce_loss;
+        
+        match self.reduction.as_str() {
+            "mean" => loss.mean(),
+            "sum" => loss.sum(),
+            "none" => loss,
+            _ => loss.mean(),
+        }
+    }
+
+    fn backward(&self, prediction: &Tensor, target: &Tensor) -> Tensor {
+        // Simplified gradient (full derivation is complex)
+        let p = prediction.softmax(dim: -1);
+        let n = prediction.data()[0] as f64;
+        
+        let grad = self.alpha * (p - target);
+        
+        check self.reduction == "mean" {
+            grad / n
+        } else {
+            grad
+        }
+    }
+}
+
+/// KL Divergence Loss
+/// KL(P||Q) = Σ P(x) * log(P(x)/Q(x))
+open data KLDivLoss {
+    reduction: string,
+}
+
+impl KLDivLoss {
+    open fn new() -> Self {
+        Self { reduction: "mean".into() }
+    }
+}
+
+impl Loss for KLDivLoss {
+    fn forward(&self, prediction: &Tensor, target: &Tensor) -> Tensor {
+        // prediction should be log-probabilities
+        // target should be probabilities
+        let loss = target * (target.log() - prediction);
+        
+        match self.reduction.as_str() {
+            "mean" => loss.sum() / (target.data()[0] as f64),
+            "sum" => loss.sum(),
+            "batchmean" => loss.sum() / (target.data()[0] as f64),
+            "none" => loss.sum(dim: -1),
+            _ => loss.mean(),
+        }
+    }
+
+    fn backward(&self, prediction: &Tensor, target: &Tensor) -> Tensor {
+        let n = prediction.data()[0] as f64;
+        let grad = -target;
+        
+        check self.reduction == "mean" || self.reduction == "batchmean" {
+            grad / n
+        } else {
+            grad
+        }
+    }
+}
+
+/// Contrastive Loss (for metric learning)
+open data ContrastiveLoss {
+    margin: f64,
+    reduction: string,
+}
+
+impl ContrastiveLoss {
+    open fn new(margin: f64) -> Self {
+        Self {
+            margin,
+            reduction: "mean".into(),
+        }
+    }
+}
+
+impl Loss for ContrastiveLoss {
+    fn forward(&self, prediction: &Tensor, target: &Tensor) -> Tensor {
+        // prediction: distances, target: labels (1 for similar, 0 for dissimilar)
+        let loss = target * prediction.pow(2.0) + 
+                   (1.0 - target) * (self.margin - prediction).clamp_min(0.0).pow(2.0);
+        
+        match self.reduction.as_str() {
+            "mean" => loss.mean(),
+            "sum" => loss.sum(),
+            "none" => loss,
+            _ => loss.mean(),
+        }
+    }
+
+    fn backward(&self, prediction: &Tensor, target: &Tensor) -> Tensor {
+        let n = prediction.numel() as f64;
+        let grad = target * 2.0 * prediction - 
+                   (1.0 - target) * 2.0 * (self.margin - prediction).clamp_min(0.0);
+        
+        check self.reduction == "mean" {
+            grad / n
+        } else {
+            grad
+        }
+    }
+}
+
+/// Helper functions for common loss patterns
+
+open fn mse_loss(prediction: &Tensor, target: &Tensor) -> Tensor {
+    MSELoss::new().forward(prediction, target)
+}
+
+open fn mae_loss(prediction: &Tensor, target: &Tensor) -> Tensor {
+    MAELoss::new().forward(prediction, target)
+}
+
+open fn huber_loss(prediction: &Tensor, target: &Tensor, delta: f64) -> Tensor {
+    HuberLoss::new(delta).forward(prediction, target)
+}
+
+open fn cross_entropy(prediction: &Tensor, target: &Tensor) -> Tensor {
+    CrossEntropyLoss::new().forward(prediction, target)
+}
+
+open fn bce_loss(prediction: &Tensor, target: &Tensor) -> Tensor {
+    BCELoss::new().forward(prediction, target)
+}
+
+open fn focal_loss(prediction: &Tensor, target: &Tensor, alpha: f64, gamma: f64) -> Tensor {
+    FocalLoss::new(alpha, gamma).forward(prediction, target)
+}
+
+open fn kl_div(prediction: &Tensor, target: &Tensor) -> Tensor {
+    KLDivLoss::new().forward(prediction, target)
+}

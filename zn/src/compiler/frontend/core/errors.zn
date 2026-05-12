@@ -1,0 +1,486 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                        Nova ERROR HANDLING                          ║
+// ║                    Unified Diagnostic & Error Reporting                       ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// Comprehensive error handling for Nova compiler:
+// - Parse errors
+// - Type errors
+// - Symbol resolution errors
+// - Semantic analysis errors
+// - Code generation errors
+// - Runtime errors (for CTFE)
+
+use std::fmt;
+use crate::frontend::ast::{TypeExpr, SymbolKind};
+use crate::frontend::core::core_types::Span;
+
+/// Main error alias for the compiler
+expose cases CompilerError {
+    Lexical(LexError),
+    Syntax(ParseError),
+    Semantic(SemanticError),
+    Type(TypeError),
+    Symbol(SymbolError),
+    CodeGen(CodeGenError),
+    Runtime(RuntimeError),
+}
+
+/// Lexical analysis errors
+expose data LexError {
+    message: String,
+    line: i64,
+    col: i64,
+    source: String,
+}
+
+impl LexError {
+    fn new(message: String, line: i64, col: i64) -> LexError {
+        LexError {
+            message,
+            line,
+            col,
+            source: "lexical".into(),
+        }
+    }
+
+    fn fmt(&self) -> String {
+        format("[LexError {}:{}] {}", self.line, self.col, self.message)
+    }
+}
+
+/// Syntax analysis errors
+expose data ParseError {
+    message: String,
+    line: i64,
+    col: i64,
+    expected: Vec<String>,
+    found: String,
+}
+
+impl ParseError {
+    fn new(message: String, line: i64, col: i64) -> ParseError {
+        ParseError {
+            message,
+            line,
+            col,
+            expected: [],
+            found: "".into(),
+        }
+    }
+
+    fn with_expected(message: String, line: i64, col: i64, expected: Vec<String>, found: String) -> ParseError {
+        ParseError {
+            message,
+            line,
+            col,
+            expected,
+            found,
+        }
+    }
+
+    fn fmt(&self) -> String {
+        check self.expected.is_empty() {
+            format("[ParseError {}:{}] {}", self.line, self.col, self.message)
+        } else {
+            format("[ParseError {}:{}] {} - expected one of: {}, found: '{}'",
+                   self.line, self.col, self.message,
+                   self.expected.join(", "), self.found)
+        }
+    }
+}
+
+/// Semantic analysis errors
+expose data SemanticError {
+    kind: SemanticErrorKind,
+    message: String,
+    span: Span,
+    context: Vec<String>,
+}
+
+expose cases SemanticErrorKind {
+    UnreachableCode,
+    UnusedVariable,
+    UnusedFunction,
+    MissingReturn,
+    DeadCode,
+    InfiniteLoop,
+    ContractViolation,
+    UnsafeOperation,
+    DeprecatedUsage,
+}
+
+impl SemanticError {
+    fn new(kind: SemanticErrorKind, message: String, span: Span) -> SemanticError {
+        SemanticError {
+            kind,
+            message,
+            span,
+            context: [],
+        }
+    }
+
+    fn with_context(kind: SemanticErrorKind, message: String, span: Span, context: Vec<String>) -> SemanticError {
+        SemanticError {
+            kind,
+            message,
+            span,
+            context,
+        }
+    }
+
+    fn fmt(&self) -> String {
+        let kind_str = match self.kind {
+            SemanticErrorKind::UnreachableCode => "UnreachableCode",
+            SemanticErrorKind::UnusedVariable => "UnusedVariable",
+            SemanticErrorKind::UnusedFunction => "UnusedFunction",
+            SemanticErrorKind::MissingReturn => "MissingReturn",
+            SemanticErrorKind::DeadCode => "DeadCode",
+            SemanticErrorKind::InfiniteLoop => "InfiniteLoop",
+            SemanticErrorKind::ContractViolation => "ContractViolation",
+            SemanticErrorKind::UnsafeOperation => "UnsafeOperation",
+            SemanticErrorKind::DeprecatedUsage => "DeprecatedUsage",
+        };
+
+        format("[SemanticError::{:?} {}:{}] {}", kind_str, self.span.line, self.span.col, self.message)
+    }
+}
+
+/// Type checking errors
+expose data TypeError {
+    message: String,
+    span: Span,
+    expected_type: Option<TypeExpr>,
+    found_type: Option<TypeExpr>,
+    context: Vec<String>,
+}
+
+impl TypeError {
+    fn new(message: String, span: Span) -> TypeError {
+        TypeError {
+            message,
+            span,
+            expected_type: None,
+            found_type: None,
+            context: [],
+        }
+    }
+
+    fn with_types(message: String, span: Span, expected: TypeExpr, found: TypeExpr) -> TypeError {
+        TypeError {
+            message,
+            span,
+            expected_type: Some(expected),
+            found_type: Some(found),
+            context: [],
+        }
+    }
+
+    fn fmt(&self) -> String {
+        var msg = format("[TypeError {}:{}] {}", self.span.line, self.span.col, self.message);
+
+        check let (Some(expected), Some(found)) = (&self.expected_type, &self.found_type) {
+            msg.push_str(&format("\n  Expected: {:?}", expected));
+            msg.push_str(&format("\n  Found: {:?}", found));
+        }
+
+        msg
+    }
+}
+
+/// Symbol kinds for error reporting and resolution
+expose cases SymbolKind derives [Display, Clone, Copy, Eq, Hash] {
+    Variable,
+    Function,
+    DataType,
+    Trait,
+    Module,
+    Field,
+    Method,
+    Constant,
+    TypeAlias,
+    Macro,
+}
+
+/// Symbol resolution errors
+expose cases SymbolError {
+    NotFound { name: String, span: Span },
+    AlreadyDefined { name: String, span: Span },
+    WrongKind { name: String, expected: SymbolKind, found: SymbolKind, span: Span },
+    NotAccessible { name: String, span: Span },
+    CircularReference { name: String, span: Span },
+}
+
+impl SymbolError {
+    fn fmt(&self) -> String {
+        match self {
+            SymbolError::NotFound { name, span } =>
+                format("[SymbolError::NotFound {}:{}] Undefined symbol: '{}'", span.line, span.col, name),
+            SymbolError::AlreadyDefined { name, span } =>
+                format("[SymbolError::AlreadyDefined {}:{}] Symbol already defined: '{}'", span.line, span.col, name),
+            SymbolError::WrongKind { name, expected, found, span } =>
+                format("[SymbolError::WrongKind {}:{}] Symbol '{}' is {:?}, expected {:?}", span.line, span.col, name, found, expected),
+            SymbolError::NotAccessible { name, span } =>
+                format("[SymbolError::NotAccessible {}:{}] Symbol '{}' is not accessible", span.line, span.col, name),
+            SymbolError::CircularReference { name, span } =>
+                format("[SymbolError::CircularReference {}:{}] Circular reference involving '{}'", span.line, span.col, name),
+        }
+    }
+}
+
+/// Code generation errors
+expose data CodeGenError {
+    message: String,
+    span: Option<Span>,
+    phase: CodeGenPhase,
+    backend: String,
+}
+
+expose cases CodeGenPhase {
+    IRGeneration,
+    Optimization,
+    TargetCodeEmission,
+    Linking,
+}
+
+impl CodeGenError {
+    fn new(message: String, phase: CodeGenPhase, backend: String) -> CodeGenError {
+        CodeGenError {
+            message,
+            span: None,
+            phase,
+            backend,
+        }
+    }
+
+    fn with_span(message: String, span: Span, phase: CodeGenPhase, backend: String) -> CodeGenError {
+        CodeGenError {
+            message,
+            span: Some(span),
+            phase,
+            backend,
+        }
+    }
+
+    fn fmt(&self) -> String {
+        let span_str = check let Some(span) = self.span {
+            format("{}:{}", span.line, span.col)
+        } else {
+            "unknown".into()
+        };
+
+        format("[CodeGenError::{:?} {} {}] {}", self.phase, self.backend, span_str, self.message)
+    }
+}
+
+/// Runtime errors (for CTFE)
+expose data RuntimeError {
+    message: String,
+    span: Span,
+    call_stack: Vec<String>,
+}
+
+impl RuntimeError {
+    fn new(message: String, span: Span) -> RuntimeError {
+        RuntimeError {
+            message,
+            span,
+            call_stack: [],
+        }
+    }
+
+    fn fmt(&self) -> String {
+        format("[RuntimeError {}:{}] {}", self.span.line, self.span.col, self.message)
+    }
+}
+
+/// Diagnostic severity levels
+expose cases Severity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+/// Compiler diagnostic
+expose data Diagnostic {
+    severity: Severity,
+    error: CompilerError,
+    suggestions: Vec<String>,
+}
+
+/// Linting warnings
+expose data LintWarning {
+    message: String,
+    span: Span,
+    category: String,
+}
+
+impl Diagnostic {
+    fn new(severity: Severity, error: CompilerError) -> Diagnostic {
+        Diagnostic {
+            severity,
+            error,
+            suggestions: [],
+        }
+    }
+
+    fn with_suggestions(severity: Severity, error: CompilerError, suggestions: Vec<String>) -> Diagnostic {
+        Diagnostic {
+            severity,
+            error,
+            suggestions,
+        }
+    }
+
+    fn fmt(&self) -> String {
+        let severity_str = match self.severity {
+            Severity::Error => "ERROR",
+            Severity::Warning => "WARNING",
+            Severity::Info => "INFO",
+            Severity::Hint => "HINT",
+        };
+
+        let error_msg = match &self.error {
+            CompilerError::Lexical(e) => e.fmt(),
+            CompilerError::Syntax(e) => e.fmt(),
+            CompilerError::Semantic(e) => e.fmt(),
+            CompilerError::Type(e) => e.fmt(),
+            CompilerError::Symbol(e) => e.fmt(),
+            CompilerError::CodeGen(e) => e.fmt(),
+            CompilerError::Runtime(e) => e.fmt(),
+        };
+
+        var result = format("{}: {}", severity_str, error_msg);
+
+        check !self.suggestions.is_empty() {
+            result.push_str("\nSuggestions:");
+            each suggestion in &self.suggestions {
+                result.push_str(&format("\n  - {}", suggestion));
+            }
+        }
+
+        result
+    }
+}
+
+/// Error collector and reporter
+expose data ErrorReporter {
+    diagnostics: Vec<Diagnostic>,
+    max_errors: usize,
+    has_errors: bool,
+}
+
+impl ErrorReporter {
+    fn new() -> ErrorReporter {
+        ErrorReporter {
+            diagnostics: [],
+            max_errors: 100,
+            has_errors: false,
+        }
+    }
+
+    fn report(&var self, diagnostic: Diagnostic) {
+        self.diagnostics.push(diagnostic);
+
+        check matches!(diagnostic.severity, Severity::Error) {
+            self.has_errors = true;
+        }
+
+        // Check error limit
+        check self.diagnostics.len() >= self.max_errors {
+            println("Too many errors ({}), compilation aborted", self.diagnostics.len());
+        }
+    }
+
+    fn report_error(&var self, error: CompilerError) {
+        self.report(Diagnostic::new(Severity::Error, error));
+    }
+
+    fn report_warning(&var self, error: CompilerError) {
+        self.report(Diagnostic::new(Severity::Warning, error));
+    }
+
+    fn report_lex_error(&var self, message: String, line: i64, col: i64) {
+        self.report_error(CompilerError::Lexical(LexError::new(message, line, col)));
+    }
+
+    fn report_parse_error(&var self, message: String, line: i64, col: i64) {
+        self.report_error(CompilerError::Syntax(ParseError::new(message, line, col)));
+    }
+
+    fn report_type_error(&var self, message: String, span: Span) {
+        self.report_error(CompilerError::Type(TypeError::new(message, span)));
+    }
+
+    fn report_symbol_error(&var self, error: SymbolError) {
+        self.report_error(CompilerError::Symbol(error));
+    }
+
+    fn has_errors(&self) -> bool {
+        self.has_errors
+    }
+
+    fn error_count(&self) -> usize {
+        self.diagnostics.iter().filter(|d| matches!(d.severity, Severity::Error)).count()
+    }
+
+    fn warning_count(&self) -> usize {
+        self.diagnostics.iter().filter(|d| matches!(d.severity, Severity::Warning)).count()
+    }
+
+    fn print_report(&self) {
+        println("\n📋 Compilation Report");
+        println("═══════════════════════════════════════════════════════════════");
+
+        each diagnostic in &self.diagnostics {
+            println("{}", diagnostic.fmt());
+            println("");
+        }
+
+        println("Summary:");
+        println("  Errors: {}", self.error_count());
+        println("  Warnings: {}", self.warning_count());
+        println("  Total diagnostics: {}", self.diagnostics.len());
+
+        check self.has_errors {
+            println("\n❌ Compilation failed");
+        } else {
+            println("\n✅ Compilation successful");
+        }
+    }
+
+    /// Generate suggestions for common errors
+    fn suggest_fix(&self, error: &CompilerError) -> Vec<String> {
+        match error {
+            CompilerError::Type(TypeError { message, .. }) => {
+                check message.contains("undefined") {
+                    [
+                        "Check check the symbol is spelled correctly".into(),
+                        "Ensure the module is imported".into(),
+                        "Verify the symbol is in scope".into(),
+                    ]
+                } else check message.contains("alias mismatch") {
+                    [
+                        "Add explicit alias annotations".into(),
+                        "Check for correct alias conversions".into(),
+                        "Verify generic alias parameters".into(),
+                    ]
+                } else {
+                    yield ["Review the alias requirements".into()]
+                }
+            }
+
+            CompilerError::Symbol(SymbolError::NotFound { name, .. }) => {
+                [
+                    format("Define '{}' or import it", name),
+                    "Check spelling and case sensitivity".into(),
+                    "Ensure the symbol is in the correct scope".into(),
+                ]
+            }
+
+            _ => ["Check the documentation for correct usage".into()],
+        }
+    }
+}
+

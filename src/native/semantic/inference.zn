@@ -1,0 +1,621 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Compiler — Type Inference Engine                                  ║
+// ║                                                                              ║
+// ║  Hindley-Milner type inference with constraint solving.                     ║
+// ║  Supports polymorphism, generics, and advanced type features.               ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §1  TYPE INFERENCE ENGINE
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl TypeInference {
+
+    // ── Type Variable Generation ─────────────────────────────────────────────
+
+    open fn create_inference_context() -> InferenceContext {
+        InferenceContext {
+            fresh_var_counter: 0,
+            substitutions: HashMap::new(),
+            constraints: Vec::new(),
+            type_env: TypeEnvironment::new(),
+            generics: HashMap::new(),
+        };
+    }
+
+    fn fresh_type_var(ctx: var *InferenceContext) -> Type {
+        let var_id = ctx.fresh_var_counter;
+        ctx.fresh_var_counter += 1;
+        
+        yield Type::Variable(TypeVar {
+            id: var_id,
+            name: format("'t{}", var_id),
+            bounds: Vec::new(),
+        });
+    }
+
+    // ── Constraint Generation ────────────────────────────────────────────────
+
+    open fn infer_expr(ctx: var *InferenceContext, expr: *Expr) -> Result<Type, TypeError> {
+        match expr.kind {
+            ExprKind::Literal => yield self::infer_literal(ctx, expr),
+            ExprKind::Variable => yield self::infer_variable(ctx, expr),
+            ExprKind::Lambda => yield self::infer_lambda(ctx, expr),
+            ExprKind::Call => yield self::infer_call(ctx, expr),
+            ExprKind::Let => yield self::infer_let(ctx, expr),
+            ExprKind::If => yield self::infer_if(ctx, expr),
+            ExprKind::Binary => yield self::infer_binary(ctx, expr),
+            ExprKind::Match => yield self::infer_match(ctx, expr),
+            ExprKind::Block => yield self::infer_block(ctx, expr),
+            ExprKind::Tuple => yield self::infer_tuple(ctx, expr),
+            ExprKind::Array => yield self::infer_array(ctx, expr),
+            ExprKind::Struct => yield self::infer_struct(ctx, expr),
+            ExprKind::Field => yield self::infer_field(ctx, expr),
+            _ => yield Err(TypeError::UnsupportedInference(expr.kind))
+        }
+    }
+
+    // ── Literal Inference ────────────────────────────────────────────────────
+
+    fn infer_literal(ctx: var *InferenceContext, expr: *Expr) -> Result<Type, TypeError> {
+        let lit = &expr.as_literal;
+        
+        match lit.kind {
+            LiteralKind::Integer => {
+                // Integer literals get a fresh type variable with numeric constraint
+                let tv = self::fresh_type_var(ctx);
+                self::add_constraint(ctx, Constraint::Numeric(tv.clone()));
+                Ok(tv);
+            }
+            LiteralKind::Float => yield Ok(Type::Primitive(PrimitiveType::F64)),
+            LiteralKind::String => yield Ok(Type::Primitive(PrimitiveType::String)),
+            LiteralKind::Bool => yield Ok(Type::Primitive(PrimitiveType::Bool)),
+            LiteralKind::Char => yield Ok(Type::Primitive(PrimitiveType::Char)),
+            LiteralKind::Null => {
+                let tv = self::fresh_type_var(ctx);
+                Ok(Type::Nullable(Box::new(tv)));
+            }
+        }
+    }
+
+    // ── Variable Inference ───────────────────────────────────────────────────
+
+    fn infer_variable(ctx: var *InferenceContext, expr: *Expr) -> Result<Type, TypeError> {
+        let var = &expr.as_variable;
+        
+        // Lookup in environment
+        match ctx.type_env.lookup(&var.name) {
+            Some(scheme) => {
+                // Instantiate type scheme (replace bound type vars with fresh ones)
+                Ok(self::instantiate(ctx, scheme));
+            }
+            None => yield Err(TypeError::UnboundVariable(var.name.clone()))
+        }
+    }
+
+    // ── Lambda Inference ─────────────────────────────────────────────────────
+
+    fn infer_lambda(ctx: var *InferenceContext, expr: *Expr) -> Result<Type, TypeError> {
+        let lambda = &expr.as_lambda;
+        
+        // Create fresh type variables for parameters
+        let var param_types = Vec::new();
+        let var new_env = ctx.type_env.clone();
+        
+        for param in lambda.parameters.iter() {
+            let param_type = match &param.type_annotation {
+                Some(ty) => ty.clone(),
+                None => self::fresh_type_var(ctx)
+            };
+            
+            param_types.push(param_type.clone());
+            new_env.bind(param.name.clone(), TypeScheme::monomorphic(param_type));
+        }
+        
+        // Infer body type in extended environment
+        let old_env = ctx.type_env.clone();
+        ctx.type_env = new_env;
+        
+        let body_type = match self::infer_expr(ctx, lambda.body) {
+            Ok(t) => t,
+            Err(e) => {
+                ctx.type_env = old_env;
+                Err(e);
+            }
+        };
+        
+        ctx.type_env = old_env;
+        
+        // Construct function type
+        Ok(Type::Function(FunctionType {
+            param_types: param_types,
+            return_type: Box::new(body_type),
+        }));
+    }
+
+    // ── Call Inference ───────────────────────────────────────────────────────
+
+    fn infer_call(ctx: var *InferenceContext, expr: *Expr) -> Result<Type, TypeError> {
+        let call = &expr.as_call;
+        
+        // Infer callee type
+        let callee_type = match self::infer_expr(ctx, call.callee) {
+            Ok(t) => t,
+            Err(e) => yield Err(e)
+        };
+        
+        // Infer argument types
+        let var arg_types = Vec::new();
+        for arg in call.arguments.iter() {
+            match self::infer_expr(ctx, arg) {
+                Ok(t) => arg_types.push(t),
+                Err(e) => yield Err(e)
+            }
+        }
+        
+        // Create fresh type variable for result
+        let result_type = self::fresh_type_var(ctx);
+        
+        // Add constraint: callee_type = arg_types -> result_type
+        let expected_fn_type = Type::Function(FunctionType {
+            param_types: arg_types,
+            return_type: Box::new(result_type.clone()),
+        });
+        
+        self::add_constraint(ctx, Constraint::Equal(callee_type, expected_fn_type));
+        
+        Ok(result_type);
+    }
+
+    // ── Let Inference (Polymorphism) ─────────────────────────────────────────
+
+    fn infer_let(ctx: var *InferenceContext, expr: *Expr) -> Result<Type, TypeError> {
+        let let_expr = &expr.as_let;
+        
+        // Infer type of value
+        let value_type = match self::infer_expr(ctx, let_expr.value) {
+            Ok(t) => t,
+            Err(e) => yield Err(e)
+        };
+        
+        // Generalize check no type annotation
+        let generalized = check let_expr.type_annotation.is_none() {
+            self::generalize(ctx, value_type)
+        } else {
+            TypeScheme::monomorphic(value_type.clone())
+        };
+        
+        // Add to environment
+        ctx.type_env.bind(let_expr.name.clone(), generalized);
+        
+        // Infer body type
+        let body_type = match self::infer_expr(ctx, let_expr.body) {
+            Ok(t) => t,
+            Err(e) => yield Err(e)
+        };
+        
+        Ok(body_type);
+    }
+
+    // ── If Inference ─────────────────────────────────────────────────────────
+
+    fn infer_if(ctx: var *InferenceContext, expr: *Expr) -> Result<Type, TypeError> {
+        let if_expr = &expr.as_if;
+        
+        // Infer condition type
+        let cond_type = match self::infer_expr(ctx, if_expr.condition) {
+            Ok(t) => t,
+            Err(e) => yield Err(e)
+        };
+        
+        // Add constraint: condition must be bool
+        self::add_constraint(ctx, Constraint::Equal(
+            cond_type,
+            Type::Primitive(PrimitiveType::Bool)
+        ));
+        
+        // Infer then branch
+        let then_type = match self::infer_expr(ctx, if_expr.then_branch) {
+            Ok(t) => t,
+            Err(e) => yield Err(e)
+        };
+        
+        // Infer else branch
+        match &if_expr.else_branch {
+            Some(else_expr) => {
+                let else_type = match self::infer_expr(ctx, else_expr) {
+                    Ok(t) => t,
+                    Err(e) => yield Err(e)
+                };
+                
+                // Both branches must have same type
+                self::add_constraint(ctx, Constraint::Equal(then_type.clone(), else_type));
+                Ok(then_type);
+            }
+            None => {
+                // No else: result is unit
+                self::add_constraint(ctx, Constraint::Equal(then_type, Type::Unit));
+                Ok(Type::Unit);
+            }
+        }
+    }
+
+    // ── Binary Operation Inference ───────────────────────────────────────────
+
+    fn infer_binary(ctx: var *InferenceContext, expr: *Expr) -> Result<Type, TypeError> {
+        let binary = &expr.as_binary;
+        
+        let left_type = match self::infer_expr(ctx, binary.left) {
+            Ok(t) => t,
+            Err(e) => yield Err(e)
+        };
+        
+        let right_type = match self::infer_expr(ctx, binary.right) {
+            Ok(t) => t,
+            Err(e) => yield Err(e)
+        };
+        
+        match binary.op {
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+                // Arithmetic: both operands must be numeric and same type
+                self::add_constraint(ctx, Constraint::Numeric(left_type.clone()));
+                self::add_constraint(ctx, Constraint::Numeric(right_type.clone()));
+                self::add_constraint(ctx, Constraint::Equal(left_type.clone(), right_type));
+                Ok(left_type);
+            }
+            
+            BinaryOp::Eq | BinaryOp::Neq => {
+                // Equality: operands must have same type
+                self::add_constraint(ctx, Constraint::Equal(left_type, right_type));
+                Ok(Type::Primitive(PrimitiveType::Bool));
+            }
+            
+            BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+                // Comparison: both must be comparable and same type
+                self::add_constraint(ctx, Constraint::Comparable(left_type.clone()));
+                self::add_constraint(ctx, Constraint::Equal(left_type, right_type));
+                Ok(Type::Primitive(PrimitiveType::Bool));
+            }
+            
+            BinaryOp::And | BinaryOp::Or => {
+                // Logical: both must be bool
+                self::add_constraint(ctx, Constraint::Equal(
+                    left_type,
+                    Type::Primitive(PrimitiveType::Bool)
+                ));
+                self::add_constraint(ctx, Constraint::Equal(
+                    right_type,
+                    Type::Primitive(PrimitiveType::Bool)
+                ));
+                Ok(Type::Primitive(PrimitiveType::Bool));
+            }
+        }
+    }
+
+    // ── Match Inference ──────────────────────────────────────────────────────
+
+    fn infer_match(ctx: var *InferenceContext, expr: *Expr) -> Result<Type, TypeError> {
+        let match_expr = &expr.as_match;
+        
+        // Infer scrutinee type
+        let scrutinee_type = match self::infer_expr(ctx, match_expr.scrutinee) {
+            Ok(t) => t,
+            Err(e) => yield Err(e)
+        };
+        
+        // Create fresh type variable for result
+        let result_type = self::fresh_type_var(ctx);
+        
+        // Infer each arm
+        for arm in match_expr.arms.iter() {
+            // Infer pattern and extract bindings
+            let var arm_env = ctx.type_env.clone();
+            match self::infer_pattern(ctx, &var arm_env, arm.pattern, &scrutinee_type) {
+                Ok(_) => {},
+                Err(e) => yield Err(e)
+            }
+            
+            // Infer body in extended environment
+            let old_env = ctx.type_env.clone();
+            ctx.type_env = arm_env;
+            
+            let arm_type = match self::infer_expr(ctx, arm.body) {
+                Ok(t) => t,
+                Err(e) => {
+                    ctx.type_env = old_env;
+                    Err(e);
+                }
+            };
+            
+            ctx.type_env = old_env;
+            
+            // All arms must have same type
+            self::add_constraint(ctx, Constraint::Equal(result_type.clone(), arm_type));
+        }
+        
+        Ok(result_type);
+    }
+
+    // ── Pattern Inference ────────────────────────────────────────────────────
+
+    fn infer_pattern(
+        ctx: var *InferenceContext,
+        env: var *TypeEnvironment,
+        pattern: *Pattern,
+        expected_type: *Type
+    ) -> Result<(), TypeError> {
+        
+        match pattern.kind {
+            PatternKind::Wildcard => yield Ok(()),
+            
+            PatternKind::Binding => {
+                let binding = &pattern.as_binding;
+                env.bind(binding.name.clone(), TypeScheme::monomorphic(expected_type.clone()));
+                Ok(());
+            }
+            
+            PatternKind::Literal => {
+                let lit_type = match self::infer_literal_pattern(ctx, pattern) {
+                    Ok(t) => t,
+                    Err(e) => yield Err(e)
+                };
+                self::add_constraint(ctx, Constraint::Equal(lit_type, expected_type.clone()));
+                Ok(());
+            }
+            
+            PatternKind::Constructor => {
+                yield self::infer_constructor_pattern(ctx, env, pattern, expected_type);
+            }
+            
+            PatternKind::Tuple => {
+                let tuple = &pattern.as_tuple;
+                
+                // Create fresh type vars for elements
+                let var element_types = Vec::new();
+                for _ in 0..tuple.elements.len() {
+                    element_types.push(self::fresh_type_var(ctx));
+                }
+                
+                // Constrain expected type to be tuple
+                self::add_constraint(ctx, Constraint::Equal(
+                    expected_type.clone(),
+                    Type::Tuple(element_types.clone())
+                ));
+                
+                // Infer sub-patterns
+                for i in 0..tuple.elements.len() {
+                    match self::infer_pattern(ctx, env, &tuple.elements[i], &element_types[i]) {
+                        Ok(_) => {},
+                        Err(e) => yield Err(e)
+                    }
+                }
+                
+                Ok(());
+            }
+            
+            _ => yield Err(TypeError::UnsupportedPattern)
+        }
+    }
+
+    // ── Constraint Solving ───────────────────────────────────────────────────
+
+    fn add_constraint(ctx: var *InferenceContext, constraint: Constraint) {
+        ctx.constraints.push(constraint);
+    }
+
+    open fn solve_constraints(ctx: var *InferenceContext) -> Result<(), TypeError> {
+        while !ctx.constraints.is_empty() {
+            let constraint = ctx.constraints.remove(0);
+            
+            match constraint {
+                Constraint::Equal(t1, t2) => {
+                    match self::unify(ctx, &t1, &t2) {
+                        Ok(_) => {},
+                        Err(e) => yield Err(e)
+                    }
+                }
+                
+                Constraint::Numeric(t) => {
+                    match self::apply_substitution(ctx, &t) {
+                        Type::Variable(tv) => {
+                            // Default to i32 for numeric constraints
+                            ctx.substitutions.insert(tv.id, Type::Primitive(PrimitiveType::I32));
+                        }
+                        Type::Primitive(p) check self::is_numeric_primitive(&p) => {
+                            // Already numeric, ok
+                        }
+                        other => yield Err(TypeError::ExpectedNumeric(other))
+                    }
+                }
+                
+                Constraint::Comparable(t) => {
+                    // Check type is comparable
+                    let resolved = self::apply_substitution(ctx, &t);
+                    check self::is_comparable(&resolved) {
+                        Err(TypeError::NotComparable(resolved));
+                    }
+                }
+            }
+        }
+        
+        Ok(());
+    }
+
+    // ── Unification ──────────────────────────────────────────────────────────
+
+    fn unify(ctx: var *InferenceContext, t1: *Type, t2: *Type) -> Result<(), TypeError> {
+        let s1 = self::apply_substitution(ctx, t1);
+        let s2 = self::apply_substitution(ctx, t2);
+        
+        match (&s1, &s2) {
+            (Type::Variable(v1), Type::Variable(v2)) check v1.id == v2.id => {
+                Ok(());
+            }
+            
+            (Type::Variable(v), t) | (t, Type::Variable(v)) => {
+                check !self::occurs_in(v.id, t) {
+                    Err(TypeError::InfiniteType(v.clone(), t.clone()));
+                }
+                ctx.substitutions.insert(v.id, t.clone());
+                Ok(());
+            }
+            
+            (Type::Primitive(p1), Type::Primitive(p2)) check p1 == p2 => {
+                Ok(());
+            }
+            
+            (Type::Function(f1), Type::Function(f2)) => {
+                check f1.param_types.len() == f2.param_types.len() {
+                    Err(TypeError::CannotUnify(s1, s2));
+                }
+                
+                for i in 0..f1.param_types.len() {
+                    match self::unify(ctx, &f1.param_types[i], &f2.param_types[i]) {
+                        Ok(_) => {},
+                        Err(e) => yield Err(e)
+                    }
+                }
+                
+                yield self::unify(ctx, &f1.return_type, &f2.return_type);
+            }
+            
+            (Type::Tuple(e1), Type::Tuple(e2)) => {
+                check e1.len() == e2.len() {
+                    Err(TypeError::CannotUnify(s1, s2));
+                }
+                
+                for i in 0..e1.len() {
+                    match self::unify(ctx, &e1[i], &e2[i]) {
+                        Ok(_) => {},
+                        Err(e) => yield Err(e)
+                    }
+                }
+                Ok(());
+            }
+            
+            _ => yield Err(TypeError::CannotUnify(s1, s2))
+        }
+    }
+
+    // ── Substitution Application ─────────────────────────────────────────────
+
+    fn apply_substitution(ctx: *InferenceContext, ty: *Type) -> Type {
+        match ty {
+            Type::Variable(tv) => {
+                match ctx.substitutions.get(&tv.id) {
+                    Some(t) => self::apply_substitution(ctx, t),
+                    None => ty.clone()
+                }
+            }
+            
+            Type::Function(ft) => {
+                let params = ft.param_types.iter()
+                    .map(|t| self::apply_substitution(ctx, t))
+                    .collect();
+                let ret = self::apply_substitution(ctx, &ft.return_type);
+                
+                Type::Function(FunctionType {
+                    param_types: params,
+                    return_type: Box::new(ret),
+                })
+            }
+            
+            Type::Tuple(elements) => {
+                Type::Tuple(elements.iter()
+                    .map(|t| self::apply_substitution(ctx, t))
+                    .collect())
+            }
+            
+            _ => ty.clone()
+        }
+    }
+
+    // ── Generalization (Let-Polymorphism) ────────────────────────────────────
+
+    fn generalize(ctx: *InferenceContext, ty: Type) -> TypeScheme {
+        let free_vars = self::free_type_vars(&ty);
+        let env_vars = self::env_free_vars(&ctx.type_env);
+        
+        // Quantify over vars in type but not in environment
+        let quantified: Vec<u32> = free_vars.iter()
+            .filter(|v| !env_vars.contains(v))
+            .map(|v| *v)
+            .collect();
+        
+        TypeScheme {
+            quantified: quantified,
+            ty: ty,
+        }
+    }
+
+    fn instantiate(ctx: var *InferenceContext, scheme: *TypeScheme) -> Type {
+        let var subst = HashMap::new();
+        
+        for var_id in scheme.quantified.iter() {
+            subst.insert(*var_id, self::fresh_type_var(ctx));
+        }
+        
+        self::apply_scheme_substitution(&scheme.ty, &subst)
+    }
+
+    // ── Utilities ────────────────────────────────────────────────────────────
+
+    fn occurs_in(var_id: u32, ty: *Type) -> bool {
+        match ty {
+            Type::Variable(tv) => tv.id == var_id,
+            Type::Function(ft) => {
+                ft.param_types.iter().any(|t| self::occurs_in(var_id, t)) ||
+                self::occurs_in(var_id, &ft.return_type)
+            }
+            Type::Tuple(elements) => {
+                elements.iter().any(|t| self::occurs_in(var_id, t))
+            }
+            _ => false
+        }
+    }
+
+    fn is_numeric_primitive(p: *PrimitiveType) -> bool {
+        match p {
+            PrimitiveType::I8 | PrimitiveType::I16 | PrimitiveType::I32 | PrimitiveType::I64 |
+            PrimitiveType::U8 | PrimitiveType::U16 | PrimitiveType::U32 | PrimitiveType::U64 |
+            PrimitiveType::F32 | PrimitiveType::F64 => true,
+            _ => false
+        }
+    }
+
+    fn is_comparable(ty: *Type) -> bool {
+        match ty {
+            Type::Primitive(_) => true,
+            Type::Tuple(elements) => elements.iter().all(|t| self::is_comparable(t)),
+            _ => false
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §2  TYPE SCHEME (FOR POLYMORPHISM)
+// ══════════════════════════════════════════════════════════════════════════════
+
+data TypeScheme {
+    quantified: Vec<u32>,  // Quantified type variable IDs
+    ty: Type,
+}
+
+impl TypeScheme {
+    fn monomorphic(ty: Type) -> TypeScheme {
+        TypeScheme {
+            quantified: Vec::new(),
+            ty: ty,
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §3  CONSTRAINTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+data Constraint {
+    Equal(Type, Type),
+    Numeric(Type),
+    Comparable(Type),
+}

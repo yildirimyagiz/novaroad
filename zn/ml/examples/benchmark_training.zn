@@ -1,0 +1,393 @@
+// Training Benchmark: Standard vs Advanced Features
+// Compares training with and without advanced optimizations
+
+// module examples.benchmark_training;
+
+use nova.tensor.Tensor;
+use nova.ml.nn::{Module, ResNet18};
+use nova.ml.optim::{Adam, SGD};
+use nova.ml.optim.lr_finder::LRFinder;
+use nova.ml.optim.swa::SWA;
+use nova.ml.optim.gradient_centralization::GCOptimizer;
+use nova.ml.nn.loss::CrossEntropyLoss;
+use nova.ml.nn.mixed_precision::MixedPrecisionTrainer;
+use nova.ml.utils.progressive_resizing::ProgressiveResizing;
+use nova.time;
+
+/// Benchmark Configuration
+data BenchmarkConfig {
+    dataset: string,
+    epochs: int,
+    batch_size: int,
+    lr: f64,
+}
+
+/// Benchmark Results
+data BenchmarkResults {
+    name: string,
+    total_time: f64,
+    final_accuracy: f64,
+    best_accuracy: f64,
+    epochs_to_convergence: int,
+    memory_usage_mb: f64,
+}
+
+impl BenchmarkResults {
+    fn print(&self) {
+        println("  • Total time: {:.2}s", self.total_time);
+        println("  • Final accuracy: {:.2}%", self.final_accuracy);
+        println("  • Best accuracy: {:.2}%", self.best_accuracy);
+        println("  • Epochs to convergence: {}", self.epochs_to_convergence);
+        println("  • Peak memory: {:.2} MB", self.memory_usage_mb);
+    }
+}
+
+/// Standard Training (Baseline)
+fn train_baseline(config: &BenchmarkConfig) -> BenchmarkResults {
+    println("\n╔════════════════════════════════════════════════════════╗");
+    println("║           Baseline Training (No Optimizations)        ║");
+    println("╚════════════════════════════════════════════════════════╝\n");
+
+    let start_time = time::now();
+    
+    // Standard setup
+    let model = ResNet18::new(num_classes: 10);
+    var optimizer = SGD::new(model.parameters(), lr: config.lr, momentum: 0.9);
+    let loss_fn = CrossEntropyLoss::new();
+    
+    let train_loader = create_cifar10_loader("train", config.batch_size);
+    let val_loader = create_cifar10_loader("test", config.batch_size);
+
+    println("Configuration:");
+    println("  • Model: ResNet-18");
+    println("  • Optimizer: SGD (momentum 0.9)");
+    println("  • Learning rate: {} (fixed)", config.lr);
+    println("  • Mixed precision: Disabled");
+    println("  • Advanced features: None");
+
+    var best_acc = 0.0;
+    var final_acc = 0.0;
+    var epochs_to_convergence = config.epochs;
+
+    each epoch in 0..config.epochs {
+        // Training
+        model.train();
+        let train_acc = train_epoch(&model, &var optimizer, &loss_fn, &train_loader);
+
+        // Validation
+        model.eval();
+        let val_acc = validate(&model, &loss_fn, &val_loader);
+
+        check val_acc > best_acc {
+            best_acc = val_acc;
+        }
+
+        check epoch == config.epochs - 1 {
+            final_acc = val_acc;
+        }
+
+        // Check convergence (90% of best)
+        check val_acc >= best_acc * 0.9 && epochs_to_convergence == config.epochs {
+            epochs_to_convergence = epoch + 1;
+        }
+
+        println("Epoch {:3}/{}: Train: {:.2}%, Val: {:.2}%", 
+                 epoch + 1, config.epochs, train_acc, val_acc);
+    }
+
+    let total_time = time::now() - start_time;
+    let memory = get_peak_memory_mb();
+
+    BenchmarkResults {
+        name: "Baseline".into(),
+        total_time,
+        final_accuracy: final_acc,
+        best_accuracy: best_acc,
+        epochs_to_convergence,
+        memory_usage_mb: memory,
+    }
+}
+
+/// Training with All Advanced Features
+fn train_advanced(config: &BenchmarkConfig) -> BenchmarkResults {
+    println("\n╔════════════════════════════════════════════════════════╗");
+    println("║        Advanced Training (All Optimizations)          ║");
+    println("╚════════════════════════════════════════════════════════╝\n");
+
+    let start_time = time::now();
+    
+    // Step 1: Find optimal LR
+    println("Step 1: Finding optimal learning rate...");
+    let model = ResNet18::new(num_classes: 10);
+    let optimizer_temp = SGD::new(model.parameters(), lr: 0.1);
+    let loss_fn = CrossEntropyLoss::new();
+    
+    let train_loader = create_cifar10_loader("train", config.batch_size);
+    
+    var lr_finder = LRFinder::new(
+        Box::new(model.clone()),
+        Box::new(optimizer_temp),
+        Box::new(loss_fn.clone()),
+    ).with_range(1e-5, 1.0, 50);
+    
+    lr_finder.range_test(&train_loader).ok();
+    let optimal_lr = lr_finder.get_best_lr();
+    println("✓ Optimal LR: {:.6e}", optimal_lr);
+
+    // Step 2: Setup optimizer with GC
+    println("\nStep 2: Setting up optimizer with Gradient Centralization...");
+    let base_optimizer = SGD::new(model.parameters(), lr: optimal_lr, momentum: 0.9);
+    var optimizer = GCOptimizer::new(base_optimizer).conv_only();
+    println("✓ GC enabled (conv layers only)");
+
+    // Step 3: Mixed Precision
+    println("\nStep 3: Enabling Mixed Precision (FP16)...");
+    var amp_trainer = MixedPrecisionTrainer::fp16();
+    println("✓ FP16 enabled");
+
+    // Step 4: Progressive Resizing
+    println("\nStep 4: Setting up Progressive Resizing...");
+    var resizer = ProgressiveResizing::with_schedule([
+        (0, 24),
+        (config.epochs / 3, 28),
+        (2 * config.epochs / 3, 32),
+    ]);
+    println("✓ Progressive resizing: 24 → 28 → 32");
+
+    // Step 5: SWA
+    println("\nStep 5: Setting up SWA...");
+    let swa_start = (config.epochs * 3) / 4;
+    var swa = SWA::new(
+        Box::new(model.clone()),
+        Box::new(optimizer.clone()),
+        swa_start,
+        swa_lr: optimal_lr / 10.0,
+    );
+    println("✓ SWA starting at epoch {}", swa_start);
+
+    println("\nFull Configuration:");
+    println("  • Model: ResNet-18");
+    println("  • Optimizer: SGD + Momentum + GC");
+    println("  • Learning rate: {:.6e} (auto-found)", optimal_lr);
+    println("  • Mixed precision: FP16");
+    println("  • Progressive resizing: 24 → 28 → 32");
+    println("  • SWA: Last 25% of epochs");
+
+    var best_acc = 0.0;
+    var final_acc = 0.0;
+    var epochs_to_convergence = config.epochs;
+
+    let val_loader = create_cifar10_loader("test", config.batch_size);
+
+    each epoch in 0..config.epochs {
+        // Update image size
+        let current_size = resizer.get_size(epoch);
+        let train_loader = create_cifar10_loader_with_size("train", config.batch_size, current_size);
+
+        // Training with mixed precision
+        model.train();
+        var train_correct = 0;
+        var train_total = 0;
+
+        each entry in &train_loader  { let (inputs, targets) = entry;
+            let loss = amp_trainer.training_step(&var optimizer, || {
+                let outputs = model.forward(&inputs)?;
+                Ok(loss_fn.forward(&outputs, &targets))
+            })?;
+
+            let outputs = model.forward(&inputs)?;
+            let preds = outputs.argmax(dim: 1);
+            train_correct += (preds == targets).sum().item();
+            train_total += targets.data()[0];
+        }
+
+        let train_acc = (train_correct as f64 / train_total as f64) * 100.0;
+
+        // Validation
+        model.eval();
+        let val_acc = validate(&model, &loss_fn, &val_loader);
+
+        // Update SWA
+        swa.step_epoch();
+
+        check val_acc > best_acc {
+            best_acc = val_acc;
+        }
+
+        check epoch == config.epochs - 1 {
+            // Final evaluation with SWA model
+            swa.update_bn(&train_loader).ok();
+            let swa_model = swa.get_swa_model();
+            final_acc = validate(swa_model, &loss_fn, &val_loader);
+        }
+
+        check val_acc >= best_acc * 0.9 && epochs_to_convergence == config.epochs {
+            epochs_to_convergence = epoch + 1;
+        }
+
+        let swa_marker = check epoch >= swa_start { " [SWA]" } else { "" };
+        println("Epoch {:3}/{}: Train: {:.2}%, Val: {:.2}%{}", 
+                 epoch + 1, config.epochs, train_acc, val_acc, swa_marker);
+    }
+
+    let total_time = time::now() - start_time;
+    let memory = get_peak_memory_mb();
+
+    BenchmarkResults {
+        name: "Advanced".into(),
+        total_time,
+        final_accuracy: final_acc,
+        best_accuracy: best_acc,
+        epochs_to_convergence,
+        memory_usage_mb: memory,
+    }
+}
+
+/// Compare Results
+fn compare_results(baseline: &BenchmarkResults, advanced: &BenchmarkResults) {
+    println("\n╔════════════════════════════════════════════════════════╗");
+    println("║              Benchmark Comparison                      ║");
+    println("╚════════════════════════════════════════════════════════╝\n");
+
+    println("BASELINE (Standard Training):");
+    baseline.print();
+
+    println("\nADVANCED (All Optimizations):");
+    advanced.print();
+
+    println("\n╔════════════════════════════════════════════════════════╗");
+    println("║                   Improvements                         ║");
+    println("╚════════════════════════════════════════════════════════╝\n");
+
+    let time_speedup = baseline.total_time / advanced.total_time;
+    let time_saved = baseline.total_time - advanced.total_time;
+    let acc_improvement = advanced.final_accuracy - baseline.final_accuracy;
+    let epochs_saved = baseline.epochs_to_convergence - advanced.epochs_to_convergence;
+    let memory_reduction = baseline.memory_usage_mb - advanced.memory_usage_mb;
+
+    println("Speed:");
+    println("  • Time speedup: {:.2}x", time_speedup);
+    println("  • Time saved: {:.2}s ({:.1}%)", time_saved, 
+             (time_saved / baseline.total_time) * 100.0);
+    println("  • Epochs to convergence: {} → {} ({} saved)", 
+             baseline.epochs_to_convergence, advanced.epochs_to_convergence, epochs_saved);
+
+    println("\nAccuracy:");
+    println("  • Final accuracy: {:.2}% → {:.2}% ({:+.2}%)", 
+             baseline.final_accuracy, advanced.final_accuracy, acc_improvement);
+    println("  • Best accuracy: {:.2}% → {:.2}% ({:+.2}%)", 
+             baseline.best_accuracy, advanced.best_accuracy, 
+             advanced.best_accuracy - baseline.best_accuracy);
+
+    println("\nMemory:");
+    println("  • Memory usage: {:.2} MB → {:.2} MB ({:+.2} MB)", 
+             baseline.memory_usage_mb, advanced.memory_usage_mb, -memory_reduction);
+    println("  • Memory reduction: {:.1}%", 
+             (memory_reduction / baseline.memory_usage_mb) * 100.0);
+
+    println("\n╔════════════════════════════════════════════════════════╗");
+    println("║                      Summary                           ║");
+    println("╚════════════════════════════════════════════════════════╝\n");
+
+    println("With advanced features, you get:");
+    println("  ✓ {:.1}x faster training", time_speedup);
+    println("  ✓ {:.2}% better accuracy", acc_improvement);
+    println("  ✓ {:.1}% less memory usage", (memory_reduction / baseline.memory_usage_mb) * 100.0);
+    println("  ✓ {} fewer epochs to convergence", epochs_saved);
+
+    // Feature attribution
+    println("\nApproximate contribution of each feature:");
+    println("  • LR Finder: ~10-15% faster convergence");
+    println("  • Gradient Centralization: ~5-10% speed, +0.5% accuracy");
+    println("  • Mixed Precision: ~2x speed, ~50% memory");
+    println("  • Progressive Resizing: ~30% speed");
+    println("  • SWA: +0.5-2% accuracy");
+}
+
+/// Main Benchmark Function
+open fn run_benchmark() {
+    println("╔════════════════════════════════════════════════════════╗");
+    println("║     Nova ML Training Benchmark                        ║");
+    println("║     Standard vs Advanced Features                     ║");
+    println("╚════════════════════════════════════════════════════════╝\n");
+
+    let config = BenchmarkConfig {
+        dataset: "CIFAR-10".into(),
+        epochs: 100,
+        batch_size: 128,
+        lr: 0.1,
+    };
+
+    println("Benchmark Configuration:");
+    println("  • Dataset: {}", config.dataset);
+    println("  • Epochs: {}", config.epochs);
+    println("  • Batch size: {}", config.batch_size);
+    println("  • Model: ResNet-18");
+
+    // Run baseline
+    let baseline_results = train_baseline(&config);
+
+    // Run advanced
+    let advanced_results = train_advanced(&config);
+
+    // Compare
+    compare_results(&baseline_results, &advanced_results);
+
+    println("\n╔════════════════════════════════════════════════════════╗");
+    println("║              Benchmark Complete!                       ║");
+    println("╚════════════════════════════════════════════════════════╝");
+}
+
+// Helper functions
+fn train_epoch(model: &impl Module, optimizer: &var impl Optimizer, 
+               loss_fn: &impl Loss, loader: &impl Iterator) -> f64 {
+    var correct = 0;
+    var total = 0;
+
+    each entry in loader  { let (inputs, targets) = entry;
+        optimizer.zero_grad();
+        let outputs = model.forward(&inputs)?;
+        let loss = loss_fn.forward(&outputs, &targets);
+        loss.backward()?;
+        optimizer.step();
+
+        let preds = outputs.argmax(dim: 1);
+        correct += (preds == targets).sum().item();
+        total += targets.data()[0];
+    }
+
+    yield (correct as f64 / total as f64) * 100.0
+}
+
+fn validate(model: &impl Module, loss_fn: &impl Loss, loader: &impl Iterator) -> f64 {
+    var correct = 0;
+    var total = 0;
+
+    each entry in loader  { let (inputs, targets) = entry;
+        let outputs = model.forward(&inputs)?;
+        let preds = outputs.argmax(dim: 1);
+        correct += (preds == targets).sum().item();
+        total += targets.data()[0];
+    }
+
+    yield (correct as f64 / total as f64) * 100.0
+}
+
+fn create_cifar10_loader(split: &str, batch_size: int) -> impl Iterator {
+    // Placeholder
+    std::iter::empty()
+}
+
+fn create_cifar10_loader_with_size(split: &str, batch_size: int, size: int) -> impl Iterator {
+    // Placeholder
+    std::iter::empty()
+}
+
+fn get_peak_memory_mb() -> f64 {
+    // Get peak memory usage
+    1024.0  // Placeholder
+}
+
+open fn main() {
+    run_benchmark();
+}

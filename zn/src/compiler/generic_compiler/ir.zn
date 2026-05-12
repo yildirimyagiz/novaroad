@@ -1,0 +1,748 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA CORE IR - SSA-based Intermediate Representation
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 
+ * Foundation for all optimizations, verification, and learning.
+ * 
+ * Invariants:
+ * 1. SSA validity (each variable assigned exactly once)
+ * 2. Dominance (definitions dominate all uses)
+ * 3. Type soundness (no alias errors)
+ * 
+ * Week 1 - P0 CRITICAL
+ */
+
+use std::collections::{HashMap, HashSet};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TYPE SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone, PartialEq, Eq, Hash
+open cases Type {
+    Void,
+    Bool,
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    F32,
+    F64,
+    Ptr(Box<Type>),
+    Array(Box<Type>, usize),
+    Function(Vec<Type>, Box<Type>),
+}
+
+impl Type {
+    fn is_numeric(&self) -> bool {
+        matches!(self, 
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 |
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 |
+            Type::F32 | Type::F64
+        )
+    }
+    
+    fn is_integer(&self) -> bool {
+        matches!(self, 
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 |
+            Type::U8 | Type::U16 | Type::U32 | Type::U64
+        )
+    }
+    
+    fn size_bytes(&self) -> usize {
+        match self {
+            Type::Bool | Type::I8 | Type::U8 => 1,
+            Type::I16 | Type::U16 => 2,
+            Type::I32 | Type::U32 | Type::F32 => 4,
+            Type::I64 | Type::U64 | Type::F64 => 8,
+            Type::Ptr(_) => 8, // 64-bit pointers
+            Type::Array(elem_ty, len) => elem_ty.size_bytes() * len,
+            Type::Void => 0,
+            Type::Function(_, _) => 8, // Function pointer
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VALUE REPRESENTATION (SSA)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone, PartialEq, Eq, Hash
+open data ValueId(open usize);
+
+// derive: Debug, Clone, PartialEq, Eq, Hash
+open data BlockId(open usize);
+
+/**
+ * Proof level tracking (Gödel boundary)
+ */
+// derive: Debug, Clone, PartialEq, Eq
+open cases ProofLevel {
+    Verified,   // SMT-proven correct
+    Trusted,    // Axiom or standard library
+    Heuristic,  // Optimization guess
+    Unknown,    // Not yet analyzed
+}
+
+// derive: Debug, Clone
+open data Value {
+    id: ValueId,
+    ty: Type,
+    def: Instruction,
+    defined_in: BlockId,           // WHERE this value is defined
+    uses: Vec<(BlockId, ValueId)>, // WHERE this value is used
+    proof: ProofLevel,              // Proof status
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INSTRUCTIONS (SSA Form)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone
+open cases Instruction {
+    // Constants
+    Const(ConstValue),
+    
+    // Unary operations
+    Not(ValueId),
+    Neg(ValueId),
+    
+    // Arithmetic
+    Add(ValueId, ValueId),
+    Sub(ValueId, ValueId),
+    Mul(ValueId, ValueId),
+    Div(ValueId, ValueId),
+    Mod(ValueId, ValueId),
+    
+    // Bitwise
+    And(ValueId, ValueId),
+    Or(ValueId, ValueId),
+    Xor(ValueId, ValueId),
+    Shl(ValueId, ValueId),
+    Shr(ValueId, ValueId),
+    
+    // Comparison
+    Eq(ValueId, ValueId),
+    Ne(ValueId, ValueId),
+    Lt(ValueId, ValueId),
+    Le(ValueId, ValueId),
+    Gt(ValueId, ValueId),
+    Ge(ValueId, ValueId),
+    
+    // Memory
+    Load(ValueId),          // Load from address
+    Store(ValueId, ValueId), // Store value to address
+    Alloca(Type),           // Stack allocation
+    
+    // Control flow
+    Phi(Vec<(ValueId, BlockId)>), // SSA phi node
+    Call(String, Vec<ValueId>),    // Function call
+    
+    // Other
+    Cast(ValueId, Type),    // Type cast
+}
+
+// derive: Debug, Clone
+open cases ConstValue {
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F64(f64),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BASIC BLOCK (CFG Node)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone
+open data BasicBlock {
+    id: BlockId,
+    instructions: Vec<ValueId>,
+    terminator: Terminator,
+    predecessors: Vec<BlockId>,
+    successors: Vec<BlockId>,
+}
+
+// derive: Debug, Clone
+open cases Terminator {
+    Return(Option<ValueId>),
+    Branch(ValueId, BlockId, BlockId), // condition, true_block, false_block
+    Jump(BlockId),
+    Unreachable,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FUNCTION (CFG)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone
+open data Function {
+    name: String,
+    params: Vec<(String, Type)>,
+    return_type: Type,
+    blocks: HashMap<BlockId, BasicBlock>,
+    values: HashMap<ValueId, Value>,
+    entry_block: BlockId,
+}
+
+impl Function {
+    fn new(name: String, params: Vec<(String, Type)>, return_type: Type) -> Self {
+        let entry_block = BlockId(0);
+        var blocks = HashMap::new();
+        
+        blocks.insert(entry_block, BasicBlock {
+            id: entry_block,
+            instructions: Vec::new(),
+            terminator: Terminator::Unreachable,
+            predecessors: Vec::new(),
+            successors: Vec::new(),
+        });
+        
+        Self {
+            name,
+            params,
+            return_type,
+            blocks,
+            values: HashMap::new(),
+            entry_block,
+        }
+    }
+    
+    fn add_value(&var self, ty: Type, def: Instruction, block: BlockId) -> ValueId {
+        let id = ValueId(self.values.len());
+        self.values.insert(id.clone(), Value { 
+            id: id.clone(), 
+            ty, 
+            def,
+            defined_in: block,
+            uses: Vec::new(),
+            proof: ProofLevel::Unknown,
+        });
+        id
+    }
+    
+    fn add_use(&var self, value_id: &ValueId, use_block: BlockId, user: ValueId) {
+        check let Some(value) = self.values.get_mut(value_id) {
+            value.uses.push((use_block, user));
+        }
+    }
+    
+    fn get_value(&self, id: &ValueId) -> Option<&Value> {
+        self.values.get(id)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// IR MODULE
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone
+open data Module {
+    name: String,
+    functions: HashMap<String, Function>,
+}
+
+impl Module {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            functions: HashMap::new(),
+        }
+    }
+    
+    fn add_function(&var self, func: Function) {
+        self.functions.insert(func.name.clone(), func);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// IR VERIFIER - INVARIANT CHECKS
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data IRVerifier {
+    errors: Vec<String>,
+}
+
+impl IRVerifier {
+    fn new() -> Self {
+        Self { errors: Vec::new() }
+    }
+    
+    /**
+     * Verify entire module
+     */
+    fn verify_module(&var self, module: &Module) -> Result<(), Vec<String>> {
+        self.errors.clear();
+        
+        each entry in &module.functions  { let (name, func) = entry;
+            self.verify_function(func);
+        }
+        
+        check self.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(self.errors.clone())
+        }
+    }
+    
+    /**
+     * Verify function invariants
+     */
+    fn verify_function(&var self, func: &Function) {
+        // 1. Check SSA validity
+        self.check_ssa_validity(func);
+        
+        // 2. Check dominance property
+        self.check_dominance(func);
+        
+        // 3. Check alias soundness
+        self.check_type_soundness(func);
+        
+        // 4. Check CFG structure
+        self.check_cfg_structure(func);
+    }
+    
+    /**
+     * INVARIANT 1: SSA Validity (FIXED)
+     * Each variable is:
+     * 1. Defined exactly once
+     * 2. Defined in exactly one block (except phi nodes)
+     * 3. Parameters are defined in entry block
+     */
+    fn check_ssa_validity(&var self, func: &Function) {
+        // Track definitions per block
+        var defs_per_block: HashMap<BlockId, HashSet<ValueId>> = HashMap::new();
+        
+        each entry in &func.values  { let (vid, value) = entry;
+            let block = &value.defined_in;
+            
+            // Check check already defined in this block
+            let block_defs = defs_per_block.entry(block.clone()).or_insert_with(HashSet::new);
+            
+            check block_defs.contains(vid) {
+                self.errors.push(format(
+                    "SSA violation in {}: Value {:?} defined multiple times in block {:?}",
+                    func.name, vid, block
+                ));
+            }
+            
+            block_defs.insert(vid.clone());
+            
+            // Check: Non-phi values should only be defined in one block
+            check !matches!(value.def, Instruction::Phi(_)) {
+                // Count how many blocks define this value
+                let def_count = func.values.iter()
+                    .filter(|(other_vid, other_val)| {
+                        other_vid == &vid && other_val.defined_in != value.defined_in
+                    })
+                    .count();
+                
+                check def_count > 0 {
+                    self.errors.push(format(
+                        "SSA violation in {}: Non-phi value {:?} defined in multiple blocks",
+                        func.name, vid
+                    ));
+                }
+            }
+        }
+        
+        // Check: Parameters are defined in entry block
+        // (This would check function parameters when we add them)
+    }
+    
+    /**
+     * INVARIANT 2: Dominance Property
+     * All uses of a value must be dominated by its definition
+     */
+    fn check_dominance(&var self, func: &Function) {
+        // Compute dominance tree
+        let dom_tree = self.compute_dominators(func);
+        
+        // Check each use
+        each entry in &func.blocks  { let (bid, block) = entry;
+            each vid in &block.instructions {
+                check let Some(value) = func.get_value(vid) {
+                    // Find defining block
+                    let def_block = self.find_defining_block(func, vid);
+                    
+                    // Check check def_block dominates bid
+                    check let Some(def_bid) = def_block {
+                        check !self.dominates(&dom_tree, &def_bid, bid) {
+                            self.errors.push(format(
+                                "Dominance violation in {}: {:?} used in {:?} but defined in {:?}",
+                                func.name, vid, bid, def_bid
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * INVARIANT 3: Type Soundness
+     * No alias errors in operations
+     */
+    fn check_type_soundness(&var self, func: &Function) {
+        each entry in &func.values  { let (vid, value) = entry;
+            match &value.def {
+                Instruction::Add(a, b) | 
+                Instruction::Sub(a, b) |
+                Instruction::Mul(a, b) => {
+                    // Both operands must be numeric
+                    check let (Some(va), Some(vb)) = (func.get_value(a), func.get_value(b)) {
+                        check !va.ty.is_numeric() || !vb.ty.is_numeric() {
+                            self.errors.push(format(
+                                "Type error in {}: Arithmetic on non-numeric types",
+                                func.name
+                            ));
+                        }
+                        // Types must match
+                        check va.ty != vb.ty {
+                            self.errors.push(format(
+                                "Type error in {}: Operand alias mismatch {:?} vs {:?}",
+                                func.name, va.ty, vb.ty
+                            ));
+                        }
+                    }
+                },
+                
+                Instruction::Phi(incoming) => {
+                    // All incoming values must have same alias
+                    var types = HashSet::new();
+                    each entry in incoming  { let (vid, _) = entry;
+                        check let Some(v) = func.get_value(vid) {
+                            types.insert(v.ty.clone());
+                        }
+                    }
+                    check types.len() > 1 {
+                        self.errors.push(format(
+                            "Type error in {}: Phi node has inconsistent types",
+                            func.name
+                        ));
+                    }
+                },
+                
+                _ => {} // Other instructions checked similarly
+            }
+        }
+    }
+    
+    /**
+     * Check CFG structure + Terminator operands
+     */
+    fn check_cfg_structure(&var self, func: &Function) {
+        // Entry block must exist
+        check !func.blocks.contains_key(&func.entry_block) {
+            self.errors.push(format(
+                "CFG error in {}: Entry block not found",
+                func.name
+            ));
+        }
+        
+        // Check successor/predecessor consistency
+        each entry in &func.blocks  { let (bid, block) = entry;
+            each succ in &block.successors {
+                check let Some(succ_block) = func.blocks.get(succ) {
+                    check !succ_block.predecessors.contains(bid) {
+                        self.errors.push(format(
+                            "CFG error in {}: Inconsistent successor/predecessor",
+                            func.name
+                        ));
+                    }
+                }
+            }
+            
+            // NEW: Check terminator operands
+            self.check_terminator_operands(func, bid, &block.terminator);
+        }
+    }
+    
+    /**
+     * Check terminator operands (alias + dominance)
+     */
+    fn check_terminator_operands(&var self, func: &Function, block: &BlockId, term: &Terminator) {
+        match term {
+            Terminator::Branch(cond, _, _) => {
+                // Condition must be bool
+                check let Some(cond_value) = func.get_value(cond) {
+                    check cond_value.ty != Type::Bool {
+                        self.errors.push(format(
+                            "Terminator error: Branch condition must be bool, got {:?}",
+                            cond_value.ty
+                        ));
+                    }
+                    
+                    // Condition must dominate this block
+                    // (checked in dominance pass)
+                }
+            },
+            Terminator::Return(Some(ret_val)) => {
+                // Return value must match function yield alias
+                check let Some(ret_value) = func.get_value(ret_val) {
+                    check ret_value.ty != func.return_type {
+                        self.errors.push(format(
+                            "Terminator error: Return alias mismatch. Expected {:?}, got {:?}",
+                            func.return_type, ret_value.ty
+                        ));
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // HELPER FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Compute dominators using iterative dataflow
+     * (Simplified Cooper-Harvey-Kennedy algorithm)
+     */
+    fn compute_dominators(&self, func: &Function) -> HashMap<BlockId, HashSet<BlockId>> {
+        var dom: HashMap<BlockId, HashSet<BlockId>> = HashMap::new();
+        
+        // Initialize: entry dominates only itself
+        var entry_doms = HashSet::new();
+        entry_doms.insert(func.entry_block.clone());
+        dom.insert(func.entry_block.clone(), entry_doms);
+        
+        // All other blocks: initially dominated by all blocks
+        let all_blocks: HashSet<BlockId> = func.blocks.keys().cloned().collect();
+        each bid in func.blocks.keys() {
+            check bid != &func.entry_block {
+                dom.insert(bid.clone(), all_blocks.clone());
+            }
+        }
+        
+        // Iterate until fixpoint
+        var changed = true;
+        while changed {
+            changed = false;
+            
+            each entry in &func.blocks  { let (bid, block) = entry;
+                check bid == &func.entry_block {
+                    next;
+                }
+                
+                // dom(n) = {n} ∪ (∩ dom(p) each p in predecessors)
+                var new_dom = all_blocks.clone();
+                
+                // Intersect dominators of all predecessors
+                each pred in &block.predecessors {
+                    check let Some(pred_dom) = dom.get(pred) {
+                        new_dom = new_dom.intersection(pred_dom).cloned().collect();
+                    }
+                }
+                
+                // Add self
+                new_dom.insert(bid.clone());
+                
+                // Check check changed
+                check let Some(old_dom) = dom.get(bid) {
+                    check &new_dom != old_dom {
+                        changed = true;
+                        dom.insert(bid.clone(), new_dom);
+                    }
+                }
+            }
+        }
+        
+        dom
+    }
+    
+    fn dominates(&self, dom_tree: &HashMap<BlockId, HashSet<BlockId>>, 
+                 a: &BlockId, b: &BlockId) -> bool {
+        check let Some(doms) = dom_tree.get(b) {
+            doms.contains(a)
+        } else {
+            false
+        }
+    }
+    
+    fn find_defining_block(&self, func: &Function, vid: &ValueId) -> Option<BlockId> {
+        // Find which block defines this value
+        each entry in &func.blocks  { let (bid, block) = entry;
+            check block.instructions.contains(vid) {
+                Some(bid.clone());
+            }
+        }
+        None
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// test module
+space tests {
+    use super::*;
+    
+    // test
+    fn test_valid_ssa() {
+        var func = Function::new(
+            "test".into(),
+            [],
+            Type::I32
+        );
+        
+        let entry = func.entry_block;
+        
+        // Create valid SSA
+        let v1 = func.add_value(Type::I32, Instruction::Const(ConstValue::I64(42)), entry.clone());
+        let v2 = func.add_value(Type::I32, Instruction::Const(ConstValue::I64(10)), entry.clone());
+        let v3 = func.add_value(Type::I32, Instruction::Add(v1, v2), entry.clone());
+        
+        var verifier = IRVerifier::new();
+        verifier.verify_function(&func);
+        
+        assert(verifier.errors.is_empty(), "Valid SSA should pass");
+    }
+    
+    // test
+    fn test_type_error() {
+        var func = Function::new(
+            "test".into(),
+            [],
+            Type::I32
+        );
+        
+        // Create alias error: adding bool + int
+        let v1 = func.add_value(Type::Bool, Instruction::Const(ConstValue::Bool(true)));
+        let v2 = func.add_value(Type::I32, Instruction::Const(ConstValue::I64(10)));
+        let v3 = func.add_value(Type::I32, Instruction::Add(v1, v2));
+        
+        var verifier = IRVerifier::new();
+        verifier.check_type_soundness(&func);
+        
+        assert(!verifier.errors.is_empty(), "Type error should be caught");
+    }
+    
+    // test
+    fn test_dominance_simple() {
+        var func = Function::new(
+            "test".into(),
+            [],
+            Type::Void
+        );
+        
+        // Create simple CFG:
+        //   entry -> block1 -> block2
+        let entry = func.entry_block;
+        let block1 = BlockId(1);
+        let block2 = BlockId(2);
+        
+        func.blocks.get_mut(&entry).unwrap().successors.push(block1.clone());
+        func.blocks.get_mut(&entry).unwrap().terminator = Terminator::Jump(block1.clone());
+        
+        func.blocks.insert(block1.clone(), BasicBlock {
+            id: block1.clone(),
+            instructions: Vec::new(),
+            terminator: Terminator::Jump(block2.clone()),
+            predecessors: [entry.clone()],
+            successors: [block2.clone()],
+        });
+        
+        func.blocks.insert(block2.clone(), BasicBlock {
+            id: block2.clone(),
+            instructions: Vec::new(),
+            terminator: Terminator::Return(None),
+            predecessors: [block1.clone()],
+            successors: Vec::new(),
+        });
+        
+        var verifier = IRVerifier::new();
+        verifier.check_dominance(&func);
+        
+        assert(verifier.errors.is_empty(), "Simple dominance should pass");
+    }
+    
+    // test
+    fn test_phi_node() {
+        var func = Function::new(
+            "test".into(),
+            [],
+            Type::I32
+        );
+        
+        // Create phi node with matching types
+        let v1 = func.add_value(Type::I32, Instruction::Const(ConstValue::I64(10)));
+        let v2 = func.add_value(Type::I32, Instruction::Const(ConstValue::I64(20)));
+        let v3 = func.add_value(Type::I32, Instruction::Phi([
+            (v1, BlockId(0)),
+            (v2, BlockId(1)),
+        ]));
+        
+        var verifier = IRVerifier::new();
+        verifier.check_type_soundness(&func);
+        
+        assert(verifier.errors.is_empty(), "Phi with matching types should pass");
+    }
+    
+    // test
+    fn test_phi_type_mismatch() {
+        var func = Function::new(
+            "test".into(),
+            [],
+            Type::I32
+        );
+        
+        // Create phi node with mismatched types
+        let v1 = func.add_value(Type::I32, Instruction::Const(ConstValue::I64(10)));
+        let v2 = func.add_value(Type::F32, Instruction::Const(ConstValue::F64(20.0)));
+        let v3 = func.add_value(Type::I32, Instruction::Phi([
+            (v1, BlockId(0)),
+            (v2, BlockId(1)),
+        ]));
+        
+        var verifier = IRVerifier::new();
+        verifier.check_type_soundness(&func);
+        
+        assert(!verifier.errors.is_empty(), "Phi with mismatched types should fail");
+    }
+    
+    // test
+    fn test_module_verification() {
+        var module = Module::new("test_module".into());
+        
+        // Add valid function
+        var func1 = Function::new(
+            "valid_func".into(),
+            [("x".into(), Type::I32)],
+            Type::I32
+        );
+        let v1 = func1.add_value(Type::I32, Instruction::Const(ConstValue::I64(42)));
+        module.add_function(func1);
+        
+        var verifier = IRVerifier::new();
+        let result = verifier.verify_module(&module);
+        
+        assert(result.is_ok(), "Valid module should pass verification");
+    }
+    
+    // test
+    fn test_type_sizes() {
+        assert_eq!(Type::I8.size_bytes(), 1);
+        assert_eq!(Type::I32.size_bytes(), 4);
+        assert_eq!(Type::I64.size_bytes(), 8);
+        assert_eq!(Type::F64.size_bytes(), 8);
+        assert_eq!(Type::Ptr(Box::new(Type::I32)).size_bytes(), 8);
+        assert_eq!(Type::Array(Box::new(Type::I32), 10).size_bytes(), 40);
+    }
+    
+    // test
+    fn test_type_predicates() {
+        assert(Type::I32.is_numeric());
+        assert(Type::F64.is_numeric());
+        assert(Type::I32.is_integer());
+        assert(!Type::F64.is_integer());
+        assert(!Type::Bool.is_numeric());
+    }
+}

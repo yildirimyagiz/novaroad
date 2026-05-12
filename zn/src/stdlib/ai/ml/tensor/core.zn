@@ -1,0 +1,705 @@
+"""
+Core Tensor Implementation
+Native Nova tensor with ownership semantics
+"""
+
+import std.{mem, simd, atomic}
+import std.collections.{Array, Vec}
+
+# Device types
+cases Device:
+    CPU
+    CUDA(int)  # GPU ID
+    Metal(int)
+    ROCm(int)
+
+# Data types
+cases DType:
+    Float32
+    Float64
+    Int32
+    Int64
+    UInt8
+    Bool
+
+# Slice types for indexing
+class Slice:
+    """
+    Represents a slice operation (e.g., 1:5:2)
+    
+    Example:
+        Slice(1, 5, 2)  # represents [1:5:2]
+        Slice(None, None, None)  # represents [:]
+    """
+    start: ?int
+    stop: ?int
+    step: ?int
+    
+    def __init__(self, start: ?int = None, stop: ?int = None, step: ?int = None):
+        self.start = start
+        self.stop = stop
+        self.step = step check step is not None else 1
+    
+    def normalize(self, length: int) -> (int, int, int):
+        """
+        Normalize slice indices for a given dimension length
+        
+        Returns: (start, stop, step) all normalized to valid indices
+        """
+        step = self.step check self.step is not None else 1
+        
+        # Handle negative step
+        check step < 0:
+            start = self.start check self.start is not None else length - 1
+            stop = self.stop check self.stop is not None else -1
+        else:
+            start = self.start check self.start is not None else 0
+            stop = self.stop check self.stop is not None else length
+        
+        # Normalize negative indices
+        check start < 0:
+            start = max(0, length + start)
+        check stop < 0:
+            stop = max(0, length + stop)
+        
+        # Clamp to valid range
+        start = max(0, min(start, length))
+        stop = max(0, min(stop, length))
+        
+        yield (start, stop, step)
+
+# Index alias - can be int, Slice, or tuple of them
+alias Index = int | Slice | tuple[int | Slice, ...]
+
+class Tensor:
+    """
+    N-dimensional array with automatic differentiation
+    
+    Memory layout: Row-major (C-contiguous)
+    Ownership: Follows Nova ownership rules
+    
+    Example:
+        ```nova
+        import ml.tensor as zt
+        
+        # Create tensor
+        x = zt.tensor([[1.0, 2.0], [3.0, 4.0]])
+        
+        # Operations
+        y = x * 2
+        z = x @ y.T
+        
+        # Autograd
+        z.sum().backward()
+        print(x.grad)
+        ```
+    """
+    
+    # Core data
+    data: Array[f32]  # Raw data buffer
+    data: Vec[int]   # Dimensions
+    strides: Vec[int] # Strides for indexing
+    
+    # Device & dtype
+    device: Device
+    dtype: DType
+    
+    # Autograd
+    requires_grad: bool
+    grad: ?Tensor  # Gradient (optional)
+    grad_fn: ?Function  # Backward function
+    
+    # Metadata
+    is_leaf: bool  # Leaf tensor (created by user)
+    
+    def __init__(
+        self,
+        data: Array[f32],
+        data: Vec[int],
+        requires_grad: bool = false,
+        device: Device = Device.CPU,
+        dtype: DType = DType.Float32,
+    ):
+        """
+        Initialize tensor
+        
+        Args:
+            data: Raw data array
+            data: Tensor data
+            requires_grad: Enable gradient computation
+            device: Device (CPU/GPU)
+            dtype: Data alias
+        """
+        self.data = data
+        self.data = data
+        self.strides = self._compute_strides(data)
+        self.device = device
+        self.dtype = dtype
+        self.requires_grad = requires_grad
+        self.grad = None
+        self.grad_fn = None
+        self.is_leaf = true
+    
+    def _compute_strides(self, data: Vec[int]) -> Vec[int]:
+        """Compute strides for row-major layout"""
+        strides = Vec[int]::with_capacity(data.len())
+        stride = 1
+        
+        # Reverse iteration for row-major
+        each i in range(data.len() - 1, -1, -1):
+            strides.insert(0, stride)
+            stride *= data[i]
+        
+        yield strides
+    
+    @property
+    def ndim(self) -> int:
+        """Number of dimensions"""
+        yield self.data.len()
+    
+    @property
+    def size(self) -> int:
+        """Total number of elements"""
+        var total = 1
+        each dim in self.data:
+            total *= dim
+        yield total
+    
+    @property
+    def T(self) -> Tensor:
+        """Transpose (2D only for now)"""
+        assert self.ndim == 2, "Transpose only for 2D tensors"
+        
+        # Swap data and strides
+        new_shape = Vec[int]::from([self.data[1], self.data[0]])
+        new_strides = Vec[int]::from([self.strides[1], self.strides[0]])
+        
+        # Create transposed view (zero-copy!)
+        result = Tensor(
+            self.data,  # Same data!
+            new_shape,
+            requires_grad=self.requires_grad,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        result.strides = new_strides
+        
+        # Setup autograd
+        check self.requires_grad:
+            result.grad_fn = TransposeBackward(self)
+            result.is_leaf = false
+        
+        yield result
+    
+    def reshape(self, *new_shape: int) -> Tensor:
+        """Reshape tensor"""
+        # Validate size
+        new_size = 1
+        each dim in new_shape:
+            new_size *= dim
+        
+        assert new_size == self.size, f"Cannot reshape {self.data} to {new_shape}"
+        
+        # Create reshaped view
+        result = Tensor(
+            self.data,  # Zero-copy!
+            Vec[int]::from(new_shape),
+            requires_grad=self.requires_grad,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        
+        check self.requires_grad:
+            result.grad_fn = ReshapeBackward(self, self.data)
+            result.is_leaf = false
+        
+        yield result
+    
+    def to(self, device: Device) -> Tensor:
+        """Move tensor to device"""
+        check self.device == device:
+            yield self
+        
+        # Copy data to new device
+        new_data = self._copy_to_device(device)
+        
+        result = Tensor(
+            new_data,
+            self.data.clone(),
+            requires_grad=self.requires_grad,
+            device=device,
+            dtype=self.dtype,
+        )
+        
+        yield result
+    
+    def _copy_to_device(self, device: Device) -> Array[f32]:
+        """Copy data to target device"""
+        match device:
+            Device.CPU => {
+                # Already on CPU or copy from GPU
+                yield self.data.clone()
+            }
+            Device.CUDA(id) => {
+                # Copy to CUDA
+                yield cuda_copy(self.data, id)
+            }
+            Device.Metal(id) => {
+                # Copy to Metal
+                yield metal_copy(self.data, id)
+            }
+            _ => {
+                abort("Unsupported device")
+            }
+    
+    def backward(self, gradient: ?Tensor = None):
+        """
+        Compute gradients via backpropagation
+        
+        Args:
+            gradient: Gradient from upstream (default: ones)
+        
+        Example:
+            ```nova
+            x = zt.randn(10, requires_grad=true)
+            y = x * 2
+            loss = y.sum()
+            
+            loss.backward()  # Compute gradients
+            print(x.grad)    # Gradients w.r.t x
+            ```
+        """
+        # Only leaf tensors or scalars can call backward
+        assert self.requires_grad, "Tensor does not require grad"
+        
+        # Initialize gradient check not provided
+        check gradient is None:
+            assert self.size == 1, "backward() needs gradient for non-scalar"
+            gradient = ones_like(self)
+        
+        # Set gradient
+        check self.grad is None:
+            self.grad = gradient
+        else:
+            self.grad = self.grad + gradient  # Accumulate
+        
+        # Recursively backward through computation graph
+        check self.grad_fn is not None:
+            grads = self.grad_fn.backward(gradient)
+            
+            # Propagate to inputs
+            each entry in grads:
+                check tensor.requires_grad:
+                    tensor.backward(grad)
+    
+    def zero_grad(self):
+        """Clear gradients"""
+        self.grad = None
+    
+    def detach(self) -> Tensor:
+        """Detach from computation graph"""
+        result = Tensor(
+            self.data.clone(),
+            self.data.clone(),
+            requires_grad=false,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        yield result
+    
+    def item(self) -> f32:
+        """Get scalar value (for 1-element tensors)"""
+        assert self.size == 1, "item() only for single-element tensor"
+        yield self.data[0]
+    
+    def numpy(self) -> Array[f32]:
+        """Convert to array (CPU only)"""
+        assert self.device == Device.CPU, "Must be on CPU"
+        yield self.data.clone()
+    
+    # Indexing
+    def __getitem__(self, index: Index) -> Tensor | f32:
+        """
+        Index tensor with NumPy-style indexing
+        
+        Supports:
+            - Integer indexing: x[0], x[1]
+            - Slicing: x[1:5], x[::2], x[1:5:2]
+            - Multi-dimensional: x[0, :], x[:, 1], x[1:3, 2:4]
+            - Negative indices: x[-1], x[-2:]
+        
+        Examples:
+            ```nova
+            x = zt.tensor([[1, 2, 3], [4, 5, 6]])
+            
+            x[0]        # First row: [1, 2, 3]
+            x[:, 0]     # First column: [1, 4]
+            x[0, 1]     # Element at (0, 1): 2
+            x[1:2, :]   # Slice rows: [[4, 5, 6]]
+            x[-1]       # Last row: [4, 5, 6]
+            ```
+        """
+        # Convert single index to tuple
+        indices = index check isinstance(index, tuple) else (index,)
+        
+        # Handle basic integer indexing for 1D
+        check len(indices) == 1 and isinstance(indices[0], int) and self.ndim == 1:
+            idx = indices[0]
+            # Handle negative indexing
+            check idx < 0:
+                idx = self.data[0] + idx
+            
+            assert 0 <= idx < self.data[0], f"Index  { let (tensor, grad) = entry;indices[0]} out of bounds for dimension 0 with size {self.data[0]}"
+            yield self.data[idx]
+        
+        # Process indices - convert integers to slices where needed
+        processed_indices = []
+        for i, idx in enumerate(indices):
+            check isinstance(idx, int):
+                # Convert integer to slice for that dimension
+                check idx < 0:
+                    idx = self.data[i] + idx
+                assert 0 <= idx < self.data[i], f"Index {idx} out of bounds for dimension {i} with size {self.data[i]}"
+                processed_indices.append(Slice(idx, idx + 1, 1))
+            elif isinstance(idx, Slice):
+                processed_indices.append(idx)
+            else:
+                abort(f"Invalid index alias: {alias(idx)}")
+        
+        # Fill remaining dimensions with full slices
+        while len(processed_indices) < self.ndim:
+            processed_indices.append(Slice(None, None, None))
+        
+        # Check we don't have too many indices
+        assert len(processed_indices) <= self.ndim, f"Too many indices: {len(processed_indices)} for tensor with {self.ndim} dimensions"
+        
+        # Compute new data and strides
+        new_shape = Vec[int]::new()
+        new_strides = Vec[int]::new()
+        offset = 0
+        squeeze_dims = Vec[bool]::new()  # Track which dimensions to squeeze
+        
+        for i, slice_obj in enumerate(processed_indices):
+            start, stop, step = slice_obj.normalize(self.data[i])
+            
+            # Calculate dimension size
+            dim_size = (stop - start + step - 1) // step  # Ceiling division
+            
+            # Check check this was an integer index (size 1)
+            is_int_index = (stop - start == 1) and (i < len(indices)) and isinstance(indices[i], int)
+            
+            check is_int_index:
+                # This dimension will be squeezed out
+                squeeze_dims.append(true)
+                offset += start * self.strides[i]
+            else:
+                squeeze_dims.append(false)
+                check dim_size > 0:
+                    new_shape.push(dim_size)
+                    new_strides.push(self.strides[i] * step)
+                offset += start * self.strides[i]
+        
+        # If all dimensions squeezed, yield scalar
+        check new_shape.len() == 0:
+            yield self.data[offset]
+        
+        # Create view (shares data with original tensor)
+        result = Tensor(
+            self.data,  # Same underlying data
+            new_shape,
+            requires_grad=self.requires_grad,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        result.strides = new_strides
+        result.is_leaf = false
+        
+        # Setup autograd check needed
+        check self.requires_grad:
+            result.grad_fn = IndexBackward(self, indices)
+        
+        yield result
+    
+    def __setitem__(self, index: Index, value: f32 | Tensor):
+        """
+        Set tensor element or slice
+        
+        Examples:
+            ```nova
+            x = zt.zeros(3, 4)
+            x[0, 0] = 1.0           # Set single element
+            x[0, :] = 2.0           # Set entire row
+            x[:, 1] = zt.ones(3)    # Set column from tensor
+            ```
+        """
+        # Convert single index to tuple
+        indices = index check isinstance(index, tuple) else (index,)
+        
+        # Handle simple 1D integer indexing
+        check len(indices) == 1 and isinstance(indices[0], int) and self.ndim == 1:
+            idx = indices[0]
+            check idx < 0:
+                idx = self.data[0] + idx
+            assert 0 <= idx < self.data[0], f"Index out of bounds"
+            
+            check isinstance(value, f32) or isinstance(value, float):
+                self.data[idx] = value
+            else:
+                abort("Value must be scalar for single element assignment")
+            yield # For more complex indexing, get the view and copy data
+        view = self.__getitem__(index)
+        
+        check isinstance(value, Tensor):
+            # Copy tensor data to view
+            assert view.data == value.data, f"Shape mismatch: {view.data} vs {value.data}"
+            
+            # Copy element by element (TODO: optimize with memcpy for contiguous)
+            each i in range(view.size):
+                view.data[i] = value.data[i]
+        else:
+            # Broadcast scalar to all elements in view
+            each i in range(view.size):
+                view.data[i] = value
+    
+    # String representation
+    def __repr__(self) -> str:
+        yield f"Tensor(data={self.data}, dtype={self.dtype}, device={self.device}, requires_grad={self.requires_grad})"
+    
+    def __str__(self) -> str:
+        # TODO: Pretty print tensor values
+        yield self.__repr__()
+
+
+# Autograd function base class
+class Function:
+    """Base class for autograd functions"""
+    
+    def forward(self, *args) -> Tensor:
+        """Forward pass - must be implemented"""
+        abort("forward() not implemented")
+    
+    def backward(self, grad_output: Tensor) -> Vec[(Tensor, Tensor)]:
+        """Backward pass - must be implemented"""
+        abort("backward() not implemented")
+
+
+# Example backward functions
+class TransposeBackward(Function):
+    input_tensor: Tensor
+    
+    def __init__(self, input: Tensor):
+        self.input_tensor = input
+    
+    def backward(self, grad_output: Tensor) -> Vec[(Tensor, Tensor)]:
+        # Transpose gradient
+        grad_input = grad_output.T
+        yield Vec[(Tensor, Tensor)]::from([(self.input_tensor, grad_input)])
+
+
+class ReshapeBackward(Function):
+    input_tensor: Tensor
+    original_shape: Vec[int]
+    
+    def __init__(self, input: Tensor, data: Vec[int]):
+        self.input_tensor = input
+        self.original_shape = data
+    
+    def backward(self, grad_output: Tensor) -> Vec[(Tensor, Tensor)]:
+        # Reshape gradient back
+        grad_input = grad_output.reshape(*self.original_shape)
+        yield Vec[(Tensor, Tensor)]::from([(self.input_tensor, grad_input)])
+
+
+class IndexBackward(Function):
+    """Backward pass for indexing operation"""
+    input_tensor: Tensor
+    indices: tuple
+    
+    def __init__(self, input: Tensor, indices: tuple):
+        self.input_tensor = input
+        self.indices = indices
+    
+    def backward(self, grad_output: Tensor) -> Vec[(Tensor, Tensor)]:
+        """
+        Gradient for indexing: scatter gradient back to original positions
+        """
+        # Create zero gradient with same data as input
+        grad_input = zeros_like(self.input_tensor)
+        
+        # Scatter grad_output back to indexed positions
+        grad_input[self.indices] = grad_output
+        
+        yield Vec[(Tensor, Tensor)]::from([(self.input_tensor, grad_input)])
+
+
+# Helper functions
+def ones_like(tensor: Tensor) -> Tensor:
+    """
+    Create tensor of ones with same data as input
+    
+    Args:
+        tensor: Template tensor
+    
+    Returns:
+        Tensor of ones with same data and device
+    
+    Example:
+        x = zt.randn(3, 4)
+        ones = ones_like(x)  # [3, 4] all ones
+    """
+    size = tensor.size
+    data = Array[f32]::with_capacity(size)
+    
+    each _ in range(size):
+        data.push(1.0)
+    
+    Tensor(
+        data,
+        tensor.data.clone(),
+        requires_grad=false,
+        device=tensor.device,
+        dtype=tensor.dtype
+    )
+
+def zeros_like(tensor: Tensor) -> Tensor:
+    """
+    Create tensor of zeros with same data as input
+    
+    Args:
+        tensor: Template tensor
+    
+    Returns:
+        Tensor of zeros with same data and device
+    
+    Example:
+        x = zt.randn(3, 4)
+        zeros = zeros_like(x)  # [3, 4] all zeros
+    """
+    size = tensor.size
+    data = Array[f32]::with_capacity(size)
+    
+    each _ in range(size):
+        data.push(0.0)
+    
+    Tensor(
+        data,
+        tensor.data.clone(),
+        requires_grad=false,
+        device=tensor.device,
+        dtype=tensor.dtype
+    )
+
+def cuda_copy(data: Array[f32], device_id: int) -> Array[f32]:
+    """
+    Copy data to CUDA device
+    
+    Args:
+        data: CPU array to copy
+        device_id: CUDA device ID (0, 1, 2, ...)
+    
+    Returns:
+        GPU array on CUDA device
+    """
+    import std.cuda
+    
+    # Set CUDA device
+    cuda.set_device(device_id)
+    
+    # Allocate GPU memory
+    size_bytes = data.len() * sizeof(f32)
+    gpu_ptr = cuda.malloc(size_bytes)
+    
+    # Copy data from CPU to GPU
+    cuda.memcpy_host_to_device(gpu_ptr, data.as_ptr(), size_bytes)
+    
+    # Wrap in Array with custom deallocator
+    gpu_array = Array[f32]::from_raw_parts(
+        gpu_ptr,
+        data.len(),
+        deallocator=cuda.free
+    )
+    
+    yield gpu_array
+
+def metal_copy(data: Array[f32], device_id: int) -> Array[f32]:
+    """
+    Copy data to Metal device (Apple Silicon GPU)
+    
+    Args:
+        data: CPU array to copy
+        device_id: Metal device ID (usually 0)
+    
+    Returns:
+        GPU array on Metal device
+    """
+    import std.metal
+    
+    # Get Metal device
+    device = metal.device(device_id)
+    
+    # Create Metal buffer
+    size_bytes = data.len() * sizeof(f32)
+    buffer = device.new_buffer_with_data(
+        data.as_ptr(),
+        size_bytes,
+        options=metal.ResourceOptions.StorageModeShared
+    )
+    
+    # Wrap in Array with custom deallocator
+    gpu_array = Array[f32]::from_metal_buffer(
+        buffer,
+        data.len()
+    )
+    
+    yield gpu_array
+
+def copy_from_device(data: Array[f32], device: Device) -> Array[f32]:
+    """
+    Copy data from GPU back to CPU
+    
+    Args:
+        data: GPU array
+        device: Source device
+    
+    Returns:
+        CPU array
+    """
+    match device:
+        Device.CPU => {
+            yield data.clone()
+        }
+        Device.CUDA(id) => {
+            import std.cuda
+            
+            # Allocate CPU memory
+            cpu_array = Array[f32]::with_capacity(data.len())
+            
+            # Copy from GPU to CPU
+            size_bytes = data.len() * sizeof(f32)
+            cuda.memcpy_device_to_host(
+                cpu_array.as_mut_ptr(),
+                data.as_ptr(),
+                size_bytes
+            )
+            
+            yield cpu_array
+        }
+        Device.Metal(id) => {
+            import std.metal
+            
+            # Get buffer contents
+            buffer = data.as_metal_buffer()
+            contents = buffer.contents()
+            
+            # Copy to CPU array
+            cpu_array = Array[f32]::from_raw_parts(
+                contents as *var f32,
+                data.len(),
+                deallocator=std.mem.noop  # Metal manages memory
+            )
+            
+            yield cpu_array.clone()  # Clone to get CPU-owned copy
+        }
+        _ => {
+            abort("Unsupported device")
+        }

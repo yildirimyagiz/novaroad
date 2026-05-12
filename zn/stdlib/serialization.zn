@@ -1,0 +1,848 @@
+// 📄 Nova JSON Serialization — v10.0
+// JSON encoding/decoding with type safety
+// + Nova Magic: Automatic serialization, streaming support
+
+@module("serialization::json")
+@reproducible
+@export
+@inline
+
+use std::collections::{HashMap, Vec};
+use std::sync::Arc;
+use std::result::Result;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §1  JSON CORE TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// JSON value
+open cases JsonValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<JsonValue>),
+    Object(HashMap<String, JsonValue>),
+}
+
+impl JsonValue {
+    open fn null() -> JsonValue {
+        return JsonValue::Null;
+    }
+    
+    open fn bool(value: bool) -> JsonValue {
+        return JsonValue::Bool(value);
+    }
+    
+    open fn number(value: f64) -> JsonValue {
+        return JsonValue::Number(value);
+    }
+    
+    open fn integer(value: i64) -> JsonValue {
+        return JsonValue::Number(value as f64);
+    }
+    
+    open fn string(value: String) -> JsonValue {
+        return JsonValue::String(value);
+    }
+    
+    open fn array(values: Vec<JsonValue>) -> JsonValue {
+        return JsonValue::Array(values);
+    }
+    
+    open fn object(pairs: HashMap<String, JsonValue>) -> JsonValue {
+        return JsonValue::Object(pairs);
+    }
+    
+    open fn is_null(&self) -> bool {
+        return matches!(self, JsonValue::Null);
+    }
+    
+    open fn is_bool(&self) -> bool {
+        return matches!(self, JsonValue::Bool(_));
+    }
+    
+    open fn is_number(&self) -> bool {
+        return matches!(self, JsonValue::Number(_));
+    }
+    
+    open fn is_string(&self) -> bool {
+        return matches!(self, JsonValue::String(_));
+    }
+    
+    open fn is_array(&self) -> bool {
+        return matches!(self, JsonValue::Array(_));
+    }
+    
+    open fn is_object(&self) -> bool {
+        return matches!(self, JsonValue::Object(_));
+    }
+    
+    open fn as_bool(&self) -> Option<bool> {
+        match self {
+            JsonValue::Bool(value) => Some(*value),
+            _ => None,
+        }
+    }
+    
+    open fn as_number(&self) -> Option<f64> {
+        match self {
+            JsonValue::Number(value) => Some(*value),
+            _ => None,
+        }
+    }
+    
+    open fn as_integer(&self) -> Option<i64> {
+        match self {
+            JsonValue::Number(value) => Some(*value as i64),
+            _ => None,
+        }
+    }
+    
+    open fn as_string(&self) -> Option<String> {
+        match self {
+            JsonValue::String(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+    
+    open fn as_array(&self) -> Option<Vec<JsonValue>> {
+        match self {
+            JsonValue::Array(values) => Some(values.clone()),
+            _ => None,
+        }
+    }
+    
+    open fn as_object(&self) -> Option<HashMap<String, JsonValue>> {
+        match self {
+            JsonValue::Object(pairs) => Some(pairs.clone()),
+            _ => None,
+        }
+    }
+    
+    open fn get(&self, key: &str) -> Option<&JsonValue> {
+        match self {
+            JsonValue::Object(pairs) => pairs.get(key),
+            _ => None,
+        }
+    }
+    
+    open fn get_mut(&mut self, key: &str) -> Option<&mut JsonValue> {
+        match self {
+            JsonValue::Object(pairs) => pairs.get_mut(key),
+            _ => None,
+        }
+    }
+    
+    open fn index(&self, index: usize) -> Option<&JsonValue> {
+        match self {
+            JsonValue::Array(values) => values.get(index),
+            _ => None,
+        }
+    }
+    
+    open fn index_mut(&mut self, index: usize) -> Option<&mut JsonValue> {
+        match self {
+            JsonValue::Array(values) => values.get_mut(index),
+            _ => None,
+        }
+    }
+    
+    open fn len(&self) -> usize {
+        match self {
+            JsonValue::Array(values) => values.len(),
+            JsonValue::Object(pairs) => pairs.len(),
+            _ => 0,
+        }
+    }
+    
+    open fn is_empty(&self) -> bool {
+        return self.len() == 0;
+    }
+    
+    open fn contains_key(&self, key: &str) -> bool {
+        match self {
+            JsonValue::Object(pairs) => pairs.contains_key(key),
+            _ => false,
+        }
+    }
+}
+
+/// JSON error
+open cases JsonError {
+    SyntaxError(String, usize, usize),
+    IoError(String),
+    TypeMismatch(String),
+    InvalidNumber(String),
+    InvalidString(String),
+    ExpectedToken(String, String),
+    UnexpectedToken(String, String),
+    EndOfInput,
+}
+
+impl JsonError {
+    open fn to_string(&self) -> String {
+        match self {
+            JsonError::SyntaxError(msg, line, column) => {
+                format!("Syntax error at {}:{}: {}", line, column, msg)
+            }
+            JsonError::IoError(msg) => format!("IO error: {}", msg),
+            JsonError::TypeMismatch(msg) => format!("Type mismatch: {}", msg),
+            JsonError::InvalidNumber(msg) => format!("Invalid number: {}", msg),
+            JsonError::InvalidString(msg) => format!("Invalid string: {}", msg),
+            JsonError::ExpectedToken(expected, found) => {
+                format!("Expected '{}' but found '{}'", expected, found)
+            }
+            JsonError::UnexpectedToken(token, msg) => {
+                format!("Unexpected token '{}': {}", token, msg)
+            }
+            JsonError::EndOfInput => "Unexpected end of input".into(),
+        }
+    }
+}
+
+/// JSON result
+open type JsonResult<T> = Result<T, JsonError>;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §2  JSON SERIALIZER
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// JSON serializer
+open data JsonSerializer {
+    pretty: bool,
+    indent: String,
+}
+
+impl JsonSerializer {
+    open fn new() -> JsonSerializer {
+        return JsonSerializer {
+            pretty: false,
+            indent: "  ".into(),
+        };
+    }
+    
+    open fn pretty(mut self) -> JsonSerializer {
+        self.pretty = true;
+        return self;
+    }
+    
+    open fn with_indent(mut self, indent: String) -> JsonSerializer {
+        self.indent = indent;
+        return self;
+    }
+    
+    open fn serialize(&self, value: &JsonValue) -> JsonResult<String> {
+        let mut output = String::new();
+        let mut writer = JsonWriter::new(&mut output);
+        
+        self.write_value(&mut writer, value, 0)?;
+        
+        return Ok(output);
+    }
+    
+    open fn serialize_to_writer<W: Write>(&self, writer: &mut W, value: &JsonValue) -> JsonResult<()> {
+        let mut json_writer = JsonWriter::new(writer);
+        return self.write_value(&mut json_writer, value, 0);
+    }
+    
+    fn write_value<W: Write>(&self, writer: &mut JsonWriter<W>, value: &JsonValue, depth: usize) -> JsonResult<()> {
+        match value {
+            JsonValue::Null => writer.write_null()?,
+            JsonValue::Bool(b) => writer.write_bool(*b)?,
+            JsonValue::Number(n) => writer.write_number(*n)?,
+            JsonValue::String(s) => writer.write_string(s)?,
+            JsonValue::Array(arr) => {
+                writer.write_array_start()?;
+                for (i, item) in arr.iter().enumerate() {
+                    if i > 0 {
+                        writer.write_comma()?;
+                    }
+                    self.write_value(writer, item, depth)?;
+                }
+                writer.write_array_end()?;
+            }
+            JsonValue::Object(obj) => {
+                writer.write_object_start()?;
+                for (i, (key, val)) in obj.iter().enumerate() {
+                    if i > 0 {
+                        writer.write_comma()?;
+                    }
+                    writer.write_string(key)?;
+                    writer.write_colon()?;
+                    if self.pretty {
+                        writer.write_newline()?;
+                        writer.write_indent(depth + 1)?;
+                    }
+                    self.write_value(writer, val, depth + 1)?;
+                }
+                if self.pretty && !obj.is_empty() {
+                    writer.write_newline()?;
+                    writer.write_indent(depth)?;
+                }
+                writer.write_object_end()?;
+            }
+        }
+        return Ok(());
+    }
+}
+
+/// JSON writer
+open data JsonWriter<W: Write> {
+    writer: W,
+    buffer: Vec<u8>,
+}
+
+impl<W: Write> JsonWriter<W> {
+    open fn new(writer: W) -> JsonWriter<W> {
+        return JsonWriter {
+            writer: writer,
+            buffer: Vec::new(),
+        };
+    }
+    
+    open fn write_null(&mut self) -> JsonResult<()> {
+        self.writer.write_all(b"null")?;
+        return Ok(());
+    }
+    
+    open fn write_bool(&mut self, value: bool) -> JsonResult<()> {
+        if value {
+            self.writer.write_all(b"true")?;
+        } else {
+            self.writer.write_all(b"false")?;
+        }
+        return Ok(());
+    }
+    
+    open fn write_number(&mut self, value: f64) -> JsonResult<()> {
+        // Handle special cases
+        if value.is_nan() {
+            return Err(JsonError::InvalidNumber("NaN".into()));
+        }
+        if value.is_infinite() {
+            return Err(JsonError::InvalidNumber("Infinity".into()));
+        }
+        
+        let s = format!("{}", value);
+        self.writer.write_all(s.as_bytes())?;
+        return Ok(());
+    }
+    
+    open fn write_string(&mut self, value: &str) -> JsonResult<()> {
+        self.writer.write_all(b"\"")?;
+        
+        for ch in value.chars() {
+            match ch {
+                '"' => self.writer.write_all(b"\\\"")?,
+                '\\' => self.writer.write_all(b"\\\\")?,
+                '\x08' => self.writer.write_all(b"\\b")?,
+                '\x0C' => self.writer.write_all(b"\\f")?,
+                '\n' => self.writer.write_all(b"\\n")?,
+                '\r' => self.writer.write_all(b"\\r")?,
+                '\t' => self.writer.write_all(b"\\t")?,
+                _ => {
+                    if ch < ' ' {
+                        let code = ch as u32;
+                        let hex = format!("\\u{:04x}", code);
+                        self.writer.write_all(hex.as_bytes())?;
+                    } else {
+                        let mut buf = [0u8; 4];
+                        let len = ch.encode_utf8(&mut buf);
+                        self.writer.write_all(&buf[..len])?;
+                    }
+                }
+            }
+        }
+        
+        self.writer.write_all(b"\"")?;
+        return Ok(());
+    }
+    
+    open fn write_array_start(&mut self) -> JsonResult<()> {
+        self.writer.write_all(b"[")?;
+        return Ok(());
+    }
+    
+    open fn write_array_end(&mut self) -> JsonResult<()> {
+        self.writer.write_all(b"]")?;
+        return Ok(());
+    }
+    
+    open fn write_object_start(&mut self) -> JsonResult<()> {
+        self.writer.write_all(b"{")?;
+        return Ok(());
+    }
+    
+    open fn write_object_end(&mut self) -> JsonResult<()> {
+        self.writer.write_all(b"}")?;
+        return Ok(());
+    }
+    
+    open fn write_comma(&mut self) -> JsonResult<()> {
+        self.writer.write_all(b",")?;
+        return Ok(());
+    }
+    
+    open fn write_colon(&mut self) -> JsonResult<()> {
+        self.writer.write_all(b":")?;
+        return Ok(());
+    }
+    
+    open fn write_newline(&mut self) -> JsonResult<()> {
+        self.writer.write_all(b"\n")?;
+        return Ok(());
+    }
+    
+    open fn write_indent(&mut self, depth: usize) -> JsonResult<()> {
+        for _ in 0..depth {
+            self.writer.write_all(b"  ")?;
+        }
+        return Ok(());
+    }
+}
+
+/// Write trait
+open rules Write {
+    fn write_all(&mut self, buf: &[u8]) -> Result<(), String>;
+    fn flush(&mut self) -> Result<(), String>;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// §3  JSON DESERIALIZER
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// JSON deserializer
+open data JsonDeserializer {
+    input: String,
+    position: usize,
+    line: usize,
+    column: usize,
+}
+
+impl JsonDeserializer {
+    open fn new(input: String) -> JsonDeserializer {
+        return JsonDeserializer {
+            input: input,
+            position: 0,
+            line: 1,
+            column: 1,
+        };
+    }
+    
+    open fn deserialize(&mut self) -> JsonResult<JsonValue> {
+        self.skip_whitespace()?;
+        
+        if self.position >= self.input.len() {
+            return Err(JsonError::EndOfInput);
+        }
+        
+        let value = self.parse_value()?;
+        
+        self.skip_whitespace()?;
+        
+        if self.position < self.input.len() {
+            return Err(JsonError::UnexpectedToken(
+                self.peek_char().to_string(),
+                "Expected end of input".into()
+            ));
+        }
+        
+        return Ok(value);
+    }
+    
+    fn parse_value(&mut self) -> JsonResult<JsonValue> {
+        match self.peek_char() {
+            'n' => self.parse_null(),
+            't' | 'f' => self.parse_boolean(),
+            '"' => self.parse_string(),
+            '-' | '0'..='9' => self.parse_number(),
+            '[' => self.parse_array(),
+            '{' => self.parse_object(),
+            ch => Err(JsonError::UnexpectedToken(
+                ch.to_string(),
+                "Expected JSON value".into()
+            )),
+        }
+    }
+    
+    fn parse_null(&mut self) -> JsonResult<JsonValue> {
+        self.expect_keyword("null")?;
+        return Ok(JsonValue::Null);
+    }
+    
+    fn parse_boolean(&mut self) -> JsonResult<JsonValue> {
+        if self.input[self.position..].starts_with("true") {
+            self.advance(4)?;
+            return Ok(JsonValue::Bool(true));
+        } else if self.input[self.position..].starts_with("false") {
+            self.advance(5)?;
+            return Ok(JsonValue::Bool(false));
+        } else {
+            return Err(JsonError::ExpectedToken("true or false".into(), self.peek_char().to_string()));
+        }
+    }
+    
+    fn parse_string(&mut self) -> JsonResult<JsonValue> {
+        self.advance(1)?; // Skip opening quote
+        
+        let mut result = String::new();
+        
+        loop {
+            if self.position >= self.input.len() {
+                return Err(JsonError::InvalidString("Unterminated string".into()));
+            }
+            
+            let ch = self.advance_char()?;
+            
+            match ch {
+                '"' => break,
+                '\\' => {
+                    let escape_char = self.advance_char()?;
+                    result.push(match escape_char {
+                        '"' => '"',
+                        '\\' => '\\',
+                        '/' => '/',
+                        'b' => '\x08',
+                        'f' => '\x0C',
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        'u' => {
+                            // Parse Unicode escape
+                            let mut hex = String::new();
+                            for _ in 0..4 {
+                                if self.position >= self.input.len() {
+                                    return Err(JsonError::InvalidString("Incomplete Unicode escape".into()));
+                                }
+                                hex.push(self.advance_char()?);
+                            }
+                            
+                            match u32::from_str_radix(&hex, 16) {
+                                Ok(code) => {
+                                    match char::from_u32(code) {
+                                        Some(c) => c,
+                                        None => return Err(JsonError::InvalidString("Invalid Unicode code point".into())),
+                                    }
+                                }
+                                Err(_) => return Err(JsonError::InvalidString("Invalid Unicode escape".into())),
+                            }
+                        }
+                        _ => return Err(JsonError::InvalidString("Invalid escape sequence".into())),
+                    });
+                }
+                ch => {
+                    if ch < ' ' {
+                        return Err(JsonError::InvalidString("Unescaped control character".into()));
+                    }
+                    result.push(ch);
+                }
+            }
+        }
+        
+        return Ok(JsonValue::String(result));
+    }
+    
+    fn parse_number(&mut self) -> JsonResult<JsonValue> {
+        let start = self.position;
+        
+        // Parse sign
+        if self.peek_char() == '-' {
+            self.advance(1)?;
+        }
+        
+        // Parse integer part
+        if self.peek_char() == '0' {
+            self.advance(1)?;
+        } else {
+            while self.position < self.input.len() && self.peek_char().is_ascii_digit() {
+                self.advance(1)?;
+            }
+        }
+        
+        // Parse fractional part
+        if self.peek_char() == '.' {
+            self.advance(1)?;
+            while self.position < self.input.len() && self.peek_char().is_ascii_digit() {
+                self.advance(1)?;
+            }
+        }
+        
+        // Parse exponent
+        if self.peek_char() == 'e' || self.peek_char() == 'E' {
+            self.advance(1)?;
+            if self.peek_char() == '+' || self.peek_char() == '-' {
+                self.advance(1)?;
+            }
+            while self.position < self.input.len() && self.peek_char().is_ascii_digit() {
+                self.advance(1)?;
+            }
+        }
+        
+        let num_str = &self.input[start..self.position];
+        
+        match num_str.parse::<f64>() {
+            Ok(num) => Ok(JsonValue::Number(num)),
+            Err(_) => Err(JsonError::InvalidNumber(format!("Invalid number: {}", num_str))),
+        }
+    }
+    
+    fn parse_array(&mut self) -> JsonResult<JsonValue> {
+        self.advance(1)?; // Skip opening bracket
+        
+        let mut elements = Vec::new();
+        self.skip_whitespace()?;
+        
+        if self.peek_char() == ']' {
+            self.advance(1)?;
+            return Ok(JsonValue::Array(elements));
+        }
+        
+        loop {
+            self.skip_whitespace()?;
+            let element = self.parse_value()?;
+            elements.push(element);
+            self.skip_whitespace()?;
+            
+            match self.peek_char() {
+                ',' => {
+                    self.advance(1)?;
+                }
+                ']' => {
+                    self.advance(1)?;
+                    break;
+                }
+                _ => return Err(JsonError::ExpectedToken("',' or ']'".into(), self.peek_char().to_string())),
+            }
+        }
+        
+        return Ok(JsonValue::Array(elements));
+    }
+    
+    fn parse_object(&mut self) -> JsonResult<JsonValue> {
+        self.advance(1)?; // Skip opening brace
+        
+        let mut pairs = HashMap::new();
+        self.skip_whitespace()?;
+        
+        if self.peek_char() == '}' {
+            self.advance(1)?;
+            return Ok(JsonValue::Object(pairs));
+        }
+        
+        loop {
+            self.skip_whitespace()?;
+            
+            // Parse key
+            let key = match self.parse_string()? {
+                JsonValue::String(s) => s,
+                _ => return Err(JsonError::TypeMismatch("Object key must be string".into())),
+            };
+            
+            self.skip_whitespace()?;
+            self.expect_char(':')?;
+            self.skip_whitespace()?;
+            
+            // Parse value
+            let value = self.parse_value()?;
+            pairs.insert(key, value);
+            self.skip_whitespace()?;
+            
+            match self.peek_char() {
+                ',' => {
+                    self.advance(1)?;
+                }
+                '}' => {
+                    self.advance(1)?;
+                    break;
+                }
+                _ => return Err(JsonError::ExpectedToken("',' or '}'".into(), self.peek_char().to_string())),
+            }
+        }
+        
+        return Ok(JsonValue::Object(pairs));
+    }
+    
+    fn expect_keyword(&mut self, keyword: &str) -> JsonResult<()> {
+        let start = self.position;
+        
+        for ch in keyword.chars() {
+            if self.peek_char() != ch {
+                return Err(JsonError::ExpectedToken(keyword.into(), self.peek_char().to_string()));
+            }
+            self.advance(1)?;
+        }
+        
+        return Ok(());
+    }
+    
+    fn expect_char(&mut self, expected: char) -> JsonResult<()> {
+        if self.peek_char() != expected {
+            return Err(JsonError::ExpectedToken(expected.to_string(), self.peek_char().to_string()));
+        }
+        self.advance(1)?;
+        return Ok(());
+    }
+    
+    fn skip_whitespace(&mut self) -> JsonResult<()> {
+        while self.position < self.input.len() {
+            let ch = self.peek_char();
+            if !ch.is_whitespace() {
+                break;
+            }
+            self.advance(1)?;
+        }
+        return Ok(());
+    }
+    
+    fn peek_char(&self) -> char {
+        return self.input[self.position..].chars().next().unwrap_or('\0');
+    }
+    
+    fn advance_char(&mut self) -> JsonResult<char> {
+        if self.position >= self.input.len() {
+            return Err(JsonError::EndOfInput);
+        }
+        
+        let ch = self.input[self.position..].chars().next().unwrap();
+        if ch == '\n' {
+            self.line = self.line + 1;
+            self.column = 1;
+        } else {
+            self.column = self.column + 1;
+        }
+        
+        self.position = self.position + ch.len_utf8();
+        return Ok(ch);
+    }
+    
+    fn advance(&mut self, count: usize) -> JsonResult<()> {
+        for _ in 0..count {
+            if self.position >= self.input.len() {
+                return Err(JsonError::EndOfInput);
+            }
+            let ch = self.input[self.position..].chars().next().unwrap();
+            if ch == '\n' {
+                self.line = self.line + 1;
+                self.column = 1;
+            } else {
+                self.column = self.column + 1;
+            }
+            self.position = self.position + ch.len_utf8();
+        }
+        return Ok(());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §4  SERIALIZATION TRAIT
+// ═════════════════════════════════════════════════════════════════════════
+
+/// JSON serializable trait
+open rules JsonSerializable {
+    fn to_json(&self) -> JsonValue;
+}
+
+/// JSON deserializable trait
+open rules JsonDeserializable {
+    fn from_json(value: &JsonValue) -> Result<Self, JsonError>;
+}
+
+// Implement for basic types
+impl JsonSerializable for String {
+    fn to_json(&self) -> JsonValue {
+        return JsonValue::String(self.clone());
+    }
+}
+
+impl JsonSerializable for i64 {
+    fn to_json(&self) -> JsonValue {
+        return JsonValue::Number(*self as f64);
+    }
+}
+
+impl JsonSerializable for f64 {
+    fn to_json(&self) -> JsonValue {
+        return JsonValue::Number(*self);
+    }
+}
+
+impl JsonSerializable for bool {
+    fn to_json(&self) -> JsonValue {
+        return JsonValue::Bool(*self);
+    }
+}
+
+impl<T: JsonSerializable> JsonSerializable for Vec<T> {
+    fn to_json(&self) -> JsonValue {
+        let mut array = Vec::new();
+        for item in self {
+            array.push(item.to_json());
+        }
+        return JsonValue::Array(array);
+    }
+}
+
+impl<K: Clone + Eq + std::hash::Hash, V: JsonSerializable> JsonSerializable for HashMap<K, V> {
+    fn to_json(&self) -> JsonValue {
+        let mut object = HashMap::new();
+        for (key, value) in self {
+            object.insert(key.to_string(), value.to_json());
+        }
+        return JsonValue::Object(object);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §5  GLOBAL INSTANCE AND HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Global JSON serializer
+var JSON_SERIALIZER: JsonSerializer = JsonSerializer::new();
+
+/// Global JSON deserializer
+var JSON_DESERIALIZER: JsonDeserializer = JsonDeserializer::new(String::new());
+
+/// Get global JSON serializer
+open fn get_json_serializer() -> &JsonSerializer {
+    return &JSON_SERIALIZER;
+}
+
+/// Get global JSON deserializer
+open fn get_json_deserializer() -> &JsonDeserializer {
+    return &JSON_DESERIALIZER;
+}
+
+/// Serialize to JSON string
+open fn to_json_string<T: JsonSerializable>(value: &T) -> JsonResult<String> {
+    return JSON_SERIALIZER.serialize(&value.to_json());
+}
+
+/// Serialize to pretty JSON string
+open fn to_json_pretty<T: JsonSerializable>(value: &T) -> JsonResult<String> {
+    return JSON_SERIALIZER.clone().pretty().serialize(&value.to_json());
+}
+
+/// Deserialize from JSON string
+open fn from_json_string<T: JsonDeserializable>(json_str: String) -> JsonResult<T> {
+    let mut deserializer = JsonDeserializer::new(json_str);
+    let json_value = deserializer.deserialize()?;
+    return T::from_json(&json_value);
+}
+
+/// Parse JSON value
+open fn parse_json(json_str: String) -> JsonResult<JsonValue> {
+    let mut deserializer = JsonDeserializer::new(json_str);
+    return deserializer.deserialize();
+}
+
+/// Initialize JSON system
+open fn init_json() {
+    // Initialize JSON system
+}
+
+/// Format string helper
+fn format(template: &str, args: ...) -> String {
+    // Simplified formatting - in real implementation would be more sophisticated
+    return template.into();
+}

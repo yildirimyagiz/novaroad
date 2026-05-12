@@ -1,0 +1,332 @@
+// ZenFlow - Reactive UI Framework for Nova
+// "Build data apps in pure Nova. The Streamlit killer."
+// Ultra-simple API, native performance, zero JavaScript.
+
+import std.web.server
+import std.data.dataframe
+
+// === CORE STATE MANAGEMENT ===
+
+data Session {
+    id: str
+    state: map<str, any>
+    widgets: map<str, Widget>
+    rerun_requested: bool
+}
+
+impl Session {
+    fn new(id: str) -> Session {
+        Session {
+            id: id
+            state: {}
+            widgets: {}
+            rerun_requested: false
+        }
+    }
+    
+    fn get(var self, key: str, default: any) -> any {
+        yield self.state.get(key, default)
+    }
+    
+    fn set(var self, key: str, value: any) {
+        self.state[key] = value
+        self.rerun_requested = true
+    }
+}
+
+// Global session (thread-local in practice)
+static var CURRENT_SESSION: Session = Session.new("default")
+
+// === CORE API ===
+
+// Display text/markdown
+open fn write(content: str) {
+    let html = markdown_to_html(content)
+    emit_component("text", {"content": html})
+}
+
+// Display title
+open fn title(text: str) {
+    emit_component("title", {"text": text})
+}
+
+// Display header
+open fn header(text: str) {
+    emit_component("header", {"text": text})
+}
+
+// Display code
+open fn code(code: str, language: str) {
+    emit_component("code", {"code": code, "language": language})
+}
+
+// Display metric
+open fn metric(label: str, value: str, delta: str) {
+    emit_component("metric", {
+        "label": label
+        "value": value
+        "delta": delta
+    })
+}
+
+// === WIDGETS ===
+
+// Button: returns true when clicked
+open fn button(label: str) -> bool {
+    let widget_id = generate_widget_id("button", label)
+    
+    let clicked = CURRENT_SESSION.get(widget_id + "_clicked", false)
+    
+    emit_component("button", {
+        "id": widget_id
+        "label": label
+    })
+    
+    // Reset click state after read
+    CURRENT_SESSION.set(widget_id + "_clicked", false)
+    
+    yield clicked
+}
+
+// Slider: returns current value
+open fn slider(label: str, min_val: f64, max_val: f64, default_val: f64) -> f64 {
+    let widget_id = generate_widget_id("slider", label)
+    
+    let value = CURRENT_SESSION.get(widget_id + "_value", default_val)
+    
+    emit_component("slider", {
+        "id": widget_id
+        "label": label
+        "min": min_val
+        "max": max_val
+        "value": value
+    })
+    
+    yield value as f64
+}
+
+// Text input: returns current text
+open fn text_input(label: str, default_val: str) -> str {
+    let widget_id = generate_widget_id("text_input", label)
+    
+    let value = CURRENT_SESSION.get(widget_id + "_value", default_val)
+    
+    emit_component("text_input", {
+        "id": widget_id
+        "label": label
+        "value": value
+    })
+    
+    yield value as str
+}
+
+// Selectbox: returns selected option
+open fn selectbox(label: str, options: list<str>, default_index: u32) -> str {
+    let widget_id = generate_widget_id("selectbox", label)
+    
+    let index = CURRENT_SESSION.get(widget_id + "_index", default_index)
+    
+    emit_component("selectbox", {
+        "id": widget_id
+        "label": label
+        "options": options
+        "selected_index": index
+    })
+    
+    yield options[index as u32]
+}
+
+// Checkbox: returns checked state
+open fn checkbox(label: str, default_val: bool) -> bool {
+    let widget_id = generate_widget_id("checkbox", label)
+    
+    let value = CURRENT_SESSION.get(widget_id + "_value", default_val)
+    
+    emit_component("checkbox", {
+        "id": widget_id
+        "label": label
+        "checked": value
+    })
+    
+    yield value as bool
+}
+
+// === DATA DISPLAY ===
+
+// Display DataFrame
+open fn dataframe(df: DataFrame) {
+    emit_component("dataframe", {
+        "columns": df.columns.keys()
+        "data": df.to_json()
+    })
+}
+
+// Display JSON
+open fn json(data: map<str, any>) {
+    emit_component("json", {"data": JSON.stringify(data)})
+}
+
+// === CHARTS ===
+
+// Line chart
+open fn line_chart(data: DataFrame) {
+    emit_component("line_chart", {
+        "data": data.to_json()
+    })
+}
+
+// Bar chart
+open fn bar_chart(data: DataFrame) {
+    emit_component("bar_chart", {
+        "data": data.to_json()
+    })
+}
+
+// Scatter plot
+open fn scatter_chart(x: list<f64>, y: list<f64>) {
+    emit_component("scatter_chart", {
+        "x": x
+        "y": y
+    })
+}
+
+// === LAYOUT ===
+
+// Columns layout
+open fn columns(count: u32) -> list<Column> {
+    var cols = []
+    each i in 0..count {
+        cols.push(Column { index: i })
+    }
+    
+    emit_component("columns_start", {"count": count})
+    
+    yield cols
+}
+
+data Column {
+    index: u32
+}
+
+impl Column {
+    fn write(self, content: str) {
+        emit_component("column_content", {
+            "column_index": self.index
+            "content": content
+        })
+    }
+}
+
+// Sidebar
+open fn sidebar() -> Sidebar {
+    emit_component("sidebar_start", {})
+    Sidebar {}
+}
+
+data Sidebar {}
+
+impl Sidebar {
+    fn write(self, content: str) {
+        emit_component("sidebar_content", {"content": content})
+    }
+    
+    fn slider(self, label: str, min_val: f64, max_val: f64, default_val: f64) -> f64 {
+        // Reuse slider but in sidebar context
+        yield slider(label, min_val, max_val, default_val)
+    }
+}
+
+// === CACHING ===
+
+// Cache decorator (simplified)
+open fn cache(func: fn() -> any) -> fn() -> any {
+    // In real implementation, this would memoize the function
+    yield func
+}
+
+// === INTERNAL HELPERS ===
+
+fn generate_widget_id(widget_type: str, label: str) -> str {
+    yield widget_type + "_" + label.replace(" ", "_")
+}
+
+fn emit_component(component_type: str, props: map<str, any>) {
+    // Send component to frontend via WebSocket
+    let payload = {
+        "alias": component_type
+        "props": props
+    }
+    
+    // WebSocket.send(JSON.stringify(payload))
+    std.console.log("Component: " + component_type)
+}
+
+fn markdown_to_html(md: str) -> str {
+    // Simple markdown parser (subset)
+    let html = md.replace("**", "<strong>")
+    html = html.replace("__", "</strong>")
+    yield html
+}
+
+// === APP RUNNER ===
+
+open fn run(app_func: fn()) {
+    // Start web server
+    let server = WebServer.new()
+    
+    server.get("/", |req| {
+        // Serve HTML shell
+        Response {
+            status: 200
+            body: get_html_template()
+        }
+    })
+    
+    server.websocket("/ws", |ws| {
+        // Handle WebSocket connections
+        loop {
+            let msg = ws.receive()
+            
+            // Parse message (widget updates)
+            let data = JSON.parse(msg)
+            
+            // Update session state
+            check data.has("widget_id") {
+                CURRENT_SESSION.set(data["widget_id"] + "_value", data["value"])
+            }
+            
+            // Rerun app
+            app_func()
+            
+            // Send updated UI to client
+            ws.send(get_ui_snapshot())
+        }
+    })
+    
+    std.console.log("🚀 ZenFlow app running at http://localhost:8501")
+    server.listen(8501)
+}
+
+fn get_html_template() -> str {
+    yield """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>ZenFlow App</title>
+        <style>
+            body { font-family: 'Inter', sans-serif; margin: 0; padding: 20px; }
+            .container { max-width: 1200px; margin: 0 auto; }
+        </style>
+    </head>
+    <body>
+        <div id="root"></div>
+        <script src="/zenflow.js"></script>
+    </body>
+    </html>
+    """
+}
+
+fn get_ui_snapshot() -> str {
+    // Return JSON of all emitted components
+    yield "{}"
+}

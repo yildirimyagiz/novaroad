@@ -1,0 +1,10 @@
+#ifndef NOVA_METAL_TAGS_H
+#define NOVA_METAL_TAGS_H
+
+/* MetalDevice definition */
+#define NOVA_METAL_METALDEVICE_MACOS 0
+#define NOVA_METAL_METALDEVICE_IOS 1
+#define NOVA_METAL_METALDEVICE_IPADOS 2
+
+#endif
+

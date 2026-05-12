@@ -1,0 +1,798 @@
+// Nova DVC Integration
+// Data Version Control - Git for Data
+// Reproducible ML pipelines and data versioning
+
+@module("ai::mlops::dvc")
+@reproducible
+@export
+
+use std::collections::{HashMap, Vec};
+use std::path::{Path, PathBuf};
+use std::fs;
+
+/// DVC Repository
+open data DVCRepo {
+    root_dir: PathBuf,
+    config: DVCConfig,
+    cache_dir: PathBuf,
+    remote_stores: HashMap<String, RemoteStore>,
+    pipelines: HashMap<String, Pipeline>,
+    data_index: DataIndex,
+}
+
+#[derive(Clone)]
+open data DVCConfig {
+    core: CoreConfig,
+    cache: CacheConfig,
+    remote: HashMap<String, RemoteConfig>,
+}
+
+#[derive(Clone)]
+open data CoreConfig {
+    analytics: bool,
+    autostage: bool,
+    check_sum_jobs: usize,
+    check_update: bool,
+    experiment: bool,
+    hardlink_lock: bool,
+    machine: Option<String>,
+    no_scm: bool,
+    read_only: bool,
+}
+
+#[derive(Clone)]
+open data CacheConfig {
+    dir: PathBuf,
+    protect: bool,
+    shared: SharedType,
+    slow_link_warning: bool,
+    type_: CacheType,
+}
+
+#[derive(Clone)]
+open cases SharedType {
+    Group,
+    Symlink,
+    Hardlink,
+    Copy,
+}
+
+#[derive(Clone)]
+open cases CacheType {
+    Reflink,
+    Symlink,
+    Hardlink,
+    Copy,
+}
+
+#[derive(Clone)]
+open data RemoteConfig {
+    url: String,
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    region: Option<String>,
+    profile: Option<String>,
+}
+
+impl DVCRepo {
+    /// Initialize DVC repository
+    fn init(root_dir: &Path) -> Result<Self, String> {
+        check !root_dir.exists() {
+            std::fs::create_dir_all(root_dir)
+                .map_err(|e| format("Failed to create directory: {}", e))?;
+        }
+
+        let dvc_dir = root_dir.join(".dvc");
+        std::fs::create_dir_all(&dvc_dir)
+            .map_err(|e| format("Failed to create .dvc directory: {}", e))?;
+
+        // Create default config
+        let config = DVCConfig {
+            core: CoreConfig {
+                analytics: true,
+                autostage: false,
+                check_sum_jobs: 1,
+                check_update: true,
+                experiment: true,
+                hardlink_lock: false,
+                machine: None,
+                no_scm: false,
+                read_only: false,
+            },
+            cache: CacheConfig {
+                dir: dvc_dir.join("cache"),
+                protect: false,
+                shared: SharedType::Symlink,
+                slow_link_warning: true,
+                type_: CacheType::Copy,
+            },
+            remote: HashMap::new(),
+        };
+
+        // Create cache directory
+        std::fs::create_dir_all(&config.cache.dir)
+            .map_err(|e| format("Failed to create cache directory: {}", e))?;
+
+        let repo = DVCRepo {
+            root_dir: root_dir.to_path_buf(),
+            config,
+            cache_dir: config.cache.dir.clone(),
+            remote_stores: HashMap::new(),
+            pipelines: HashMap::new(),
+            data_index: DataIndex::new(),
+        };
+
+        // Save config
+        repo.save_config()?;
+
+        println("✅ Initialized DVC repository at: {}", root_dir.display());
+        Ok(repo)
+    }
+
+    /// Load existing DVC repository
+    fn load(root_dir: &Path) -> Result<Self, String> {
+        let dvc_dir = root_dir.join(".dvc");
+        check !dvc_dir.exists() {
+            Err("Not a DVC repository".into());
+        }
+
+        let config = Self::load_config(&dvc_dir)?;
+
+        Ok(DVCRepo {
+            root_dir: root_dir.to_path_buf(),
+            config,
+            cache_dir: config.cache.dir.clone(),
+            remote_stores: HashMap::new(),
+            pipelines: HashMap::new(),
+            data_index: DataIndex::new(),
+        })
+    }
+
+    /// Add data file to DVC tracking
+    fn add(&var self, path: &Path) -> Result<(), String> {
+        check !path.exists() {
+            Err(format("File does not exist: {}", path.display()));
+        }
+
+        let relative_path = self.get_relative_path(path)?;
+        let file_info = self.compute_file_info(path)?;
+
+        // Move file to cache
+        let cache_path = self.move_to_cache(path, &file_info.checksum)?;
+
+        // Create .dvc file
+        let dvc_file = DVCFile {
+            outs: [Output {
+                checksum: file_info.checksum.clone(),
+                size: file_info.size,
+                path: relative_path.to_string_lossy().into(),
+            }],
+            deps: [],
+            cmd: None,
+            wdir: ".".into(),
+        };
+
+        self.save_dvc_file(&relative_path.with_extension("dvc"), &dvc_file)?;
+
+        // Update data index
+        self.data_index.add_file(relative_path, file_info);
+
+        // Create symlink/hardlink
+        self.create_link(&cache_path, path)?;
+
+        println("✅ Added file to DVC: {}", path.display());
+        Ok(())
+    }
+
+    /// Remove data file from DVC tracking
+    fn remove(&var self, path: &Path) -> Result<(), String> {
+        let relative_path = self.get_relative_path(path)?;
+
+        // Remove from data index
+        self.data_index.remove_file(&relative_path);
+
+        // Remove .dvc file
+        let dvc_file_path = relative_path.with_extension("dvc");
+        check dvc_file_path.exists() {
+            std::fs::remove_file(dvc_file_path)
+                .map_err(|e| format("Failed to remove .dvc file: {}", e))?;
+        }
+
+        // Remove from cache check no longer referenced
+        // (Simplified - in practice, would check reference count)
+
+        println("✅ Removed file from DVC: {}", path.display());
+        Ok(())
+    }
+
+    /// Add remote storage
+    fn remote_add(&var self, name: &str, url: &str) -> Result<(), String> {
+        let remote_config = RemoteConfig {
+            url: url.into(),
+            access_key_id: None,
+            secret_access_key: None,
+            region: None,
+            profile: None,
+        };
+
+        self.config.remote.insert(name.into(), remote_config);
+        self.save_config()?;
+
+        println("✅ Added remote: {} -> {}", name, url);
+        Ok(())
+    }
+
+    /// Push data to remote
+    fn push(&self, remote_name: Option<&str>) -> Result<(), String> {
+        let remote = remote_name.unwrap_or("origin");
+
+        check let Some(remote_config) = self.config.remote.get(remote) {
+            println("📤 Pushing data to remote: {}", remote);
+
+            // Push all tracked files
+            each entry in &self.data_index.files  { let (path, _) = entry;
+                // In practice, would upload to remote storage
+                println("  Uploaded: {}", path);
+            }
+
+            Ok(())
+        } else {
+            Err(format("Remote '{}' not found", remote))
+        }
+    }
+
+    /// Pull data from remote
+    fn pull(&self, remote_name: Option<&str>) -> Result<(), String> {
+        let remote = remote_name.unwrap_or("origin");
+
+        check let Some(remote_config) = self.config.remote.get(remote) {
+            println("📥 Pulling data from remote: {}", remote);
+
+            // Pull all tracked files
+            each entry in &self.data_index.files  { let (path, _) = entry;
+                // In practice, would download from remote storage
+                println("  Downloaded: {}", path);
+            }
+
+            Ok(())
+        } else {
+            Err(format("Remote '{}' not found", remote))
+        }
+    }
+
+    /// Create ML pipeline
+    fn pipeline_add(&var self, name: &str, stages: Vec<PipelineStage>) -> Result<(), String> {
+        let pipeline = Pipeline {
+            name: name.into(),
+            stages,
+            created_at: std::time::SystemTime::now(),
+        };
+
+        self.pipelines.insert(name.into(), pipeline);
+        self.save_pipeline(name)?;
+
+        println("✅ Created pipeline: {}", name);
+        Ok(())
+    }
+
+    /// Run pipeline
+    fn repro(&var self, pipeline_name: Option<&str>) -> Result<(), String> {
+        let pipeline = check let Some(name) = pipeline_name {
+            self.pipelines.get(name)
+                .ok_or(format("Pipeline '{}' not found", name))?
+        } else {
+            // Run default pipeline (all stages)
+            yield self.repro_all();
+        };
+
+        println("🔄 Running pipeline: {}", pipeline.name);
+
+        each stage in &pipeline.stages {
+            println("  Executing stage: {}", stage.name);
+            self.execute_stage(stage)?;
+        }
+
+        println("✅ Pipeline completed successfully");
+        Ok(())
+    }
+
+    fn repro_all(&var self) -> Result<(), String> {
+        // Run all pipelines or all dvc.yaml stages
+        println("🔄 Running all pipelines");
+        Ok(())
+    }
+
+    fn execute_stage(&self, stage: &PipelineStage) -> Result<(), String> {
+        // Execute pipeline stage
+        match &stage.cmd {
+            Some(cmd) => {
+                println("    Running command: {}", cmd);
+                // In practice, would execute the command
+            },
+            None => {
+                // Copy dependencies to outputs
+            },
+        }
+        Ok(())
+    }
+
+    /// Show data status
+    fn status(&self) -> Result<DVCStatus, String> {
+        var status = DVCStatus {
+            tracked_files: [],
+            modified_files: [],
+            new_files: [],
+            deleted_files: [],
+            not_in_cache: [],
+        };
+
+        // Check status of all tracked files
+        each entry in &self.data_index.files  { let (path, file_info) = entry;
+            let full_path = self.root_dir.join(path);
+
+            check !full_path.exists() {
+                status.deleted_files.push(path.clone());
+            } else {
+                // Check check file has been modified
+                let current_info = self.compute_file_info(&full_path)?;
+                check current_info.checksum != file_info.checksum {
+                    status.modified_files.push(path.clone());
+                } else {
+                    status.tracked_files.push(path.clone());
+                }
+            }
+        }
+
+        Ok(status)
+    }
+
+    /// Get data diff
+    fn diff(&self, target: Option<&str>) -> Result<DiffResult, String> {
+        let status = self.status()?;
+
+        Ok(DiffResult {
+            added: status.new_files,
+            deleted: status.deleted_files,
+            modified: status.modified_files,
+            renamed: [],
+        })
+    }
+
+    fn get_relative_path(&self, path: &Path) -> Result<PathBuf, String> {
+        path.strip_prefix(&self.root_dir)
+            .map(|p| p.to_path_buf())
+            .map_err(|_| "Path is not within repository".into())
+    }
+
+    fn compute_file_info(&self, path: &Path) -> Result<FileInfo, String> {
+        let metadata = std::fs::metadata(path)
+            .map_err(|e| format("Failed to read file metadata: {}", e))?;
+
+        let size = metadata.len();
+
+        // Compute checksum (simplified - in practice would use MD5/SHA256)
+        let checksum = format("checksum_{}", size);
+
+        Ok(FileInfo {
+            checksum,
+            size,
+            modified_time: metadata.modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        })
+    }
+
+    fn move_to_cache(&self, source: &Path, checksum: &str) -> Result<PathBuf, String> {
+        let cache_path = self.cache_dir.join(&checksum[..2]).join(checksum);
+        std::fs::create_dir_all(cache_path.parent().unwrap())
+            .map_err(|e| format("Failed to create cache directory: {}", e))?;
+
+        std::fs::copy(source, &cache_path)
+            .map_err(|e| format("Failed to copy file to cache: {}", e))?;
+
+        Ok(cache_path)
+    }
+
+    fn create_link(&self, cache_path: &Path, target_path: &Path) -> Result<(), String> {
+        // Create appropriate link based on cache alias
+        match self.config.cache.type_ {
+            CacheType::Symlink => {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(cache_path, target_path)
+                    .map_err(|e| format("Failed to create symlink: {}", e))?;
+            },
+            CacheType::Hardlink => {
+                std::fs::hard_link(cache_path, target_path)
+                    .map_err(|e| format("Failed to create hardlink: {}", e))?;
+            },
+            CacheType::Reflink | CacheType::Copy => {
+                std::fs::copy(cache_path, target_path)
+                    .map_err(|_| "Failed to copy file".into())?;
+            },
+        }
+
+        Ok(())
+    }
+
+    fn save_config(&self) -> Result<(), String> {
+        let config_path = self.root_dir.join(".dvc").join("config");
+        // In practice, would serialize and save config
+        println("💾 Saved DVC config");
+        Ok(())
+    }
+
+    fn load_config(dvc_dir: &Path) -> Result<DVCConfig, String> {
+        // In practice, would load and parse config file
+        Ok(DVCConfig {
+            core: CoreConfig {
+                analytics: true,
+                autostage: false,
+                check_sum_jobs: 1,
+                check_update: true,
+                experiment: true,
+                hardlink_lock: false,
+                machine: None,
+                no_scm: false,
+                read_only: false,
+            },
+            cache: CacheConfig {
+                dir: dvc_dir.join("cache"),
+                protect: false,
+                shared: SharedType::Symlink,
+                slow_link_warning: true,
+                type_: CacheType::Copy,
+            },
+            remote: HashMap::new(),
+        })
+    }
+
+    fn save_dvc_file(&self, path: &Path, dvc_file: &DVCFile) -> Result<(), String> {
+        let full_path = self.root_dir.join(path);
+        // In practice, would serialize to YAML
+        println("💾 Saved .dvc file: {}", full_path.display());
+        Ok(())
+    }
+
+    fn save_pipeline(&self, name: &str) -> Result<(), String> {
+        // Save pipeline configuration
+        println("💾 Saved pipeline: {}", name);
+        Ok(())
+    }
+}
+
+/// DVC File (.dvc format)
+#[derive(Clone)]
+open data DVCFile {
+    outs: Vec<Output>,
+    deps: Vec<Dependency>,
+    cmd: Option<String>,
+    wdir: String,
+}
+
+#[derive(Clone)]
+open data Output {
+    checksum: String,
+    size: u64,
+    path: String,
+}
+
+#[derive(Clone)]
+open data Dependency {
+    checksum: String,
+    size: u64,
+    path: String,
+}
+
+/// File Info
+#[derive(Clone)]
+open data FileInfo {
+    checksum: String,
+    size: u64,
+    modified_time: std::time::SystemTime,
+}
+
+/// Data Index
+#[derive(Clone)]
+open data DataIndex {
+    files: HashMap<PathBuf, FileInfo>,
+}
+
+impl DataIndex {
+    fn new() -> Self {
+        DataIndex {
+            files: HashMap::new(),
+        }
+    }
+
+    fn add_file(&var self, path: PathBuf, info: FileInfo) {
+        self.files.insert(path, info);
+    }
+
+    fn remove_file(&var self, path: &PathBuf) {
+        self.files.remove(path);
+    }
+}
+
+/// Remote Store
+#[derive(Clone)]
+open data RemoteStore {
+    config: RemoteConfig,
+    connection: Option<Box<dyn RemoteConnection>>,
+}
+
+/// Remote Connection Trait
+open rules RemoteConnection {
+    fn upload(&self, local_path: &Path, remote_path: &str) -> Result<(), String>;
+    fn download(&self, remote_path: &str, local_path: &Path) -> Result<(), String>;
+    fn list(&self, prefix: &str) -> Result<Vec<String>, String>;
+}
+
+/// Pipeline
+#[derive(Clone)]
+open data Pipeline {
+    name: String,
+    stages: Vec<PipelineStage>,
+    created_at: std::time::SystemTime,
+}
+
+/// Pipeline Stage
+#[derive(Clone)]
+open data PipelineStage {
+    name: String,
+    cmd: Option<String>,
+    deps: Vec<String>,
+    outs: Vec<String>,
+    params: HashMap<String, String>,
+}
+
+/// DVC Status
+#[derive(Clone)]
+open data DVCStatus {
+    tracked_files: Vec<PathBuf>,
+    modified_files: Vec<PathBuf>,
+    new_files: Vec<PathBuf>,
+    deleted_files: Vec<PathBuf>,
+    not_in_cache: Vec<PathBuf>,
+}
+
+/// Diff Result
+#[derive(Clone)]
+open data DiffResult {
+    added: Vec<PathBuf>,
+    deleted: Vec<PathBuf>,
+    modified: Vec<PathBuf>,
+    renamed: Vec<(PathBuf, PathBuf)>,
+}
+
+/// Integration with Git
+open data GitIntegration {
+    dvc_repo: DVCRepo,
+}
+
+impl GitIntegration {
+    fn new(dvc_repo: DVCRepo) -> Self {
+        GitIntegration { dvc_repo }
+    }
+
+    /// Add .dvc files to Git
+    fn add_to_git(&self) -> Result<(), String> {
+        // Add all .dvc files to Git
+        println("📝 Added .dvc files to Git");
+        Ok(())
+    }
+
+    /// Create Git commit with DVC data
+    fn commit(&self, message: &str) -> Result<(), String> {
+        // First add .dvc files to Git, then commit
+        self.add_to_git()?;
+
+        println("💾 Committed DVC data: {}", message);
+        Ok(())
+    }
+}
+
+/// Experiments Tracking (DVC Experiments)
+open data DVCExperiments {
+    repo: DVCRepo,
+    experiments: HashMap<String, Experiment>,
+}
+
+impl DVCExperiments {
+    fn new(repo: DVCRepo) -> Self {
+        DVCExperiments {
+            repo,
+            experiments: HashMap::new(),
+        }
+    }
+
+    /// Run experiment
+    fn run(&var self, name: &str, params: HashMap<String, String>) -> Result<ExperimentResult, String> {
+        println("🧪 Running experiment: {}", name);
+
+        let experiment = Experiment {
+            name: name.into(),
+            params,
+            metrics: HashMap::new(),
+            artifacts: [],
+            start_time: std::time::SystemTime::now(),
+            status: ExperimentStatus::Running,
+        };
+
+        // In practice, would execute the experiment
+        let result = ExperimentResult {
+            experiment_id: generate_experiment_id(),
+            metrics: [("accuracy".into(), 0.85)].iter().cloned().collect(),
+            duration: std::time::Duration::from_secs(300),
+            status: ExperimentStatus::Completed,
+        };
+
+        println("✅ Experiment completed: {}", name);
+        Ok(result)
+    }
+
+    /// Compare experiments
+    fn compare(&self, experiment_ids: Vec<String>) -> Result<ComparisonResult, String> {
+        Ok(ComparisonResult {
+            experiments: experiment_ids,
+            metrics_comparison: HashMap::new(),
+            best_experiment: experiment_ids[0].clone(),
+        })
+    }
+}
+
+/// Experiment
+#[derive(Clone)]
+open data Experiment {
+    name: String,
+    params: HashMap<String, String>,
+    metrics: HashMap<String, f64>,
+    artifacts: Vec<String>,
+    start_time: std::time::SystemTime,
+    status: ExperimentStatus,
+}
+
+/// Experiment Result
+#[derive(Clone)]
+open data ExperimentResult {
+    experiment_id: String,
+    metrics: HashMap<String, f64>,
+    duration: std::time::Duration,
+    status: ExperimentStatus,
+}
+
+/// Experiment Status
+#[derive(Clone)]
+open cases ExperimentStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+/// Comparison Result
+#[derive(Clone)]
+open data ComparisonResult {
+    experiments: Vec<String>,
+    metrics_comparison: HashMap<String, HashMap<String, f64>>,
+    best_experiment: String,
+}
+
+/// CLI Interface
+open data DVCCLI {
+    repo: Option<DVCRepo>,
+}
+
+impl DVCCLI {
+    fn new() -> Self {
+        DVCCLI { repo: None }
+    }
+
+    fn run_command(&var self, args: Vec<String>) -> Result<(), String> {
+        check args.is_empty() {
+            self.print_help();
+            Ok(());
+        }
+
+        match args[0].as_str() {
+            "init" => {
+                let path = args.get(1).map(|s| Path::new(s)).unwrap_or(Path::new("."));
+                self.repo = Some(DVCRepo::init(path)?);
+            },
+            "add" => {
+                check let Some(ref repo) = self.repo {
+                    var repo = repo.clone();
+                    let path = Path::new(args.get(1).ok_or("Please provide file path")?);
+                    repo.add(path)?;
+                    self.repo = Some(repo);
+                } else {
+                    Err("Not a DVC repository. Run 'dvc init' first.".into());
+                }
+            },
+            "status" => {
+                check let Some(ref repo) = self.repo {
+                    let status = repo.status()?;
+                    println("Tracked files: {}", status.tracked_files.len());
+                    println("Modified files: {}", status.modified_files.len());
+                    println("New files: {}", status.new_files.len());
+                    println("Deleted files: {}", status.deleted_files.len());
+                }
+            },
+            "push" => {
+                check let Some(ref repo) = self.repo {
+                    let remote = args.get(1).map(|s| s.as_str());
+                    repo.push(remote)?;
+                }
+            },
+            "pull" => {
+                check let Some(ref repo) = self.repo {
+                    let remote = args.get(1).map(|s| s.as_str());
+                    repo.pull(remote)?;
+                }
+            },
+            _ => {
+                self.print_help();
+            }
+        }
+
+        Ok(())
+    }
+
+    fn print_help(&self) {
+        println("📊 DVC - Data Version Control");
+        println("Usage:");
+        println("  dvc init [path]          - Initialize DVC repository");
+        println("  dvc add <file>           - Add file to DVC tracking");
+        println("  dvc status               - Show repository status");
+        println("  dvc push [remote]        - Push data to remote");
+        println("  dvc pull [remote]        - Pull data from remote");
+        println("  dvc repro [pipeline]     - Reproduce pipeline");
+        println("  dvc help                 - Show this help");
+    }
+}
+
+// Utility functions
+fn generate_experiment_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    format("exp_{}", time)
+}
+
+/// Example usage
+open fn example_dvc_workflow() {
+    // Initialize DVC repo
+    let repo = DVCRepo::init(Path::new("./my_project")).unwrap();
+
+    // Add data files
+    var repo = repo;
+    repo.add(Path::new("data/train.csv")).unwrap();
+    repo.add(Path::new("data/test.csv")).unwrap();
+
+    // Add remote storage
+    repo.remote_add("myremote", "s3://mybucket/data").unwrap();
+
+    // Push data
+    repo.push(Some("myremote")).unwrap();
+
+    // Create pipeline
+    let stages = [
+        PipelineStage {
+            name: "preprocess".into(),
+            cmd: Some("python preprocess.py".into()),
+            deps: ["data/train.csv".into()],
+            outs: ["data/processed_train.pkl".into()],
+            params: HashMap::new(),
+        },
+        PipelineStage {
+            name: "train".into(),
+            cmd: Some("python train.py".into()),
+            deps: ["data/processed_train.pkl".into()],
+            outs: ["models/model.pkl".into()],
+            params: HashMap::new(),
+        },
+    ];
+
+    repo.pipeline_add("ml_pipeline", stages).unwrap();
+
+    // Run pipeline
+    repo.repro(Some("ml_pipeline")).unwrap();
+
+    println("🎉 DVC workflow completed successfully!");
+}

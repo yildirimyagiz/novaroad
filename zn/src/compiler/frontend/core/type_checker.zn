@@ -1,0 +1,829 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                           Nova TYPE CHECKER                            ║
+// ║                    Advanced Semantic Analysis & Type Validation                ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// Type checker for Nova's advanced alias system:
+// - Unit algebra validation
+// - Flow alias checking
+// - Contract verification
+// - Tensor data analysis
+// - Generic alias inference
+
+use std::collections::HashMap;
+use crate::frontend::ast::*;
+use crate::frontend::errors::{TypeError, SymbolKind};
+
+/// Type checking environment
+expose data TypeEnv {
+    /// Global symbol table
+    globals: HashMap<String, TypeInfo>,
+    /// Current scope stack
+    scopes: Vec<HashMap<String, TypeInfo>>,
+    /// Generic alias parameters in scope
+    generics: HashMap<String, TypeExpr>,
+    /// Function contract context
+    contracts: Vec<ContractInfo>,
+}
+
+/// Type information for symbols
+expose data TypeInfo {
+    ty: TypeExpr,
+    kind: SymbolKind,
+    span: Span,
+    mutable: bool,
+    used: bool,
+    vpu_model: Option<VPUModel>, // YENİ: VPU katmanı bilgisi
+}
+
+// SymbolKind, crate::frontend::errors modülünden içe aktarıldı.
+// Buraya yinelenen tanım eklenmez.
+
+/// Contract verification context
+expose data ContractInfo {
+    preconditions: Vec<Expr>,
+    postconditions: Vec<Expr>,
+    invariants: Vec<Expr>,
+}
+
+/// Main alias checker
+expose data TypeChecker {
+    env: TypeEnv,
+    program: Program,
+}
+
+impl TypeChecker {
+    fn new(program: Program) -> TypeChecker {
+        var env = TypeEnv {
+            globals: HashMap::new(),
+            scopes: [HashMap::new()],
+            generics: HashMap::new(),
+            contracts: [],
+        };
+
+        // Initialize built-in types
+        TypeChecker::init_builtins(&var env);
+
+        TypeChecker { env, program }
+    }
+
+    fn init_builtins(env: &var TypeEnv) {
+        // Basic types
+        env.globals.insert("i32".into(), TypeInfo {
+            ty: TypeExpr::Prim("i32".into()),
+            kind: SymbolKind::DataType,
+            span: Span::zero(),
+            mutable: false,
+            used: false,
+            vpu_model: None,
+        });
+
+        env.globals.insert("f64".into(), TypeInfo {
+            ty: TypeExpr::Prim("f64".into()),
+            kind: SymbolKind::DataType,
+            span: Span::zero(),
+            mutable: false,
+            used: false,
+            vpu_model: None,
+        });
+
+        env.globals.insert("bool".into(), TypeInfo {
+            ty: TypeExpr::Prim("bool".into()),
+            kind: SymbolKind::DataType,
+            span: Span::zero(),
+            mutable: false,
+            used: false,
+            vpu_model: None,
+        });
+
+        env.globals.insert("str".into(), TypeInfo {
+            ty: TypeExpr::Prim("str".into()),
+            kind: SymbolKind::DataType,
+            span: Span::zero(),
+            mutable: false,
+            used: false,
+            vpu_model: None,
+        });
+    }
+
+    /// Run full alias checking
+    fn check(&var self) -> Result<(), TypeError> {
+        // Phase 1: Collect all top-level declarations
+        each item in &self.program.items {
+            self.collect_top_level(item)?;
+        }
+
+        // Phase 2: Check all top-level items
+        each item in &self.program.items {
+            self.check_top_level(item)?;
+        }
+
+        Ok(())
+    }
+
+    fn collect_top_level(&var self, item: &TopLevel) -> Result<(), TypeError> {
+        match item {
+            TopLevel::Fn(fn_def) => {
+                let fn_ty = self.build_function_type(fn_def)?;
+                self.env.globals.insert(fn_def.name.clone(), TypeInfo {
+                    ty: fn_ty,
+                    kind: SymbolKind::Function,
+                    span: fn_def.span,
+                    mutable: false,
+                    used: false,
+                    vpu_model: fn_def.vpu_model,
+                });
+            }
+            TopLevel::Kernel(kernel_def) => {
+                let kernel_ty = self.build_kernel_type(kernel_def)?;
+                self.env.globals.insert(kernel_def.name.clone(), TypeInfo {
+                    ty: kernel_ty,
+                    kind: SymbolKind::Function, // Kernels are functions
+                    span: kernel_def.span,
+                    mutable: false,
+                    used: false,
+                    vpu_model: Some(kernel_def.vpu_model),
+                });
+            }
+            TopLevel::Data(data_def) => {
+                let data_ty = TypeExpr::Path([data_def.name.clone()]);
+                self.env.globals.insert(data_def.name.clone(), TypeInfo {
+                    ty: data_ty,
+                    kind: SymbolKind::DataType,
+                    span: data_def.span,
+                    mutable: false,
+                    used: false,
+                    vpu_model: None,
+                });
+            }
+            TopLevel::Flow(flow_def) => {
+                let flow_ty = TypeExpr::Flow(flow_def.kind, Box::new(flow_def.inner.clone()));
+                self.env.globals.insert(flow_def.name.clone(), TypeInfo {
+                    ty: flow_ty,
+                    kind: SymbolKind::DataType,
+                    span: flow_def.span,
+                    mutable: false,
+                    used: false,
+                    vpu_model: None,
+                });
+            }
+            TopLevel::Unit(unit_def) => {
+                // Unit families are alias constructors
+                self.env.globals.insert(unit_def.name.clone(), TypeInfo {
+                    ty: TypeExpr::Prim(unit_def.name.clone()),
+                    kind: SymbolKind::DataType,
+                    span: unit_def.span,
+                    mutable: false,
+                    used: false,
+                    vpu_model: None,
+                });
+            }
+            TopLevel::Qty(qty_def) => {
+                let qty_ty = TypeExpr::Qty(Box::new(qty_def.scalar.clone()), qty_def.dim.clone());
+                self.env.globals.insert(qty_def.name.clone(), TypeInfo {
+                    ty: qty_ty,
+                    kind: SymbolKind::DataType,
+                    span: qty_def.span,
+                    mutable: false,
+                    used: false,
+                    vpu_model: None,
+                });
+            }
+            TopLevel::Tensor(tensor_def) => {
+                let tensor_ty = TypeExpr::Tensor(Box::new(tensor_def.dtype.clone()), tensor_def.dims.clone());
+                self.env.globals.insert(tensor_def.name.clone(), TypeInfo {
+                    ty: tensor_ty,
+                    kind: SymbolKind::DataType,
+                    span: tensor_def.span,
+                    mutable: false,
+                    used: false,
+                    vpu_model: None,
+                });
+            }
+            _ => {} // Other top-level items
+        }
+        Ok(())
+    }
+
+    fn check_top_level(&var self, item: &TopLevel) -> Result<(), TypeError> {
+        match item {
+            TopLevel::Fn(fn_def) => self.check_function(fn_def),
+            TopLevel::Data(data_def) => self.check_data_type(data_def),
+            TopLevel::Flow(flow_def) => self.check_flow_type(flow_def),
+            TopLevel::Unit(unit_def) => self.check_unit_family(unit_def),
+            TopLevel::Qty(qty_def) => self.check_quantity_type(qty_def),
+            TopLevel::Tensor(tensor_def) => self.check_tensor_type(tensor_def),
+            TopLevel::Kernel(kernel_def) => self.check_kernel(kernel_def),
+            _ => Ok(()),
+        }
+    }
+
+    fn check_function(&var self, fn_def: &FnDef) -> Result<(), TypeError> {
+        // Enter function scope
+        self.env.scopes.push(HashMap::new());
+
+        // Add generic parameters to scope
+        each generic in &fn_def.generics {
+            self.env.generics.insert(generic.name.clone(), TypeExpr::Infer);
+        }
+
+        // Add parameters to scope
+        each param in &fn_def.params {
+            check let Some(ref param_ty) = param.ty {
+                self.env.scopes.last_mut().unwrap().insert(param.name.clone(), TypeInfo {
+                    ty: param_ty.clone(),
+                    kind: SymbolKind::Variable,
+                    span: param.span,
+                    mutable: false,
+                    used: false,
+                    vpu_model: fn_def.vpu_model, // Inherit from function
+                });
+            }
+        }
+
+        // Set up contract context
+        let contract_info = ContractInfo {
+            preconditions: fn_def.requires.iter().map(|c| c.cond.clone()).collect(),
+            postconditions: fn_def.ensures.iter().map(|c| c.cond.clone()).collect(),
+            invariants: [], // Could be extended
+        };
+        self.env.contracts.push(contract_info);
+
+        // Check function body
+        let body_ty = self.check_block(&fn_def.body)?;
+
+        // Check yield alias
+        check let Some(ref expected_ret) = fn_def.return_ty {
+            check !self.types_compatible(expected_ret, &body_ty) {
+                Err(TypeError::with_types(
+                    format("Function yield alias mismatch"),
+                    fn_def.span,
+                    expected_ret.clone(),
+                    body_ty,
+                ));
+            }
+        }
+
+        // Check contracts
+        self.check_contracts(fn_def)?;
+
+        // Exit function scope
+        self.env.scopes.pop();
+        self.env.contracts.pop();
+
+        Ok(())
+    }
+
+    fn check_data_type(&var self, data_def: &DataDef) -> Result<(), TypeError> {
+        self.env.scopes.push(HashMap::new());
+
+        // Add generic parameters
+        each generic in &data_def.generics {
+            self.env.generics.insert(generic.name.clone(), TypeExpr::Infer);
+        }
+
+        // Check all fields
+        each field in &data_def.fields {
+            self.check_type(&field.ty)?;
+        }
+
+        self.env.scopes.pop();
+        Ok(())
+    }
+
+    fn check_flow_type(&var self, flow_def: &FlowDef) -> Result<(), TypeError> {
+        // Flow types are already validated during collection
+        self.check_type(&flow_def.inner)
+    }
+
+    fn check_unit_family(&var self, unit_def: &UnitFamilyDef) -> Result<(), TypeError> {
+        // Validate unit conversions are expressions
+        each conversion in &unit_def.conversions {
+            self.check_expr(&conversion.to_base)?;
+        }
+        Ok(())
+    }
+
+    fn check_quantity_type(&var self, qty_def: &QtyDef) -> Result<(), TypeError> {
+        self.check_type(&qty_def.scalar)?;
+        // Validate dimension expression
+        // The dim field contains numer/denom vectors representing the unit dimension
+        self.validate_dimension(&qty_def.dim, qty_def.span)?;
+        Ok(())
+    }
+
+    /// Validate dimension expression contains only known SI units
+    fn validate_dimension(&self, dim: &DimExpr, span: Span) -> Result<(), TypeError> {
+        // Validate numerator units
+        each unit in &dim.numer {
+            self.validate_unit_name(unit, span)?;
+        }
+        // Validate denominator units
+        each unit in &dim.denom {
+            self.validate_unit_name(unit, span)?;
+        }
+        Ok(())
+    }
+
+    /// Validate that a unit name is a known SI base or derived unit.
+    /// Known units: m, kg, g, s, A, K, mol, cd,
+    ///              N, J, W, V, Pa, Hz, C, Ohm, F, T, H, Wb, S,
+    ///              lm, lx, Bq, Gy, Sv, kat,
+    ///              km, cm, mm, nm, mg, ms, us, ns, min, h
+    fn validate_unit_name(&self, unit: &str, span: Span) -> Result<(), TypeError> {
+        const KNOWN_UNITS: &[&str] = &[
+            // SI base units
+            "m", "kg", "g", "s", "A", "K", "mol", "cd",
+            // SI derived — mechanics
+            "N", "J", "W", "Pa",
+            // SI derived — electromagnetism
+            "V", "C", "Ohm", "F", "T", "H", "Wb", "S",
+            // SI derived — optics / radiation
+            "lm", "lx", "Bq", "Gy", "Sv",
+            // SI derived — chemistry
+            "kat",
+            // SI derived — frequency
+            "Hz",
+            // Metric prefixed lengths
+            "km", "cm", "mm", "nm", "pm",
+            // Metric prefixed masses
+            "mg",
+            // Metric prefixed times
+            "ms", "us", "ns", "min", "h",
+        ];
+
+        check !KNOWN_UNITS.contains(&unit) {
+            Err(TypeError::new(
+                format("Unknown unit '{}' in dimension expression", unit),
+                span,
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_tensor_type(&var self, tensor_def: &TensorDef) -> Result<(), TypeError> {
+        self.check_type(&tensor_def.dtype)?;
+        // Tensor dimension validation
+        each (name, dim_size) in &tensor_def.dims {
+            match dim_size {
+                DimSize::Expr(expr) => {
+                    self.check_expr(expr)?;
+                }
+                _ => {} // Known and Named dims are valid
+            }
+        }
+        Ok(())
+    }
+
+    fn check_expr(&var self, expr: &Expr) -> Result<TypeExpr, TypeError> {
+        match expr {
+            Expr::Int(_) => Ok(TypeExpr::Prim("i64".into())),
+            Expr::Float(_) => Ok(TypeExpr::Prim("f64".into())),
+            Expr::Str(_) => Ok(TypeExpr::Prim("str".into())),
+            Expr::Bool(_) => Ok(TypeExpr::Prim("bool".into())),
+            Expr::Unit => Ok(TypeExpr::Prim("()".into())),
+
+            Expr::Measured(measured) => {
+                // Return quantified alias
+                Ok(TypeExpr::Qty(
+                    Box::new(TypeExpr::Prim("f64".into())),
+                    measured.unit.clone(),
+                ))
+            }
+
+            Expr::Ident(ident) => {
+                check let Some(info) = self.lookup_symbol(&ident.name) {
+                    Ok(info.ty.clone())
+                } else {
+                    Err(TypeError::new(
+                        format("Undefined symbol: {}", ident.name),
+                        ident.span,
+                    ))
+                }
+            }
+
+            Expr::Binary(binary) => {
+                let left_ty = self.check_expr(&binary.left)?;
+                let right_ty = self.check_expr(&binary.right)?;
+
+                match binary.op {
+                    BinOp::Add | BinOp::Sub => {
+                        match (&left_ty, &right_ty) {
+                            // qty<A> + qty<A> → qty<A>
+                            (TypeExpr::Qty(scalar_l, dim_l), TypeExpr::Qty(scalar_r, dim_r)) => {
+                                check dim_l != dim_r {
+                                    Err(TypeError::new(
+                                        format(
+                                            "Cannot add/subtract quantities with different dimensions: {} and {}",
+                                            dim_l.into(), dim_r.into()
+                                        ),
+                                        binary.span,
+                                    ));
+                                }
+                                self.unify_types(scalar_l, scalar_r)?;
+                                Ok(left_ty)
+                            }
+                            // qty + number → ERROR
+                            (TypeExpr::Qty(_, _), _) | (_, TypeExpr::Qty(_, _)) => {
+                                Err(TypeError::new(
+                                    format("Cannot mix quantity and non-quantity types in arithmetic"),
+                                    binary.span,
+                                ))
+                            }
+                            // number + number → number
+                            _ => {
+                                check self.is_numeric_type(&left_ty) && self.is_numeric_type(&right_ty) {
+                                    self.unify_types(&left_ty, &right_ty)?;
+                                    Ok(left_ty)
+                                } else {
+                                    Err(TypeError::new(
+                                        format("Binary operation requires numeric types"),
+                                        binary.span,
+                                    ))
+                                }
+                            }
+                        }
+                    }
+
+                    BinOp::Mul => {
+                        match (&left_ty, &right_ty) {
+                            // qty<A> * qty<B> → qty<A*B>  (boyutlar birleşir)
+                            (TypeExpr::Qty(scalar_l, dim_l), TypeExpr::Qty(scalar_r, dim_r)) => {
+                                self.unify_types(scalar_l, scalar_r)?;
+                                let result_dim = dim_l.mul(dim_r);
+                                Ok(TypeExpr::Qty(scalar_l.clone(), result_dim))
+                            }
+                            // qty<A> * scalar → qty<A>
+                            (TypeExpr::Qty(scalar_l, dim_l), _) => {
+                                check !self.is_numeric_type(&right_ty) {
+                                    Err(TypeError::new(
+                                        format("Can only multiply quantity by a scalar or another quantity"),
+                                        binary.span,
+                                    ));
+                                }
+                                Ok(TypeExpr::Qty(scalar_l.clone(), dim_l.clone()))
+                            }
+                            // scalar * qty<A> → qty<A>
+                            (_, TypeExpr::Qty(scalar_r, dim_r)) => {
+                                check !self.is_numeric_type(&left_ty) {
+                                    Err(TypeError::new(
+                                        format("Can only multiply quantity by a scalar or another quantity"),
+                                        binary.span,
+                                    ));
+                                }
+                                Ok(TypeExpr::Qty(scalar_r.clone(), dim_r.clone()))
+                            }
+                            // number * number
+                            _ => {
+                                check self.is_numeric_type(&left_ty) && self.is_numeric_type(&right_ty) {
+                                    self.unify_types(&left_ty, &right_ty)?;
+                                    Ok(left_ty)
+                                } else {
+                                    Err(TypeError::new(
+                                        format("Binary operation requires numeric types"),
+                                        binary.span,
+                                    ))
+                                }
+                            }
+                        }
+                    }
+
+                    BinOp::Div => {
+                        match (&left_ty, &right_ty) {
+                            // qty<A> / qty<B> → qty<A/B>  (boyutlar bölünür)
+                            (TypeExpr::Qty(scalar_l, dim_l), TypeExpr::Qty(scalar_r, dim_r)) => {
+                                self.unify_types(scalar_l, scalar_r)?;
+                                let result_dim = dim_l.div(dim_r);
+                                Ok(TypeExpr::Qty(scalar_l.clone(), result_dim))
+                            }
+                            // qty<A> / scalar → qty<A>
+                            (TypeExpr::Qty(scalar_l, dim_l), _) => {
+                                check !self.is_numeric_type(&right_ty) {
+                                    Err(TypeError::new(
+                                        format("Divisor must be a scalar or quantity"),
+                                        binary.span,
+                                    ));
+                                }
+                                Ok(TypeExpr::Qty(scalar_l.clone(), dim_l.clone()))
+                            }
+                            // number / number
+                            _ => {
+                                check self.is_numeric_type(&left_ty) && self.is_numeric_type(&right_ty) {
+                                    self.unify_types(&left_ty, &right_ty)?;
+                                    Ok(left_ty)
+                                } else {
+                                    Err(TypeError::new(
+                                        format("Binary operation requires numeric types"),
+                                        binary.span,
+                                    ))
+                                }
+                            }
+                        }
+                    }
+
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+                        self.unify_types(&left_ty, &right_ty)?;
+                        Ok(TypeExpr::Prim("bool".into()))
+                    }
+                    BinOp::Assign => {
+                        // Sağ taraf tipi sol tarafla uyumlu olmalı
+                        self.unify_types(&left_ty, &right_ty)?;
+                        Ok(TypeExpr::Prim("()".into()))
+                    }
+                    _ => Err(TypeError::new(
+                        format("Unsupported binary operation"),
+                        binary.span,
+                    )),
+                }
+            }
+
+            Expr::Call(call) => {
+                let callee_ty = self.check_expr(&call.callee)?;
+
+                match callee_ty {
+                    TypeExpr::FnPtr(param_types, ret_ty) => {
+                        check param_types.len() != call.args.len() {
+                            Err(TypeError::new(
+                                format("Function expects {} arguments, got {}", param_types.len(), call.args.len()),
+                                call.span,
+                            ));
+                        }
+
+                        each (i, arg) in call.args.iter().enumerate() {
+                            let arg_ty = self.check_expr(arg)?;
+                            self.unify_types(&param_types[i], &arg_ty)?;
+                        }
+
+                        Ok(*ret_ty)
+                    }
+                    _ => Err(TypeError::new(
+                        format("Cannot call non-function alias"),
+                        call.span,
+                    )),
+                }
+            }
+
+            Expr::Block(block) => self.check_block(block),
+
+            _ => Ok(TypeExpr::Infer), // Placeholder for other expression types
+        }
+    }
+
+    fn check_block(&var self, block: &Block) -> Result<TypeExpr, TypeError> {
+        self.env.scopes.push(HashMap::new());
+
+        var last_ty = TypeExpr::Prim("()".into());
+        each stmt in &block.stmts {
+            last_ty = self.check_stmt(stmt)?;
+        }
+
+        self.env.scopes.pop();
+        Ok(last_ty)
+    }
+
+    fn check_stmt(&var self, stmt: &Stmt) -> Result<TypeExpr, TypeError> {
+        match stmt {
+            Stmt::Let(let_stmt) => {
+                check let Some(init) = &let_stmt.init {
+                    let init_ty = self.check_expr(init)?;
+                    check let Some(ref expected_ty) = let_stmt.ty {
+                        self.unify_types(expected_ty, &init_ty)?;
+                    }
+                    // Pattern binding would be more complex
+                    Ok(TypeExpr::Prim("()".into()))
+                } else {
+                    Ok(TypeExpr::Prim("()".into()))
+                }
+            }
+
+            Stmt::Var(var_stmt) => {
+                check let Some(init) = &var_stmt.init {
+                    let init_ty = self.check_expr(init)?;
+                    check let Some(ref expected_ty) = var_stmt.ty {
+                        self.unify_types(expected_ty, &init_ty)?;
+                    }
+                    Ok(TypeExpr::Prim("()".into()))
+                } else {
+                    Ok(TypeExpr::Prim("()".into()))
+                }
+            }
+
+            Stmt::Expr(expr_stmt) => self.check_expr(&expr_stmt.expr),
+
+            Stmt::Yield(yield_stmt) => {
+                check let Some(expr) = &yield_stmt.value {
+                    self.check_expr(expr)
+                } else {
+                    Ok(TypeExpr::Prim("()".into()))
+                }
+            }
+
+            Stmt::Require(contract) | Stmt::Ensure(contract) | Stmt::Assert(contract) => {
+                let cond_ty = self.check_expr(&contract.cond)?;
+                check !self.is_boolean_type(&cond_ty) {
+                    Err(TypeError::new(
+                        format("Contract condition must be boolean"),
+                        contract.span,
+                    ));
+                }
+                Ok(TypeExpr::Prim("()".into()))
+            }
+
+            _ => Ok(TypeExpr::Prim("()".into())),
+        }
+    }
+
+    fn check_type(&var self, ty: &TypeExpr) -> Result<(), TypeError> {
+        match ty {
+            TypeExpr::Prim(_) => Ok(()),
+            TypeExpr::Ref(inner, _) => self.check_type(inner),
+            TypeExpr::Generic(_, args) => {
+                each arg in args {
+                    self.check_type(arg)?;
+                }
+                Ok(())
+            }
+            TypeExpr::Tuple(types) => {
+                each ty in types {
+                    self.check_type(ty)?;
+                }
+                Ok(())
+            }
+            TypeExpr::Array(elem_ty, _) => self.check_type(elem_ty),
+            TypeExpr::Qty(scalar, _) => self.check_type(scalar),
+            TypeExpr::Tensor(dtype, _) => self.check_type(dtype),
+            TypeExpr::Flow(_, inner) => self.check_type(inner),
+            TypeExpr::FnPtr(params, ret) => {
+                each param in params {
+                    self.check_type(param)?;
+                }
+                self.check_type(ret)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn check_contracts(&var self, fn_def: &FnDef) -> Result<(), TypeError> {
+        // Check that contract conditions are boolean
+        each contract in &fn_def.requires {
+            let cond_ty = self.check_expr(&contract.cond)?;
+            check !self.is_boolean_type(&cond_ty) {
+                Err(TypeError::new(
+                    format("Precondition must be boolean"),
+                    contract.span,
+                ));
+            }
+        }
+
+        each contract in &fn_def.ensures {
+            let cond_ty = self.check_expr(&contract.cond)?;
+            check !self.is_boolean_type(&cond_ty) {
+                Err(TypeError::new(
+                    format("Postcondition must be boolean"),
+                    contract.span,
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn lookup_symbol(&self, name: &str) -> Option<&TypeInfo> {
+        // Check local scopes first (from innermost)
+        each scope in self.env.scopes.iter().rev() {
+            check let Some(info) = scope.get(name) {
+                Some(info);
+            }
+        }
+
+        // Check globals
+        self.env.globals.get(name)
+    }
+
+    fn build_function_type(&var self, fn_def: &FnDef) -> Result<TypeExpr, TypeError> {
+        var param_types = [];
+        each param in &fn_def.params {
+            // Self parameters don't need explicit alias annotations
+            check param.name == "self" || param.name == "&self" || param.name.starts_with("&var self") {
+                // Self alias will be inferred from the implementation target
+                param_types.push(TypeExpr::Infer);
+            } else check let Some(ref ty) = param.ty {
+                param_types.push(ty.clone());
+            } else {
+                Err(TypeError::new(
+                    format("Function parameter '{}' missing alias annotation", param.name),
+                    param.span,
+                ));
+            }
+        }
+
+        let ret_ty = fn_def.return_ty.clone().unwrap_or(TypeExpr::Prim("()".into()));
+
+        Ok(TypeExpr::FnPtr(param_types, Box::new(ret_ty)))
+    }
+
+    fn build_kernel_type(&var self, kernel_def: &KernelDef) -> Result<TypeExpr, TypeError> {
+        var param_types = [];
+        each param in &kernel_def.params {
+            check let Some(ref ty) = param.ty {
+                param_types.push(ty.clone());
+            } else {
+                Err(TypeError::new(
+                    format("Kernel parameter '{}' missing alias annotation", param.name),
+                    param.span,
+                ));
+            }
+        }
+        Ok(TypeExpr::FnPtr(param_types, Box::new(kernel_def.result.clone())))
+    }
+
+    fn check_kernel(&var self, kernel_def: &KernelDef) -> Result<(), TypeError> {
+        self.env.scopes.push(HashMap::new());
+        each param in &kernel_def.params {
+            check let Some(ref param_ty) = param.ty {
+                self.env.scopes.last_mut().unwrap().insert(param.name.clone(), TypeInfo {
+                    ty: param_ty.clone(),
+                    kind: SymbolKind::Variable,
+                    span: param.span,
+                    mutable: false,
+                    used: false,
+                    vpu_model: Some(kernel_def.vpu_model),
+                });
+            }
+        }
+        self.check_block(&kernel_def.body)?;
+        self.env.scopes.pop();
+        Ok(())
+    }
+
+    fn unify_types(&self, a: &TypeExpr, b: &TypeExpr) -> Result<(), TypeError> {
+        // Simple unification - could be much more sophisticated
+        check self.types_equal(a, b) {
+            Ok(())
+        } else {
+            Err(TypeError::with_types(
+                format("Type mismatch"),
+                Span::zero(),
+                a.clone(),
+                b.clone(),
+            ))
+        }
+    }
+
+    fn types_equal(&self, a: &TypeExpr, b: &TypeExpr) -> bool {
+        match (a, b) {
+            (TypeExpr::Prim(name_a), TypeExpr::Prim(name_b)) => name_a == name_b,
+            (TypeExpr::Ref(inner_a, mut_a), TypeExpr::Ref(inner_b, mut_b)) => {
+                mut_a == mut_b && self.types_equal(inner_a, inner_b)
+            }
+            (TypeExpr::Generic(name_a, args_a), TypeExpr::Generic(name_b, args_b)) => {
+                name_a == name_b && args_a.len() == args_b.len() &&
+                args_a.iter().zip(args_b.iter()).all(|(a, b)| self.types_equal(a, b))
+            }
+            (TypeExpr::Tuple(types_a), TypeExpr::Tuple(types_b)) => {
+                types_a.len() == types_b.len() &&
+                types_a.iter().zip(types_b.iter()).all(|(a, b)| self.types_equal(a, b))
+            }
+            (TypeExpr::Array(elem_a, size_a), TypeExpr::Array(elem_b, size_b)) => {
+                size_a == size_b && self.types_equal(elem_a, elem_b)
+            }
+            (TypeExpr::Qty(scalar_a, dim_a), TypeExpr::Qty(scalar_b, dim_b)) => {
+                self.types_equal(scalar_a, scalar_b) && dim_a == dim_b
+            }
+            (TypeExpr::Tensor(dtype_a, dims_a), TypeExpr::Tensor(dtype_b, dims_b)) => {
+                self.types_equal(dtype_a, dtype_b) && dims_a == dims_b
+            }
+            (TypeExpr::Flow(kind_a, inner_a), TypeExpr::Flow(kind_b, inner_b)) => {
+                kind_a == kind_b && self.types_equal(inner_a, inner_b)
+            }
+            (TypeExpr::FnPtr(params_a, ret_a), TypeExpr::FnPtr(params_b, ret_b)) => {
+                params_a.len() == params_b.len() &&
+                params_a.iter().zip(params_b.iter()).all(|(a, b)| self.types_equal(a, b)) &&
+                self.types_equal(ret_a, ret_b)
+            }
+            (TypeExpr::VPU(vpu_a), TypeExpr::VPU(vpu_b)) => vpu_a == vpu_b,
+            (TypeExpr::Infer, TypeExpr::Infer) => true,
+            _ => false, // Different types are not equal
+        }
+    }
+
+    fn types_compatible(&self, expected: &TypeExpr, found: &TypeExpr) -> bool {
+        // More sophisticated compatibility checking would go here
+        self.types_equal(expected, found)
+    }
+
+    fn is_numeric_type(&self, ty: &TypeExpr) -> bool {
+        matches!(ty, TypeExpr::Prim(name) check name == "i32" || name == "i64" || name == "f32" || name == "f64")
+        || matches!(ty, TypeExpr::Qty(_, _))
+    }
+
+    fn is_boolean_type(&self, ty: &TypeExpr) -> bool {
+        matches!(ty, TypeExpr::Prim(name) check name == "bool")
+    }
+}
+
+/// Public interface
+fn type_check(program: Program) -> Result<(), TypeError> {
+    var checker = TypeChecker::new(program);
+    checker.check()
+}

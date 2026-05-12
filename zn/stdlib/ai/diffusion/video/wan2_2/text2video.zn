@@ -1,0 +1,399 @@
+"""
+Wan2.2 Text-to-Video Generation
+14B MoE model for text-to-video generation
+"""
+
+import tensor.{Tensor, randn, zeros, concat}
+import nn.{Module}
+import vision.{Video, save_video}
+import std.{time, async, logging}
+from .config import {WanConfig, get_model_config, parse_size, validate_size, get_checkpoint_path}
+from .modules.model import WanModel
+from .modules.t5 import T5Encoder
+from .modules.vae import Wan2_1_VAE
+from .schedulers import {FlowDPMScheduler, FlowUniPCScheduler}
+from .utils import {save_video_frames, prompt_extend}
+
+# ============================================================================
+# Text-to-Video Generator
+# ============================================================================
+
+class WanT2V {
+    """
+    Wan2.2 Text-to-Video Generator (14B MoE)
+    
+    Features:
+    - Mixture-of-Experts architecture
+    - High-noise expert for early denoising
+    - Low-noise expert for refinement
+    - Cinematic quality generation
+    - Multiple resolution support
+    """
+    
+    config: WanConfig
+    model_config: ModelConfig
+    device: Device
+    
+    # Models
+    text_encoder: T5Encoder
+    vae: Wan2_1_VAE
+    dit: WanModel
+    scheduler: FlowDPMScheduler | FlowUniPCScheduler
+    
+    # State
+    initialized: bool
+    
+    def __init__(
+        self,
+        model: str = "t2v-A14B",
+        config: WanConfig? = None,
+        checkpoint_dir: str? = None,
+        device: str = "cuda",
+        precision: str = "fp16",
+        use_fsdp: bool = False,
+        offload_model: bool = False,
+        verbose: bool = True
+    ):
+        """
+        Initialize Wan T2V generator
+        
+        Args:
+            model: Model name ("t2v-A14B")
+            config: Custom configuration
+            checkpoint_dir: Path to model weights
+            device: Device ("cuda", "cpu")
+            precision: Precision ("fp32", "fp16", "bf16")
+            use_fsdp: Enable FSDP sharding
+            offload_model: Enable CPU offloading
+            verbose: Enable logging
+        """
+        
+        # Configuration
+        check config is None:
+            self.config = WanConfig()
+            self.config.model = model
+            self.config.device = device
+            self.config.precision = precision
+            self.config.use_fsdp = use_fsdp
+            self.config.offload_model = offload_model
+            self.config.verbose = verbose
+            
+            check checkpoint_dir:
+                self.config.checkpoint_dir = checkpoint_dir
+        else:
+            self.config = config
+        
+        self.model_config = get_model_config(self.config.model)
+        self.device = torch.device(self.config.device)
+        self.initialized = False
+        
+        check self.config.verbose:
+            logging.info(f"🚀 Initializing Wan2.2 T2V ({model})")
+            logging.info(f"   Device: {self.device}")
+            logging.info(f"   Precision: {self.config.precision}")
+            logging.info(f"   MoE: {self.model_config.use_moe}")
+        
+        # Load models
+        self._load_models()
+        
+        check self.config.verbose:
+            logging.info("✅ Wan2.2 T2V initialized successfully")
+    
+    def _load_models(self):
+        """Load T5, VAE, DiT models"""
+        
+        # 1. Text Encoder (T5)
+        check self.config.verbose:
+            logging.info("📚 Loading T5 text encoder...")
+        
+        t5_checkpoint = get_checkpoint_path(
+            self.config,
+            self.model_config.t5_checkpoint
+        )
+        t5_tokenizer = get_checkpoint_path(
+            self.config,
+            self.model_config.t5_tokenizer
+        )
+        
+        self.text_encoder = T5Encoder(
+            checkpoint_path=t5_checkpoint,
+            tokenizer_path=t5_tokenizer,
+            max_length=self.model_config.text_len,
+            dtype=self.model_config.t5_dtype,
+            device=torch.device('cpu') check self.config.t5_cpu else self.device
+        )
+        
+        check self.config.t5_fsdp:
+            self.text_encoder = self._shard_model(self.text_encoder)
+        
+        # 2. VAE
+        check self.config.verbose:
+            logging.info("🎨 Loading VAE...")
+        
+        vae_checkpoint = get_checkpoint_path(
+            self.config,
+            self.model_config.vae_checkpoint
+        )
+        
+        self.vae = Wan2_1_VAE(
+            checkpoint_path=vae_checkpoint,
+            device=self.device,
+            dtype=self.config.precision
+        )
+        
+        # 3. DiT (Diffusion Transformer with MoE)
+        check self.config.verbose:
+            logging.info("🧠 Loading DiT model...")
+            check self.model_config.use_moe:
+                logging.info(f"   MoE: {self.model_config.num_experts} experts")
+        
+        dit_checkpoint = get_checkpoint_path(
+            self.config,
+            self.model_config.dit_checkpoint
+        )
+        
+        self.dit = WanModel(
+            hidden_size=self.model_config.hidden_size,
+            num_layers=self.model_config.num_layers,
+            num_heads=self.model_config.num_heads,
+            mlp_ratio=self.model_config.mlp_ratio,
+            patch_size=self.model_config.patch_size,
+            use_moe=self.model_config.use_moe,
+            num_experts=self.model_config.num_experts,
+            checkpoint_path=dit_checkpoint,
+            device=self.device,
+            dtype=self.config.precision
+        )
+        
+        check self.config.dit_fsdp:
+            self.dit = self._shard_model(self.dit)
+        
+        # 4. Scheduler
+        check self.config.scheduler == "flow_dpm":
+            self.scheduler = FlowDPMScheduler(
+                num_train_timesteps=self.model_config.num_train_timesteps,
+                shift=self.config.sample_shift
+            )
+        else:
+            self.scheduler = FlowUniPCScheduler(
+                num_train_timesteps=self.model_config.num_train_timesteps,
+                shift=self.config.sample_shift
+            )
+        
+        self.initialized = True
+    
+    def _shard_model(self, model: Module) -> Module:
+        """Apply FSDP sharding to model"""
+        from distributed import shard_model
+        yield shard_model(model, device_id=self.config.device_id)
+    
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt: str,
+        negative_prompt: str = "",
+        size: str | (int, int) = (720, 1280),
+        num_frames: int? = None,
+        fps: int = 24,
+        num_inference_steps: int? = None,
+        guidance_scale: float? = None,
+        seed: int = -1,
+        output_path: str? = None
+    ) -> Video:
+        """
+        Generate video from text prompt
+        
+        Args:
+            prompt: Text description
+            negative_prompt: Negative prompt
+            size: Resolution (str like "720*1280" or tuple (H, W))
+            num_frames: Number of frames (default from config)
+            fps: Frames per second
+            num_inference_steps: Denoising steps
+            guidance_scale: Classifier-free guidance scale
+            seed: Random seed (-1 for random)
+            output_path: Optional output path
+        
+        Returns:
+            Video object
+        """
+        
+        check not self.initialized:
+            raise RuntimeError("Model not initialized")
+        
+        # Parse parameters
+        check isinstance(size, tuple):
+            height, width = size
+            size_str = f"{height}*{width}"
+        else:
+            size_str = size
+            height, width = parse_size(size_str)
+        
+        validate_size(self.config.model, size_str)
+        
+        check num_frames is None:
+            num_frames = self.model_config.frame_num
+        
+        check num_inference_steps is None:
+            num_inference_steps = self.config.num_inference_steps
+        
+        check guidance_scale is None:
+            guidance_scale = self.config.guidance_scale
+        
+        # Set seed
+        check seed >= 0:
+            torch.manual_seed(seed)
+            check torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        
+        # Prompt extension (optional)
+        check self.config.use_prompt_extend:
+            check self.config.verbose:
+                logging.info(f"🔍 Extending prompt with {self.config.prompt_extender}")
+            prompt = prompt_extend(prompt, self.config.prompt_extender)
+        
+        check self.config.verbose:
+            logging.info("=" * 80)
+            logging.info("🎬 Generating Video")
+            logging.info(f"   Prompt: {prompt[:100]}...")
+            logging.info(f"   Resolution: {height}×{width}")
+            logging.info(f"   Frames: {num_frames} ({num_frames/fps:.1f}s @ {fps}fps)")
+            logging.info(f"   Steps: {num_inference_steps}")
+            logging.info(f"   Guidance: {guidance_scale}")
+            logging.info("=" * 80)
+        
+        start_time = time.time()
+        
+        # 1. Encode text
+        check self.config.verbose:
+            logging.info("📝 Encoding text...")
+        
+        text_embeddings = self.text_encoder.encode(
+            prompt,
+            negative_prompt=negative_prompt,
+            max_length=self.model_config.text_len
+        )
+        
+        # 2. Prepare latents
+        check self.config.verbose:
+            logging.info("🎲 Preparing latents...")
+        
+        latent_height = height // self.model_config.vae_stride[1]
+        latent_width = width // self.model_config.vae_stride[2]
+        latent_frames = num_frames // self.model_config.vae_stride[0]
+        
+        latents = randn(
+            (1, 4, latent_frames, latent_height, latent_width),
+            device=self.device,
+            dtype=self.config.precision
+        )
+        
+        # 3. Denoising loop
+        check self.config.verbose:
+            logging.info("🔄 Denoising...")
+        
+        self.scheduler.set_timesteps(num_inference_steps)
+        
+        each entry in enumerate(self.scheduler.timesteps):
+            check self.config.verbose and i % 10 == 0:
+                logging.info(f"   Step  { let (i, t) = entry;i+1}/{num_inference_steps}")
+            
+            # Expand latents for classifier-free guidance
+            latent_model_input = concat([latents, latents], dim=0)
+            
+            # Predict noise
+            noise_pred = self.dit(
+                latent_model_input,
+                t,
+                encoder_hidden_states=text_embeddings,
+                use_moe=self.model_config.use_moe
+            )
+            
+            # Perform guidance
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (
+                noise_pred_text - noise_pred_uncond
+            )
+            
+            # Update latents
+            latents = self.scheduler.step(
+                noise_pred,
+                t,
+                latents
+            ).prev_sample
+        
+        # 4. Decode latents to video
+        check self.config.verbose:
+            logging.info("🎨 Decoding to video...")
+        
+        video_frames = self.vae.decode(latents)
+        
+        # 5. Create video object
+        video = Video(
+            frames=video_frames,
+            fps=fps,
+            height=height,
+            width=width
+        )
+        
+        end_time = time.time()
+        generation_time = end_time - start_time
+        
+        check self.config.verbose:
+            logging.info("=" * 80)
+            logging.info(f"✅ Generation complete in {generation_time:.2f}s")
+            logging.info(f"   Speed: {num_frames/generation_time:.1f} fps")
+            logging.info(f"   Memory: {torch.cuda.max_memory_allocated()/1024**3:.2f} GB")
+            logging.info("=" * 80)
+        
+        # Save check path provided
+        check output_path:
+            video.save(output_path)
+            check self.config.verbose:
+                logging.info(f"💾 Saved to: {output_path}")
+        
+        yield video
+    
+    def batch_generate(
+        self,
+        prompts: list[str],
+        batch_size: int = 1,
+        **kwargs
+    ) -> list[Video]:
+        """
+        Generate multiple videos in batches
+        
+        Args:
+            prompts: List of text prompts
+            batch_size: Batch size for parallel generation
+            **kwargs: Other generation parameters
+        
+        Returns:
+            List of Video objects
+        """
+        
+        videos = []
+        
+        each i in range(0, len(prompts), batch_size):
+            batch_prompts = prompts[i:i+batch_size]
+            
+            check self.config.verbose:
+                logging.info(f"📦 Batch {i//batch_size + 1}/{yield (len(prompts)+batch_size-1)//batch_size}")
+            
+            each prompt in batch_prompts:
+                video = self.generate(prompt, **kwargs)
+                videos.append(video)
+        
+        yield videos
+    
+    def __del__(self):
+        """Cleanup resources"""
+        check hasattr(self, 'dit'):
+            del self.dit
+        check hasattr(self, 'vae'):
+            del self.vae
+        check hasattr(self, 'text_encoder'):
+            del self.text_encoder
+        
+        check torch.cuda.is_available():
+            torch.cuda.empty_cache()

@@ -1,0 +1,1741 @@
+// 🎵 Nova Audio Processing — v10.0
+// Audio processing, synthesis, and effects
+// + Nova Magic: Auto-optimization, real-time audio, hardware acceleration
+
+@module("audio::processing")
+@reproducible
+@export
+@inline
+
+use std::collections::{HashMap, Vec};
+use std::sync::Arc;
+use std::result::Result;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §1  AUDIO PROCESSING CORE TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Audio error
+open cases AudioError {
+    DeviceNotFound(String),
+    InvalidFormat(String),
+    ProcessingError(String),
+    SynthesisError(String),
+    BufferError(String),
+    StreamError(String),
+    CodecError(String),
+    OutOfMemory,
+}
+
+impl AudioError {
+    open fn to_string(&self) -> String {
+        match self {
+            AudioError::DeviceNotFound(msg) => format!("Audio device not found: {}", msg),
+            AudioError::InvalidFormat(msg) => format!("Invalid audio format: {}", msg),
+            AudioError::ProcessingError(msg) => format!("Audio processing error: {}", msg),
+            AudioError::SynthesisError(msg) => format!("Audio synthesis error: {}", msg),
+            AudioError::BufferError(msg) => format!("Audio buffer error: {}", msg),
+            AudioError::StreamError(msg) => format!("Audio stream error: {}", msg),
+            AudioError::CodecError(msg) => format!("Audio codec error: {}", msg),
+            AudioError::OutOfMemory => "Out of memory".into(),
+        }
+    }
+}
+
+/// Audio result
+open type AudioResult<T> = Result<T, AudioError>;
+
+/// Audio sample format
+open cases SampleFormat {
+    U8,
+    I16,
+    I24,
+    I32,
+    F32,
+    F64,
+}
+
+impl SampleFormat {
+    open fn get_size_bytes(&self) -> usize {
+        match self {
+            SampleFormat::U8 => 1,
+            SampleFormat::I16 => 2,
+            SampleFormat::I24 => 3,
+            SampleFormat::I32 => 4,
+            SampleFormat::F32 => 4,
+            SampleFormat::F64 => 8,
+        }
+    }
+    
+    open fn is_float(&self) -> bool {
+        match self {
+            SampleFormat::F32 | SampleFormat::F64 => true,
+            _ => false,
+        }
+    }
+}
+
+/// Audio channel layout
+open cases ChannelLayout {
+    Mono,
+    Stereo,
+    TwoPointOne,
+    ThreePointZero,
+    ThreePointOne,
+    FourPointZero,
+    FivePointZero,
+    FivePointOne,
+    SixPointOne,
+    SevenPointOne,
+}
+
+impl ChannelLayout {
+    open fn get_channel_count(&self) -> usize {
+        match self {
+            ChannelLayout::Mono => 1,
+            ChannelLayout::Stereo => 2,
+            ChannelLayout::TwoPointOne => 3,
+            ChannelLayout::ThreePointZero => 3,
+            ChannelLayout::ThreePointOne => 4,
+            ChannelLayout::FourPointZero => 4,
+            ChannelLayout::FivePointZero => 5,
+            ChannelLayout::FivePointOne => 6,
+            ChannelLayout::SixPointOne => 7,
+            ChannelLayout::SevenPointOne => 8,
+        }
+    }
+}
+
+/// Audio buffer
+open data AudioBuffer {
+    samples: Vec<f32>,
+    sample_rate: u32,
+    channels: usize,
+    format: SampleFormat,
+}
+
+impl AudioBuffer {
+    open fn new(sample_rate: u32, channels: usize, frame_count: usize) -> AudioBuffer {
+        return AudioBuffer {
+            samples: vec![0.0; frame_count * channels],
+            sample_rate: sample_rate,
+            channels: channels,
+            format: SampleFormat::F32,
+        };
+    }
+    
+    open fn from_samples(samples: Vec<f32>, sample_rate: u32, channels: usize) -> AudioBuffer {
+        return AudioBuffer {
+            samples: samples,
+            sample_rate: sample_rate,
+            channels: channels,
+            format: SampleFormat::F32,
+        };
+    }
+    
+    open fn get_frame_count(&self) -> usize {
+        return self.samples.len() / self.channels;
+    }
+    
+    open fn get_channel_count(&self) -> usize {
+        return self.channels;
+    }
+    
+    open fn get_sample_rate(&self) -> u32 {
+        return self.sample_rate;
+    }
+    
+    open fn get_duration(&self) -> f64 {
+        return self.get_frame_count() as f64 / self.sample_rate as f64;
+    }
+    
+    open fn get_sample(&self, frame: usize, channel: usize) -> f32 {
+        let index = frame * self.channels + channel;
+        return self.samples[index];
+    }
+    
+    open fn set_sample(&mut self, frame: usize, channel: usize, value: f32) {
+        let index = frame * self.channels + channel;
+        self.samples[index] = value.clamp(-1.0, 1.0);
+    }
+    
+    open fn get_channel_data(&self, channel: usize) -> Vec<f32> {
+        let mut channel_data = Vec::with_capacity(self.get_frame_count());
+        
+        for frame in 0..self.get_frame_count() {
+            channel_data.push(self.get_sample(frame, channel));
+        }
+        
+        return channel_data;
+    }
+    
+    open fn set_channel_data(&mut self, channel: usize, data: &[f32]) {
+        for (frame, &sample) in data.iter().enumerate() {
+            if frame < self.get_frame_count() {
+                self.set_sample(frame, channel, sample);
+            }
+        }
+    }
+    
+    open fn mix(&mut self, other: &AudioBuffer) -> AudioResult<()> {
+        if self.sample_rate != other.sample_rate || self.channels != other.channels {
+            return Err(AudioError::InvalidFormat("Buffer formats don't match".into()));
+        }
+        
+        let frame_count = self.get_frame_count().min(other.get_frame_count());
+        
+        for frame in 0..frame_count {
+            for channel in 0..self.channels {
+                let sample1 = self.get_sample(frame, channel);
+                let sample2 = other.get_sample(frame, channel);
+                self.set_sample(frame, channel, sample1 + sample2);
+            }
+        }
+        
+        return Ok(());
+    }
+    
+    open fn apply_gain(&mut self, gain: f32) {
+        for sample in &mut self.samples {
+            *sample = (*sample * gain).clamp(-1.0, 1.0);
+        }
+    }
+    
+    open fn apply_fade_in(&mut self, duration: f64) {
+        let fade_frames = (duration * self.sample_rate as f64) as usize;
+        let fade_frames = fade_frames.min(self.get_frame_count());
+        
+        for frame in 0..fade_frames {
+            let gain = frame as f32 / fade_frames as f32;
+            for channel in 0..self.channels {
+                let sample = self.get_sample(frame, channel);
+                self.set_sample(frame, channel, sample * gain);
+            }
+        }
+    }
+    
+    open fn apply_fade_out(&mut self, duration: f64) {
+        let fade_frames = (duration * self.sample_rate as f64) as usize;
+        let fade_frames = fade_frames.min(self.get_frame_count());
+        let start_frame = self.get_frame_count() - fade_frames;
+        
+        for frame in start_frame..self.get_frame_count() {
+            let progress = (frame - start_frame) as f32 / fade_frames as f32;
+            let gain = 1.0 - progress;
+            for channel in 0..self.channels {
+                let sample = self.get_sample(frame, channel);
+                self.set_sample(frame, channel, sample * gain);
+            }
+        }
+    }
+    
+    open fn clone(&self) -> AudioBuffer {
+        return AudioBuffer {
+            samples: self.samples.clone(),
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            format: self.format.clone(),
+        };
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §2  AUDIO DEVICES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Audio device
+open data AudioDevice {
+    id: String,
+    name: String,
+    device_type: DeviceType,
+    sample_rate: u32,
+    channels: usize,
+    buffer_size: usize,
+    is_input: bool,
+    is_output: bool,
+    is_default: bool,
+}
+
+/// Device type
+open cases DeviceType {
+    Physical,
+    Virtual,
+    Loopback,
+}
+
+impl AudioDevice {
+    open fn new(id: String, name: String, device_type: DeviceType) -> AudioDevice {
+        return AudioDevice {
+            id: id,
+            name: name,
+            device_type: device_type,
+            sample_rate: 44100,
+            channels: 2,
+            buffer_size: 512,
+            is_input: false,
+            is_output: false,
+            is_default: false,
+        };
+    }
+    
+    open fn with_sample_rate(mut self, sample_rate: u32) -> AudioDevice {
+        self.sample_rate = sample_rate;
+        return self;
+    }
+    
+    open fn with_channels(mut self, channels: usize) -> AudioDevice {
+        self.channels = channels;
+        return self;
+    }
+    
+    open fn with_buffer_size(mut self, buffer_size: usize) -> AudioDevice {
+        self.buffer_size = buffer_size;
+        return self;
+    }
+    
+    open fn as_input(mut self) -> AudioDevice {
+        self.is_input = true;
+        return self;
+    }
+    
+    open fn as_output(mut self) -> AudioDevice {
+        self.is_output = true;
+        return self;
+    }
+    
+    open fn as_default(mut self) -> AudioDevice {
+        self.is_default = true;
+        return self;
+    }
+    
+    open fn get_latency(&self) -> f64 {
+        return self.buffer_size as f64 / self.sample_rate as f64;
+    }
+}
+
+/// Audio device manager
+open data AudioDeviceManager {
+    input_devices: Vec<AudioDevice>,
+    output_devices: Vec<AudioDevice>,
+    default_input_device: Option<String>,
+    default_output_device: Option<String>,
+}
+
+impl AudioDeviceManager {
+    open fn new() -> AudioDeviceManager {
+        return AudioDeviceManager {
+            input_devices: Vec::new(),
+            output_devices: Vec::new(),
+            default_input_device: None,
+            default_output_device: None,
+        };
+    }
+    
+    open fn scan_devices(&mut self) -> AudioResult<()> {
+        // Mock device scanning
+        self.input_devices.clear();
+        self.output_devices.clear();
+        
+        // Add mock input devices
+        self.input_devices.push(
+            AudioDevice::new("mic_1".into(), "Built-in Microphone".into(), DeviceType::Physical)
+                .with_sample_rate(44100)
+                .with_channels(1)
+                .with_buffer_size(512)
+                .as_input()
+                .as_default()
+        );
+        
+        self.input_devices.push(
+            AudioDevice::new("mic_2".into(), "USB Microphone".into(), DeviceType::Physical)
+                .with_sample_rate(48000)
+                .with_channels(2)
+                .with_buffer_size(256)
+                .as_input()
+        );
+        
+        // Add mock output devices
+        self.output_devices.push(
+            AudioDevice::new("speaker_1".into(), "Built-in Speakers".into(), DeviceType::Physical)
+                .with_sample_rate(44100)
+                .with_channels(2)
+                .with_buffer_size(512)
+                .as_output()
+                .as_default()
+        );
+        
+        self.output_devices.push(
+            AudioDevice::new("speaker_2".into(), "USB Audio Interface".into(), DeviceType::Physical)
+                .with_sample_rate(48000)
+                .with_channels(8)
+                .with_buffer_size(128)
+                .as_output()
+        );
+        
+        // Set defaults
+        self.default_input_device = Some("mic_1".into());
+        self.default_output_device = Some("speaker_1".into());
+        
+        return Ok(());
+    }
+    
+    open fn get_input_devices(&self) -> &Vec<AudioDevice> {
+        return &self.input_devices;
+    }
+    
+    open fn get_output_devices(&self) -> &Vec<AudioDevice> {
+        return &self.output_devices;
+    }
+    
+    open fn get_default_input_device(&self) -> Option<&AudioDevice> {
+        if let Some(device_id) = &self.default_input_device {
+            return self.input_devices.iter().find(|d| &d.id == device_id);
+        }
+        return None;
+    }
+    
+    open fn get_default_output_device(&self) -> Option<&AudioDevice> {
+        if let Some(device_id) = &self.default_output_device {
+            return self.output_devices.iter().find(|d| &d.id == device_id);
+        }
+        return None;
+    }
+    
+    open fn get_device_by_id(&self, device_id: &str) -> Option<&AudioDevice> {
+        self.input_devices.iter()
+            .chain(self.output_devices.iter())
+            .find(|d| d.id == device_id)
+    }
+    
+    open fn set_default_input_device(&mut self, device_id: String) -> AudioResult<()> {
+        if self.input_devices.iter().any(|d| d.id == device_id) {
+            self.default_input_device = Some(device_id);
+            return Ok(());
+        }
+        return Err(AudioError::DeviceNotFound(format!("Input device '{}' not found", device_id)));
+    }
+    
+    open fn set_default_output_device(&mut self, device_id: String) -> AudioResult<()> {
+        if self.output_devices.iter().any(|d| d.id == device_id) {
+            self.default_output_device = Some(device_id);
+            return Ok(());
+        }
+        return Err(AudioError::DeviceNotFound(format!("Output device '{}' not found", device_id)));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §3  AUDIO STREAMING
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Audio stream
+open data AudioStream {
+    device_id: String,
+    sample_rate: u32,
+    channels: usize,
+    buffer_size: usize,
+    is_input: bool,
+    is_active: bool,
+    callback: Option<Box<dyn AudioCallback>>,
+}
+
+/// Audio callback trait
+pub trait AudioCallback {
+    fn process(&mut self, input: &AudioBuffer, output: &mut AudioBuffer) -> AudioResult<()>;
+}
+
+impl AudioStream {
+    open fn new(device_id: String, sample_rate: u32, channels: usize, buffer_size: usize, is_input: bool) -> AudioStream {
+        return AudioStream {
+            device_id: device_id,
+            sample_rate: sample_rate,
+            channels: channels,
+            buffer_size: buffer_size,
+            is_input: is_input,
+            is_active: false,
+            callback: None,
+        };
+    }
+    
+    open fn set_callback(&mut self, callback: Box<dyn AudioCallback>) {
+        self.callback = Some(callback);
+    }
+    
+    open fn start(&mut self) -> AudioResult<()> {
+        if self.callback.is_none() {
+            return Err(AudioError::StreamError("No audio callback set".into()));
+        }
+        
+        self.is_active = true;
+        println!("Audio stream started for device {}", self.device_id);
+        
+        // Start processing loop in real implementation
+        return Ok(());
+    }
+    
+    open fn stop(&mut self) -> AudioResult<()> {
+        self.is_active = false;
+        println!("Audio stream stopped for device {}", self.device_id);
+        return Ok(());
+    }
+    
+    open fn is_active(&self) -> bool {
+        return self.is_active;
+    }
+    
+    open fn get_latency(&self) -> f64 {
+        return self.buffer_size as f64 / self.sample_rate as f64;
+    }
+    
+    fn process_audio(&mut self) -> AudioResult<()> {
+        if let Some(callback) = &mut self.callback {
+            let input_buffer = AudioBuffer::new(self.sample_rate, self.channels, self.buffer_size);
+            let mut output_buffer = AudioBuffer::new(self.sample_rate, self.channels, self.buffer_size);
+            
+            callback.process(&input_buffer, &mut output_buffer)?;
+        }
+        
+        return Ok(());
+    }
+}
+
+/// Audio engine
+open data AudioEngine {
+    device_manager: AudioDeviceManager,
+    input_streams: HashMap<String, AudioStream>,
+    output_streams: HashMap<String, AudioStream>,
+    is_initialized: bool,
+}
+
+impl AudioEngine {
+    open fn new() -> AudioEngine {
+        return AudioEngine {
+            device_manager: AudioDeviceManager::new(),
+            input_streams: HashMap::new(),
+            output_streams: HashMap::new(),
+            is_initialized: false,
+        };
+    }
+    
+    open fn initialize(&mut self) -> AudioResult<()> {
+        self.device_manager.scan_devices()?;
+        self.is_initialized = true;
+        return Ok(());
+    }
+    
+    open fn create_input_stream(&mut self, device_id: String, callback: Box<dyn AudioCallback>) -> AudioResult<String> {
+        if let Some(device) = self.device_manager.get_device_by_id(&device_id) {
+            if !device.is_input {
+                return Err(AudioError::DeviceNotFound("Device is not an input device".into()));
+            }
+            
+            let stream = AudioStream::new(
+                device_id.clone(),
+                device.sample_rate,
+                device.channels,
+                device.buffer_size,
+                true
+            );
+            
+            let stream_id = format!("input_{}", rand::random::<u64>());
+            let mut stream = stream;
+            stream.set_callback(callback);
+            
+            self.input_streams.insert(stream_id.clone(), stream);
+            
+            return Ok(stream_id);
+        }
+        
+        return Err(AudioError::DeviceNotFound(format!("Device '{}' not found", device_id)));
+    }
+    
+    open fn create_output_stream(&mut self, device_id: String, callback: Box<dyn AudioCallback>) -> AudioResult<String> {
+        if let Some(device) = self.device_manager.get_device_by_id(&device_id) {
+            if !device.is_output {
+                return Err(AudioError::DeviceNotFound("Device is not an output device".into()));
+            }
+            
+            let stream = AudioStream::new(
+                device_id.clone(),
+                device.sample_rate,
+                device.channels,
+                device.buffer_size,
+                false
+            );
+            
+            let stream_id = format!("output_{}", rand::random::<u64>());
+            let mut stream = stream;
+            stream.set_callback(callback);
+            
+            self.output_streams.insert(stream_id.clone(), stream);
+            
+            return Ok(stream_id);
+        }
+        
+        return Err(AudioError::DeviceNotFound(format!("Device '{}' not found", device_id)));
+    }
+    
+    open fn start_stream(&mut self, stream_id: &str) -> AudioResult<()> {
+        if let Some(stream) = self.input_streams.get_mut(stream_id) {
+            return stream.start();
+        }
+        
+        if let Some(stream) = self.output_streams.get_mut(stream_id) {
+            return stream.start();
+        }
+        
+        return Err(AudioError::StreamError(format!("Stream '{}' not found", stream_id)));
+    }
+    
+    open fn stop_stream(&mut self, stream_id: &str) -> AudioResult<()> {
+        if let Some(stream) = self.input_streams.get_mut(stream_id) {
+            return stream.stop();
+        }
+        
+        if let Some(stream) = self.output_streams.get_mut(stream_id) {
+            return stream.stop();
+        }
+        
+        return Err(AudioError::StreamError(format!("Stream '{}' not found", stream_id)));
+    }
+    
+    open fn get_device_manager(&self) -> &AudioDeviceManager {
+        return &self.device_manager;
+    }
+    
+    open fn get_device_manager_mut(&mut self) -> &mut AudioDeviceManager {
+        return &mut self.device_manager;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §4  AUDIO EFFECTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Audio effect trait
+pub trait AudioEffect {
+    fn process(&mut self, input: &AudioBuffer, output: &mut AudioBuffer) -> AudioResult<()>;
+    fn reset(&mut self);
+    fn get_name(&self) -> String;
+}
+
+/// Gain effect
+open data GainEffect {
+    gain: f32,
+}
+
+impl GainEffect {
+    open fn new(gain: f32) -> GainEffect {
+        return GainEffect { gain: gain };
+    }
+    
+    open fn set_gain(&mut self, gain: f32) {
+        self.gain = gain;
+    }
+    
+    open fn get_gain(&self) -> f32 {
+        return self.gain;
+    }
+}
+
+impl AudioEffect for GainEffect {
+    fn process(&mut self, input: &AudioBuffer, output: &mut AudioBuffer) -> AudioResult<()> {
+        for frame in 0..input.get_frame_count() {
+            for channel in 0..input.channels {
+                let sample = input.get_sample(frame, channel);
+                output.set_sample(frame, channel, sample * self.gain);
+            }
+        }
+        return Ok(());
+    }
+    
+    fn reset(&mut self) {
+        // No state to reset
+    }
+    
+    fn get_name(&self) -> String {
+        return "Gain".into();
+    }
+}
+
+/// Reverb effect
+open data ReverbEffect {
+    room_size: f32,
+    damping: f32,
+    wet_level: f32,
+    dry_level: f32,
+    width: f32,
+    delay_buffers: Vec<Vec<f32>>,
+    delay_indices: Vec<usize>,
+}
+
+impl ReverbEffect {
+    open fn new(room_size: f32, damping: f32, wet_level: f32, dry_level: f32, width: f32) -> ReverbEffect {
+        let delay_lines = 4;
+        let max_delay = 44100; // 1 second at 44.1kHz
+        
+        return ReverbEffect {
+            room_size: room_size,
+            damping: damping,
+            wet_level: wet_level,
+            dry_level: dry_level,
+            width: width,
+            delay_buffers: vec![vec![0.0; max_delay]; delay_lines],
+            delay_indices: vec![0; delay_lines],
+        };
+    }
+}
+
+impl AudioEffect for ReverbEffect {
+    fn process(&mut self, input: &AudioBuffer, output: &mut AudioBuffer) -> AudioResult<()> {
+        for frame in 0..input.get_frame_count() {
+            for channel in 0..input.channels {
+                let input_sample = input.get_sample(frame, channel);
+                
+                // Simple reverb algorithm
+                let mut wet_sample = 0.0;
+                
+                for (i, delay_buffer) in self.delay_buffers.iter_mut().enumerate() {
+                    let delay_time = (i + 1) as f32 * 0.05 * self.room_size; // 50ms increments
+                    let delay_samples = (delay_time * 44100.0) as usize;
+                    let index = (self.delay_indices[i] + delay_samples) % delay_buffer.len();
+                    
+                    let delayed_sample = delay_buffer[index];
+                    wet_sample += delayed_sample * (1.0 / self.delay_buffers.len() as f32);
+                    
+                    // Update delay buffer
+                    delay_buffer[self.delay_indices[i]] = input_sample + delayed_sample * self.damping;
+                    self.delay_indices[i] = (self.delay_indices[i] + 1) % delay_buffer.len();
+                }
+                
+                // Mix wet and dry signals
+                let output_sample = input_sample * self.dry_level + wet_sample * self.wet_level;
+                output.set_sample(frame, channel, output_sample);
+            }
+        }
+        
+        return Ok(());
+    }
+    
+    fn reset(&mut self) {
+        for delay_buffer in &mut self.delay_buffers {
+            for sample in delay_buffer {
+                *sample = 0.0;
+            }
+        }
+        
+        for index in &mut self.delay_indices {
+            *index = 0;
+        }
+    }
+    
+    fn get_name(&self) -> String {
+        return "Reverb".into();
+    }
+}
+
+/// Delay effect
+open data DelayEffect {
+    delay_time: f32,
+    feedback: f32,
+    wet_level: f32,
+    dry_level: f32,
+    delay_buffer: Vec<f32>,
+    delay_index: usize,
+}
+
+impl DelayEffect {
+    open fn new(delay_time: f32, feedback: f32, wet_level: f32, dry_level: f32, sample_rate: u32) -> DelayEffect {
+        let max_delay_samples = (delay_time * sample_rate as f32) as usize + 1;
+        
+        return DelayEffect {
+            delay_time: delay_time,
+            feedback: feedback,
+            wet_level: wet_level,
+            dry_level: dry_level,
+            delay_buffer: vec![0.0; max_delay_samples],
+            delay_index: 0,
+        };
+    }
+    
+    open fn set_delay_time(&mut self, delay_time: f32, sample_rate: u32) {
+        self.delay_time = delay_time;
+        let max_delay_samples = (delay_time * sample_rate as f32) as usize + 1;
+        self.delay_buffer.resize(max_delay_samples, 0.0);
+        self.delay_index = 0;
+    }
+}
+
+impl AudioEffect for DelayEffect {
+    fn process(&mut self, input: &AudioBuffer, output: &mut AudioBuffer) -> AudioResult<()> {
+        for frame in 0..input.get_frame_count() {
+            for channel in 0..input.channels {
+                let input_sample = input.get_sample(frame, channel);
+                
+                let delay_samples = (self.delay_time * 44100.0) as usize;
+                let read_index = (self.delay_index + delay_samples) % self.delay_buffer.len();
+                let delayed_sample = self.delay_buffer[read_index];
+                
+                let feedback_sample = input_sample + delayed_sample * self.feedback;
+                self.delay_buffer[self.delay_index] = feedback_sample;
+                
+                let output_sample = input_sample * self.dry_level + delayed_sample * self.wet_level;
+                output.set_sample(frame, channel, output_sample);
+                
+                self.delay_index = (self.delay_index + 1) % self.delay_buffer.len();
+            }
+        }
+        
+        return Ok(());
+    }
+    
+    fn reset(&mut self) {
+        for sample in &mut self.delay_buffer {
+            *sample = 0.0;
+        }
+        self.delay_index = 0;
+    }
+    
+    fn get_name(&self) -> String {
+        return "Delay".into();
+    }
+}
+
+/// Filter effect
+open data FilterEffect {
+    filter_type: FilterType,
+    frequency: f32,
+    q: f32,
+    sample_rate: u32,
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+}
+
+/// Filter type
+open cases FilterType {
+    LowPass,
+    HighPass,
+    BandPass,
+    Notch,
+    Peak,
+    LowShelf,
+    HighShelf,
+}
+
+impl FilterEffect {
+    open fn new(filter_type: FilterType, frequency: f32, q: f32, sample_rate: u32) -> FilterEffect {
+        return FilterEffect {
+            filter_type: filter_type,
+            frequency: frequency,
+            q: q,
+            sample_rate: sample_rate,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        };
+    }
+    
+    open fn set_frequency(&mut self, frequency: f32) {
+        self.frequency = frequency;
+    }
+    
+    open fn set_q(&mut self, q: f32) {
+        self.q = q;
+    }
+    
+    fn calculate_coefficients(&self) -> (f32, f32, f32, f32, f32) {
+        let omega = 2.0 * std::f32::consts::PI * self.frequency / self.sample_rate as f32;
+        let sin_omega = omega.sin();
+        let cos_omega = omega.cos();
+        let alpha = sin_omega / (2.0 * self.q);
+        
+        match self.filter_type {
+            FilterType::LowPass => {
+                let b0 = (1.0 - cos_omega) / 2.0;
+                let b1 = 1.0 - cos_omega;
+                let b2 = (1.0 - cos_omega) / 2.0;
+                let a0 = 1.0 + alpha;
+                let a1 = -2.0 * cos_omega;
+                let a2 = 1.0 - alpha;
+                
+                (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+            }
+            FilterType::HighPass => {
+                let b0 = (1.0 + cos_omega) / 2.0;
+                let b1 = -(1.0 + cos_omega);
+                let b2 = (1.0 + cos_omega) / 2.0;
+                let a0 = 1.0 + alpha;
+                let a1 = -2.0 * cos_omega;
+                let a2 = 1.0 - alpha;
+                
+                (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+            }
+            // Simplified for other filter types
+            _ => {
+                (1.0, 0.0, 0.0, 0.0, 0.0)
+            }
+        }
+    }
+}
+
+impl AudioEffect for FilterEffect {
+    fn process(&mut self, input: &AudioBuffer, output: &mut AudioBuffer) -> AudioResult<()> {
+        let (b0, b1, b2, a1, a2) = self.calculate_coefficients();
+        
+        for frame in 0..input.get_frame_count() {
+            for channel in 0..input.channels {
+                let x0 = input.get_sample(frame, channel);
+                
+                let y0 = b0 * x0 + b1 * self.x1 + b2 * self.x2 - a1 * self.y1 - a2 * self.y2;
+                
+                output.set_sample(frame, channel, y0);
+                
+                // Update delay lines
+                self.x2 = self.x1;
+                self.x1 = x0;
+                self.y2 = self.y1;
+                self.y1 = y0;
+            }
+        }
+        
+        return Ok(());
+    }
+    
+    fn reset(&mut self) {
+        self.x1 = 0.0;
+        self.x2 = 0.0;
+        self.y1 = 0.0;
+        self.y2 = 0.0;
+    }
+    
+    fn get_name(&self) -> String {
+        return format!("{:?}", self.filter_type);
+    }
+}
+
+/// Compressor effect
+open data CompressorEffect {
+    threshold: f32,
+    ratio: f32,
+    attack_time: f32,
+    release_time: f32,
+    sample_rate: u32,
+    envelope: f32,
+    attack_coefficient: f32,
+    release_coefficient: f32,
+}
+
+impl CompressorEffect {
+    open fn new(threshold: f32, ratio: f32, attack_time: f32, release_time: f32, sample_rate: u32) -> CompressorEffect {
+        let attack_coefficient = if attack_time > 0.0 {
+            (-1.0 / (attack_time * sample_rate as f32)).exp()
+        } else {
+            0.0
+        };
+        
+        let release_coefficient = if release_time > 0.0 {
+            (-1.0 / (release_time * sample_rate as f32)).exp()
+        } else {
+            0.0
+        };
+        
+        return CompressorEffect {
+            threshold: threshold,
+            ratio: ratio,
+            attack_time: attack_time,
+            release_time: release_time,
+            sample_rate: sample_rate,
+            envelope: 0.0,
+            attack_coefficient: attack_coefficient,
+            release_coefficient: release_coefficient,
+        };
+    }
+    
+    open fn set_threshold(&mut self, threshold: f32) {
+        self.threshold = threshold;
+    }
+    
+    open fn set_ratio(&mut self, ratio: f32) {
+        self.ratio = ratio;
+    }
+}
+
+impl AudioEffect for CompressorEffect {
+    fn process(&mut self, input: &AudioBuffer, output: &mut AudioBuffer) -> AudioResult<()> {
+        for frame in 0..input.get_frame_count() {
+            for channel in 0..input.channels {
+                let input_sample = input.get_sample(frame, channel);
+                let input_level = input_sample.abs();
+                
+                // Calculate envelope follower
+                let target_envelope = if input_level > self.envelope {
+                    input_level + (self.envelope - input_level) * self.attack_coefficient
+                } else {
+                    input_level + (self.envelope - input_level) * self.release_coefficient
+                };
+                
+                self.envelope = target_envelope;
+                
+                // Calculate gain reduction
+                let gain_reduction = if self.envelope > self.threshold {
+                    let over_threshold = self.envelope - self.threshold;
+                    let reduction_db = over_threshold * (1.0 - 1.0 / self.ratio);
+                    (-reduction_db * 0.115129254).exp() // Convert dB to linear
+                } else {
+                    1.0
+                };
+                
+                let output_sample = input_sample * gain_reduction;
+                output.set_sample(frame, channel, output_sample);
+            }
+        }
+        
+        return Ok(());
+    }
+    
+    fn reset(&mut self) {
+        self.envelope = 0.0;
+    }
+    
+    fn get_name(&self) -> String {
+        return "Compressor".into();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §5  AUDIO SYNTHESIS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Synthesizer
+open data Synthesizer {
+    sample_rate: u32,
+    voices: Vec<Voice>,
+    oscillators: Vec<Oscillator>,
+    envelope: Envelope,
+    filter: FilterEffect,
+    lfo: Oscillator,
+}
+
+impl Synthesizer {
+    open fn new(sample_rate: u32) -> Synthesizer {
+        return Synthesizer {
+            sample_rate: sample_rate,
+            voices: Vec::new(),
+            oscillators: Vec::new(),
+            envelope: Envelope::new(sample_rate),
+            filter: FilterEffect::new(FilterType::LowPass, 1000.0, 1.0, sample_rate),
+            lfo: Oscillator::new(OscillatorType::Sine, 1.0, sample_rate),
+        };
+    }
+    
+    open fn note_on(&mut self, note: u8, velocity: f32) {
+        let frequency = 440.0 * ((note as f32 - 69.0) / 12.0).exp2();
+        
+        let voice = Voice::new(frequency, velocity, self.sample_rate);
+        self.voices.push(voice);
+        
+        // Limit number of voices
+        if self.voices.len() > 16 {
+            self.voices.remove(0);
+        }
+    }
+    
+    open fn note_off(&mut self, note: u8) {
+        let frequency = 440.0 * ((note as f32 - 69.0) / 12.0).exp2();
+        
+        for voice in &mut self.voices {
+            if (voice.frequency - frequency).abs() < 0.1 {
+                voice.note_off();
+            }
+        }
+    }
+    
+    open fn render(&mut self, buffer: &mut AudioBuffer) -> AudioResult<()> {
+        // Clear buffer
+        for frame in 0..buffer.get_frame_count() {
+            for channel in 0..buffer.channels {
+                buffer.set_sample(frame, channel, 0.0);
+            }
+        }
+        
+        // Render each voice
+        for voice in &mut self.voices {
+            let mut voice_buffer = AudioBuffer::new(buffer.sample_rate, buffer.channels, buffer.get_frame_count());
+            voice.render(&mut voice_buffer)?;
+            
+            // Mix voice buffer into main buffer
+            buffer.mix(&voice_buffer)?;
+        }
+        
+        // Remove finished voices
+        self.voices.retain(|voice| voice.is_active());
+        
+        return Ok(());
+    }
+    
+    open fn set_filter_cutoff(&mut self, frequency: f32) {
+        self.filter.set_frequency(frequency);
+    }
+    
+    open fn set_filter_resonance(&mut self, q: f32) {
+        self.filter.set_q(q);
+    }
+    
+    open fn set_lfo_frequency(&mut self, frequency: f32) {
+        self.lfo.set_frequency(frequency);
+    }
+}
+
+/// Voice
+open data Voice {
+    frequency: f32,
+    velocity: f32,
+    phase: f32,
+    envelope: Envelope,
+    is_active: bool,
+    sample_rate: u32,
+}
+
+impl Voice {
+    open fn new(frequency: f32, velocity: f32, sample_rate: u32) -> Voice {
+        let mut voice = Voice {
+            frequency: frequency,
+            velocity: velocity,
+            phase: 0.0,
+            envelope: Envelope::new(sample_rate),
+            is_active: true,
+            sample_rate: sample_rate,
+        };
+        
+        voice.envelope.note_on();
+        
+        return voice;
+    }
+    
+    open fn note_off(&mut self) {
+        self.envelope.note_off();
+    }
+    
+    open fn is_active(&self) -> bool {
+        return self.is_active && self.envelope.is_active();
+    }
+    
+    open fn render(&mut self, buffer: &mut AudioBuffer) -> AudioResult<()> {
+        let phase_increment = self.frequency / self.sample_rate as f32 * 2.0 * std::f32::consts::PI;
+        
+        for frame in 0..buffer.get_frame_count() {
+            let sample = self.phase.sin() * self.velocity;
+            let envelope_value = self.envelope.get_value();
+            
+            for channel in 0..buffer.channels {
+                let current_sample = buffer.get_sample(frame, channel);
+                buffer.set_sample(frame, channel, current_sample + sample * envelope_value);
+            }
+            
+            self.phase += phase_increment;
+            if self.phase > 2.0 * std::f32::consts::PI {
+                self.phase -= 2.0 * std::f32::consts::PI;
+            }
+            
+            self.envelope.advance();
+        }
+        
+        return Ok(());
+    }
+}
+
+/// Oscillator
+open data Oscillator {
+    oscillator_type: OscillatorType,
+    frequency: f32,
+    phase: f32,
+    sample_rate: u32,
+}
+
+/// Oscillator type
+open cases OscillatorType {
+    Sine,
+    Square,
+    Sawtooth,
+    Triangle,
+    Noise,
+}
+
+impl Oscillator {
+    open fn new(oscillator_type: OscillatorType, frequency: f32, sample_rate: u32) -> Oscillator {
+        return Oscillator {
+            oscillator_type: oscillator_type,
+            frequency: frequency,
+            phase: 0.0,
+            sample_rate: sample_rate,
+        };
+    }
+    
+    open fn set_frequency(&mut self, frequency: f32) {
+        self.frequency = frequency;
+    }
+    
+    open fn get_sample(&mut self) -> f32 {
+        let phase_increment = self.frequency / self.sample_rate as f32;
+        
+        let sample = match self.oscillator_type {
+            OscillatorType::Sine => self.phase.sin(),
+            OscillatorType::Square => if self.phase < std::f32::consts::PI { 1.0 } else { -1.0 },
+            OscillatorType::Sawtooth => (self.phase / std::f32::consts::PI) - 1.0,
+            OscillatorType::Triangle => {
+                if self.phase < std::f32::consts::PI {
+                    (self.phase / std::f32::consts::PI) * 2.0 - 1.0
+                } else {
+                    1.0 - ((self.phase - std::f32::consts::PI) / std::f32::consts::PI) * 2.0
+                }
+            }
+            OscillatorType::Noise => rand::random::<f32>() * 2.0 - 1.0,
+        };
+        
+        self.phase += phase_increment * 2.0 * std::f32::consts::PI;
+        if self.phase > 2.0 * std::f32::consts::PI {
+            self.phase -= 2.0 * std::f32::consts::PI;
+        }
+        
+        return sample;
+    }
+}
+
+/// Envelope
+open data Envelope {
+    sample_rate: u32,
+    stage: EnvelopeStage,
+    value: f32,
+    attack_time: f32,
+    decay_time: f32,
+    sustain_level: f32,
+    release_time: f32,
+    current_time: f32,
+}
+
+/// Envelope stage
+open cases EnvelopeStage {
+    Idle,
+    Attack,
+    Decay,
+    Sustain,
+    Release,
+}
+
+impl Envelope {
+    open fn new(sample_rate: u32) -> Envelope {
+        return Envelope {
+            sample_rate: sample_rate,
+            stage: EnvelopeStage::Idle,
+            value: 0.0,
+            attack_time: 0.1,
+            decay_time: 0.2,
+            sustain_level: 0.7,
+            release_time: 0.3,
+            current_time: 0.0,
+        };
+    }
+    
+    open fn note_on(&mut self) {
+        self.stage = EnvelopeStage::Attack;
+        self.current_time = 0.0;
+    }
+    
+    open fn note_off(&mut self) {
+        if self.stage != EnvelopeStage::Idle {
+            self.stage = EnvelopeStage::Release;
+            self.current_time = 0.0;
+        }
+    }
+    
+    open fn is_active(&self) -> bool {
+        match self.stage {
+            EnvelopeStage::Idle => false,
+            EnvelopeStage::Release => self.value > 0.001,
+            _ => true,
+        }
+    }
+    
+    open fn get_value(&self) -> f32 {
+        return self.value;
+    }
+    
+    open fn advance(&mut self) {
+        let dt = 1.0 / self.sample_rate as f32;
+        self.current_time += dt;
+        
+        match self.stage {
+            EnvelopeStage::Idle => {
+                self.value = 0.0;
+            }
+            EnvelopeStage::Attack => {
+                if self.current_time >= self.attack_time {
+                    self.stage = EnvelopeStage::Decay;
+                    self.current_time = 0.0;
+                    self.value = 1.0;
+                } else {
+                    self.value = self.current_time / self.attack_time;
+                }
+            }
+            EnvelopeStage::Decay => {
+                if self.current_time >= self.decay_time {
+                    self.stage = EnvelopeStage::Sustain;
+                    self.current_time = 0.0;
+                    self.value = self.sustain_level;
+                } else {
+                    let progress = self.current_time / self.decay_time;
+                    self.value = 1.0 - (1.0 - self.sustain_level) * progress;
+                }
+            }
+            EnvelopeStage::Sustain => {
+                self.value = self.sustain_level;
+            }
+            EnvelopeStage::Release => {
+                if self.current_time >= self.release_time {
+                    self.stage = EnvelopeStage::Idle;
+                    self.current_time = 0.0;
+                    self.value = 0.0;
+                } else {
+                    let progress = self.current_time / self.release_time;
+                    self.value = self.sustain_level * (1.0 - progress);
+                }
+            }
+        }
+    }
+    
+    open fn set_attack_time(&mut self, attack_time: f32) {
+        self.attack_time = attack_time;
+    }
+    
+    open fn set_decay_time(&mut self, decay_time: f32) {
+        self.decay_time = decay_time;
+    }
+    
+    open fn set_sustain_level(&mut self, sustain_level: f32) {
+        self.sustain_level = sustain_level;
+    }
+    
+    open fn set_release_time(&mut self, release_time: f32) {
+        self.release_time = release_time;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §6  AUDIO ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Audio analyzer
+open data AudioAnalyzer {
+    fft_size: usize,
+    window_size: usize,
+    window_function: WindowFunction,
+    fft_input: Vec<Complex>,
+    fft_output: Vec<Complex>,
+}
+
+/// Complex number
+open data Complex {
+    real: f32,
+    imag: f32,
+}
+
+impl Complex {
+    open fn new(real: f32, imag: f32) -> Complex {
+        return Complex { real: real, imag: imag };
+    }
+    
+    open fn magnitude(&self) -> f32 {
+        return (self.real * self.real + self.imag * self.imag).sqrt();
+    }
+    
+    open fn phase(&self) -> f32 {
+        return self.imag.atan2(self.real);
+    }
+}
+
+/// Window function
+open cases WindowFunction {
+    Hann,
+    Hamming,
+    Blackman,
+    Rectangular,
+}
+
+impl AudioAnalyzer {
+    open fn new(fft_size: usize, window_function: WindowFunction) -> AudioAnalyzer {
+        return AudioAnalyzer {
+            fft_size: fft_size,
+            window_size: fft_size,
+            window_function: window_function,
+            fft_input: vec![Complex::new(0.0, 0.0); fft_size],
+            fft_output: vec![Complex::new(0.0, 0.0); fft_size],
+        };
+    }
+    
+    open fn analyze_spectrum(&mut self, buffer: &AudioBuffer) -> Vec<f32> {
+        let frame_count = buffer.get_frame_count();
+        let samples_to_process = frame_count.min(self.window_size);
+        
+        // Copy samples to FFT input
+        for i in 0..samples_to_process {
+            let sample = buffer.get_sample(i, 0); // Use first channel
+            let windowed_sample = sample * self.get_window_value(i, samples_to_process);
+            self.fft_input[i] = Complex::new(windowed_sample, 0.0);
+        }
+        
+        // Zero-pad if necessary
+        for i in samples_to_process..self.fft_size {
+            self.fft_input[i] = Complex::new(0.0, 0.0);
+        }
+        
+        // Perform FFT
+        self.fft();
+        
+        // Calculate magnitudes
+        let mut spectrum = Vec::with_capacity(self.fft_size / 2);
+        for i in 0..self.fft_size / 2 {
+            spectrum.push(self.fft_output[i].magnitude());
+        }
+        
+        return spectrum;
+    }
+    
+    open fn analyze_rms(&self, buffer: &AudioBuffer) -> f32 {
+        let mut sum = 0.0;
+        let mut count = 0;
+        
+        for frame in 0..buffer.get_frame_count() {
+            for channel in 0..buffer.channels {
+                let sample = buffer.get_sample(frame, channel);
+                sum += sample * sample;
+                count += 1;
+            }
+        }
+        
+        if count > 0 {
+            return (sum / count as f32).sqrt();
+        }
+        
+        return 0.0;
+    }
+    
+    open fn analyze_peak(&self, buffer: &AudioBuffer) -> f32 {
+        let mut peak = 0.0;
+        
+        for frame in 0..buffer.get_frame_count() {
+            for channel in 0..buffer.channels {
+                let sample = buffer.get_sample(frame, channel).abs();
+                if sample > peak {
+                    peak = sample;
+                }
+            }
+        }
+        
+        return peak;
+    }
+    
+    open fn analyze_zero_crossing_rate(&self, buffer: &AudioBuffer) -> f32 {
+        let mut crossings = 0;
+        let mut previous_sample = 0.0;
+        
+        for frame in 0..buffer.get_frame_count() {
+            let sample = buffer.get_sample(frame, 0); // Use first channel
+            
+            if previous_sample * sample < 0.0 {
+                crossings += 1;
+            }
+            
+            previous_sample = sample;
+        }
+        
+        return crossings as f32 / buffer.get_frame_count() as f32;
+    }
+    
+    fn fft(&mut self) {
+        // Simplified FFT implementation (Cooley-Tukey)
+        let n = self.fft_size;
+        
+        // Bit-reversal permutation
+        let mut j = 0;
+        for i in 1..n {
+            let mut bit = n >> 1;
+            while j & bit != 0 {
+                j ^= bit;
+                bit >>= 1;
+            }
+            j ^= bit;
+            
+            if i < j {
+                self.fft_input.swap(i, j);
+            }
+        }
+        
+        // FFT computation
+        let mut length = 2;
+        while length <= n {
+            let angle = -2.0 * std::f32::consts::PI / length as f32;
+            let w_m = Complex::new(angle.cos(), angle.sin());
+            
+            for i in (0..n).step_by(length) {
+                let mut w = Complex::new(1.0, 0.0);
+                
+                for j in 0..length / 2 {
+                    let u = self.fft_input[i + j].clone();
+                    let t = self.fft_input[i + j + length / 2].clone();
+                    
+                    let t_w = Complex::new(
+                        t.real * w.real - t.imag * w.imag,
+                        t.real * w.imag + t.imag * w.real
+                    );
+                    
+                    self.fft_input[i + j] = Complex::new(u.real + t_w.real, u.imag + t_w.imag);
+                    self.fft_input[i + j + length / 2] = Complex::new(u.real - t_w.real, u.imag - t_w.imag);
+                    
+                    w = Complex::new(
+                        w.real * w_m.real - w.imag * w_m.imag,
+                        w.real * w_m.imag + w.imag * w_m.real
+                    );
+                }
+            }
+            
+            length <<= 1;
+        }
+        
+        // Copy to output
+        self.fft_output.copy_from_slice(&self.fft_input);
+    }
+    
+    fn get_window_value(&self, index: usize, size: usize) -> f32 {
+        let n = size as f32;
+        let i = index as f32;
+        
+        match self.window_function {
+            WindowFunction::Hann => 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i / (n - 1.0)).cos()),
+            WindowFunction::Hamming => 0.54 - 0.46 * (2.0 * std::f32::consts::PI * i / (n - 1.0)).cos(),
+            WindowFunction::Blackman => {
+                let a0 = 0.42;
+                let a1 = 0.5;
+                let a2 = 0.08;
+                a0 - a1 * (2.0 * std::f32::consts::PI * i / (n - 1.0)).cos()
+                    + a2 * (4.0 * std::f32::consts::PI * i / (n - 1.0)).cos()
+            }
+            WindowFunction::Rectangular => 1.0,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §7  AUDIO FILE I/O
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Audio file format
+open cases AudioFileFormat {
+    WAV,
+    MP3,
+    FLAC,
+    OGG,
+    AAC,
+}
+
+/// Audio file reader
+open data AudioFileReader {
+    format: AudioFileFormat,
+    sample_rate: u32,
+    channels: usize,
+    bit_depth: u32,
+    duration: f64,
+}
+
+impl AudioFileReader {
+    open fn new(file_path: &str) -> AudioResult<AudioFileReader> {
+        // Determine format from file extension
+        let format = if file_path.ends_with(".wav") {
+            AudioFileFormat::WAV
+        } else if file_path.ends_with(".mp3") {
+            AudioFileFormat::MP3
+        } else if file_path.ends_with(".flac") {
+            AudioFileFormat::FLAC
+        } else if file_path.ends_with(".ogg") {
+            AudioFileFormat::OGG
+        } else if file_path.ends_with(".aac") {
+            AudioFileFormat::AAC
+        } else {
+            return Err(AudioError::InvalidFormat("Unsupported file format".into()));
+        };
+        
+        // Mock file reading
+        return Ok(AudioFileReader {
+            format: format,
+            sample_rate: 44100,
+            channels: 2,
+            bit_depth: 16,
+            duration: 10.0,
+        });
+    }
+    
+    open fn read(&self) -> AudioResult<AudioBuffer> {
+        let frame_count = (self.duration * self.sample_rate as f64) as usize;
+        let mut buffer = AudioBuffer::new(self.sample_rate, self.channels, frame_count);
+        
+        // Mock audio data
+        for frame in 0..frame_count {
+            for channel in 0..self.channels {
+                let sample = (frame as f32 / frame_count as f32 * 2.0 - 1.0) * 
+                            (std::f32::consts::PI * 2.0 * 440.0 * frame as f32 / self.sample_rate as f32).sin();
+                buffer.set_sample(frame, channel, sample * 0.5);
+            }
+        }
+        
+        return Ok(buffer);
+    }
+    
+    open fn get_sample_rate(&self) -> u32 {
+        return self.sample_rate;
+    }
+    
+    open fn get_channels(&self) -> usize {
+        return self.channels;
+    }
+    
+    open fn get_duration(&self) -> f64 {
+        return self.duration;
+    }
+    
+    open fn get_format(&self) -> AudioFileFormat {
+        return self.format.clone();
+    }
+}
+
+/// Audio file writer
+open data AudioFileWriter {
+    format: AudioFileFormat,
+    sample_rate: u32,
+    channels: usize,
+    bit_depth: u32,
+}
+
+impl AudioFileWriter {
+    open fn new(format: AudioFileFormat, sample_rate: u32, channels: usize, bit_depth: u32) -> AudioFileWriter {
+        return AudioFileWriter {
+            format: format,
+            sample_rate: sample_rate,
+            channels: channels,
+            bit_depth: bit_depth,
+        };
+    }
+    
+    open fn write(&self, file_path: &str, buffer: &AudioBuffer) -> AudioResult<()> {
+        // Mock file writing
+        println!("Writing audio file: {}", file_path);
+        println!("Format: {:?}", self.format);
+        println!("Sample rate: {}", self.sample_rate);
+        println!("Channels: {}", self.channels);
+        println!("Bit depth: {}", self.bit_depth);
+        println!("Duration: {} seconds", buffer.get_duration());
+        
+        return Ok(());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §8  GLOBAL INSTANCE AND HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Create audio buffer
+open fn create_audio_buffer(sample_rate: u32, channels: usize, frame_count: usize) -> AudioBuffer {
+    return AudioBuffer::new(sample_rate, channels, frame_count);
+}
+
+/// Create audio buffer from samples
+open fn create_audio_buffer_from_samples(samples: Vec<f32>, sample_rate: u32, channels: usize) -> AudioBuffer {
+    return AudioBuffer::from_samples(samples, sample_rate, channels);
+}
+
+/// Create audio device
+open fn create_audio_device(id: String, name: String, device_type: DeviceType) -> AudioDevice {
+    return AudioDevice::new(id, name, device_type);
+}
+
+/// Create audio device manager
+open fn create_audio_device_manager() -> AudioDeviceManager {
+    return AudioDeviceManager::new();
+}
+
+/// Create audio engine
+open fn create_audio_engine() -> AudioEngine {
+    return AudioEngine::new();
+}
+
+/// Create audio stream
+open fn create_audio_stream(device_id: String, sample_rate: u32, channels: usize, buffer_size: usize, is_input: bool) -> AudioStream {
+    return AudioStream::new(device_id, sample_rate, channels, buffer_size, is_input);
+}
+
+/// Create gain effect
+open fn create_gain_effect(gain: f32) -> Box<dyn AudioEffect> {
+    return Box::new(GainEffect::new(gain));
+}
+
+/// Create reverb effect
+open fn create_reverb_effect(room_size: f32, damping: f32, wet_level: f32, dry_level: f32, width: f32) -> Box<dyn AudioEffect> {
+    return Box::new(ReverbEffect::new(room_size, damping, wet_level, dry_level, width));
+}
+
+/// Create delay effect
+open fn create_delay_effect(delay_time: f32, feedback: f32, wet_level: f32, dry_level: f32, sample_rate: u32) -> Box<dyn AudioEffect> {
+    return Box::new(DelayEffect::new(delay_time, feedback, wet_level, dry_level, sample_rate));
+}
+
+/// Create filter effect
+open fn create_filter_effect(filter_type: FilterType, frequency: f32, q: f32, sample_rate: u32) -> Box<dyn AudioEffect> {
+    return Box::new(FilterEffect::new(filter_type, frequency, q, sample_rate));
+}
+
+/// Create compressor effect
+open fn create_compressor_effect(threshold: f32, ratio: f32, attack_time: f32, release_time: f32, sample_rate: u32) -> Box<dyn AudioEffect> {
+    return Box::new(CompressorEffect::new(threshold, ratio, attack_time, release_time, sample_rate));
+}
+
+/// Create synthesizer
+open fn create_synthesizer(sample_rate: u32) -> Synthesizer {
+    return Synthesizer::new(sample_rate);
+}
+
+/// Create oscillator
+open fn create_oscillator(oscillator_type: OscillatorType, frequency: f32, sample_rate: u32) -> Oscillator {
+    return Oscillator::new(oscillator_type, frequency, sample_rate);
+}
+
+/// Create envelope
+open fn create_envelope(sample_rate: u32) -> Envelope {
+    return Envelope::new(sample_rate);
+}
+
+/// Create audio analyzer
+open fn create_audio_analyzer(fft_size: usize, window_function: WindowFunction) -> AudioAnalyzer {
+    return AudioAnalyzer::new(fft_size, window_function);
+}
+
+/// Create audio file reader
+open fn create_audio_file_reader(file_path: &str) -> AudioResult<AudioFileReader> {
+    return AudioFileReader::new(file_path);
+}
+
+/// Create audio file writer
+open fn create_audio_file_writer(format: AudioFileFormat, sample_rate: u32, channels: usize, bit_depth: u32) -> AudioFileWriter {
+    return AudioFileWriter::new(format, sample_rate, channels, bit_depth);
+}
+
+/// Initialize audio processing system
+open fn init_audio_processing() {
+    // Initialize audio processing system
+}
+
+/// Format string helper
+fn format(template: &str, args: ...) -> String {
+    // Simplified formatting
+    return template.into();
+}

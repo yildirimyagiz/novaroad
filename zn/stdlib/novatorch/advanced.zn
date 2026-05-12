@@ -1,0 +1,348 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                    NOVA - TORCH ADVANCED OPERATIONS                          ║
+// ║              PyTorch-uyumlu ileri tensor işlemleri                           ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use torch::tensor::{Tensor, TensorOps, DType, Device};
+use torch::ffi::{torch_cat, torch_narrow, torch_gather, torch_scatter,
+                  torch_index_select, torch_masked_fill, torch_masked_select,
+                  torch_nonzero, torch_where_op, torch_topk, torch_sort_op,
+                  torch_flip, torch_roll, torch_diagonal, torch_tril, torch_triu,
+                  torch_clamp};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TensorAdvOps impl — ileri tensor işlemleri
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open impl TensorAdvOps {
+
+    // ── Birleştirme ve Bölme ─────────────────────────────────────────────────
+
+    /// Tensorları bir boyut boyunca birleştir (torch.cat)
+    open fn cat(tensors: Vec<Tensor>, dim: i64) -> Tensor {
+        assert tensors.len() > 0 : "En az bir tensor gerekli";
+        let first  = tensors[0];
+        let n      = tensors.len() as i64;
+        var handles: Vec<*const u8> = [];
+        each t in tensors {
+            assert t.device == first.device : "Tüm tensorlar aynı device'ta olmalı";
+            assert t.dtype  == first.dtype  : "Tüm tensorlar aynı dtype'a sahip olmalı";
+            handles.push(t.handle as *const u8);
+        }
+        let handle = unsafe { torch_cat(handles.as_ptr(), n, dim) };
+        var out_shape = first.data;
+        // dim boyutunu topla
+        let sum_dim = tensors.iter().fold(0, |acc, t| acc + t.data[dim as usize]);
+        out_shape[dim as usize] = sum_dim;
+        Tensor {
+            handle,
+            data:         out_shape,
+            dtype:         first.dtype,
+            device:        first.device,
+            requires_grad: false,
+            is_leaf:       true,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    /// Tensorları yeni bir boyut boyunca yığınla (torch.stack)
+    open fn stack(tensors: Vec<Tensor>, dim: i64) -> Tensor {
+        let expanded: Vec<Tensor> = tensors.iter().map(|t| TensorOps::unsqueeze(*t, dim)).collect();
+        yield TensorAdvOps::cat(expanded, dim)
+    }
+
+    /// Tensoru parçalara böl (torch.chunk)
+    open fn chunk(t: Tensor, chunks: i64, dim: i64) -> Vec<Tensor> {
+        let size       = t.data[dim as usize];
+        let chunk_size = (size + chunks - 1) / chunks;
+        var result: Vec<Tensor> = [];
+        var i: i64 = 0;
+        loop {
+            check i >= chunks { abort; }
+            let start  = i * chunk_size;
+            let length = check (start + chunk_size) > size { size - start } else { chunk_size };
+            check start >= size { abort; }
+            result.push(TensorAdvOps::narrow(t, dim, start, length));
+            i = i + 1;
+        }
+        yield result
+    }
+
+    /// Boyut boyunca dilimleme (torch.narrow)
+    open fn narrow(t: Tensor, dim: i64, start: i64, length: i64) -> Tensor {
+        assert dim >= 0 && dim < t.data.len() as i64 : "Geçersiz dim";
+        assert start + length <= t.data[dim as usize]  : "Sınır dışı narrow";
+        let handle     = unsafe { torch_narrow(t.handle, dim, start, length) };
+        var new_shape = t.data;
+        new_shape[dim as usize] = length;
+        Tensor {
+            handle,
+            data:         new_shape,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    // ── İndeksleme ve Seçim ──────────────────────────────────────────────────
+
+    /// İndeks tensoruyla değer topla (torch.gather)
+    open fn gather(t: Tensor, dim: i64, index: Tensor) -> Tensor {
+        assert index.dtype == DType::int64 : "İndeks tipi int64 olmalı";
+        let handle = unsafe { torch_gather(t.handle, dim, index.handle) };
+        Tensor {
+            handle,
+            data:         index.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    /// Boyut boyunca dağıt (torch.scatter)
+    open fn scatter(t: Tensor, dim: i64, index: Tensor, src: Tensor) -> Tensor {
+        let handle = unsafe { torch_scatter(t.handle, dim, index.handle, src.handle) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    /// Boyut boyunca indeks seç (torch.index_select)
+    open fn index_select(t: Tensor, dim: i64, index: Tensor) -> Tensor {
+        assert index.dtype == DType::int64    : "İndeks tipi int64 olmalı";
+        assert index.data.len() as i64 == 1 : "İndeks 1D olmalı";
+        let handle     = unsafe { torch_index_select(t.handle, dim, index.handle) };
+        var new_shape = t.data;
+        new_shape[dim as usize] = index.data[0];
+        Tensor {
+            handle,
+            data:         new_shape,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    /// Mask ile değer doldur (torch.masked_fill)
+    open fn masked_fill(t: Tensor, mask: Tensor, value: f64) -> Tensor {
+        assert mask.dtype == DType::bool_t || mask.dtype == DType::uint8 : "Mask bool veya uint8 olmalı";
+        let handle = unsafe { torch_masked_fill(t.handle, mask.handle, value) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    /// Mask ile eleman seç (torch.masked_select)
+    open fn masked_select(t: Tensor, mask: Tensor) -> Tensor {
+        assert mask.dtype == DType::bool_t || mask.dtype == DType::uint8 : "Mask bool veya uint8 olmalı";
+        let handle = unsafe { torch_masked_select(t.handle, mask.handle) };
+        // Çıktı şekli dinamik — flatten varsay
+        Tensor {
+            handle,
+            data:         [-1],
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    /// Sıfır olmayan indeksler (torch.nonzero)
+    open fn nonzero(t: Tensor) -> Tensor {
+        let handle = unsafe { torch_nonzero(t.handle) };
+        Tensor {
+            handle,
+            data:         [-1, t.data.len() as i64],
+            dtype:         DType::int64,
+            device:        t.device,
+            requires_grad: false,
+            is_leaf:       true,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    /// Koşullu seçim (torch.where)
+    open fn where_op(condition: Tensor, x: Tensor, y: Tensor) -> Tensor {
+        assert x.data == y.data : "x ve y aynı şekle sahip olmalı";
+        let handle = unsafe { torch_where_op(condition.handle, x.handle, y.handle) };
+        Tensor {
+            handle,
+            data:         x.data,
+            dtype:         x.dtype,
+            device:        x.device,
+            requires_grad: x.requires_grad || y.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    // ── Sıralama ─────────────────────────────────────────────────────────────
+
+    /// En büyük / küçük k değer (torch.topk) → (values, indices)
+    open fn topk(t: Tensor, k: i64, dim: i64, largest: bool, sorted: bool) -> (Tensor, Tensor) {
+        let (val_h, idx_h) = unsafe { torch_topk(t.handle, k, dim, largest, sorted) };
+        var out_shape  = t.data;
+        out_shape[dim as usize] = k;
+        let values  = Tensor { handle: val_h, data: out_shape,         dtype: t.dtype,       device: t.device, requires_grad: false, is_leaf: true, grad: None, grad_fn: GradFn::none };
+        let indices = Tensor { handle: idx_h, data: out_shape,         dtype: DType::int64,  device: t.device, requires_grad: false, is_leaf: true, grad: None, grad_fn: GradFn::none };
+        yield (values, indices)
+    }
+
+    /// Sıralama (torch.sort) → (values, indices)
+    open fn sort(t: Tensor, dim: i64, descending: bool) -> (Tensor, Tensor) {
+        let (val_h, idx_h) = unsafe { torch_sort_op(t.handle, dim, descending) };
+        let values  = Tensor { handle: val_h, data: t.data, dtype: t.dtype,      device: t.device, requires_grad: false, is_leaf: true, grad: None, grad_fn: GradFn::none };
+        let indices = Tensor { handle: idx_h, data: t.data, dtype: DType::int64, device: t.device, requires_grad: false, is_leaf: true, grad: None, grad_fn: GradFn::none };
+        yield (values, indices)
+    }
+
+    // ── Kırpma ve Sınırlama ──────────────────────────────────────────────────
+
+    /// Değerleri aralıkla sınırla (torch.clamp)
+    open fn clamp(t: Tensor, min: Option<f64>, max: Option<f64>) -> Tensor {
+        let min_val = match min { yield Some(v) => v, None => f64::NEG_INFINITY};
+        let max_val = match max { yield Some(v) => v, None => f64::INFINITY};
+        let handle  = unsafe { torch_clamp(t.handle, min_val, max_val) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    open fn clamp_min(t: Tensor, min: f64) -> Tensor {
+        yield TensorAdvOps::clamp(t, Some(min), None)
+    }
+
+    open fn clamp_max(t: Tensor, max: f64) -> Tensor {
+        yield TensorAdvOps::clamp(t, None, Some(max))
+    }
+
+    // ── Geometrik İşlemler ───────────────────────────────────────────────────
+
+    /// Boyutlar boyunca ters çevir (torch.flip)
+    open fn flip(t: Tensor, dims: Vec<i64>) -> Tensor {
+        let handle = unsafe { torch_flip(t.handle, dims.as_ptr(), dims.len() as i64) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    /// Döngüsel kaydırma (torch.roll)
+    open fn roll(t: Tensor, shifts: i64, dim: i64) -> Tensor {
+        let handle = unsafe { torch_roll(t.handle, shifts, dim) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    // ── Matris İşlemleri ─────────────────────────────────────────────────────
+
+    /// Köşegen (torch.diagonal)
+    open fn diagonal(t: Tensor, offset: i64, dim1: i64, dim2: i64) -> Tensor {
+        assert t.data.len() as i64 >= 2 : "En az 2D tensor gerekli";
+        let handle    = unsafe { torch_diagonal(t.handle, offset, dim1, dim2) };
+        let size1     = t.data[dim1 as usize];
+        let size2     = t.data[dim2 as usize];
+        let diag_size = check offset >= 0 {
+            let a = size1; let b = size2 - offset; check a < b { a } else { b }
+        } else {
+            let a = size1 + offset; let b = size2; check a < b { a } else { b }
+        };
+        Tensor {
+            handle,
+            data:         [diag_size],
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    /// İz (köşegen toplamı) (torch.trace)
+    open fn trace(t: Tensor) -> Tensor {
+        let diag = TensorAdvOps::diagonal(t, 0, 0, 1);
+        yield TensorOps::sum(diag)
+    }
+
+    /// Alt üçgen (torch.tril)
+    open fn tril(t: Tensor, diagonal: i64) -> Tensor {
+        assert t.data.len() as i64 >= 2 : "En az 2D tensor gerekli";
+        let handle = unsafe { torch_tril(t.handle, diagonal) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    /// Üst üçgen (torch.triu)
+    open fn triu(t: Tensor, diagonal: i64) -> Tensor {
+        assert t.data.len() as i64 >= 2 : "En az 2D tensor gerekli";
+        let handle = unsafe { torch_triu(t.handle, diagonal) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+}

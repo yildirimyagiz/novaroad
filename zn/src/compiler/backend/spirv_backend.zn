@@ -1,0 +1,792 @@
+//===- spirv_backend.zn - SPIR-V Shader Code Generation Backend --------------===//
+//
+// Part of the Nova Compiler - GPU Compute & Graphics
+//
+//===----------------------------------------------------------------------===//
+//
+// This backend generates SPIR-V bytecode for GPU kernels and shaders.
+// SPIR-V is the intermediate representation used by Vulkan, OpenGL, and
+// other modern graphics APIs.
+//
+// Key Features:
+// - GPU kernel compilation for compute shaders
+// - Graphics pipeline shader generation
+// - Memory model for GPU execution
+// - Cross-vendor GPU compatibility (NVIDIA, AMD, Intel, etc.)
+//
+// Architecture:
+// - IR → SPIR-V Module → SPIR-V Bytecode
+// - Handles GPU-specific constructs (workgroups, barriers, etc.)
+// - Supports OpenCL-style and Vulkan-style kernels
+//
+
+use std::collections::HashMap;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §1  SPIR-V BACKEND CORE
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data SpirvBackend derives [Clone] {
+    open target: GpuTarget,
+    open version: SpirvVersion,
+    open capabilities: Vec<Capability>,
+    open extensions: Vec<String>,
+    open memory_model: MemoryModel,
+}
+
+expose cases GpuTarget derives [Clone, Copy] {
+    Vulkan,      // Vulkan API
+    OpenCL,      // OpenCL kernels
+    Metal,       // Apple Metal
+    DirectX,     // DirectX 12
+}
+
+expose data SpirvVersion derives [Clone, Copy] {
+    open major: u32,
+    open minor: u32,
+}
+
+impl SpirvVersion {
+    open fn v1_0() -> SpirvVersion { SpirvVersion { major: 1, minor: 0 } }
+    open fn v1_3() -> SpirvVersion { SpirvVersion { major: 1, minor: 3 } }
+    open fn v1_5() -> SpirvVersion { SpirvVersion { major: 1, minor: 5 } }
+}
+
+expose cases Capability derives [Clone, Copy] {
+    Shader,
+    Kernel,
+    Int64,
+    Float64,
+    AtomicStorage,
+    StorageImageReadWithoutFormat,
+    StorageImageWriteWithoutFormat,
+    VariablePointers,
+    VariablePointersStorageBuffer,
+}
+
+expose cases MemoryModel derives [Clone, Copy] {
+    Simple,
+    GLSL450,
+    OpenCL,
+    Vulkan,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §2  SPIR-V MODULE STRUCTURE
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Complete SPIR-V module
+expose data SpirvModule derives [Clone] {
+    open header: ModuleHeader,
+    open capabilities: Vec<Capability>,
+    open extensions: Vec<String>,
+    open imports: Vec<String>,           // OpExtInstImport
+    open memory_model: MemoryModel,
+    open entry_points: Vec<EntryPoint>,
+    open execution_modes: Vec<ExecutionMode>,
+    open debug_info: Vec<DebugInstruction>,
+    open annotations: Vec<Annotation>,
+    open types: Vec<TypeInstruction>,
+    open constants: Vec<ConstantInstruction>,
+    open variables: Vec<VariableInstruction>,
+    open functions: Vec<Function>,
+}
+
+expose data ModuleHeader derives [Clone] {
+    open magic: u32,                     // 0x07230203
+    open version: SpirvVersion,
+    open generator_magic: u32,           // Tool identifier
+    open bound: u32,                     // Max ID + 1
+    open schema: u32,                    // Reserved
+}
+
+expose data EntryPoint derives [Clone] {
+    open execution_model: ExecutionModel,
+    open function_id: u32,
+    open name: String,
+    open interface: Vec<u32>,            // Variable IDs
+}
+
+expose cases ExecutionModel derives [Clone, Copy] {
+    Vertex,
+    TessellationControl,
+    TessellationEvaluation,
+    Geometry,
+    Fragment,
+    GLCompute,
+    Kernel,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §3  INSTRUCTIONS AND OPERANDS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Base instruction alias
+expose data Instruction derives [Clone] {
+    open opcode: u32,
+    open operands: Vec<Operand>,
+}
+
+expose cases Operand derives [Clone] {
+    Id(u32),                             // Result ID or operand ID
+    LiteralInt(u32),                     // Integer literal
+    LiteralString(String),               // String literal
+    LiteralFloat(f32),                   // Float literal
+    LiteralComposite(Vec<Operand>),      // Composite literal
+}
+
+expose data DebugInstruction derives [Clone] {
+    open kind: DebugOp,
+    open operands: Vec<Operand>,
+}
+
+expose cases DebugOp derives [Clone, Copy] {
+    Source,
+    SourceExtension,
+    Name,
+    MemberName,
+    String,
+    Line,
+}
+
+expose data Annotation derives [Clone] {
+    open target_id: u32,
+    open kind: AnnotationOp,
+    open operands: Vec<Operand>,
+}
+
+expose cases AnnotationOp derives [Clone, Copy] {
+    Decorate,
+    MemberDecorate,
+    GroupDecorate,
+    GroupMemberDecorate,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §4  TYPE SYSTEM
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data TypeInstruction derives [Clone] {
+    open result_id: u32,
+    open kind: TypeOp,
+    open operands: Vec<Operand>,
+}
+
+expose cases TypeOp derives [Clone, Copy] {
+    Void,
+    Bool,
+    Int,
+    Float,
+    Vector,
+    Matrix,
+    Image,
+    Sampler,
+    SampledImage,
+    Array,
+    RuntimeArray,
+    Struct,
+    Pointer,
+    Function,
+    Event,
+    DeviceEvent,
+    ReserveId,
+    Queue,
+    Pipe,
+    ForwardPointer,
+}
+
+expose data ConstantInstruction derives [Clone] {
+    open result_id: u32,
+    open result_type: u32,
+    open kind: ConstantOp,
+    open operands: Vec<Operand>,
+}
+
+expose cases ConstantOp derives [Clone, Copy] {
+    True,
+    False,
+    Constant,
+    ConstantComposite,
+    ConstantSampler,
+    ConstantNull,
+    SpecConstant,
+    SpecConstantComposite,
+    SpecConstantOp,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §5  VARIABLES AND STORAGE
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data VariableInstruction derives [Clone] {
+    open result_id: u32,
+    open result_type: u32,
+    open storage_class: StorageClass,
+    open initializer: Option<u32>,       // Initial value ID
+}
+
+expose cases StorageClass derives [Clone, Copy] {
+    UniformConstant,
+    Input,
+    Uniform,
+    Output,
+    Workgroup,
+    CrossWorkgroup,
+    Private,
+    Function,
+    Generic,
+    PushConstant,
+    AtomicCounter,
+    Image,
+    StorageBuffer,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §6  FUNCTIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data Function derives [Clone] {
+    open result_id: u32,
+    open result_type: u32,
+    open function_control: FunctionControl,
+    open function_type: u32,
+    open parameters: Vec<Parameter>,
+    open blocks: Vec<Block>,
+}
+
+expose cases FunctionControl derives [Clone, Copy] {
+    None,
+    Inline,
+    DontInline,
+    Pure,
+    Const,
+}
+
+expose data Parameter derives [Clone] {
+    open result_id: u32,
+    open result_type: u32,
+}
+
+expose data Block derives [Clone] {
+    open label_id: u32,
+    open instructions: Vec<Instruction>,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §7  EXECUTION MODES
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data ExecutionMode derives [Clone] {
+    open entry_point: u32,
+    open mode: ExecutionModeKind,
+    open literals: Vec<u32>,
+}
+
+expose cases ExecutionModeKind derives [Clone, Copy] {
+    Invocations,
+    SpacingEqual,
+    SpacingFractionalEven,
+    SpacingFractionalOdd,
+    VertexOrderCw,
+    VertexOrderCcw,
+    PixelCenterInteger,
+    OriginUpperLeft,
+    OriginLowerLeft,
+    EarlyFragmentTests,
+    PointMode,
+    Xfb,
+    DepthReplacing,
+    DepthGreater,
+    DepthLess,
+    DepthUnchanged,
+    LocalSize,
+    LocalSizeHint,
+    InputPoints,
+    InputLines,
+    InputLinesAdjacency,
+    Triangles,
+    InputTrianglesAdjacency,
+    Quads,
+    Isolines,
+    OutputVertices,
+    OutputPoints,
+    OutputLineStrip,
+    OutputTriangleStrip,
+    VecTypeHint,
+    ContractionOff,
+    Initializer,
+    Finalizer,
+    SubgroupSize,
+    SubgroupsPerWorkgroup,
+    SubgroupsPerWorkgroupId,
+    LocalSizeId,
+    LocalSizeHintId,
+    PostDepthCoverage,
+    DenormPreserve,
+    DenormFlushToZero,
+    SignedZeroInfNanPreserve,
+    RoundingModeRTE,
+    RoundingModeRTZ,
+    StencilRefReplacingEXT,
+    OutputLinesNV,
+    OutputPrimitivesNV,
+    DerivativeGroupQuadsNV,
+    DerivativeGroupLinearNV,
+    OutputTrianglesNV,
+    PixelInterlockOrderedEXT,
+    PixelInterlockUnorderedEXT,
+    SampleInterlockOrderedEXT,
+    SampleInterlockUnorderedEXT,
+    ShadingRateInterlockOrderedEXT,
+    ShadingRateInterlockUnorderedEXT,
+    SharedLocalMemorySizeINTEL,
+    RoundingModeRTPINTEL,
+    RoundingModeRTNINTEL,
+    FloatingPointModeALTINTEL,
+    FloatingPointModeIEEEINTEL,
+    MaxWorkgroupSizeINTEL,
+    MaxWorkDimINTEL,
+    NoGlobalOffsetINTEL,
+    NumSIMDWorkitemsINTEL,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §8  CODE GENERATION CONTEXT
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data CodegenContext derives [Clone] {
+    open backend: SpirvBackend,
+    open module: SpirvModule,
+    open id_counter: u32,
+    open type_map: HashMap<String, u32>,      // Type name -> SPIR-V ID
+    open constant_map: HashMap<String, u32>,  // Constant name -> SPIR-V ID
+    open function_map: HashMap<String, u32>,  // Function name -> SPIR-V ID
+    open variable_map: HashMap<String, u32>,  // Variable name -> SPIR-V ID
+}
+
+impl CodegenContext {
+
+    open fn new(backend: SpirvBackend) -> CodegenContext {
+        CodegenContext {
+            backend,
+            module: SpirvModule::new(),
+            id_counter: 1, // IDs start from 1
+            type_map: HashMap::new(),
+            constant_map: HashMap::new(),
+            function_map: HashMap::new(),
+            variable_map: HashMap::new(),
+        }
+    }
+
+    fn allocate_id(self) -> u32 {
+        let id = self.id_counter;
+        self.id_counter += 1;
+        id
+    }
+
+    open fn compile_module(self, ir_module: IRModule) -> Result<SpirvModule, CodegenError> {
+        // 1. Set up module header and capabilities
+        self.setup_module_header(ir_module.name);
+
+        // 2. Process types
+        each ir_type in ir_module.types {
+            self.compile_type(ir_type)?;
+        }
+
+        // 3. Process constants
+        each ir_const in ir_module.constants {
+            self.compile_constant(ir_const)?;
+        }
+
+        // 4. Process globals
+        each ir_global in ir_module.globals {
+            self.compile_global(ir_global)?;
+        }
+
+        // 5. Process functions
+        each ir_func in ir_module.functions {
+            self.compile_function(ir_func)?;
+        }
+
+        // 6. Set up entry points
+        self.setup_entry_points();
+
+        Ok(self.module)
+    }
+
+    fn setup_module_header(self, name: String) {
+        self.module.header = ModuleHeader {
+            magic: 0x07230203,
+            version: self.backend.version,
+            generator_magic: 0x4E564E4E, // "NVNN" for Nova
+            bound: 0, // Will be set later
+            schema: 0,
+        };
+
+        self.module.capabilities = self.backend.capabilities.clone();
+        self.module.extensions = self.backend.extensions.clone();
+        self.module.memory_model = self.backend.memory_model;
+    }
+
+    fn compile_type(self, ir_type: IRType) -> Result<(), CodegenError> {
+        let id = self.allocate_id();
+        let type_inst = match ir_type {
+            IRType::Void => TypeInstruction {
+                result_id: id,
+                kind: TypeOp::Void,
+                operands: [],
+            },
+            IRType::I32 => TypeInstruction {
+                result_id: id,
+                kind: TypeOp::Int,
+                operands: [Operand::LiteralInt(32), Operand::LiteralInt(1)], // 32-bit signed
+            },
+            IRType::F32 => TypeInstruction {
+                result_id: id,
+                kind: TypeOp::Float,
+                operands: [Operand::LiteralInt(32)],
+            },
+            IRType::Vector(elem_ty, count) => {
+                let elem_id = self.get_or_create_type(elem_ty)?;
+                TypeInstruction {
+                    result_id: id,
+                    kind: TypeOp::Vector,
+                    operands: [Operand::Id(elem_id), Operand::LiteralInt(count)],
+                }
+            },
+            IRType::Array(elem_ty, size) => {
+                let elem_id = self.get_or_create_type(elem_ty)?;
+                let size_id = self.get_or_create_constant(size)?;
+                TypeInstruction {
+                    result_id: id,
+                    kind: TypeOp::Array,
+                    operands: [Operand::Id(elem_id), Operand::Id(size_id)],
+                }
+            },
+            IRType::Struct(fields) => {
+                let field_ids = fields.iter()
+                    .map(|f| self.get_or_create_type(f.clone()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let operands = field_ids.into_iter().map(Operand::Id).collect();
+                TypeInstruction {
+                    result_id: id,
+                    kind: TypeOp::Struct,
+                    operands,
+                }
+            },
+            _ => yield Err(CodegenError::UnsupportedType),
+        };
+
+        self.module.types.push(type_inst);
+        Ok(())
+    }
+
+    fn compile_constant(self, ir_const: IRConstant) -> Result<(), CodegenError> {
+        let id = self.allocate_id();
+        let const_inst = match ir_const {
+            IRConstant::Int32(val) => ConstantInstruction {
+                result_id: id,
+                result_type: self.get_type_id("i32")?,
+                kind: ConstantOp::Constant,
+                operands: [Operand::LiteralInt(val as u32)],
+            },
+            IRConstant::Float32(val) => ConstantInstruction {
+                result_id: id,
+                result_type: self.get_type_id("f32")?,
+                kind: ConstantOp::Constant,
+                operands: [Operand::LiteralFloat(val)],
+            },
+            _ => yield Err(CodegenError::UnsupportedConstant),
+        };
+
+        self.module.constants.push(const_inst);
+        Ok(())
+    }
+
+    fn compile_global(self, ir_global: IRGlobal) -> Result<(), CodegenError> {
+        let id = self.allocate_id();
+        var_inst = VariableInstruction {
+            result_id: id,
+            result_type: self.get_type_id(&ir_global.ty.into())?,
+            storage_class: StorageClass::Private, // Default
+            initializer: None,
+        };
+
+        self.module.variables.push(var_inst);
+        Ok(())
+    }
+
+    fn compile_function(self, ir_func: IRFunction) -> Result<(), CodegenError> {
+        let func_id = self.allocate_id();
+
+        // Function alias
+        let func_type_id = self.allocate_id();
+        let func_type_inst = TypeInstruction {
+            result_id: func_type_id,
+            kind: TypeOp::Function,
+            operands: [
+                Operand::Id(self.get_type_id(&ir_func.return_ty.into())?),
+            ].into_iter()
+             .chain(ir_func.params.iter().map(|p| Operand::Id(self.get_type_id(&p.ty.into()).unwrap())))
+             .collect(),
+        };
+        self.module.types.push(func_type_inst);
+
+        // Function definition
+        var func = Function {
+            result_id: func_id,
+            result_type: self.get_type_id(&ir_func.return_ty.into())?,
+            function_control: FunctionControl::None,
+            function_type: func_type_id,
+            parameters: [],
+            blocks: [],
+        };
+
+        // Parameters
+        each param in ir_func.params {
+            let param_id = self.allocate_id();
+            func.parameters.push(Parameter {
+                result_id: param_id,
+                result_type: self.get_type_id(&param.ty.into())?,
+            });
+        }
+
+        // Body
+        each ir_block in ir_func.blocks {
+            let block = self.compile_block(ir_block)?;
+            func.blocks.push(block);
+        }
+
+        self.module.functions.push(func);
+        Ok(())
+    }
+
+    fn compile_block(self, ir_block: IRBlock) -> Result<Block, CodegenError> {
+        let label_id = self.allocate_id();
+        var block = Block {
+            label_id,
+            instructions: [],
+        };
+
+        // Label instruction
+        block.instructions.push(Instruction {
+            opcode: 248, // OpLabel
+            operands: [Operand::Id(label_id)],
+        });
+
+        // Instructions
+        each ir_inst in ir_block.instructions {
+            let inst = self.compile_instruction(ir_inst)?;
+            block.instructions.push(inst);
+        }
+
+        Ok(block)
+    }
+
+    fn compile_instruction(self, ir_inst: IRInstruction) -> Result<Instruction, CodegenError> {
+        match ir_inst {
+            IRInstruction::Add(lhs, rhs) => {
+                let result_id = self.allocate_id();
+                Ok(Instruction {
+                    opcode: 128, // OpIAdd
+                    operands: [
+                        Operand::Id(result_id),
+                        Operand::Id(lhs),
+                        Operand::Id(rhs),
+                    ],
+                })
+            },
+            IRInstruction::Return(val) => {
+                Ok(Instruction {
+                    opcode: 253, // OpReturn
+                    operands: check let Some(v) = val { yield [Operand::Id(v)]} else { yield []},
+                })
+            },
+            _ => Err(CodegenError::UnsupportedInstruction),
+        }
+    }
+
+    fn get_or_create_type(self, ir_type: IRType) -> Result<u32, CodegenError> {
+        let key = ir_type.into();
+        check let Some(id) = self.type_map.get(&key) {
+            Ok(*id)
+        } else {
+            self.compile_type(ir_type)?;
+            Ok(*self.type_map.get(&key).unwrap())
+        }
+    }
+
+    fn get_type_id(self, type_name: &str) -> Result<u32, CodegenError> {
+        self.type_map.get(type_name)
+            .copied()
+            .ok_or(CodegenError::TypeNotFound(type_name.into()))
+    }
+
+    fn get_or_create_constant(self, value: i32) -> Result<u32, CodegenError> {
+        let key = format("const_i32_{}", value);
+        check let Some(id) = self.constant_map.get(&key) {
+            Ok(*id)
+        } else {
+            self.compile_constant(IRConstant::Int32(value))?;
+            Ok(*self.constant_map.get(&key).unwrap())
+        }
+    }
+
+    fn setup_entry_points(self) {
+        // For compute kernels, set up entry points
+        each func in &self.module.functions {
+            check self.backend.target == GpuTarget::Vulkan || self.backend.target == GpuTarget::OpenCL {
+                self.module.entry_points.push(EntryPoint {
+                    execution_model: ExecutionModel::GLCompute,
+                    function_id: func.result_id,
+                    name: format("main_{}", func.result_id),
+                    interface: [],
+                });
+            }
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §9  ERROR HANDLING
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose cases CodegenError derives [Clone] {
+    UnsupportedInstruction,
+    UnsupportedType,
+    UnsupportedConstant,
+    TypeNotFound(String),
+    CompilationFailed(String),
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §10  UTILITY FUNCTIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl SpirvModule {
+    open fn new() -> SpirvModule {
+        SpirvModule {
+            header: ModuleHeader::default(),
+            capabilities: [],
+            extensions: [],
+            imports: [],
+            memory_model: MemoryModel::Vulkan,
+            entry_points: [],
+            execution_modes: [],
+            debug_info: [],
+            annotations: [],
+            types: [],
+            constants: [],
+            variables: [],
+            functions: [],
+        }
+    }
+}
+
+impl ModuleHeader {
+    open fn default() -> ModuleHeader {
+        ModuleHeader {
+            magic: 0x07230203,
+            version: SpirvVersion::v1_5(),
+            generator_magic: 0,
+            bound: 0,
+            schema: 0,
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §11  INTEGRATION WITH COMPILER PIPELINE
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl SpirvBackend {
+
+    open fn new(target: GpuTarget) -> SpirvBackend {
+        let capabilities = match target {
+            GpuTarget::Vulkan => [Capability::Shader],
+            GpuTarget::OpenCL => [Capability::Kernel, Capability::Int64],
+            GpuTarget::Metal => [Capability::Shader],
+            GpuTarget::DirectX => [Capability::Shader],
+        };
+
+        SpirvBackend {
+            target,
+            version: SpirvVersion::v1_5(),
+            capabilities,
+            extensions: [],
+            memory_model: MemoryModel::Vulkan,
+        }
+    }
+
+    open fn generate_code(self, ir: IRModule) -> Result<SpirvModule, CodegenError> {
+        let context = CodegenContext::new(self);
+        context.compile_module(ir)
+    }
+
+    open fn supported_targets(self) -> Vec<String> {
+        [
+            "vulkan".into(),
+            "opencl".into(),
+            "metal".into(),
+            "directx".into(),
+        ]
+    }
+
+    open fn add_capability(self, cap: Capability) -> SpirvBackend {
+        var caps = self.capabilities;
+        caps.push(cap);
+        SpirvBackend { capabilities: caps, ..self }
+    }
+
+    open fn add_extension(self, ext: String) -> SpirvBackend {
+        var exts = self.extensions;
+        exts.push(ext);
+        SpirvBackend { extensions: exts, ..self }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §12  SPIR-V BYTECODE EMISSION
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl SpirvModule {
+
+    open fn to_binary(self) -> Vec<u8> {
+        var binary = Vec::new();
+
+        // Header
+        binary.extend_from_slice(&self.header.magic.to_le_bytes());
+        binary.extend_from_slice(&self.header.version.major.to_le_bytes());
+        binary.extend_from_slice(&self.header.version.minor.to_le_bytes());
+        binary.extend_from_slice(&self.header.generator_magic.to_le_bytes());
+        binary.extend_from_slice(&self.header.bound.to_le_bytes());
+        binary.extend_from_slice(&self.header.schema.to_le_bytes());
+
+        // Capabilities
+        each cap in &self.capabilities {
+            // OpCapability
+            let word_count = 2;
+            let opcode = (word_count << 16) | 17; // OpCapability = 17
+            binary.extend_from_slice(&opcode.to_le_bytes());
+            binary.extend_from_slice(&(*cap as u32).to_le_bytes());
+        }
+
+        // Extensions, imports, memory model, etc.
+        // ... (implementation would continue for all sections)
+
+        binary
+    }
+
+    open fn validate(self) -> Result<(), ValidationError> {
+        // SPIR-V validation logic would go here
+        // Check capabilities, alias consistency, etc.
+        Ok(())
+    }
+}
+
+expose cases ValidationError derives [Clone] {
+    InvalidHeader,
+    MissingCapability(Capability),
+    TypeMismatch,
+    InvalidInstruction,
+}

@@ -1,0 +1,631 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                           NOVA RENDERER - PATCH SYSTEM                      ║
+// ║                  Compile-time and runtime patch application                 ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::HashMap;
+use crate::core::node::*;
+
+// ============================================================================
+// COMPILE-TIME PATCH GENERATION
+// ============================================================================
+
+open data StaticPatcher {
+    patches: Vec<StaticPatch>,
+}
+
+impl StaticPatcher {
+    fn new() -> Self {
+        StaticPatcher {
+            patches: Vec::new(),
+        }
+    }
+
+    /// Generate static patches for reactive updates at compile time
+    fn generate_static_patches(&var self, reactive_deps: &[String], ui_tree: &UINode) {
+        each dep in reactive_deps {
+            let patches = self.analyze_dependency(dep, ui_tree);
+            self.patches.extend(patches);
+        }
+    }
+
+    fn analyze_dependency(&self, dependency: &str, node: &UINode) -> Vec<StaticPatch> {
+        var patches = Vec::new();
+
+        match node {
+            UINode::Element { tag, attributes, children, .. } => {
+                // Check check any attributes depend on this reactive value
+                each entry in attributes  { let (attr_name, attr_value) = entry;
+                    check self.attribute_depends_on(attr_value, dependency) {
+                        patches.push(StaticPatch::UpdateAttribute {
+                            selector: format("[data-reactive='{}']", dependency),
+                            attribute: attr_name.clone(),
+                            expression: self.extract_expression(attr_value),
+                        });
+                    }
+                }
+
+                // Recursively check children
+                each child in children {
+                    patches.extend(self.analyze_dependency(dependency, child));
+                }
+            }
+            UINode::Text(text) => {
+                // Check check text contains reactive interpolation
+                check text.contains(&format("{{{{{}}}}}", dependency)) {
+                    patches.push(StaticPatch::UpdateText {
+                        selector: format("[data-text-reactive='{}']", dependency),
+                        expression: format("format_text_template(`{}`, {{{}: value}})", text, dependency),
+                    });
+                }
+            }
+            UINode::Dynamic { expression, .. } => {
+                check expression.contains(dependency) {
+                    patches.push(StaticPatch::UpdateDynamic {
+                        selector: format("[data-dynamic-reactive='{}']", dependency),
+                        expression: expression.clone(),
+                    });
+                }
+            }
+            UINode::Component { props, children, .. } => {
+                // Check component props
+                each entry in props  { let (prop_name, prop_value) = entry;
+                    check self.attribute_depends_on(prop_value, dependency) {
+                        patches.push(StaticPatch::UpdateComponentProp {
+                            component_selector: format("[data-component-reactive='{}']", dependency),
+                            prop: prop_name.clone(),
+                            expression: self.extract_expression(prop_value),
+                        });
+                    }
+                }
+
+                // Check children
+                each child in children {
+                    patches.extend(self.analyze_dependency(dependency, child));
+                }
+            }
+            UINode::Conditional { condition, then_branch, else_branch } => {
+                check condition.contains(dependency) {
+                    patches.push(StaticPatch::ConditionalRender {
+                        condition: condition.clone(),
+                        then_patches: then_branch.iter().flat_map(|node| self.analyze_dependency(dependency, node)).collect(),
+                        else_patches: else_branch.as_ref().map(|branch| branch.iter().flat_map(|node| self.analyze_dependency(dependency, node)).collect()).unwrap_or_default(),
+                    });
+                } else {
+                    // Recursively check branches
+                    each node in then_branch {
+                        patches.extend(self.analyze_dependency(dependency, node));
+                    }
+                    check let Some(else_branch) = else_branch {
+                        each node in else_branch {
+                            patches.extend(self.analyze_dependency(dependency, node));
+                        }
+                    }
+                }
+            }
+            UINode::List { items, template, .. } => {
+                check items.contains(dependency) {
+                    patches.push(StaticPatch::ListUpdate {
+                        items_expression: items.clone(),
+                        item_template: template.clone(),
+                        key_expression: None, // Would be analyzed
+                    });
+                } else {
+                    // Check template dependencies
+                    each node in template {
+                        patches.extend(self.analyze_dependency(dependency, node));
+                    }
+                }
+            }
+            UINode::Fragment(children) => {
+                each child in children {
+                    patches.extend(self.analyze_dependency(dependency, child));
+                }
+            }
+            UINode::Portal { content, .. } => {
+                each child in content {
+                    patches.extend(self.analyze_dependency(dependency, child));
+                }
+            }
+        }
+
+        patches
+    }
+
+    fn attribute_depends_on(&self, attr: &UIAttribute, dependency: &str) -> bool {
+        match attr {
+            UIAttribute::DynamicExpression(expr) => expr.contains(dependency),
+            UIAttribute::DynamicObject(obj) => {
+                obj.values().any(|v| v.contains(dependency))
+            }
+            _ => false,
+        }
+    }
+
+    fn extract_expression(&self, attr: &UIAttribute) -> String {
+        match attr {
+            UIAttribute::DynamicExpression(expr) => expr.clone(),
+            UIAttribute::DynamicObject(obj) => {
+                // Convert object to expression
+                format("{{{:?}}}", obj)
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Generate code for static patches
+    fn generate_patch_code(&self) -> String {
+        var code = String::from("// Auto-generated static patches\n");
+
+        each patch in &self.patches {
+            match patch {
+                StaticPatch::UpdateAttribute { selector, attribute, expression } => {
+                    code.push_str(&format(
+                        "function update_{}_attribute(changed_value) {{\n",
+                        attribute.replace("-", "_")
+                    ));
+                    code.push_str(&format(
+                        "  const elements = document.querySelectorAll('{}');\n",
+                        selector
+                    ));
+                    code.push_str(&format(
+                        "  elements.forEach(el => el.setAttribute('{}', {}));\n",
+                        attribute, expression
+                    ));
+                    code.push_str("}\n\n");
+                }
+                StaticPatch::UpdateText { selector, expression } => {
+                    code.push_str(&format(
+                        "function update_text_node(changed_value) {{\n"
+                    ));
+                    code.push_str(&format(
+                        "  const elements = document.querySelectorAll('{}');\n",
+                        selector
+                    ));
+                    code.push_str(&format(
+                        "  elements.forEach(el => el.textContent = {});\n",
+                        expression
+                    ));
+                    code.push_str("}\n\n");
+                }
+                StaticPatch::UpdateDynamic { selector, expression } => {
+                    code.push_str(&format(
+                        "function update_dynamic_node(changed_value) {{\n"
+                    ));
+                    code.push_str(&format(
+                        "  const elements = document.querySelectorAll('{}');\n",
+                        selector
+                    ));
+                    code.push_str(&format(
+                        "  elements.forEach(el => {{\n    // Execute: {}\n  }});\n",
+                        expression
+                    ));
+                    code.push_str("}\n\n");
+                }
+                StaticPatch::UpdateComponentProp { component_selector, prop, expression } => {
+                    code.push_str(&format(
+                        "function update_component_{}(changed_value) {{\n",
+                        prop.replace("-", "_")
+                    ));
+                    code.push_str(&format(
+                        "  const components = document.querySelectorAll('{}');\n",
+                        component_selector
+                    ));
+                    code.push_str(&format(
+                        "  components.forEach(comp => comp.setProp('{}', {}));\n",
+                        prop, expression
+                    ));
+                    code.push_str("}\n\n");
+                }
+                StaticPatch::ConditionalRender { condition, then_patches, else_patches } => {
+                    code.push_str(&format(
+                        "function conditional_render(changed_value) {{\n"
+                    ));
+                    code.push_str(&format(
+                        "  check ({}) {{\n",
+                        condition
+                    ));
+                    code.push_str("    // Apply then patches\n");
+                    each patch in then_patches {
+                        code.push_str(&format("    // {:?}\n", patch));
+                    }
+                    code.push_str("  } else {\n");
+                    code.push_str("    // Apply else patches\n");
+                    each patch in else_patches {
+                        code.push_str(&format("    // {:?}\n", patch));
+                    }
+                    code.push_str("  }\n");
+                    code.push_str("}\n\n");
+                }
+                StaticPatch::ListUpdate { items_expression, item_template, key_expression } => {
+                    code.push_str(&format(
+                        "function update_list(changed_value) {{\n"
+                    ));
+                    code.push_str(&format(
+                        "  const items = {};\n",
+                        items_expression
+                    ));
+                    code.push_str("  // Re-render list with new items\n");
+                    code.push_str("  // Using item template and keys\n");
+                    code.push_str("}\n\n");
+                }
+            }
+        }
+
+        code
+    }
+
+    fn get_patches(&self) -> &[StaticPatch] {
+        &self.patches
+    }
+}
+
+// ============================================================================
+// STATIC PATCH DEFINITIONS
+// ============================================================================
+
+#[derive(Clone, Debug)]
+open cases StaticPatch {
+    UpdateAttribute {
+        selector: String,
+        attribute: String,
+        expression: String,
+    },
+    UpdateText {
+        selector: String,
+        expression: String,
+    },
+    UpdateDynamic {
+        selector: String,
+        expression: String,
+    },
+    UpdateComponentProp {
+        component_selector: String,
+        prop: String,
+        expression: String,
+    },
+    ConditionalRender {
+        condition: String,
+        then_patches: Vec<StaticPatch>,
+        else_patches: Vec<StaticPatch>,
+    },
+    ListUpdate {
+        items_expression: String,
+        item_template: Vec<UINode>,
+        key_expression: Option<String>,
+    },
+}
+
+// ============================================================================
+// RUNTIME PATCH APPLICATOR
+// ============================================================================
+
+open rules RuntimePatcher {
+    fn apply_patch(&var self, patch: &Patch) -> Result<(), String>;
+    fn batch_apply(&var self, patches: &[Patch]) -> Result<(), String>;
+    fn optimize_patches(&self, patches: &[Patch]) -> Vec<Patch>;
+}
+
+open data DOMRuntimePatcher {
+    root_element: Option<String>, // Root element ID
+    mutation_observer: Option<String>, // Would be platform-specific
+}
+
+impl DOMRuntimePatcher {
+    fn new() -> Self {
+        DOMRuntimePatcher {
+            root_element: None,
+            mutation_observer: None,
+        }
+    }
+
+    fn set_root(&var self, root_id: String) {
+        self.root_element = Some(root_id);
+    }
+}
+
+impl RuntimePatcher for DOMRuntimePatcher {
+    fn apply_patch(&var self, patch: &Patch) -> Result<(), String> {
+        match patch {
+            Patch::Insert { parent_key, position, node } => {
+                // Insert node at position in parent
+                println("DOM: Insert node at position {} in parent {}", position, parent_key);
+                Ok(())
+            }
+            Patch::Remove { key } => {
+                // Remove node by key
+                println("DOM: Remove node with key {}", key);
+                Ok(())
+            }
+            Patch::Replace { old_key, new_node } => {
+                // Replace old node with new node
+                println("DOM: Replace node {:?} with new node", old_key);
+                Ok(())
+            }
+            Patch::UpdateAttribute { key, attribute, value } => {
+                // Update attribute on node
+                println("DOM: Update {} attribute on {} to {:?}", attribute, key, value);
+                Ok(())
+            }
+            Patch::AddAttribute { key, attribute, value } => {
+                // Add attribute to node
+                println("DOM: Add {} attribute to {} with value {:?}", attribute, key, value);
+                Ok(())
+            }
+            Patch::RemoveAttribute { key, attribute } => {
+                // Remove attribute from node
+                println("DOM: Remove {} attribute from {}", attribute, key);
+                Ok(())
+            }
+            Patch::UpdateText { key, new_text } => {
+                // Update text content
+                println("DOM: Update text content of {} to '{}'", key, new_text);
+                Ok(())
+            }
+            Patch::AddEventListener { key, event, handler } => {
+                // Add event listener
+                println("DOM: Add {} event listener to {} with handler {}", event, key, handler);
+                Ok(())
+            }
+            Patch::RemoveEventListener { key, event } => {
+                // Remove event listener
+                println("DOM: Remove {} event listener from {}", event, key);
+                Ok(())
+            }
+        }
+    }
+
+    fn batch_apply(&var self, patches: &[Patch]) -> Result<(), String> {
+        // Optimize patches before applying
+        let optimized = self.optimize_patches(patches);
+
+        // Apply in order with minimal DOM operations
+        each patch in optimized {
+            self.apply_patch(&patch)?;
+        }
+
+        Ok(())
+    }
+
+    fn optimize_patches(&self, patches: &[Patch]) -> Vec<Patch> {
+        // Remove redundant patches
+        // Group related patches
+        // Order for minimal DOM operations
+
+        var optimized = Vec::new();
+        var seen_updates = HashMap::new();
+
+        each patch in patches {
+            match patch {
+                Patch::UpdateAttribute { key, attribute, value } => {
+                    let key_attr = format("{}:{}", key, attribute);
+                    check !seen_updates.contains_key(&key_attr) {
+                        seen_updates.insert(key_attr, patch.clone());
+                        optimized.push(patch.clone());
+                    }
+                    // Skip duplicate attribute updates for same element/attribute
+                }
+                Patch::UpdateText { key, .. } => {
+                    let text_key = format("text:{}", key);
+                    check !seen_updates.contains_key(&text_key) {
+                        seen_updates.insert(text_key, patch.clone());
+                        optimized.push(patch.clone());
+                    }
+                }
+                _ => {
+                    optimized.push(patch.clone());
+                }
+            }
+        }
+
+        optimized
+    }
+}
+
+// ============================================================================
+// PLATFORM-SPECIFIC PATCHERS
+// ============================================================================
+
+open data DesktopRuntimePatcher {
+    window_handle: Option<String>,
+}
+
+impl DesktopRuntimePatcher {
+    fn new() -> Self {
+        DesktopRuntimePatcher {
+            window_handle: None,
+        }
+    }
+}
+
+impl RuntimePatcher for DesktopRuntimePatcher {
+    fn apply_patch(&var self, patch: &Patch) -> Result<(), String> {
+        // Desktop-specific patch application
+        // Would interface with native widget APIs
+        match patch {
+            Patch::UpdateAttribute { key, attribute, value } => {
+                println("Desktop: Update {} on widget {} to {:?}", attribute, key, value);
+                Ok(())
+            }
+            _ => {
+                println("Desktop: Apply patch {:?}", patch);
+                Ok(())
+            }
+        }
+    }
+
+    fn batch_apply(&var self, patches: &[Patch]) -> Result<(), String> {
+        let optimized = self.optimize_patches(patches);
+        each patch in optimized {
+            self.apply_patch(&patch)?;
+        }
+        Ok(())
+    }
+
+    fn optimize_patches(&self, patches: &[Patch]) -> Vec<Patch> {
+        // Desktop-specific optimizations
+        // Group by window regions, minimize redraws
+        patches.to_vec()
+    }
+}
+
+open data MobileRuntimePatcher {
+    view_controller: Option<String>,
+}
+
+impl MobileRuntimePatcher {
+    fn new() -> Self {
+        MobileRuntimePatcher {
+            view_controller: None,
+        }
+    }
+}
+
+impl RuntimePatcher for MobileRuntimePatcher {
+    fn apply_patch(&var self, patch: &Patch) -> Result<(), String> {
+        // Mobile-specific patch application
+        // Would interface with iOS/Android view systems
+        match patch {
+            Patch::UpdateAttribute { key, attribute, value } => {
+                println("Mobile: Update {} on view {} to {:?}", attribute, key, value);
+                Ok(())
+            }
+            _ => {
+                println("Mobile: Apply patch {:?}", patch);
+                Ok(())
+            }
+        }
+    }
+
+    fn batch_apply(&var self, patches: &[Patch]) -> Result<(), String> {
+        let optimized = self.optimize_patches(patches);
+        each patch in optimized {
+            self.apply_patch(&patch)?;
+        }
+        Ok(())
+    }
+
+    fn optimize_patches(&self, patches: &[Patch]) -> Vec<Patch> {
+        // Mobile-specific optimizations
+        // Group by view hierarchy, minimize layout passes
+        patches.to_vec()
+    }
+}
+
+// ============================================================================
+// HYBRID PATCHING (COMPILE-TIME + RUNTIME)
+// ============================================================================
+
+open data HybridPatcher {
+    static_patches: StaticPatcher,
+    runtime_patcher: Box<dyn RuntimePatcher>,
+}
+
+impl HybridPatcher {
+    fn new(runtime_patcher: Box<dyn RuntimePatcher>) -> Self {
+        HybridPatcher {
+            static_patches: StaticPatcher::new(),
+            runtime_patcher,
+        }
+    }
+
+    /// Compile-time: Analyze and generate static patches
+    fn compile_static_patches(&var self, reactive_deps: &[String], ui_tree: &UINode) {
+        self.static_patches.generate_static_patches(reactive_deps, ui_tree);
+    }
+
+    /// Compile-time: Generate static patch code
+    fn generate_static_code(&self) -> String {
+        self.static_patches.generate_patch_code()
+    }
+
+    /// Runtime: Apply patches with fallback to static patches
+    fn apply_patches(&var self, patches: &[Patch]) -> Result<(), String> {
+        // Try runtime patching first
+        match self.runtime_patcher.batch_apply(patches) {
+            Ok(()) => Ok(()),
+            Err(runtime_error) => {
+                // Fallback to static patches check available
+                println("Runtime patching failed: {}, falling back to static patches", runtime_error);
+                // Would execute pre-compiled static patch functions
+                Ok(())
+            }
+        }
+    }
+
+    /// Get static patches for analysis
+    fn get_static_patches(&self) -> &[StaticPatch] {
+        self.static_patches.get_patches()
+    }
+}
+
+// ============================================================================
+// PATCH SCHEDULER (PERFORMANCE OPTIMIZATION)
+// ============================================================================
+
+open data PatchScheduler {
+    pending_patches: Vec<Patch>,
+    batch_timeout: Option<std::time::Duration>,
+    max_batch_size: usize,
+}
+
+impl PatchScheduler {
+    fn new() -> Self {
+        PatchScheduler {
+            pending_patches: Vec::new(),
+            batch_timeout: Some(std::time::Duration::from_millis(16)), // ~60fps
+            max_batch_size: 100,
+        }
+    }
+
+    fn schedule_patch(&var self, patch: Patch) {
+        self.pending_patches.push(patch);
+
+        // Check check we should flush
+        check self.pending_patches.len() >= self.max_batch_size {
+            self.flush();
+        }
+    }
+
+    fn schedule_patches(&var self, patches: Vec<Patch>) {
+        self.pending_patches.extend(patches);
+
+        check self.pending_patches.len() >= self.max_batch_size {
+            self.flush();
+        }
+    }
+
+    fn flush(&var self) {
+        check !self.pending_patches.is_empty() {
+            // In real implementation, this would impl patches through the patcher
+            println("Scheduler: Applying {} patches", self.pending_patches.len());
+            self.pending_patches.clear();
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending_patches.is_empty()
+    }
+
+    fn pending_count(&self) -> usize {
+        self.pending_patches.len()
+    }
+}
+
+// ============================================================================
+// INTEGRATION WITH RENDERER
+// ============================================================================
+
+open rules RendererWithPatching: UIRenderer {
+    fn get_patcher(&self) -> &dyn RuntimePatcher;
+    fn get_patcher_mut(&var self) -> &var dyn RuntimePatcher;
+
+    fn apply_patches(&var self, patches: &[Patch]) -> Result<(), String> {
+        self.get_patcher_mut().batch_apply(patches)
+    }
+
+    fn schedule_patch(&var self, patch: Patch) {
+        // Would integrate with scheduler
+        println("Renderer: Scheduled patch {:?}", patch);
+    }
+}

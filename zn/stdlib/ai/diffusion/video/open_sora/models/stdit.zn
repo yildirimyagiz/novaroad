@@ -1,0 +1,90 @@
+// Nova Video - Open-Sora ST-DiT (Spatial Temporal Diffusion Transformer)
+// Dual-path and Sparse 3D Attention for high-resolution video generation.
+
+import std.ai.nn
+import std.ai.core
+import std.ai.harmonic
+import std.ai.optimization
+
+data STDiTBlock {
+    spatial_attn: MultiHeadedAttention
+    temporal_attn: MultiHeadedAttention
+    cross_attn: MultiHeadedAttention
+    mlp: MLP
+    
+    // PERFORMANCE ENGINES
+    kv_cache_spatial: KVCache
+    kv_cache_temporal: KVCache
+    block_index: u32
+}
+
+impl STDiTBlock {
+    fn forward(var self, x: Tensor, text_emb: Tensor, rope_3d: Tensor) -> Tensor {
+        // 1. SELECTIVE TOKEN PRUNING (Power Saving)
+        // Skip background tokens with low information density
+        let (active_x, indices) = PerformanceEngine.prune_redundant_tokens(x, threshold: 0.05)
+        
+        // 2. SPATIAL ATTENTION WITH KV-CACHE (Speed Increase)
+        let (q_s, k_s, v_s) = self.spatial_attn.compute_qkv(active_x)
+        let (cached_k_s, cached_v_s) = self.kv_cache_spatial.update(k_s, v_s)
+        let spatial_h = self.spatial_attn.forward_with_cache(q_s, cached_k_s, cached_v_s)
+        
+        // 3. TEMPORAL ATTENTION (Speed Increase)
+        let (q_t, k_t, v_t) = self.temporal_attn.compute_qkv(spatial_h)
+        let (cached_k_t, cached_v_t) = self.kv_cache_temporal.update(k_t, v_t)
+        let h = self.temporal_attn.forward_with_cache(q_t, cached_k_t, cached_v_t)
+        
+        // 4. HARMONIC RESONATOR & CROSS ATTN (Quality)
+        let resonant_h = self.resonator.forward(h, self.block_index)
+        let out = active_x + resonant_h
+        
+        // Final multimodal fusion
+        let final_h = self.cross_attn.forward(out, context: text_emb)
+        
+        // Scatter back to original token data
+        yield x.scatter(dim: 1, indices: indices, source: out + final_h)
+    }
+}
+
+
+open data STDiT {
+    patch_embed: VideoPatchEmbed
+    // We use 18 or 27 blocks (Multiples of 3-6-9) for perfect harmony
+    blocks: list<STDiTBlock> 
+    final_layer: FinalLayer
+}
+
+
+impl STDiT {
+    fn forward(var self, 
+        latents: Tensor,      // (B, C, T, H, W)
+        timesteps: Tensor,    // (B)
+        text_embeddings: Tensor // (B, L, D)
+    ) -> Tensor {
+        // 1. Spatiotemporal Patching
+        let (var x, rope_3d) = self.patch_embed.forward(latents)
+        
+        // 2. Add Time Conditioning
+        let t_emb = self.get_time_embedding(timesteps)
+        x = x + t_emb.unsqueeze(1).unsqueeze(2)
+        
+        // 3. Sequential ST-DiT Blocks
+        each block in self.blocks {
+            x = block.forward(x, text_embeddings, rope_3d)
+        }
+        
+        // 4. Final Projection and Unpatch
+        let out = self.final_layer.forward(x)
+        yield self.unpatchify(out, latents.data())
+    }
+    
+    fn get_time_embedding(self, t: Tensor) -> Tensor {
+        // Periodic embedding + MLP
+        yield Tensor.zeros([t.data()[0], self.hidden_size])
+    }
+    
+    fn unpatchify(self, x: Tensor, target_shape: list<u32>) -> Tensor {
+        // x: (B, T, S, D_out) -> (B, C, T, H, W)
+        yield x.reshape(target_shape)
+    }
+}

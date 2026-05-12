@@ -1,0 +1,976 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  NOVA PARSER v10.0 - Clean Implementation                                    ║
+// ║  Uses tokens.zn Token struct properly                                         ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use errors::DiagnosticBuilder;
+use span::{Span, Spanned};
+use std::collections::HashMap;
+use tokens::{Token, TokenKind};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §1  TYPE EXPRESSIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Type expression for parsing
+space cases TypeExpr {
+    Prim(String),        // Primitive type: i64, f64, bool
+    Ref(Box<TypeExpr>, bool),  // Reference: &T or &var T
+    Tuple(Vec<TypeExpr>), // Tuple: (T, U)
+    Array(Box<TypeExpr>, usize), // Array: [T; N]
+    Data(String, Vec<TypeExpr>), // Data type: Data<T, U>
+    Tensor(Box<TypeExpr>, Vec<usize>), // Tensor: tensor<f32>[batch, seq]
+    Quantity(Box<TypeExpr>, String), // Unit algebra: 5.kg
+    Unknown,            // Unknown type
+}
+
+/// Attribute for parsing #[name(args)]
+space data Attr {
+    open name: String,
+    open args: Vec<Expr>,
+    open span: Span,
+}
+
+/// Generic parameter <T: Clone, U: Debug>
+space data GenericParam {
+    open name: String,
+    open constraints: Vec<TypeExpr>,
+}
+
+/// Measured literal for unit algebra: "5.0:kg"
+space data MeasuredLit {
+    open value: f64,
+    open unit: String,
+}
+
+/// Flow construct for reactive programming
+space cases FlowConstruct {
+    Signal(String),
+    Stream(String),
+    Spawn(Box<Expr>),
+}
+
+/// Contract for formal verification
+space data Contract {
+    open pre_conditions: Vec<Expr>,
+    open post_conditions: Vec<Expr>,
+    open invariants: Vec<Expr>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §2  AST NODES
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Program {
+    open modules: Vec<Module>,
+    open items:   Vec<Item>,
+}
+
+open data Module {
+    open name:   Ident,
+    open items:  Vec<Item>,
+}
+
+open data Ident {
+    open name: String,
+}
+
+open cases Visibility {
+    Public,
+    Private,
+    Restricted(String),
+}
+
+// ── Declaration Items ───────────────────────────────────────────────
+
+open data FnItem {
+    open vis:       Visibility,
+    open name:      Ident,
+    open generics:  Vec<GenericParam>,
+    open params:    Vec<Param>,
+    open return_ty: Option<TypeExpr>,
+    open contract:  Option<Contract>,
+    open body:      Block,
+    open is_async:  bool,
+    open span:      Span,
+}
+
+open data DataItem {
+    open vis:    Visibility,
+    open name:   Ident,
+    open fields: Vec<Field>,
+    open span:   Span,
+}
+
+open data CasesItem {
+    open vis:      Visibility,
+    open name:     Ident,
+    open cases:    Vec<Case>,
+    open span:     Span,
+}
+
+open data RulesItem {
+    open vis:      Visibility,
+    open name:     Ident,
+    open rules:    Vec<Rule>,
+    open span:     Span,
+}
+
+open data AliasItem {
+    open vis:       Visibility,
+    open name:      Ident,
+    open params:    Vec<GenericParam>,
+    open target:    TypeExpr,
+    open span:      Span,
+}
+
+open data ImplItem {
+    open target: TypeExpr,
+    open items:  Vec<Item>,
+    open span:   Span,
+}
+
+open data UseItem {
+    open path:   Path,
+    open alias:  Option<Ident>,
+    open span:   Span,
+}
+
+open data Param {
+    open vis:   Visibility,
+    open name:  Ident,
+    open ty:    TypeExpr,
+    open span:  Span,
+}
+
+open data Field {
+    open vis:   Visibility,
+    open name:  Ident,
+    open ty:    TypeExpr,
+    open span:  Span,
+}
+
+open data Case {
+    open name:   Ident,
+    open fields: Vec<Field>,
+    open span:   Span,
+}
+
+open data Rule {
+    open name:     Ident,
+    open pattern: Pat,
+    open body:    Expr,
+    open span:    Span,
+}
+
+// ── Statements ─────────────────────────────────────────────────────
+
+open data Stmt {
+    open span: Span,
+    open kind: StmtKind,
+}
+
+open cases StmtKind {
+    Let(LetStmt),
+    Var(VarStmt),
+    Expr(Expr),
+    Return(Option<Expr>),
+    Break,
+    Continue,
+    Abort,
+    Yield(Option<Expr>),
+    Check(Expr),
+    Match(MatchStmt),
+    Loop(LoopStmt),
+    While(WhileStmt),
+    For(ForStmt),
+    Block(Block),
+    Empty,
+}
+
+open data LetStmt {
+    open name: Ident,
+    open ty:   Option<TypeExpr>,
+    open init: Expr,
+    open span: Span,
+}
+
+open data VarStmt {
+    open name: Ident,
+    open ty:   Option<TypeExpr>,
+    open init: Expr,
+    open span: Span,
+}
+
+open data MatchStmt {
+    open expr:   Expr,
+    open arms:   Vec<MatchArm>,
+    open span:   Span,
+}
+
+open data MatchArm {
+    open pat:  Pat,
+    open body: Expr,
+    open span: Span,
+}
+
+open data LoopStmt {
+    open body: Block,
+    open span: Span,
+}
+
+open data WhileStmt {
+    open cond: Expr,
+    open body: Block,
+    open span: Span,
+}
+
+open data ForStmt {
+    open pat:  Pat,
+    open iter: Expr,
+    open body: Block,
+    open span: Span,
+}
+
+// ── Expressions ────────────────────────────────────────────────────
+
+open data Expr {
+    open span: Span,
+    open kind: ExprKind,
+}
+
+open cases ExprKind {
+    Lit(Literal),
+    Ident(Ident),
+    Binary(BinOp, Box<Expr>, Box<Expr>),
+    Unary(UnOp, Box<Expr>),
+    Call(Box<Expr>, Vec<Expr>),
+    Method(Box<Expr>, Ident, Vec<Expr>),
+    Field(Box<Expr>, Ident),
+    Index(Box<Expr>, Box<Expr>),
+    If(IfExpr),
+    Match(MatchExpr),
+    Lambda(Vec<Param>, Box<Expr>),
+    Block(Block),
+    Flow(FlowConstruct),
+    Measured(MeasuredLit),
+    Tensor(TensorLit),
+    Unit(UnitLit),
+}
+
+open data IfExpr {
+    open cond:  Box<Expr>,
+    open then:  Block,
+    open else_: Option<Box<Expr>>,
+    open span:  Span,
+}
+
+open data MatchExpr {
+    open expr: Box<Expr>,
+    open arms: Vec<MatchArm>,
+    open span: Span,
+}
+
+open data Block {
+    open stmts: Vec<Stmt>,
+    open expr:  Option<Expr>,
+    open span:  Span,
+}
+
+// ── Patterns ───────────────────────────────────────────────────────
+
+open data Pat {
+    open span: Span,
+    open kind: PatKind,
+}
+
+open cases PatKind {
+    Wild,
+    Binding(Ident),
+    Literal(Literal),
+    Tuple(Vec<Pat>),
+    Struct(Ident, Vec<(Ident, Pat)>),
+    Enum(Ident, Vec<Pat>),
+    Ref(Box<Pat>),
+    Or(Vec<Pat>),
+}
+
+// ── Literals ───────────────────────────────────────────────────────
+
+open data Literal {
+    open span: Span,
+    open kind: LitKind,
+}
+
+open cases LitKind {
+    Int(i64),
+    Float(f64),
+    String(String),
+    Bool(bool),
+    Char(char),
+}
+
+open data TensorLit {
+    open base_type: TypeExpr,
+    open shape:     Vec<usize>,
+    open span:      Span,
+}
+
+open data UnitLit {
+    open value: f64,
+    open unit:  String,
+    open span:  Span,
+}
+
+// ── Types (Legacy compatibility) ─────────────────────────────────────
+
+open cases Type {
+    Path(Path),
+    Tuple(Vec<Type>),
+    Array(Box<Type>, ArrayLen),
+    Slice(Box<Type>),
+    Fn(FnType),
+    Ptr(Box<Type>),
+    Ref(Box<Type>),
+    Option(Box<Type>),
+    Result(Box<Type>, Box<Type>),
+    Flow(Box<Type>),
+    Vec(Box<Type>),
+    Bool, I32, I64, F32, F64, StringTy,
+}
+
+open cases ArrayLen { yield Lit(usize), Ident(Ident) }
+open data FnType    { open params: Vec<Type>, open return_ty: Box<Type> }
+open data Path      { open segments: Vec<Ident> }
+
+// ── Operators ───────────────────────────────────────────────────────
+
+open cases BinOp {
+    Add, Sub, Mul, Div, Mod, Pow,
+    Eq, Ne, Lt, Le, Gt, Ge,
+    And, Or,
+    BitAnd, BitOr, BitXor,
+    Shl, Shr,
+}
+
+open cases UnOp { Not, Neg, BitNot }
+
+// ── Items ───────────────────────────────────────────────────────────
+
+open cases Item {
+    Fn(FnItem),
+    Data(DataItem),
+    Cases(CasesItem),
+    Rules(RulesItem),
+    Alias(AliasItem),
+    Impl(ImplItem),
+    Use(UseItem),
+    Struct(StructItem),
+    Enum(EnumItem),
+    Trait(TraitItem),
+}
+
+open data StructItem {
+    open vis:    Visibility,
+    open name:   Ident,
+    open fields: Vec<Field>,
+    open span:   Span,
+}
+
+open data EnumItem {
+    open vis:     Visibility,
+    open name:    Ident,
+    open variants: Vec<Variant>,
+    open span:    Span,
+}
+
+open data Variant {
+    open name:   Ident,
+    open fields: Vec<Field>,
+    open span:   Span,
+}
+
+open data TraitItem {
+    open vis:    Visibility,
+    open name:   Ident,
+    open items:  Vec<Item>,
+    open span:   Span,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §3  PARSER ENGINE
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Parser {
+    open tokens: Vec<Spanned<Token>>,
+    open pos:    usize,
+    open errors: Vec<DiagnosticBuilder>,
+}
+
+impl Parser {
+    fn new(tokens: Vec<Token>) -> Parser {
+        // Convert Vec<Token> to Vec<Spanned<Token>>
+        var spanned_tokens = [];
+        each token in tokens {
+            let span = Span::dummy(); // TODO: proper span calculation
+            spanned_tokens.push(Spanned::new(token, span));
+        }
+        Parser { tokens: spanned_tokens, pos: 0, errors: [] };
+    }
+
+    // ── Cursor Helpers ────────────────────────────────────────────────────
+
+    fn peek(&self) -> Option<&Spanned<Token>> {
+        yield self.tokens.get(self.pos);
+    }
+
+    fn advance(&var self) -> Option<&Spanned<Token>> {
+        check !self.at_end() {
+            self.pos += 1;
+        }
+        yield self.tokens.get(self.pos - 1);
+    }
+
+    fn at_end(&self) -> bool {
+        self.pos >= self.tokens.len() || 
+        match self.peek() {
+            Some(spanned) => spanned.node.kind == TokenKind::Eof,
+            None => true,
+        }
+    }
+
+    fn current_span(&self) -> Span {
+        match self.peek() {
+            Some(spanned) => spanned.span,
+            None => Span::dummy(),
+        }
+    }
+
+    fn error(&self, msg: String) -> DiagnosticBuilder {
+        let span = self.current_span();
+        DiagnosticBuilder::new(span, msg)
+    }
+
+    // ── Token Helpers ────────────────────────────────────────────────────
+
+    fn check_token(&self, kind: TokenKind) -> bool {
+        match self.peek() {
+            Some(Spanned { node: token, .. }) => token.kind == kind,
+            None => false,
+        }
+    }
+
+    fn peek_token(&self, kind: TokenKind) -> Option<&Spanned<Token>> {
+        match self.peek() {
+            Some(spanned) if spanned.node.kind == kind => Some(spanned),
+            _ => None,
+        }
+    }
+
+    fn expect_token(&var self, kind: TokenKind) -> Result<Spanned<Token>, DiagnosticBuilder> {
+        match self.peek() {
+            Some(spanned) if spanned.node.kind == kind => {
+                self.advance();
+                Ok(spanned.clone())
+            }
+            Some(spanned) => {
+                let token = &spanned.node;
+                self.error(format!("expected {:?}, found {:?} '{}'", kind, token.kind, token.lexeme))
+            }
+            None => self.error(format!("expected {:?}, found EOF", kind)),
+        }
+    }
+
+    fn eat_token(&var self, kind: TokenKind) -> Option<Spanned<Token>> {
+        match self.peek() {
+            Some(spanned) if spanned.node.kind == kind => {
+                self.advance();
+                Some(spanned.clone())
+            }
+            _ => None,
+        }
+    }
+
+    // ── Entry Point ─────────────────────────────────────────────────────
+
+    fn parse_program(&var self) -> Result<Program, Vec<DiagnosticBuilder>> {
+        var modules = [];
+        var items   = [];
+
+        loop {
+            check self.at_end() { abort; }
+
+            check self.peek_token(TokenKind::Mod) {
+                modules.push(self.parse_module()?);
+            } else {
+                items.push(self.parse_item()?);
+            }
+        }
+
+        check self.errors.is_empty() {
+            Ok(Program { modules, items });
+        }
+        Err(self.errors.clone());
+    }
+
+    fn parse_module(&var self) -> Result<Module, ()> {
+        self.expect_token(TokenKind::Mod)?;
+        let name = self.parse_ident()?;
+        self.expect_token(TokenKind::LBrace)?;
+
+        var items = [];
+        loop {
+            check self.check_token(TokenKind::RBrace) || self.at_end() { abort; }
+            items.push(self.parse_item()?);
+        }
+
+        self.expect_token(TokenKind::RBrace)?;
+        Ok(Module { name, items });
+    }
+
+    // ── Item Parsing ────────────────────────────────────────────────
+
+    fn parse_item(&var self) -> Result<Item, ()> {
+        let vis = self.parse_visibility();
+
+        // v10 Intent-First parsing: try new keywords first
+        match self.peek() {
+            Some(Spanned { node: token, .. }) => match token.kind {
+                TokenKind::Data  => yield Ok(Item::Data(self.parse_data_item(vis)?)),
+                TokenKind::Cases => yield Ok(Item::Cases(self.parse_cases_item(vis)?)),
+                TokenKind::Rules => yield Ok(Item::Rules(self.parse_rules_item(vis)?)),
+                TokenKind::Alias => yield Ok(Item::Alias(self.parse_alias_item(vis)?)),
+                TokenKind::Fn    => yield Ok(Item::Fn(self.parse_fn_item(vis)?)),
+                TokenKind::Async => yield Ok(Item::Fn(self.parse_async_fn_item(vis)?)),
+                TokenKind::Skill => yield Ok(Item::Impl(self.parse_impl_item()?)), // Skill -> Impl
+                TokenKind::Use   => yield Ok(Item::Use(self.parse_use_item()?)),
+
+                /* Legacy compat: old syntax accepted, lowered to v10 */
+                TokenKind::Struct => yield Ok(Item::Struct(self.parse_struct_compat(vis)?)),
+                TokenKind::Enum   => yield Ok(Item::Enum(self.parse_enum_compat(vis)?)),
+                TokenKind::Trait  => yield Ok(Item::Trait(self.parse_trait_compat(vis)?)),
+
+                _ => yield self.error("expected item"),
+            },
+            None => yield self.error("expected item"),
+        }
+    }
+
+    fn parse_visibility(&var self) -> Visibility {
+        match self.peek() {
+            Some(Spanned { node: token, .. }) => match token.kind {
+                TokenKind::Pub => {
+                    self.advance();
+                    Visibility::Public
+                }
+                _ => Visibility::Private,
+            },
+            None => Visibility::Private,
+        }
+    }
+
+    fn parse_ident(&var self) -> Result<Ident, DiagnosticBuilder> {
+        match self.peek() {
+            Some(Spanned { node: token, .. }) => match &token.kind {
+                TokenKind::Ident(name) => {
+                    self.advance();
+                    Ok(Ident { name: name.clone() })
+                }
+                _ => self.error("expected identifier"),
+            },
+            None => self.error("expected identifier"),
+        }
+    }
+
+    // ── Advanced Parsing Methods (from core/parser.zn) ───────────────────────
+
+    fn parse_type(&var self) -> Result<TypeExpr, DiagnosticBuilder> {
+        yield self.parse_type_inner();
+    }
+
+    fn parse_type_inner(&var self) -> Result<TypeExpr, DiagnosticBuilder> {
+        // Reference: &T or &var T
+        check self.check_token(TokenKind::BitAnd) {
+            self.advance();
+            let mutable = self.check_token(TokenKind::Var);
+            let inner = self.parse_type()?;
+            yield TypeExpr::Ref(Box::new(inner), mutable);
+        }
+
+        // Tensor type: tensor<f32>[batch, seq]
+        check self.check_token(TokenKind::Tensor) {
+            self.advance();
+            self.expect_token(TokenKind::LBrack)?;
+            let base_type = self.parse_type()?;
+            var dims = [];
+            while self.check_token(TokenKind::Comma) {
+                self.advance();
+                // Parse dimension (simplified)
+                check let Some(Spanned { node: token, .. }) = self.peek() {
+                    match &token.kind {
+                        TokenKind::LitInt(n) => {
+                            self.advance();
+                            dims.push(*n as usize);
+                        }
+                        _ => yield self.error("expected integer dimension"),
+                    }
+                }
+            }
+            self.expect_token(TokenKind::RBrack)?;
+            yield TypeExpr::Tensor(Box::new(base_type), dims);
+        }
+
+        // Primitive type
+        check let Some(Spanned { node: token, .. }) = self.peek() {
+            match &token.kind {
+                TokenKind::Ident(name) => {
+                    self.advance();
+                    yield TypeExpr::Prim(name.clone());
+                }
+                _ => yield self.error("expected type"),
+            }
+        }
+
+        yield self.error("expected type");
+    }
+
+    fn parse_attrs(&var self) -> Result<Vec<Attr>, DiagnosticBuilder> {
+        var attrs = [];
+        while self.check_token(TokenKind::Hash) {
+            let span = self.current_span();
+            self.advance();
+            self.expect_token(TokenKind::LBrack)?;
+            let name = self.parse_ident()?;
+            var args = [];
+            check self.check_token(TokenKind::LParen) {
+                while !self.check_token(TokenKind::RParen) && !self.at_end() {
+                    args.push(self.parse_expr()?);
+                    self.eat_token(TokenKind::Comma);
+                }
+                self.expect_token(TokenKind::RParen)?;
+            }
+            self.expect_token(TokenKind::RBrack)?;
+            attrs.push(Attr { name: name.name, args, span });
+        }
+        yield attrs;
+    }
+
+    fn parse_generics(&var self) -> Result<Vec<GenericParam>, DiagnosticBuilder> {
+        var params = [];
+        check !self.check_token(TokenKind::Lt) { yield params; }
+        self.advance();
+        while !self.check_token(TokenKind::Gt) && !self.at_end() {
+            let name = self.parse_ident()?;
+            var constraints = [];
+            check self.check_token(TokenKind::Colon) {
+                loop {
+                    constraints.push(self.parse_type()?);
+                    check !self.check_token(TokenKind::Plus) { abort; }
+                }
+            }
+            params.push(GenericParam { name: name.name, constraints });
+            self.eat_token(TokenKind::Comma);
+        }
+        self.expect_token(TokenKind::Gt)?;
+        yield params;
+    }
+
+    fn parse_measured_literal(&var self) -> Result<MeasuredLit, DiagnosticBuilder> {
+        // Parse "5.0:kg" format
+        check let Some(Spanned { node: token, .. }) = self.peek() {
+            match &token.kind {
+                TokenKind::LitFloat(value) => {
+                    self.advance();
+                    self.expect_token(TokenKind::Colon)?;
+                    check let Some(Spanned { node: token2, .. }) = self.peek() {
+                        match &token2.kind {
+                            TokenKind::Ident(unit) => {
+                                self.advance();
+                                yield MeasuredLit { value: *value, unit: unit.clone() };
+                            }
+                            _ => yield self.error("expected unit identifier"),
+                        }
+                    }
+                }
+                _ => yield self.error("expected measured literal"),
+            }
+        }
+        yield self.error("expected measured literal");
+    }
+
+    fn parse_flow_construct(&var self) -> Result<FlowConstruct, DiagnosticBuilder> {
+        match self.peek() {
+            Some(Spanned { node: token, .. }) => match &token.kind {
+                TokenKind::Ident(name) if name == "signal" => {
+                    self.advance();
+                    self.expect_token(TokenKind::LParen)?;
+                    let signal_name = self.parse_ident()?;
+                    self.expect_token(TokenKind::RParen)?;
+                    yield FlowConstruct::Signal(signal_name.name);
+                }
+                TokenKind::Ident(name) if name == "stream" => {
+                    self.advance();
+                    self.expect_token(TokenKind::LParen)?;
+                    let stream_name = self.parse_ident()?;
+                    self.expect_token(TokenKind::RParen)?;
+                    yield FlowConstruct::Stream(stream_name.name);
+                }
+                TokenKind::Spawn => {
+                    self.advance();
+                    self.expect_token(TokenKind::LBrace)?;
+                    let expr = self.parse_expr()?;
+                    self.expect_token(TokenKind::RBrace)?;
+                    yield FlowConstruct::Spawn(Box::new(expr));
+                }
+                _ => yield self.error("expected flow construct"),
+            },
+            None => yield self.error("expected flow construct"),
+        }
+    }
+
+    fn parse_contract(&var self) -> Result<Contract, DiagnosticBuilder> {
+        var pre_conditions = [];
+        var post_conditions = [];
+        var invariants = [];
+
+        // Parse pre-conditions: require { ... }
+        check self.check_token(TokenKind::Require) {
+            self.advance();
+            self.expect_token(TokenKind::LBrace)?;
+            while !self.check_token(TokenKind::RBrace) && !self.at_end() {
+                pre_conditions.push(self.parse_expr()?);
+                self.eat_token(TokenKind::Semi);
+            }
+            self.expect_token(TokenKind::RBrace)?;
+        }
+
+        // Parse post-conditions: ensure { ... }
+        check self.check_token(TokenKind::Ensure) {
+            self.advance();
+            self.expect_token(TokenKind::LBrace)?;
+            while !self.check_token(TokenKind::RBrace) && !self.at_end() {
+                post_conditions.push(self.parse_expr()?);
+                self.eat_token(TokenKind::Semi);
+            }
+            self.expect_token(TokenKind::RBrace)?;
+        }
+
+        // Parse invariants: invariant { ... }
+        check self.check_token(TokenKind::Assert) {
+            self.advance();
+            self.expect_token(TokenKind::LBrace)?;
+            while !self.check_token(TokenKind::RBrace) && !self.at_end() {
+                invariants.push(self.parse_expr()?);
+                self.eat_token(TokenKind::Semi);
+            }
+            self.expect_token(TokenKind::RBrace)?;
+        }
+
+        yield Contract { pre_conditions, post_conditions, invariants };
+    }
+
+    // ── Expression Parsing (stubs) ───────────────────────────────────────
+
+    fn parse_expr(&var self) -> Result<Expr, DiagnosticBuilder> {
+        // TODO: Implement full expression parsing
+        let span = self.current_span();
+        yield self.error("expression parsing not implemented");
+    }
+
+    fn parse_fn_item(&var self, vis: Visibility) -> Result<FnItem, ()> {
+        self.expect_token(TokenKind::Fn)?;
+        let name = self.parse_ident()?;
+        
+        // Parse generics <T: Clone, U: Debug>
+        let generics = self.parse_generics().unwrap_or([]);
+        
+        // Parse parameters (x: i64, y: f64)
+        self.expect_token(TokenKind::LParen)?;
+        var params = [];
+        while !self.check_token(TokenKind::RParen) && !self.at_end() {
+            let param_vis = self.parse_visibility();
+            let param_name = self.parse_ident()?;
+            self.expect_token(TokenKind::Colon)?;
+            let param_ty = self.parse_type().unwrap_or(TypeExpr::Unknown);
+            let span = self.current_span();
+            params.push(Param { 
+                vis: param_vis, 
+                name: param_name, 
+                ty: param_ty, 
+                span 
+            });
+            self.eat_token(TokenKind::Comma);
+        }
+        self.expect_token(TokenKind::RParen)?;
+        
+        // Parse return type -> i64
+        var return_ty = None;
+        check self.check_token(TokenKind::Arrow) {
+            self.advance();
+            return_ty = Some(self.parse_type().unwrap_or(TypeExpr::Unknown));
+        }
+        
+        // Parse contract { require { ... } ensure { ... } }
+        var contract = None;
+        check self.check_token(TokenKind::LBrace) {
+            contract = Some(self.parse_contract().unwrap_or(Contract { 
+                pre_conditions: [], 
+                post_conditions: [], 
+                invariants: [] 
+            }));
+        }
+        
+        // Parse body { ... }
+        self.expect_token(TokenKind::LBrace)?;
+        var body_stmts = [];
+        while !self.check_token(TokenKind::RBrace) && !self.at_end() {
+            // TODO: Parse statements
+            self.advance(); // Skip for now
+        }
+        self.expect_token(TokenKind::RBrace)?;
+        
+        let span = self.current_span();
+        Ok(FnItem {
+            vis,
+            name,
+            generics,
+            params,
+            return_ty,
+            contract,
+            body: Block { stmts: body_stmts, expr: None, span },
+            is_async: false,
+            span,
+        })
+    }
+
+    fn parse_data_item(&var self, vis: Visibility) -> Result<DataItem, ()> {
+        self.expect_token(TokenKind::Data)?;
+        let name = self.parse_ident()?;
+        
+        // TODO: Implement full data parsing
+        let span = self.current_span();
+        Ok(DataItem {
+            vis,
+            name,
+            fields: [],
+            span,
+        })
+    }
+
+    fn parse_cases_item(&var self, vis: Visibility) -> Result<CasesItem, ()> {
+        self.expect_token(TokenKind::Cases)?;
+        let name = self.parse_ident()?;
+        
+        // TODO: Implement full cases parsing
+        let span = self.current_span();
+        Ok(CasesItem {
+            vis,
+            name,
+            cases: [],
+            span,
+        })
+    }
+
+    fn parse_rules_item(&var self, vis: Visibility) -> Result<RulesItem, ()> {
+        self.expect_token(TokenKind::Rules)?;
+        let name = self.parse_ident()?;
+        
+        // TODO: Implement full rules parsing
+        let span = self.current_span();
+        Ok(RulesItem {
+            vis,
+            name,
+            rules: [],
+            span,
+        })
+    }
+
+    fn parse_alias_item(&var self, vis: Visibility) -> Result<AliasItem, ()> {
+        self.expect_token(TokenKind::Alias)?;
+        let name = self.parse_ident()?;
+        
+        // TODO: Implement full alias parsing
+        let span = self.current_span();
+        Ok(AliasItem {
+            vis,
+            name,
+            params: [],
+            target: TypeExpr::Unknown,
+            span,
+        })
+    }
+
+    fn parse_async_fn_item(&var self, vis: Visibility) -> Result<FnItem, ()> {
+        self.expect_token(TokenKind::Async)?;
+        self.expect_token(TokenKind::Fn)?;
+        let name = self.parse_ident()?;
+        let span = self.current_span();
+        Ok(FnItem {
+            vis,
+            name,
+            generics: [],
+            params: [],
+            return_ty: None,
+            contract: None,
+            body: Block { stmts: [], expr: None, span },
+            is_async: true,
+            span,
+        })
+    }
+
+    fn parse_impl_item(&var self) -> Result<ImplItem, ()> {
+        self.expect_token(TokenKind::Skill)?; // Skill -> Impl
+        let span = self.current_span();
+        Ok(ImplItem {
+            target: TypeExpr::Unknown,
+            items: [],
+            span,
+        })
+    }
+
+    fn parse_use_item(&var self) -> Result<UseItem, ()> {
+        self.expect_token(TokenKind::Use)?;
+        let span = self.current_span();
+        Ok(UseItem {
+            path: Path { segments: [] },
+            alias: None,
+            span,
+        })
+    }
+
+    fn parse_struct_compat(&var self, vis: Visibility) -> Result<StructItem, ()> {
+        self.expect_token(TokenKind::Struct)?;
+        let name = self.parse_ident()?;
+        let span = self.current_span();
+        Ok(StructItem {
+            vis,
+            name,
+            fields: [],
+            span,
+        })
+    }
+
+    fn parse_enum_compat(&var self, vis: Visibility) -> Result<EnumItem, ()> {
+        self.expect_token(TokenKind::Enum)?;
+        let name = self.parse_ident()?;
+        let span = self.current_span();
+        Ok(EnumItem {
+            vis,
+            name,
+            variants: [],
+            span,
+        })
+    }
+
+    fn parse_trait_compat(&var self, vis: Visibility) -> Result<TraitItem, ()> {
+        self.expect_token(TokenKind::Trait)?;
+        let name = self.parse_ident()?;
+        let span = self.current_span();
+        Ok(TraitItem {
+            vis,
+            name,
+            items: [],
+            span,
+        })
+    }
+}

@@ -1,0 +1,492 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                         NOVA - PYTORCH TENSOR                               ║
+// ║         PyTorch-uyumlu Tensor ve Otomatik Türev (Autograd)                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use core::option::{Option, Some, None};
+use torch::ffi::{TorchHandle, torch_zeros, torch_ones, torch_randn,
+                  torch_add, torch_mul, torch_matmul, torch_pow,
+                  torch_sum, torch_mean, torch_relu, torch_sigmoid,
+                  torch_tanh, torch_log, torch_exp, torch_transpose,
+                  torch_reshape, torch_backward, torch_detach,
+                  torch_to_cpu, torch_to_cuda, torch_item,
+                  torch_shape, torch_ndim, torch_numel,
+                  torch_clone, torch_zero_grad, torch_new,
+                  torch_from_data, torch_mul_scalar, torch_add_scalar};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Device cases
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data Device {
+    cpu,
+    cuda(index: i64),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DType cases
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data DType {
+    float32,
+    float64,
+    int32,
+    int64,
+    bool_t,
+    uint8,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GradFunction: Hesaplama grafiği için geri yayılım tipi
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data GradFn {
+    add_fn   { left: TorchHandle, right: TorchHandle },
+    mul_fn   { left: TorchHandle, right: TorchHandle },
+    matmul_fn{ left: TorchHandle, right: TorchHandle },
+    pow_fn   { input: TorchHandle, exponent: f64 },
+    sum_fn   { input: TorchHandle },
+    mean_fn  { input: TorchHandle },
+    relu_fn  { input: TorchHandle },
+    sigmoid_fn { input: TorchHandle },
+    tanh_fn  { input: TorchHandle },
+    log_fn   { input: TorchHandle },
+    exp_fn   { input: TorchHandle },
+    none,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tensor: Ana veri yapısı
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data Tensor {
+    handle:        TorchHandle,
+    data:         Vec<i64>,
+    dtype:         DType,
+    device:        Device,
+    requires_grad: bool,
+    is_leaf:       bool,
+    grad:          Option<TorchHandle>,
+    grad_fn:       GradFn,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TensorOps impl — tüm tensor işlemleri
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open impl TensorOps {
+
+    // ── Constructors ──────────────────────────────────────────────────────────
+
+    open fn zeros(data: Vec<i64>, requires_grad: bool) -> Tensor {
+        let handle = unsafe { torch_zeros(data.as_ptr(), data.len() as i64) };
+        Tensor {
+            handle,
+            data,
+            dtype:         DType::float32,
+            device:        Device::cpu,
+            requires_grad,
+            is_leaf:       true,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    open fn ones(data: Vec<i64>, requires_grad: bool) -> Tensor {
+        let handle = unsafe { torch_ones(data.as_ptr(), data.len() as i64) };
+        Tensor {
+            handle,
+            data,
+            dtype:         DType::float32,
+            device:        Device::cpu,
+            requires_grad,
+            is_leaf:       true,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    open fn randn(data: Vec<i64>, requires_grad: bool) -> Tensor {
+        let handle = unsafe { torch_randn(data.as_ptr(), data.len() as i64) };
+        Tensor {
+            handle,
+            data,
+            dtype:         DType::float32,
+            device:        Device::cpu,
+            requires_grad,
+            is_leaf:       true,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    open fn from_data(data: Vec<f64>, data: Vec<i64>, requires_grad: bool) -> Tensor {
+        let handle = unsafe {
+            torch_from_data(data.as_ptr(), data.len() as i64,
+                            data.as_ptr(), data.len() as i64)
+        };
+        Tensor {
+            handle,
+            data,
+            dtype:         DType::float64,
+            device:        Device::cpu,
+            requires_grad,
+            is_leaf:       true,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    // ── Metadata ─────────────────────────────────────────────────────────────
+
+    open fn ndim(t: Tensor) -> i64 {
+        yield t.data.len() as i64
+    }
+
+    open fn numel(t: Tensor) -> i64 {
+        var n: i64 = 1;
+        each s in t.data {
+            n = n * s;
+        }
+        yield n
+    }
+
+    open fn item(t: Tensor) -> f64 {
+        assert TensorOps::numel(t) == 1 : "item() sadece tek elemanlı tensor için geçerli";
+        yield unsafe { torch_item(t.handle) }
+    }
+
+    // ── Aritmetik İşlemler ───────────────────────────────────────────────────
+
+    open fn add(a: Tensor, b: Tensor) -> Tensor {
+        let handle = unsafe { torch_add(a.handle, b.handle) };
+        let rg     = a.requires_grad || b.requires_grad;
+        Tensor {
+            handle,
+            data:         a.data,
+            dtype:         a.dtype,
+            device:        a.device,
+            requires_grad: rg,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       check rg { GradFn::add_fn { left: a.handle, right: b.handle } }
+                           else  { GradFn::none },
+        }
+    }
+
+    open fn add_scalar(t: Tensor, s: f64) -> Tensor {
+        let handle = unsafe { torch_add_scalar(t.handle, s) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    open fn mul(a: Tensor, b: Tensor) -> Tensor {
+        let handle = unsafe { torch_mul(a.handle, b.handle) };
+        let rg     = a.requires_grad || b.requires_grad;
+        Tensor {
+            handle,
+            data:         a.data,
+            dtype:         a.dtype,
+            device:        a.device,
+            requires_grad: rg,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       check rg { GradFn::mul_fn { left: a.handle, right: b.handle } }
+                           else  { GradFn::none },
+        }
+    }
+
+    open fn mul_scalar(t: Tensor, s: f64) -> Tensor {
+        let handle = unsafe { torch_mul_scalar(t.handle, s) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    open fn matmul(a: Tensor, b: Tensor) -> Tensor {
+        let handle = unsafe { torch_matmul(a.handle, b.handle) };
+        let rg     = a.requires_grad || b.requires_grad;
+        // data: [a.data[0], b.data[1]]
+        let out_shape = [a.data[0], b.data[b.data.len() as i64 - 1]];
+        Tensor {
+            handle,
+            data:         out_shape,
+            dtype:         a.dtype,
+            device:        a.device,
+            requires_grad: rg,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       check rg { GradFn::matmul_fn { left: a.handle, right: b.handle } }
+                           else  { GradFn::none },
+        }
+    }
+
+    open fn pow(t: Tensor, exponent: f64) -> Tensor {
+        let handle = unsafe { torch_pow(t.handle, exponent) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       check t.requires_grad {
+                               GradFn::pow_fn { input: t.handle, exponent }
+                           } else { GradFn::none },
+        }
+    }
+
+    // ── Reduction ─────────────────────────────────────────────────────────────
+
+    open fn sum(t: Tensor) -> Tensor {
+        let handle = unsafe { torch_sum(t.handle) };
+        Tensor {
+            handle,
+            data:         [1],
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       check t.requires_grad { GradFn::sum_fn { input: t.handle } }
+                           else { GradFn::none },
+        }
+    }
+
+    open fn mean(t: Tensor) -> Tensor {
+        let handle = unsafe { torch_mean(t.handle) };
+        Tensor {
+            handle,
+            data:         [1],
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       check t.requires_grad { GradFn::mean_fn { input: t.handle } }
+                           else { GradFn::none },
+        }
+    }
+
+    // ── Aktivasyon Fonksiyonları ──────────────────────────────────────────────
+
+    open fn relu(t: Tensor) -> Tensor {
+        let handle = unsafe { torch_relu(t.handle) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       check t.requires_grad { GradFn::relu_fn { input: t.handle } }
+                           else { GradFn::none },
+        }
+    }
+
+    open fn sigmoid(t: Tensor) -> Tensor {
+        let handle = unsafe { torch_sigmoid(t.handle) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       check t.requires_grad { GradFn::sigmoid_fn { input: t.handle } }
+                           else { GradFn::none },
+        }
+    }
+
+    open fn tanh(t: Tensor) -> Tensor {
+        let handle = unsafe { torch_tanh(t.handle) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       check t.requires_grad { GradFn::tanh_fn { input: t.handle } }
+                           else { GradFn::none },
+        }
+    }
+
+    open fn log(t: Tensor) -> Tensor {
+        let handle = unsafe { torch_log(t.handle) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       check t.requires_grad { GradFn::log_fn { input: t.handle } }
+                           else { GradFn::none },
+        }
+    }
+
+    open fn exp(t: Tensor) -> Tensor {
+        let handle = unsafe { torch_exp(t.handle) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       check t.requires_grad { GradFn::exp_fn { input: t.handle } }
+                           else { GradFn::none },
+        }
+    }
+
+    // ── Şekil Dönüşümleri ────────────────────────────────────────────────────
+
+    open fn transpose(t: Tensor) -> Tensor {
+        let handle = unsafe { torch_transpose(t.handle) };
+        let new_shape = [t.data[1], t.data[0]];
+        Tensor {
+            handle,
+            data:         new_shape,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    open fn reshape(t: Tensor, new_shape: Vec<i64>) -> Tensor {
+        let handle = unsafe { torch_reshape(t.handle, new_shape.as_ptr(), new_shape.len() as i64) };
+        Tensor {
+            handle,
+            data:         new_shape,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    open fn unsqueeze(t: Tensor, dim: i64) -> Tensor {
+        var new_shape = t.data;
+        new_shape.insert(dim, 1);
+        yield TensorOps::reshape(t, new_shape)
+    }
+
+    open fn squeeze(t: Tensor, dim: i64) -> Tensor {
+        var new_shape: Vec<i64> = [];
+        var i: i64 = 0;
+        each s in t.data {
+            check i != dim || s != 1 {
+                new_shape.push(s);
+            }
+            i = i + 1;
+        }
+        yield TensorOps::reshape(t, new_shape)
+    }
+
+    // ── Device Yönetimi ──────────────────────────────────────────────────────
+
+    open fn to_cpu(t: Tensor) -> Tensor {
+        let handle = unsafe { torch_to_cpu(t.handle) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        Device::cpu,
+            requires_grad: t.requires_grad,
+            is_leaf:       t.is_leaf,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    open fn to_cuda(t: Tensor, index: i64) -> Tensor {
+        let handle = unsafe { torch_to_cuda(t.handle, index) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        Device::cuda(index),
+            requires_grad: t.requires_grad,
+            is_leaf:       t.is_leaf,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    // ── Autograd ─────────────────────────────────────────────────────────────
+
+    open fn backward(t: Tensor) {
+        check t.requires_grad {
+            unsafe { torch_backward(t.handle) }
+        }
+    }
+
+    open fn detach(t: Tensor) -> Tensor {
+        let handle = unsafe { torch_detach(t.handle) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: false,
+            is_leaf:       true,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    open fn zero_grad(t: Tensor) -> Tensor {
+        unsafe { torch_zero_grad(t.handle) }
+        Tensor {
+            handle:        t.handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       t.is_leaf,
+            grad:          None,
+            grad_fn:       t.grad_fn,
+        }
+    }
+
+    open fn clone(t: Tensor) -> Tensor {
+        let handle = unsafe { torch_clone(t.handle) };
+        Tensor {
+            handle,
+            data:         t.data,
+            dtype:         t.dtype,
+            device:        t.device,
+            requires_grad: t.requires_grad,
+            is_leaf:       true,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+}

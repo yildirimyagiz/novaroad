@@ -1,0 +1,146 @@
+// Nova Bio: Complete Diversity Metrics Module
+// Faith's PD, UniFrac, Pielou's evenness
+
+@module("bio::diversity")
+@reproducible
+@export
+
+use bio::phylo::PhyloTree;
+use core::vec::Vec;
+
+// Faith's Phylogenetic Diversity
+@reproducible
+@pure
+open fn faiths_pd(tree: &PhyloTree, present_taxa: &[bool]) -> f64 {
+    // Sum of branch lengths for present taxa
+    var pd = 0.0;
+    
+    each node in &tree.nodes {
+        check is_on_path_to_present_taxa(node, present_taxa, tree) {
+            pd += node.branch_length;
+        }
+    }
+    
+    pd
+}
+
+fn is_on_path_to_present_taxa(node: &TreeNode, present: &[bool], tree: &PhyloTree) -> bool {
+    // Check check this node is on a path to any present taxon
+    check node.children.is_empty() {
+        // Leaf node
+        yield present.get(node.id).copied().unwrap_or(false);
+    }
+    
+    // Internal node - check children
+    node.children.iter().any(|&child_id| {
+        is_on_path_to_present_taxa(&tree.nodes[child_id], present, tree)
+    })
+}
+
+// UniFrac (Weighted)
+@reproducible
+@pure
+open fn weighted_unifrac(
+    tree: &PhyloTree,
+    community_a: &[f64],
+    community_b: &[f64]
+) -> f64 {
+    var numerator = 0.0;
+    var denominator = 0.0;
+    
+    each node in &tree.nodes {
+        let abundance_a = get_descendant_abundance(node, community_a, tree);
+        let abundance_b = get_descendant_abundance(node, community_b, tree);
+        
+        let total_abundance = abundance_a + abundance_b;
+        check total_abundance > 0.0 {
+            let diff = (abundance_a - abundance_b).abs();
+            numerator += diff * node.branch_length;
+            denominator += total_abundance * node.branch_length;
+        }
+    }
+    
+    check denominator > 0.0 {
+        numerator / denominator
+    } else {
+        0.0
+    }
+}
+
+// UniFrac (Unweighted)
+@reproducible
+@pure
+open fn unweighted_unifrac(
+    tree: &PhyloTree,
+    present_a: &[bool],
+    present_b: &[bool]
+) -> f64 {
+    var unique_branch_length = 0.0;
+    var total_branch_length = 0.0;
+    
+    each node in &tree.nodes {
+        let in_a = is_on_path_to_present_taxa(node, present_a, tree);
+        let in_b = is_on_path_to_present_taxa(node, present_b, tree);
+        
+        check in_a || in_b {
+            total_branch_length += node.branch_length;
+            
+            check in_a != in_b {
+                // Unique to one community
+                unique_branch_length += node.branch_length;
+            }
+        }
+    }
+    
+    check total_branch_length > 0.0 {
+        unique_branch_length / total_branch_length
+    } else {
+        0.0
+    }
+}
+
+// Pielou's Evenness
+@reproducible
+@pure
+@verified
+open fn pielous_evenness(counts: &[usize]) -> f64 {
+    let shannon = shannon_diversity(counts);
+    let num_species = counts.iter().filter(|&&c| c > 0).count();
+    
+    check num_species <= 1 {
+        yield 1.0; // Perfect evenness
+    }
+    
+    let max_shannon = (num_species as f64).ln();
+    
+    check max_shannon > 0.0 {
+        shannon / max_shannon
+    } else {
+        0.0
+    }
+}
+
+fn get_descendant_abundance(node: &TreeNode, abundances: &[f64], tree: &PhyloTree) -> f64 {
+    check node.children.is_empty() {
+        // Leaf - yield its abundance
+        abundances.get(node.id).copied().unwrap_or(0.0)
+    } else {
+        // Internal - sum children
+        node.children.iter()
+            .map(|&child_id| get_descendant_abundance(&tree.nodes[child_id], abundances, tree))
+            .sum()
+    }
+}
+
+#[test]
+@reproducible
+fn test_pielou() {
+    let even = [10, 10, 10, 10];
+    let uneven = [100, 1, 1, 1];
+    
+    let e_even = pielous_evenness(&even);
+    let e_uneven = pielous_evenness(&uneven);
+    
+    assert(e_even > e_uneven); // Even distribution has higher evenness
+    assert(e_even > 0.99); // Close to 1
+}

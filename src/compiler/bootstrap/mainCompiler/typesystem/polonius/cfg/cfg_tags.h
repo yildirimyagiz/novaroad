@@ -1,0 +1,11 @@
+#ifndef NOVA_CFG_TAGS_H
+#define NOVA_CFG_TAGS_H
+
+/* EdgeKind definition */
+#define NOVA_CFG_EDGEKIND_NORMAL 0
+#define NOVA_CFG_EDGEKIND_CONDITIONAL 1
+#define NOVA_CFG_EDGEKIND_EXCEPTION 2
+#define NOVA_CFG_EDGEKIND_RETURN 3
+
+#endif
+

@@ -1,0 +1,310 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                         NOVA - PYTORCH OPTIM                                ║
+// ║              "Optimization Algorithms in Nova"                              ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+import stdlib.torch.tensor
+
+// Optimizer rules
+open rules Optimizer {
+    fn step(&var self);
+    fn zero_grad(&var self);
+}
+
+// Stochastic Gradient Descent
+open data SGD {
+    params: Vec<Tensor>,
+    lr: f64,
+    momentum: f64,
+    dampening: f64,
+    weight_decay: f64,
+    nesterov: bool,
+    velocity: Vec<Tensor>
+}
+
+impl SGD {
+    fn new(params: Vec<Tensor>, lr: f64) -> Self {
+        let velocity = params.iter()
+            .map(|p| Tensor::zeros(p.data(), false))
+            .collect();
+        
+        SGD {
+            params,
+            lr,
+            momentum: 0.0,
+            dampening: 0.0,
+            weight_decay: 0.0,
+            nesterov: false,
+            velocity
+        }
+    }
+    
+    fn with_momentum(var self, momentum: f64) -> Self {
+        self.momentum = momentum;
+        self
+    }
+    
+    fn with_weight_decay(var self, weight_decay: f64) -> Self {
+        self.weight_decay = weight_decay;
+        self
+    }
+}
+
+impl Optimizer for SGD {
+    fn step(&var self) {
+        each entry in self.params.iter_mut().enumerate()  { let (i, param) = entry;
+            check let Some(ref grad) = param.grad {
+                var d_p = grad.data.copy();
+                
+                // Weight decay
+                check self.weight_decay != 0.0 {
+                    d_p = d_p.add(&param.data.mul_scalar(self.weight_decay)).unwrap();
+                }
+                
+                // Momentum
+                check self.momentum != 0.0 {
+                    let v = &var self.velocity[i];
+                    v.data = v.data.mul_scalar(self.momentum)
+                        .add(&d_p.mul_scalar(1.0 - self.dampening)).unwrap();
+                    
+                    check self.nesterov {
+                        d_p = d_p.add(&v.data.mul_scalar(self.momentum)).unwrap();
+                    } else {
+                        d_p = v.data.copy();
+                    }
+                }
+                
+                // Update parameters
+                param.data = param.data.add(&d_p.mul_scalar(-self.lr)).unwrap();
+            }
+        }
+    }
+    
+    fn zero_grad(&var self) {
+        each param in &var self.params {
+            param.zero_grad();
+        }
+    }
+}
+
+// Adam Optimizer
+open data Adam {
+    params: Vec<Tensor>,
+    lr: f64,
+    betas: (f64, f64),
+    eps: f64,
+    weight_decay: f64,
+    m: Vec<Tensor>,  // First moment
+    v: Vec<Tensor>,  // Second moment
+    t: usize         // Time step
+}
+
+impl Adam {
+    fn new(params: Vec<Tensor>, lr: f64) -> Self {
+        let m = params.iter()
+            .map(|p| Tensor::zeros(p.data(), false))
+            .collect();
+        let v = params.iter()
+            .map(|p| Tensor::zeros(p.data(), false))
+            .collect();
+        
+        Adam {
+            params,
+            lr,
+            betas: (0.9, 0.999),
+            eps: 1e-8,
+            weight_decay: 0.0,
+            m,
+            v,
+            t: 0
+        }
+    }
+    
+    fn with_betas(var self, beta1: f64, beta2: f64) -> Self {
+        self.betas = (beta1, beta2);
+        self
+    }
+    
+    fn with_weight_decay(var self, weight_decay: f64) -> Self {
+        self.weight_decay = weight_decay;
+        self
+    }
+}
+
+impl Optimizer for Adam {
+    fn step(&var self) {
+        self.t += 1;
+        let (beta1, beta2) = self.betas;
+        
+        each entry in self.params.iter_mut().enumerate()  { let (i, param) = entry;
+            check let Some(ref grad) = param.grad {
+                var g = grad.data.copy();
+                
+                // Weight decay
+                check self.weight_decay != 0.0 {
+                    g = g.add(&param.data.mul_scalar(self.weight_decay)).unwrap();
+                }
+                
+                // Update biased first moment
+                self.m[i].data = self.m[i].data.mul_scalar(beta1)
+                    .add(&g.mul_scalar(1.0 - beta1)).unwrap();
+                
+                // Update biased second moment
+                let g_squared = g.pow(2.0);
+                self.v[i].data = self.v[i].data.mul_scalar(beta2)
+                    .add(&g_squared.mul_scalar(1.0 - beta2)).unwrap();
+                
+                // Bias correction
+                let m_hat = self.m[i].data.mul_scalar(1.0 / (1.0 - beta1.powi(self.t as i32)));
+                let v_hat = self.v[i].data.mul_scalar(1.0 / (1.0 - beta2.powi(self.t as i32)));
+                
+                // Update parameters
+                let denom = v_hat.sqrt().add_scalar(self.eps);
+                let update = m_hat.div(&denom).unwrap().mul_scalar(self.lr);
+                param.data = param.data.add(&update.mul_scalar(-1.0)).unwrap();
+            }
+        }
+    }
+    
+    fn zero_grad(&var self) {
+        each param in &var self.params {
+            param.zero_grad();
+        }
+    }
+}
+
+// AdamW (Adam with decoupled weight decay)
+open data AdamW {
+    params: Vec<Tensor>,
+    lr: f64,
+    betas: (f64, f64),
+    eps: f64,
+    weight_decay: f64,
+    m: Vec<Tensor>,
+    v: Vec<Tensor>,
+    t: usize
+}
+
+impl AdamW {
+    fn new(params: Vec<Tensor>, lr: f64, weight_decay: f64) -> Self {
+        let m = params.iter().map(|p| Tensor::zeros(p.data(), false)).collect();
+        let v = params.iter().map(|p| Tensor::zeros(p.data(), false)).collect();
+        
+        AdamW {
+            params,
+            lr,
+            betas: (0.9, 0.999),
+            eps: 1e-8,
+            weight_decay,
+            m,
+            v,
+            t: 0
+        }
+    }
+}
+
+impl Optimizer for AdamW {
+    fn step(&var self) {
+        self.t += 1;
+        let (beta1, beta2) = self.betas;
+        
+        each entry in self.params.iter_mut().enumerate()  { let (i, param) = entry;
+            check let Some(ref grad) = param.grad {
+                // Decoupled weight decay
+                check self.weight_decay != 0.0 {
+                    param.data = param.data.mul_scalar(1.0 - self.lr * self.weight_decay);
+                }
+                
+                // Adam update (same as regular Adam)
+                let g = grad.data.copy();
+                
+                self.m[i].data = self.m[i].data.mul_scalar(beta1)
+                    .add(&g.mul_scalar(1.0 - beta1)).unwrap();
+                
+                let g_squared = g.pow(2.0);
+                self.v[i].data = self.v[i].data.mul_scalar(beta2)
+                    .add(&g_squared.mul_scalar(1.0 - beta2)).unwrap();
+                
+                let m_hat = self.m[i].data.mul_scalar(1.0 / (1.0 - beta1.powi(self.t as i32)));
+                let v_hat = self.v[i].data.mul_scalar(1.0 / (1.0 - beta2.powi(self.t as i32)));
+                
+                let denom = v_hat.sqrt().add_scalar(self.eps);
+                let update = m_hat.div(&denom).unwrap().mul_scalar(self.lr);
+                param.data = param.data.add(&update.mul_scalar(-1.0)).unwrap();
+            }
+        }
+    }
+    
+    fn zero_grad(&var self) {
+        each param in &var self.params {
+            param.zero_grad();
+        }
+    }
+}
+
+// RMSprop
+open data RMSprop {
+    params: Vec<Tensor>,
+    lr: f64,
+    alpha: f64,
+    eps: f64,
+    weight_decay: f64,
+    momentum: f64,
+    v: Vec<Tensor>,
+    buf: Vec<Tensor>
+}
+
+impl RMSprop {
+    fn new(params: Vec<Tensor>, lr: f64) -> Self {
+        let v = params.iter().map(|p| Tensor::zeros(p.data(), false)).collect();
+        let buf = params.iter().map(|p| Tensor::zeros(p.data(), false)).collect();
+        
+        RMSprop {
+            params,
+            lr,
+            alpha: 0.99,
+            eps: 1e-8,
+            weight_decay: 0.0,
+            momentum: 0.0,
+            v,
+            buf
+        }
+    }
+}
+
+impl Optimizer for RMSprop {
+    fn step(&var self) {
+        each entry in self.params.iter_mut().enumerate()  { let (i, param) = entry;
+            check let Some(ref grad) = param.grad {
+                var g = grad.data.copy();
+                
+                check self.weight_decay != 0.0 {
+                    g = g.add(&param.data.mul_scalar(self.weight_decay)).unwrap();
+                }
+                
+                // Update running average of squared gradients
+                let g_squared = g.pow(2.0);
+                self.v[i].data = self.v[i].data.mul_scalar(self.alpha)
+                    .add(&g_squared.mul_scalar(1.0 - self.alpha)).unwrap();
+                
+                let avg = self.v[i].data.sqrt().add_scalar(self.eps);
+                
+                check self.momentum > 0.0 {
+                    self.buf[i].data = self.buf[i].data.mul_scalar(self.momentum)
+                        .add(&g.div(&avg).unwrap()).unwrap();
+                    param.data = param.data.add(&self.buf[i].data.mul_scalar(-self.lr)).unwrap();
+                } else {
+                    param.data = param.data.add(&g.div(&avg).unwrap().mul_scalar(-self.lr)).unwrap();
+                }
+            }
+        }
+    }
+    
+    fn zero_grad(&var self) {
+        each param in &var self.params {
+            param.zero_grad();
+        }
+    }
+}
+
+export { Optimizer, SGD, Adam, AdamW, RMSprop }

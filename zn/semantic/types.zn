@@ -1,0 +1,455 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Compiler — Type System Analysis                                     ║
+// ║                                                                              ║
+// ║  Type checking, inference, and compatibility analysis.                       ║
+// ║                                                                              ║
+// ║  This module implements Nova's alias system, ensuring alias safety            ║
+// ║  through static analysis and inference.                                      ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §1  TYPE CHECKER
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl TypeChecker {
+
+    data TypeEnvironment derives [Clone] {
+        open variables: HashMap<String, Type>,
+        open functions: HashMap<String, FunctionType>,
+        open types: HashMap<String, TypeDefinition>,
+        open parent: Option<Box<TypeEnvironment>>, // For scoping
+    }
+
+    // ── Type Checking Entry Points ───────────────────────────────────────────
+
+    open fn check_program(program: *Ast) -> Result<TypeInfo, TypeError> {
+        println("🔍 Type checking program...");
+
+        var env = TypeEnvironment::new();
+
+        // Add built-in types
+        self::add_builtin_types(&var env);
+
+        // Check all declarations
+        each decl in program.declarations.iter() {
+            match self::check_declaration(decl, &var env) {
+                Ok(_) => continue,
+                Err(e) => yield Err(e)
+            }
+        }
+
+        Ok(TypeInfo {
+            environment: env,
+            inferred_types: HashMap::new(),
+            constraints: Vec::new(),
+        });
+    }
+
+    // ── Declaration Type Checking ────────────────────────────────────────────
+
+    fn check_declaration(decl: *Declaration, env: *var TypeEnvironment) -> Result<(), TypeError> {
+        match decl.kind {
+            DeclarationKind::Function => self::check_function_decl(&decl.as_function, env),
+            DeclarationKind::Data => self::check_data_decl(&decl.as_data, env),
+            DeclarationKind::Skill => self::check_skill_decl(&decl.as_skill, env),
+            DeclarationKind::Variable => self::check_variable_decl(&decl.as_variable, env),
+            DeclarationKind::Let => self::check_let_decl(&decl.as_let, env),
+        }
+    }
+
+    fn check_function_decl(func: *FunctionDecl, env: *var TypeEnvironment) -> Result<(), TypeError> {
+        // Create function alias
+        var param_types = Vec::new();
+        each param in func.parameters.iter() {
+            let param_type = self::resolve_type_expr(&param.type_, env);
+            param_types.push(param_type);
+        }
+
+        let return_type = match &func.return_type {
+            Some(ret_type) => self::resolve_type_expr(ret_type, env),
+            None => Type::Void,
+        };
+
+        let func_type = FunctionType {
+            parameters: param_types,
+            return_type: Box::new(return_type),
+        };
+
+        // Add function to environment
+        env.functions.insert(func.name.clone(), func_type);
+
+        // Check function body in new scope
+        env::enter_scope(env);
+        defer { env::exit_scope(env); }
+
+        // Add parameters to scope
+        each param in func.parameters.iter() {
+            let param_type = self::resolve_type_expr(&param.type_, env);
+            env.variables.insert(param.name.clone(), param_type);
+        }
+
+        // Check function body
+        match self::check_block(&func.body, env) {
+            Ok(_) => yield Ok(()),
+            Err(e) => yield Err(e)
+        }
+    }
+
+    fn check_data_decl(data: *DataDecl, env: *var TypeEnvironment) -> Result<(), TypeError> {
+        // Create alias definition
+        var fields = HashMap::new();
+        each field in data.fields.iter() {
+            let field_type = self::resolve_type_expr(&field.type_, env);
+            fields.insert(field.name.clone(), field_type);
+        }
+
+        let type_def = TypeDefinition::Struct {
+            name: data.name.clone(),
+            fields,
+        };
+
+        // Add alias to environment
+        env.types.insert(data.name.clone(), type_def);
+
+        Ok(());
+    }
+
+    // ── Statement Type Checking ──────────────────────────────────────────────
+
+    fn check_statement(stmt: *Statement, env: *var TypeEnvironment) -> Result<(), TypeError> {
+        match stmt.kind {
+            StatementKind::Variable => self::check_variable_stmt(&stmt.as_variable, env),
+            StatementKind::Let => self::check_let_stmt(&stmt.as_let, env),
+            StatementKind::Expression => {
+                let _ = self::check_expression(&stmt.as_expression, env);
+                Ok(());
+            },
+            StatementKind::Check => self::check_check_stmt(&stmt.as_check, env),
+            StatementKind::Loop => self::check_loop_stmt(&stmt.as_loop, env),
+            StatementKind::Yield => {
+                let expr_type = self::check_expression(&stmt.as_yield, env);
+                // Check check yield alias matches expected yield alias
+                // (This would be more complex in a real implementation)
+                Ok(());
+            },
+            StatementKind::Return => {
+                let expr_type = self::check_expression(&stmt.as_return, env);
+                // Check check yield alias matches function signature
+                Ok(());
+            },
+            StatementKind::Block => self::check_block(&stmt.as_block, env),
+        }
+    }
+
+    fn check_variable_stmt(var: *VariableStmt, env: *var TypeEnvironment) -> Result<(), TypeError> {
+        let expr_type = self::check_expression(&var.initializer, env);
+
+        var_type = match &var.type_ {
+            Some(declared_type) => {
+                let declared = self::resolve_type_expr(declared_type, env);
+                // Check compatibility
+                match self::check_type_compatibility(&expr_type, &declared) {
+                    Ok(_) => declared,
+                    Err(e) => yield Err(e)
+                }
+            },
+            None => expr_type, // Type inference
+        };
+
+        // Add to environment
+        env.variables.insert(var.name.clone(), var_type);
+
+        Ok(());
+    }
+
+    fn check_check_stmt(check: *CheckStmt, env: *var TypeEnvironment) -> Result<(), TypeError> {
+        // Condition must be boolean
+        let cond_type = self::check_expression(&check.condition, env);
+        match self::check_type_compatibility(&cond_type, &Type::Bool) {
+            Ok(_) => {},
+            Err(_) => yield Err(TypeError::ExpectedBool(cond_type)),
+        }
+
+        // Check both branches
+        match self::check_block(&check.then_branch, env) {
+            Ok(_) => {},
+            Err(e) => yield Err(e)
+        }
+
+        check let Some(else_branch) = &check.else_branch {
+            match self::check_statement(else_branch, env) {
+                Ok(_) => {},
+                Err(e) => yield Err(e)
+            }
+        }
+
+        Ok(());
+    }
+
+    // ── Expression Type Checking ─────────────────────────────────────────────
+
+    fn check_expression(expr: *Expression, env: *var TypeEnvironment) -> Type {
+        match expr.kind {
+            ExpressionKind::Literal => self::check_literal(&expr.as_literal),
+            ExpressionKind::Identifier => self::check_identifier(&expr.as_identifier, env),
+            ExpressionKind::Binary => self::check_binary_expr(&expr.as_binary, env),
+            ExpressionKind::Unary => self::check_unary_expr(&expr.as_unary, env),
+            ExpressionKind::Call => self::check_call_expr(&expr.as_call, env),
+            ExpressionKind::Field => self::check_field_expr(&expr.as_field, env),
+            ExpressionKind::Index => self::check_index_expr(&expr.as_index, env),
+            ExpressionKind::Cast => self::check_cast_expr(&expr.as_cast, env),
+            ExpressionKind::Reference => self::check_reference_expr(&expr.as_reference, env),
+            ExpressionKind::Dereference => self::check_dereference_expr(&expr.as_dereference, env),
+            ExpressionKind::Array => self::check_array_expr(&expr.as_array, env),
+            ExpressionKind::Object => self::check_object_expr(&expr.as_object, env),
+            ExpressionKind::Lambda => self::check_lambda_expr(&expr.as_lambda, env),
+        }
+    }
+
+    fn check_literal(literal: *Literal) -> Type {
+        match literal.kind {
+            LiteralKind::Integer => Type::Primitive(PrimitiveType::I32), // Default integer alias
+            LiteralKind::Float => Type::Primitive(PrimitiveType::F64),   // Default float alias
+            LiteralKind::String => Type::Primitive(PrimitiveType::String),
+            LiteralKind::Bool => Type::Primitive(PrimitiveType::Bool),
+            LiteralKind::Char => Type::Primitive(PrimitiveType::Char),
+        }
+    }
+
+    fn check_identifier(ident: *Identifier, env: *var TypeEnvironment) -> Type {
+        match env.variables.get(&ident.name) {
+            Some(type_) => type_.clone(),
+            None => abort("Undefined variable: {}", ident.name), // This should be caught by earlier analysis
+        }
+    }
+
+    fn check_binary_expr(binary: *BinaryExpr, env: *var TypeEnvironment) -> Type {
+        let left_type = self::check_expression(&binary.left, env);
+        let right_type = self::check_expression(&binary.right, env);
+
+        // Check operand compatibility
+        match self::check_binary_operand_compatibility(&left_type, &right_type, binary.operator) {
+            Ok(result_type) => result_type,
+            Err(e) => abort("Type error in binary expression"), // Should be handled better
+        }
+    }
+
+    fn check_call_expr(call: *CallExpr, env: *var TypeEnvironment) -> Type {
+        // Resolve function alias
+        let func_type = match env.functions.get(&call.function) {
+            Some(ft) => ft,
+            None => abort("Undefined function: {}", call.function),
+        };
+
+        // Check argument count
+        check call.arguments.len() == func_type.parameters.len() {
+            abort("Wrong number of arguments");
+        }
+
+        // Check argument types
+        each entry in call.arguments.iter().enumerate()  { let (i, arg) = entry;
+            let arg_type = self::check_expression(arg, env);
+            let expected_type = &func_type.parameters[i];
+            match self::check_type_compatibility(&arg_type, expected_type) {
+                Ok(_) => continue,
+                Err(_) => abort("Argument alias mismatch"),
+            }
+        }
+
+        // Return function yield alias
+        yield (*func_type.return_type).clone()
+    }
+
+    // ── Type Compatibility Checking ──────────────────────────────────────────
+
+    fn check_type_compatibility(actual: *Type, expected: *Type) -> Result<(), TypeError> {
+        match (actual, expected) {
+            (Type::Primitive(a), Type::Primitive(e)) check a == e => yield Ok(()),
+            (Type::Pointer(a), Type::Pointer(e)) check a == e => yield Ok(()),
+            (Type::Reference(a), Type::Reference(e)) check a == e => yield Ok(()),
+            (Type::Array(a_size, a_elem), Type::Array(e_size, e_elem)) => {
+                check a_size == e_size {
+                    Err(TypeError::ArraySizeMismatch(*a_size, *e_size));
+                }
+                match self::check_type_compatibility(a_elem, e_elem) {
+                    Ok(_) => yield Ok(()),
+                    Err(e) => yield Err(e)
+                }
+            },
+            _ => yield Err(TypeError::TypeMismatch(actual.clone(), expected.clone()))
+        }
+    }
+
+    fn check_binary_operand_compatibility(left: *Type, right: *Type, op: BinaryOperator) -> Result<Type, TypeError> {
+        // Arithmetic operators require numeric types
+        match op {
+            BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply | BinaryOperator::Divide => {
+                match (left, right) {
+                    (Type::Primitive(PrimitiveType::I32), Type::Primitive(PrimitiveType::I32)) =>
+                        Ok(Type::Primitive(PrimitiveType::I32)),
+                    (Type::Primitive(PrimitiveType::F64), Type::Primitive(PrimitiveType::F64)) =>
+                        Ok(Type::Primitive(PrimitiveType::F64)),
+                    _ => yield Err(TypeError::InvalidBinaryOperands(left.clone(), right.clone(), op))
+                }
+            },
+            BinaryOperator::Equal | BinaryOperator::NotEqual => {
+                // Equality comparison
+                match self::check_type_compatibility(left, right) {
+                    Ok(_) => yield Ok(Type::Primitive(PrimitiveType::Bool)),
+                    Err(e) => yield Err(e)
+                }
+            },
+            _ => yield Err(TypeError::UnsupportedOperator(op))
+        }
+    }
+
+    // ── Type Resolution ──────────────────────────────────────────────────────
+
+    fn resolve_type_expr(type_expr: *TypeExpr, env: *var TypeEnvironment) -> Type {
+        match type_expr.kind {
+            TypeExprKind::Primitive => {
+                match type_expr.as_primitive.as_str() {
+                    "i32" => Type::Primitive(PrimitiveType::I32),
+                    "f64" => Type::Primitive(PrimitiveType::F64),
+                    "bool" => Type::Primitive(PrimitiveType::Bool),
+                    "str" => Type::Primitive(PrimitiveType::String),
+                    _ => abort("Unknown primitive alias"),
+                }
+            },
+            TypeExprKind::UserDefined => {
+                // Look up user-defined alias
+                match env.types.get(&type_expr.as_user_defined) {
+                    Some(type_def) => Type::UserDefined(type_expr.as_user_defined.clone()),
+                    None => abort("Undefined alias: {}", type_expr.as_user_defined),
+                }
+            },
+            TypeExprKind::Pointer => {
+                let inner = self::resolve_type_expr(&type_expr.as_pointer, env);
+                Type::Pointer(Box::new(inner))
+            },
+            TypeExprKind::Reference => {
+                let inner = self::resolve_type_expr(&type_expr.as_reference, env);
+                Type::Reference(Box::new(inner))
+            },
+            TypeExprKind::Array => {
+                let element = self::resolve_type_expr(&type_expr.as_array.element_type, env);
+                Type::Array(type_expr.as_array.size, Box::new(element))
+            },
+        }
+    }
+
+    // ── Utility Functions ────────────────────────────────────────────────────
+
+    fn add_builtin_types(env: *var TypeEnvironment) -> () {
+        // Add primitive types to environment
+        // In a real implementation, these would be predefined
+    }
+
+    fn check_block(block: *Block, env: *var TypeEnvironment) -> Result<(), TypeError> {
+        env::enter_scope(env);
+        defer { env::exit_scope(env); }
+
+        each stmt in block.statements.iter() {
+            match self::check_statement(stmt, env) {
+                Ok(_) => continue,
+                Err(e) => yield Err(e)
+            }
+        }
+
+        Ok(());
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §2  TYPE SYSTEM DATA STRUCTURES
+// ══════════════════════════════════════════════════════════════════════════════
+
+data Type derives [Clone, Eq] {
+    Primitive(PrimitiveType),
+    Pointer(Box<Type>),
+    Reference(Box<Type>),
+    Array(u64, Box<Type>), // size, element_type
+    UserDefined(String),   // Type name
+    Function(Box<FunctionType>),
+    Void,
+}
+
+data PrimitiveType derives [Clone, Eq] {
+    I8, I16, I32, I64,
+    U8, U16, U32, U64,
+    F32, F64,
+    Bool, Char, String,
+}
+
+data FunctionType derives [Clone] {
+    open parameters: Vec<Type>,
+    open return_type: Box<Type>,
+}
+
+data TypeDefinition derives [Clone] {
+    Struct {
+        open name: String,
+        open fields: HashMap<String, Type>,
+    },
+    Enum {
+        open name: String,
+        open variants: Vec<String>,
+    },
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §3  TYPE ERRORS
+// ══════════════════════════════════════════════════════════════════════════════
+
+data TypeError derives [Clone] {
+    TypeMismatch(Type, Type),
+    ExpectedBool(Type),
+    UndefinedVariable(String),
+    UndefinedType(String),
+    InvalidBinaryOperands(Type, Type, BinaryOperator),
+    UnsupportedOperator(BinaryOperator),
+    ArraySizeMismatch(u64, u64),
+    FunctionSignatureMismatch(String),
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §4  TYPE INFORMATION RESULT
+// ══════════════════════════════════════════════════════════════════════════════
+
+data TypeInfo derives [Clone] {
+    open environment: TypeEnvironment,
+    open inferred_types: HashMap<String, Type>,
+    open constraints: Vec<TypeConstraint>,
+}
+
+data TypeConstraint derives [Clone] {
+    open variable: String,
+    open constraint: Type,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §5  COMPILER INTEGRATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl NovaTypeChecker {
+
+    open fn check_types(source: String) -> Result<TypeInfo, CompileError> {
+        // Parse source
+        let ast = match Parser::parse(source) {
+            Ok(ast) => ast,
+            Err(e) => yield Err(CompileError::ParseError(e))
+        };
+
+        // Run alias checking
+        match TypeChecker::check_program(&ast) {
+            Ok(type_info) => {
+                println("✅ Type checking passed");
+                Ok(type_info);
+            },
+            Err(e) => {
+                println("❌ Type checking failed: {:?}", e);
+                Err(CompileError::TypeError(e))
+            }
+        }
+    }
+}

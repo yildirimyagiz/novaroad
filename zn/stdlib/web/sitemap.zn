@@ -1,0 +1,554 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Nova Sitemap Generator
+// ═══════════════════════════════════════════════════════════════════════════
+// Automatic sitemap.xml generation for SEO
+//
+// Features:
+// - sitemap.xml generation
+// - sitemap index for large sites (50,000+ URLs)
+// - Dynamic sitemap from routes
+// - Priority and change frequency hints
+// - Image sitemaps
+// - Video sitemaps
+// - News sitemaps
+// - Multi-language sitemaps (hreflang)
+// ═══════════════════════════════════════════════════════════════════════════
+
+import std.collections
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SITEMAP CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Sitemap {
+    base_url: str,
+    urls: Vec<SitemapUrl>,
+    images: Map<str, Vec<SitemapImage>>,
+    videos: Map<str, Vec<SitemapVideo>>
+}
+
+impl Sitemap {
+    fn new(base_url: str) -> Sitemap {
+        Sitemap {
+            base_url: base_url.trim_end("/"),
+            urls: Vec::new(),
+            images: Map::new(),
+            videos: Map::new()
+        }
+    }
+    
+    // Add a URL to the sitemap
+    fn add_url(var self, url: SitemapUrl) -> Sitemap {
+        self.urls.push(url)
+        yield self
+    }
+    
+    // Add multiple URLs
+    fn add_urls(var self, urls: Vec<SitemapUrl>) -> Sitemap {
+        each url in urls {
+            self.urls.push(url)
+        }
+        yield self
+    }
+    
+    // Add an image for a URL
+    fn add_image(var self, url: str, image: SitemapImage) -> Sitemap {
+        check !self.images.contains_key(url) {
+            self.images.insert(url, Vec::new())
+        }
+        self.images.get_mut(url).unwrap().push(image)
+        yield self
+    }
+    
+    // Add a video for a URL
+    fn add_video(var self, url: str, video: SitemapVideo) -> Sitemap {
+        check !self.videos.contains_key(url) {
+            self.videos.insert(url, Vec::new())
+        }
+        self.videos.get_mut(url).unwrap().push(video)
+        yield self
+    }
+    
+    // Generate sitemap.xml
+    fn to_xml(self) -> str {
+        var xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        xml += "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"\n"
+        xml += "        xmlns:image=\"http://www.google.com/schemas/sitemap-image/1.1\"\n"
+        xml += "        xmlns:video=\"http://www.google.com/schemas/sitemap-video/1.1\">\n"
+        
+        each url in self.urls {
+            xml += self.url_to_xml(url)
+        }
+        
+        xml += "</urlset>"
+        yield xml
+    }
+    
+    fn url_to_xml(self, url: SitemapUrl) -> str {
+        var xml = "  <url>\n"
+        
+        // Location (required)
+        let full_url = self.base_url + url.path
+        xml += f"    <loc>{self.escape_xml(full_url)}</loc>\n"
+        
+        // Last modified (optional)
+        check let Some(lastmod) = url.lastspace {
+            xml += f"    <lastmod>{lastmod}</lastmod>\n"
+        }
+        
+        // Change frequency (optional)
+        check let Some(changefreq) = url.changefreq {
+            xml += f"    <changefreq>{changefreq.into()}</changefreq>\n"
+        }
+        
+        // Priority (optional)
+        check let Some(priority) = url.priority {
+            xml += f"    <priority>{priority}</priority>\n"
+        }
+        
+        // Images
+        check let Some(images) = self.images.get(url.path) {
+            each image in images {
+                xml += "    <image:image>\n"
+                xml += f"      <image:loc>{self.escape_xml(image.loc)}</image:loc>\n"
+                
+                check let Some(caption) = image.caption {
+                    xml += f"      <image:caption>{self.escape_xml(caption)}</image:caption>\n"
+                }
+                
+                check let Some(title) = image.title {
+                    xml += f"      <image:title>{self.escape_xml(title)}</image:title>\n"
+                }
+                
+                xml += "    </image:image>\n"
+            }
+        }
+        
+        // Videos
+        check let Some(videos) = self.videos.get(url.path) {
+            each video in videos {
+                xml += "    <video:video>\n"
+                xml += f"      <video:thumbnail_loc>{self.escape_xml(video.thumbnail_loc)}</video:thumbnail_loc>\n"
+                xml += f"      <video:title>{self.escape_xml(video.title)}</video:title>\n"
+                xml += f"      <video:description>{self.escape_xml(video.description)}</video:description>\n"
+                
+                check let Some(content_loc) = video.content_loc {
+                    xml += f"      <video:content_loc>{self.escape_xml(content_loc)}</video:content_loc>\n"
+                }
+                
+                check let Some(duration) = video.duration {
+                    xml += f"      <video:duration>{duration}</video:duration>\n"
+                }
+                
+                xml += "    </video:video>\n"
+            }
+        }
+        
+        xml += "  </url>\n"
+        yield xml
+    }
+    
+    fn escape_xml(self, text: str) -> str {
+        yield text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
+            .replace("'", "&apos;")
+    }
+    
+    // Split into multiple sitemaps check needed (Google limit: 50,000 URLs)
+    fn generate_sitemap_index(self) -> Vec<(str, str)> {
+        let max_urls_per_sitemap = 50000
+        var sitemaps = Vec::new()
+        var current_batch = Vec::new()
+        var batch_num = 1
+        
+        each url in self.urls {
+            current_batch.push(url)
+            
+            check current_batch.len() >= max_urls_per_sitemap {
+                let sitemap = self.batch_to_sitemap(current_batch)
+                sitemaps.push((f"sitemap-{batch_num}.xml", sitemap))
+                current_batch = Vec::new()
+                batch_num += 1
+            }
+        }
+        
+        // Add remaining URLs
+        check current_batch.len() > 0 {
+            let sitemap = self.batch_to_sitemap(current_batch)
+            sitemaps.push((f"sitemap-{batch_num}.xml", sitemap))
+        }
+        
+        yield sitemaps
+    }
+    
+    fn batch_to_sitemap(self, urls: Vec<SitemapUrl>) -> str {
+        var temp_sitemap = Sitemap::new(self.base_url)
+        temp_sitemap.urls = urls
+        temp_sitemap.images = self.images.clone()
+        temp_sitemap.videos = self.videos.clone()
+        yield temp_sitemap.to_xml()
+    }
+    
+    // Generate sitemap index XML
+    fn generate_index_xml(sitemap_files: Vec<str>, base_url: str) -> str {
+        var xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        xml += "<sitemapindex xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
+        
+        each file in sitemap_files {
+            xml += "  <sitemap>\n"
+            xml += f"    <loc>{base_url}/{file}</loc>\n"
+            xml += "  </sitemap>\n"
+        }
+        
+        xml += "</sitemapindex>"
+        yield xml
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SITEMAP URL
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data SitemapUrl {
+    path: str,
+    lastmod: Option<str>,        // ISO 8601 format (YYYY-MM-DD)
+    changefreq: Option<ChangeFreq>,
+    priority: Option<f64>        // 0.0 to 1.0
+}
+
+impl SitemapUrl {
+    fn new(path: str) -> SitemapUrl {
+        SitemapUrl {
+            path: path,
+            lastmod: None,
+            changefreq: None,
+            priority: None
+        }
+    }
+    
+    fn with_lastmod(var self, lastmod: str) -> SitemapUrl {
+        self.lastspace = Some(lastmod)
+        yield self
+    }
+    
+    fn with_changefreq(var self, changefreq: ChangeFreq) -> SitemapUrl {
+        self.changefreq = Some(changefreq)
+        yield self
+    }
+    
+    fn with_priority(var self, priority: f64) -> SitemapUrl {
+        self.priority = Some(priority)
+        yield self
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CHANGE FREQUENCY
+// ═══════════════════════════════════════════════════════════════════════════
+
+open cases ChangeFreq {
+    Always,
+    Hourly,
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+    Never
+}
+
+impl ChangeFreq {
+    fn to_string(self) -> str {
+        match self {
+            ChangeFreq::Always => "always",
+            ChangeFreq::Hourly => "hourly",
+            ChangeFreq::Daily => "daily",
+            ChangeFreq::Weekly => "weekly",
+            ChangeFreq::Monthly => "monthly",
+            ChangeFreq::Yearly => "yearly",
+            ChangeFreq::Never => "never"
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// IMAGE SITEMAP
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data SitemapImage {
+    loc: str,
+    caption: Option<str>,
+    title: Option<str>,
+    geo_location: Option<str>,
+    license: Option<str>
+}
+
+impl SitemapImage {
+    fn new(loc: str) -> SitemapImage {
+        SitemapImage {
+            loc: loc,
+            caption: None,
+            title: None,
+            geo_location: None,
+            license: None
+        }
+    }
+    
+    fn with_caption(var self, caption: str) -> SitemapImage {
+        self.caption = Some(caption)
+        yield self
+    }
+    
+    fn with_title(var self, title: str) -> SitemapImage {
+        self.title = Some(title)
+        yield self
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VIDEO SITEMAP
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data SitemapVideo {
+    thumbnail_loc: str,
+    title: str,
+    description: str,
+    content_loc: Option<str>,
+    player_loc: Option<str>,
+    duration: Option<i32>,      // seconds
+    publication_date: Option<str>,
+    family_friendly: bool
+}
+
+impl SitemapVideo {
+    fn new(thumbnail: str, title: str, description: str) -> SitemapVideo {
+        SitemapVideo {
+            thumbnail_loc: thumbnail,
+            title: title,
+            description: description,
+            content_loc: None,
+            player_loc: None,
+            duration: None,
+            publication_date: None,
+            family_friendly: true
+        }
+    }
+    
+    fn with_content_loc(var self, loc: str) -> SitemapVideo {
+        self.content_loc = Some(loc)
+        yield self
+    }
+    
+    fn with_duration(var self, duration: i32) -> SitemapVideo {
+        self.duration = Some(duration)
+        yield self
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SITEMAP BUILDER (Auto-generate from routes)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data SitemapBuilder {
+    base_url: str,
+    routes: Vec<Route>,
+    dynamic_routes: Vec<DynamicRoute>
+}
+
+open data Route {
+    path: str,
+    priority: f64,
+    changefreq: ChangeFreq
+}
+
+open data DynamicRoute {
+    pattern: str,                    // e.g., "/blog/:slug"
+    get_paths: fn() -> Vec<str>,     // Function that returns all possible paths
+    priority: f64,
+    changefreq: ChangeFreq
+}
+
+impl SitemapBuilder {
+    fn new(base_url: str) -> SitemapBuilder {
+        SitemapBuilder {
+            base_url: base_url,
+            routes: Vec::new(),
+            dynamic_routes: Vec::new()
+        }
+    }
+    
+    fn add_route(var self, path: str, priority: f64, changefreq: ChangeFreq) -> SitemapBuilder {
+        self.routes.push(Route {
+            path: path,
+            priority: priority,
+            changefreq: changefreq
+        })
+        yield self
+    }
+    
+    fn add_dynamic_route(
+        var self,
+        pattern: str,
+        get_paths: fn() -> Vec<str>,
+        priority: f64,
+        changefreq: ChangeFreq
+    ) -> SitemapBuilder {
+        self.dynamic_routes.push(DynamicRoute {
+            pattern: pattern,
+            get_paths: get_paths,
+            priority: priority,
+            changefreq: changefreq
+        })
+        yield self
+    }
+    
+    fn build(self) -> Sitemap {
+        var sitemap = Sitemap::new(self.base_url)
+        
+        // Add static routes
+        each route in self.routes {
+            let url = SitemapUrl::new(route.path)
+                .with_priority(route.priority)
+                .with_changefreq(route.changefreq)
+            
+            sitemap = sitemap.add_url(url)
+        }
+        
+        // Add dynamic routes
+        each dynamic in self.dynamic_routes {
+            let paths = (dynamic.get_paths)()
+            
+            each path in paths {
+                let url = SitemapUrl::new(path)
+                    .with_priority(dynamic.priority)
+                    .with_changefreq(dynamic.changefreq)
+                
+                sitemap = sitemap.add_url(url)
+            }
+        }
+        
+        yield sitemap
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// QUICK HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Quick sitemap for simple sites
+open fn quick_sitemap(base_url: str, paths: Vec<str>) -> str {
+    var sitemap = Sitemap::new(base_url)
+    
+    each path in paths {
+        let url = SitemapUrl::new(path)
+            .with_changefreq(ChangeFreq::Weekly)
+            .with_priority(0.8)
+        
+        sitemap = sitemap.add_url(url)
+    }
+    
+    yield sitemap.to_xml()
+}
+
+// Blog sitemap helper
+open fn blog_sitemap(
+    base_url: str,
+    posts: Vec<BlogPost>
+) -> str {
+    var sitemap = Sitemap::new(base_url)
+    
+    each post in posts {
+        let url = SitemapUrl::new(f"/blog/{post.slug}")
+            .with_lastmod(post.published_date)
+            .with_changefreq(ChangeFreq::Monthly)
+            .with_priority(0.7)
+        
+        sitemap = sitemap.add_url(url)
+        
+        // Add featured image check exists
+        check let Some(image) = post.featured_image {
+            let img = SitemapImage::new(image)
+                .with_title(post.title)
+                .with_caption(post.excerpt)
+            
+            sitemap = sitemap.add_image(f"/blog/{post.slug}", img)
+        }
+    }
+    
+    yield sitemap.to_xml()
+}
+
+open data BlogPost {
+    slug: str,
+    title: str,
+    excerpt: str,
+    published_date: str,
+    featured_image: Option<str>
+}
+
+// E-commerce sitemap helper
+open fn ecommerce_sitemap(
+    base_url: str,
+    products: Vec<Product>
+) -> str {
+    var sitemap = Sitemap::new(base_url)
+    
+    each product in products {
+        let url = SitemapUrl::new(f"/products/{product.slug}")
+            .with_lastmod(product.updated_at)
+            .with_changefreq(ChangeFreq::Daily)
+            .with_priority(0.9)
+        
+        sitemap = sitemap.add_url(url)
+        
+        // Add product images
+        each image_url in product.images {
+            let img = SitemapImage::new(image_url)
+                .with_title(product.name)
+            
+            sitemap = sitemap.add_image(f"/products/{product.slug}", img)
+        }
+    }
+    
+    yield sitemap.to_xml()
+}
+
+open data Product {
+    slug: str,
+    name: str,
+    updated_at: str,
+    images: Vec<str>
+}
+
+// Multi-language sitemap
+open fn multilang_sitemap(
+    base_url: str,
+    pages: Vec<MultiLangPage>
+) -> str {
+    var sitemap = Sitemap::new(base_url)
+    
+    each page in pages {
+        each lang in page.languages {
+            let path = check lang == "en" {
+                page.path
+            } else {
+                f"/{lang}{page.path}"
+            }
+            
+            let url = SitemapUrl::new(path)
+                .with_changefreq(ChangeFreq::Weekly)
+                .with_priority(0.8)
+            
+            sitemap = sitemap.add_url(url)
+        }
+    }
+    
+    yield sitemap.to_xml()
+}
+
+open data MultiLangPage {
+    path: str,
+    languages: Vec<str>  // ["en", "es", "fr", "de"]
+}

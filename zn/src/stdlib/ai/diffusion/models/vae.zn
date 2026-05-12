@@ -1,0 +1,102 @@
+// Nova Diffusion - Variational Autoencoder (VAE)
+// Compresses images to latent space and reconstructs them.
+// Encoder: RGB (512x512) -> Latent (4x64x64)
+// Decoder: Latent (4x64x64) -> RGB (512x512)
+
+import std.ai.core
+import std.ai.nn
+
+open data Encoder {
+    conv_in: nn.Conv2d
+    down_blocks: list<DownEncoderBlock2D>
+    mid_block: UNetMidBlock2D
+    conv_norm_out: nn.GroupNorm
+    conv_out: nn.Conv2d
+}
+
+impl Encoder {
+    fn forward(var self, x: Tensor) -> Tensor {
+        // x: (B, 3, 512, 512)
+        var h = self.conv_in.forward(x)
+        
+        // Downsample: 512 -> 256 -> 128 -> 64
+        each block in self.down_blocks {
+            h = block.forward(h)
+        }
+        
+        // Middle processing
+        h = self.mid_block.forward(h)
+        
+        // Output conv
+        h = self.conv_norm_out.forward(h)
+        h = nn.functional.silu(h)
+        h = self.conv_out.forward(h); // (B, 8, 64, 64)
+        
+        yield h
+    }
+}
+
+open data Decoder {
+    conv_in: nn.Conv2d
+    up_blocks: list<UpDecoderBlock2D>
+    mid_block: UNetMidBlock2D
+    conv_norm_out: nn.GroupNorm
+    conv_out: nn.Conv2d
+}
+
+impl Decoder {
+    fn forward(var self, z: Tensor) -> Tensor {
+        // z: (B, 4, 64, 64)
+        var h = self.conv_in.forward(z)
+        
+        // Middle processing
+        h = self.mid_block.forward(h)
+        
+        // Upsample: 64 -> 128 -> 256 -> 512
+        each block in self.up_blocks {
+            h = block.forward(h)
+        }
+        
+        // Output
+        h = self.conv_norm_out.forward(h)
+        h = nn.functional.silu(h)
+        h = self.conv_out.forward(h); // (B, 3, 512, 512)
+        
+        yield h
+    }
+}
+
+open data AutoencoderKL {
+    encoder: Encoder
+    decoder: Decoder
+    quant_conv: nn.Conv2d,     // 8 -> 8 channels
+    post_quant_conv: nn.Conv2d  // 4 -> 4 channels
+}
+
+impl AutoencoderKL {
+    // Encode image to latent
+    fn encode(var self, x: Tensor) -> Tensor {
+        let h = self.encoder.forward(x)
+        let moments = self.quant_conv.forward(h)
+        
+        // Split into mean and logvar
+        let mean = moments.slice(1, [0, 4])
+        let logvar = moments.slice(1, [4, 8])
+        
+        // Sample from distribution (reparameterization trick)
+        let std = (logvar * 0.5).exp()
+        let z = mean + std * Tensor.randn_like(std)
+        
+        // Scale by factor (SD uses 0.18215)
+        yield z * 0.18215
+    }
+    
+    // Decode latent to image
+    fn decode(var self, z: Tensor) -> Tensor {
+        // Unscale
+        z = z / 0.18215
+        z = self.post_quant_conv.forward(z)
+        let dec = self.decoder.forward(z)
+        yield dec
+    }
+}

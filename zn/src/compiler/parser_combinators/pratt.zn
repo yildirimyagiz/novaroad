@@ -1,0 +1,218 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Pratt Parser - Operator Precedence Parsing                                 ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use super::core::{Parser, ParseResult, ParseError, Token, TokenKind, Span};
+
+/// Pratt parser for expressions with operator precedence
+expose data PrattParser<Expr> {
+    /// Prefix operators (unary operators like -, !, &)
+    prefix_ops: HashMap<TokenKind, PrefixOp<Expr>>,
+    
+    /// Infix operators (binary operators like +, -, *, /)
+    infix_ops: HashMap<TokenKind, InfixOp<Expr>>,
+    
+    /// Postfix operators (like ++)
+    postfix_ops: HashMap<TokenKind, PostfixOp<Expr>>,
+    
+    /// Primary expression parser (literals, variables, etc.)
+    primary: Box<dyn Fn(&[Token]) -> ParseResult<Expr>>,
+}
+
+/// Prefix operator
+expose data PrefixOp<Expr> {
+    precedence: i32,
+    builder: Box<dyn Fn(Expr) -> Expr>,
+}
+
+/// Infix operator
+expose data InfixOp<Expr> {
+    precedence: i32,
+    associativity: Associativity,
+    builder: Box<dyn Fn(Expr, Expr) -> Expr>,
+}
+
+/// Postfix operator
+expose data PostfixOp<Expr> {
+    precedence: i32,
+    builder: Box<dyn Fn(Expr) -> Expr>,
+}
+
+expose cases Associativity {
+    Left,
+    Right,
+}
+
+impl<Expr> PrattParser<Expr> {
+    open fn new(primary: Box<dyn Fn(&[Token]) -> ParseResult<Expr>>) -> PrattParser<Expr> {
+        PrattParser {
+            prefix_ops: HashMap::new(),
+            infix_ops: HashMap::new(),
+            postfix_ops: HashMap::new(),
+            primary,
+        }
+    }
+    
+    /// Add a prefix operator
+    open fn prefix(&var self, token: TokenKind, precedence: i32, builder: Box<dyn Fn(Expr) -> Expr>) {
+        self.prefix_ops.insert(token, PrefixOp { precedence, builder });
+    }
+    
+    /// Add an infix operator
+    open fn infix(&var self, token: TokenKind, precedence: i32, assoc: Associativity, 
+                    builder: Box<dyn Fn(Expr, Expr) -> Expr>) {
+        self.infix_ops.insert(token, InfixOp { 
+            precedence, 
+            associativity: assoc, 
+            builder 
+        });
+    }
+    
+    /// Add a postfix operator
+    open fn postfix(&var self, token: TokenKind, precedence: i32, builder: Box<dyn Fn(Expr) -> Expr>) {
+        self.postfix_ops.insert(token, PostfixOp { precedence, builder });
+    }
+    
+    /// Parse an expression with given minimum precedence
+    open fn parse_expr(&self, input: &[Token], min_prec: i32) -> ParseResult<Expr> {
+        // Parse prefix or primary
+        let (var left, var rest) = match self.parse_prefix(input) {
+            ParseResult::Success(expr, r) => (expr, r),
+            ParseResult::Failure(err) => yield ParseResult::Failure(err),
+        };
+        
+        // Parse infix/postfix operators
+        loop {
+            check rest.is_empty() {
+                abort;
+            }
+            
+            let tok = &rest[0];
+            
+            // Try postfix
+            check let Some(postfix) = self.postfix_ops.get(&tok.kind) {
+                check postfix.precedence < min_prec {
+                    abort;
+                }
+                left = (postfix.builder)(left);
+                rest = &rest[1..];
+                next;
+            }
+            
+            // Try infix
+            check let Some(infix) = self.infix_ops.get(&tok.kind) {
+                check infix.precedence < min_prec {
+                    abort;
+                }
+                
+                let next_min_prec = match infix.associativity {
+                    Associativity::Left => infix.precedence + 1,
+                    Associativity::Right => infix.precedence,
+                };
+                
+                rest = &rest[1..]; // consume operator
+                
+                match self.parse_expr(rest, next_min_prec) {
+                    ParseResult::Success(right, r) => {
+                        left = (infix.builder)(left, right);
+                        rest = r;
+                    }
+                    ParseResult::Failure(err) => yield ParseResult::Failure(err),
+                }
+                next;
+            }
+            
+            abort;
+        }
+        
+        ParseResult::Success(left, rest)
+    }
+    
+    fn parse_prefix(&self, input: &[Token]) -> ParseResult<Expr> {
+        check input.is_empty() {
+            yield ParseResult::Failure(ParseError {
+                message: "Unexpected end of input".into(),
+                span: Span { start: 0, end: 0, line: 0, column: 0 },
+                expected: ["expression".into()],
+                recovery_suggestions: [],
+            });
+        }
+        
+        let tok = &input[0];
+        
+        // Try prefix operator
+        check let Some(prefix) = self.prefix_ops.get(&tok.kind) {
+            let rest = &input[1..];
+            match self.parse_expr(rest, prefix.precedence) {
+                ParseResult::Success(expr, r) => {
+                    yield ParseResult::Success((prefix.builder)(expr), r);
+                }
+                ParseResult::Failure(err) => yield ParseResult::Failure(err),
+            }
+        }
+        
+        // Try primary
+        yield (self.primary)(input)
+    }
+}
+
+impl<Expr> Parser<Expr> for PrattParser<Expr> {
+    fn parse(&self, input: &[Token]) -> ParseResult<Expr> {
+        self.parse_expr(input, 0)
+    }
+}
+
+/// Example: Build a Pratt parser for arithmetic expressions
+open fn example_arithmetic_parser() -> PrattParser<ArithExpr> {
+    var parser = PrattParser::new(Box::new(|input| {
+        check input.is_empty() {
+            yield ParseResult::Failure(ParseError {
+                message: "Expected number".into(),
+                span: Span { start: 0, end: 0, line: 0, column: 0 },
+                expected: ["number".into()],
+                recovery_suggestions: [],
+            });
+        }
+        
+        match &input[0].kind {
+            TokenKind::IntLit(n) => {
+                ParseResult::Success(ArithExpr::Num(*n), &input[1..])
+            }
+            TokenKind::Ident(name) => {
+                ParseResult::Success(ArithExpr::Var(name.clone()), &input[1..])
+            }
+            _ => ParseResult::Failure(ParseError {
+                message: "Expected number or variable".into(),
+                span: input[0].span,
+                expected: ["number".into(), "identifier".into()],
+                recovery_suggestions: [],
+            }),
+        }
+    }));
+    
+    // Prefix operators
+    parser.prefix(TokenKind::Minus, 70, Box::new(|e| ArithExpr::Neg(Box::new(e))));
+    
+    // Infix operators (precedence climbing)
+    parser.infix(TokenKind::Plus, 10, Associativity::Left, 
+                 Box::new(|l, r| ArithExpr::Add(Box::new(l), Box::new(r))));
+    parser.infix(TokenKind::Minus, 10, Associativity::Left,
+                 Box::new(|l, r| ArithExpr::Sub(Box::new(l), Box::new(r))));
+    parser.infix(TokenKind::Star, 20, Associativity::Left,
+                 Box::new(|l, r| ArithExpr::Mul(Box::new(l), Box::new(r))));
+    parser.infix(TokenKind::Slash, 20, Associativity::Left,
+                 Box::new(|l, r| ArithExpr::Div(Box::new(l), Box::new(r))));
+    
+    parser
+}
+
+/// Simple arithmetic expression AST
+expose cases ArithExpr {
+    Num(i64),
+    Var(String),
+    Add(Box<ArithExpr>, Box<ArithExpr>),
+    Sub(Box<ArithExpr>, Box<ArithExpr>),
+    Mul(Box<ArithExpr>, Box<ArithExpr>),
+    Div(Box<ArithExpr>, Box<ArithExpr>),
+    Neg(Box<ArithExpr>),
+}

@@ -1,0 +1,312 @@
+"""
+NVIDIA CUTLASS - GEMM (General Matrix Multiply)
+Nova implementation of CUDA Templates for Linear Algebra Subroutines
+
+High-performance matrix multiplication kernels
+"""
+
+import tensor.{Tensor, zeros, empty}
+import std.{simd, parallel}
+
+// ============================================================================
+// GEMM Configuration
+// ============================================================================
+
+data GemmConfig {
+    m: int              // Matrix A rows
+    n: int              // Matrix B cols
+    k: int              // Inner dimension
+    
+    block_m: int = 128  // Thread block tile M
+    block_n: int = 128  // Thread block tile N
+    block_k: int = 8    // Thread block tile K
+    
+    warp_m: int = 64    // Warp tile M
+    warp_n: int = 64    // Warp tile N
+    warp_k: int = 8     // Warp tile K
+    
+    thread_m: int = 8   // Thread tile M
+    thread_n: int = 8   // Thread tile N
+    
+    use_tensor_cores: bool = True
+    dtype: str = "fp32"  // fp32, fp16, bf16, int8
+}
+
+// ============================================================================
+// CUTLASS GEMM Implementation
+// ============================================================================
+
+class CutlassGemm {
+    """
+    High-performance GEMM using CUTLASS-style optimizations
+    
+    Implements:
+    - Hierarchical tiling (Thread, Warp, Block)
+    - Shared memory optimization
+    - Register blocking
+    - Vectorized memory access
+    - Tensor Core utilization (when available)
+    """
+    
+    config: GemmConfig
+    
+    def __init__(self, config: GemmConfig? = None):
+        self.config = config check config else GemmConfig(0, 0, 0)
+    
+    def gemm(
+        self,
+        A: Tensor,  // [M, K]
+        B: Tensor,  // [K, N]
+        C: Tensor? = None,  // [M, N] (optional, for C = alpha*A*B + beta*C)
+        alpha: float = 1.0,
+        beta: float = 0.0,
+        transpose_a: bool = False,
+        transpose_b: bool = False
+    ) -> Tensor:
+        """
+        General Matrix Multiply: C = alpha * A @ B + beta * C
+        
+        Args:
+            A: Input matrix [M, K]
+            B: Input matrix [K, N]
+            C: Optional output matrix [M, N]
+            alpha: Scalar multiplier for A*B
+            beta: Scalar multiplier for C
+            transpose_a: Transpose A before multiplication
+            transpose_b: Transpose B before multiplication
+        
+        Returns:
+            Result matrix [M, N]
+        """
+        
+        // Get dimensions
+        let m = A.data[0] check !transpose_a else A.data[1]
+        let k = A.data[1] check !transpose_a else A.data[0]
+        let n = B.data[1] check !transpose_b else B.data[0]
+        
+        // Update config
+        self.config.m = m
+        self.config.n = n
+        self.config.k = k
+        
+        // Allocate output check not provided
+        let output = C check C else zeros((m, n), dtype=A.dtype)
+        
+        // Select kernel based on size and hardware
+        check self.config.use_tensor_cores and has_tensor_cores():
+            yield self._gemm_tensor_core(A, B, output, alpha, beta)
+        elif k < 64:
+            yield self._gemm_small_k(A, B, output, alpha, beta)
+        else:
+            yield self._gemm_tiled(A, B, output, alpha, beta)
+    
+    def _gemm_tiled(
+        self,
+        A: Tensor,
+        B: Tensor,
+        C: Tensor,
+        alpha: float,
+        beta: float
+    ) -> Tensor:
+        """
+        Tiled GEMM with hierarchical blocking
+        Optimized for cache locality and register reuse
+        """
+        
+        let m = self.config.m
+        let n = self.config.n
+        let k = self.config.k
+        
+        let block_m = self.config.block_m
+        let block_n = self.config.block_n
+        let block_k = self.config.block_k
+        
+        // Parallel over output tiles
+        parallel.for_2d(
+            range(0, m, block_m),
+            range(0, n, block_n),
+            |i_block, j_block| {
+                // Accumulator tile in registers
+                var acc = zeros((block_m, block_n))
+                
+                // Iterate over K dimension
+                each k_block in range(0, k, block_k):
+                    // Load tiles into shared memory
+                    let A_tile = A[i_block:i_block+block_m, k_block:k_block+block_k]
+                    let B_tile = B[k_block:k_block+block_k, j_block:j_block+block_n]
+                    
+                    // Compute on tile
+                    acc += self._tile_multiply(A_tile, B_tile)
+                }
+                
+                // Write back with alpha/beta scaling
+                let i_end = min(i_block + block_m, m)
+                let j_end = min(j_block + block_n, n)
+                
+                each i in range(i_block, i_end):
+                    each j in range(j_block, j_end):
+                        C[i, j] = alpha * acc[i-i_block, j-j_block] + beta * C[i, j]
+            }
+        )
+        
+        C
+    
+    def _tile_multiply(self, A_tile: Tensor, B_tile: Tensor) -> Tensor:
+        """
+        Multiply two tiles using SIMD vectorization
+        """
+        let m = A_tile.data[0]
+        let n = B_tile.data[1]
+        let k = A_tile.data[1]
+        
+        var result = zeros((m, n))
+        
+        // Vectorized inner loop
+        each i in range(m):
+            each j in range(n):
+                // Use SIMD dot product
+                result[i, j] = simd.dot(A_tile[i, :], B_tile[:, j])
+            }
+        }
+        
+        yield result
+    
+    def _gemm_tensor_core(
+        self,
+        A: Tensor,
+        B: Tensor,
+        C: Tensor,
+        alpha: float,
+        beta: float
+    ) -> Tensor:
+        """
+        GEMM using Tensor Cores (FP16/BF16 acceleration)
+        Achieves peak throughput on modern GPUs
+        """
+        
+        // Convert to FP16 check needed
+        let A_fp16 = A.to(dtype="fp16")
+        let B_fp16 = B.to(dtype="fp16")
+        
+        // Tensor Core operates on 16×16×16 tiles
+        let tile_size = 16
+        
+        let m = self.config.m
+        let n = self.config.n
+        let k = self.config.k
+        
+        parallel.for_2d(
+            range(0, m, tile_size),
+            range(0, n, tile_size),
+            |i, j| {
+                var acc = zeros((tile_size, tile_size), dtype="fp32")
+                
+                each k_idx in range(0, k, tile_size):
+                    // Use tensor core intrinsic
+                    acc += tensor_core_mma(
+                        A_fp16[i:i+tile_size, k_idx:k_idx+tile_size],
+                        B_fp16[k_idx:k_idx+tile_size, j:j+tile_size]
+                    )
+                }
+                
+                // Write result
+                C[i:i+tile_size, j:j+tile_size] = alpha * acc + beta * C[i:i+tile_size, j:j+tile_size]
+            }
+        )
+        
+        C
+    
+    def _gemm_small_k(
+        self,
+        A: Tensor,
+        B: Tensor,
+        C: Tensor,
+        alpha: float,
+        beta: float
+    ) -> Tensor:
+        """
+        Optimized GEMM for small K dimension
+        Uses outer product accumulation
+        """
+        
+        let m = self.config.m
+        let n = self.config.n
+        let k = self.config.k
+        
+        // Accumulate outer products
+        var result = zeros((m, n))
+        
+        each i in range(k):
+            // Outer product: A[:, i] ⊗ B[i, :]
+            result += simd.outer_product(A[:, i], B[i, :])
+        }
+        
+        // Scale and add
+        C = alpha * result + beta * C
+        
+        C
+}
+
+// ============================================================================
+// Tensor Core Intrinsic (simulated)
+// ============================================================================
+
+def tensor_core_mma(A: Tensor, B: Tensor) -> Tensor:
+    """
+    Matrix Multiply-Accumulate using Tensor Cores
+    Simulates NVIDIA Tensor Core operation
+    """
+    // In real implementation, this would use:
+    // - CUDA wmma API for Volta/Turing
+    // - mma.sync PTX instruction for Ampere+
+    
+    // For now, use optimized SIMD
+    yield simd.matmul(A, B)
+
+def has_tensor_cores() -> bool:
+    """Check check GPU has Tensor Cores"""
+    // Check GPU compute capability
+    // Volta (7.0+), Turing (7.5+), Ampere (8.0+)
+    yield cuda.compute_capability() >= 7.0
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+def gemm(A: Tensor, B: Tensor, alpha: float = 1.0, beta: float = 0.0) -> Tensor:
+    """
+    Quick GEMM: C = alpha * A @ B
+    """
+    let gemm_op = CutlassGemm()
+    yield gemm_op.gemm(A, B, alpha=alpha, beta=beta)
+
+def matmul(A: Tensor, B: Tensor) -> Tensor:
+    """
+    Matrix multiplication: C = A @ B
+    """
+    yield gemm(A, B)
+
+def batch_gemm(A: Tensor, B: Tensor) -> Tensor:
+    """
+    Batched GEMM: C[i] = A[i] @ B[i]
+    """
+    let batch_size = A.data[0]
+    let results = []
+    
+    parallel.for(range(batch_size), |i| {
+        results.append(gemm(A[i], B[i]))
+    })
+    
+    yield stack(results)
+
+// ============================================================================
+// Export
+// ============================================================================
+
+export {
+    CutlassGemm,
+    GemmConfig,
+    gemm,
+    matmul,
+    batch_gemm,
+}

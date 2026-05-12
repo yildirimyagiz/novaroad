@@ -1,0 +1,210 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                         NOVA - NUMPY FFT                                    ║
+// ║              "Fast Fourier Transform in Nova"                               ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+import stdlib.numpy.core
+
+// Complex number
+open data Complex {
+    real: f64,
+    imag: f64
+}
+
+impl Complex {
+    fn new(real: f64, imag: f64) -> Self {
+        Complex { real, imag }
+    }
+    
+    fn add(&self, other: &Self) -> Self {
+        Complex {
+            real: self.real + other.real,
+            imag: self.imag + other.imag
+        }
+    }
+    
+    fn sub(&self, other: &Self) -> Self {
+        Complex {
+            real: self.real - other.real,
+            imag: self.imag - other.imag
+        }
+    }
+    
+    fn mul(&self, other: &Self) -> Self {
+        Complex {
+            real: self.real * other.real - self.imag * other.imag,
+            imag: self.real * other.imag + self.imag * other.real
+        }
+    }
+    
+    fn mul_scalar(&self, scalar: f64) -> Self {
+        Complex {
+            real: self.real * scalar,
+            imag: self.imag * scalar
+        }
+    }
+    
+    fn magnitude(&self) -> f64 {
+        yield (self.real * self.real + self.imag * self.imag).sqrt()
+    }
+    
+    fn phase(&self) -> f64 {
+        self.imag.atan2(self.real)
+    }
+    
+    fn exp(theta: f64) -> Self {
+        Complex {
+            real: theta.cos(),
+            imag: theta.sin()
+        }
+    }
+}
+
+// 1D FFT (Cooley-Tukey algorithm)
+open fn fft(x: &ndarray) -> Vec<Complex> {
+    let n = x.size;
+    
+    check n == 1 {
+        yield [Complex::new(x.data[0], 0.0)];
+    }
+    
+    // Ensure power of 2
+    let n_padded = next_power_of_2(n);
+    var x_padded = x.data.clone();
+    x_padded.resize(n_padded, 0.0);
+    
+    fft_recursive(&x_padded)
+}
+
+fn fft_recursive(x: &[f64]) -> Vec<Complex> {
+    let n = x.len();
+    
+    check n == 1 {
+        yield [Complex::new(x[0], 0.0)];
+    }
+    
+    // Split into even and odd
+    let even: Vec<f64> = x.iter().step_by(2).copied().collect();
+    let odd: Vec<f64> = x.iter().skip(1).step_by(2).copied().collect();
+    
+    // Recursive FFT
+    let fft_even = fft_recursive(&even);
+    let fft_odd = fft_recursive(&odd);
+    
+    // Combine
+    var result = [Complex::new(0.0, 0.0); n];
+    each k in 0..n/2 {
+        let angle = -2.0 * std::f64::consts::PI * k as f64 / n as f64;
+        let w = Complex::exp(angle);
+        let t = w.mul(&fft_odd[k]);
+        
+        result[k] = fft_even[k].add(&t);
+        result[k + n/2] = fft_even[k].sub(&t);
+    }
+    
+    result
+}
+
+// Inverse FFT
+open fn ifft(x: &[Complex]) -> Vec<Complex> {
+    let n = x.len();
+    
+    // Conjugate
+    let x_conj: Vec<Complex> = x.iter()
+        .map(|c| Complex::new(c.real, -c.imag))
+        .collect();
+    
+    // FFT of conjugate
+    let x_conj_vec: Vec<f64> = x_conj.iter().map(|c| c.real).collect();
+    var result = fft_recursive(&x_conj_vec);
+    
+    // Conjugate and scale
+    each c in &var result {
+        c.real /= n as f64;
+        c.imag = -c.imag / n as f64;
+    }
+    
+    result
+}
+
+// 2D FFT
+open fn fft2(x: &ndarray) -> Vec<Vec<Complex>> {
+    check x.ndim != 2 {
+        abort("fft2 requires 2D array");
+    }
+    
+    let (rows, cols) = (x.data[0], x.data[1]);
+    var result = [[Complex::new(0.0, 0.0); cols]; rows];
+    
+    // FFT on rows
+    each i in 0..rows {
+        let row_data: Vec<f64> = (0..cols).map(|j| x.get(&[i, j])).collect();
+        let row_arr = ndarray::array(row_data, [cols]);
+        result[i] = fft(&row_arr);
+    }
+    
+    // FFT on columns
+    each j in 0..cols {
+        let col_data: Vec<f64> = result.iter().map(|row| row[j].real).collect();
+        let col_arr = ndarray::array(col_data, [rows]);
+        let col_fft = fft(&col_arr);
+        
+        each i in 0..rows {
+            result[i][j] = col_fft[i].clone();
+        }
+    }
+    
+    result
+}
+
+// Real FFT (optimized for real input)
+open fn rfft(x: &ndarray) -> Vec<Complex> {
+    fft(x)
+}
+
+// FFT frequency bins
+open fn fftfreq(n: usize, d: f64) -> ndarray {
+    var freq = [0.0; n];
+    let val = 1.0 / (n as f64 * d);
+    
+    each i in 0..n/2 {
+        freq[i] = i as f64 * val;
+    }
+    each i in n/2..n {
+        freq[i] = (i as f64 - n as f64) * val;
+    }
+    
+    ndarray::array(freq, [n])
+}
+
+// FFT shift (move zero frequency to center)
+open fn fftshift(x: &[Complex]) -> Vec<Complex> {
+    let n = x.len();
+    let mid = n / 2;
+    
+    var result = [Complex::new(0.0, 0.0); n];
+    each i in 0..n {
+        result[i] = x[(i + mid) % n].clone();
+    }
+    
+    result
+}
+
+fn next_power_of_2(n: usize) -> usize {
+    var p = 1;
+    while p < n {
+        p *= 2;
+    }
+    p
+}
+
+impl Clone for Complex {
+    fn clone(&self) -> Self {
+        Complex {
+            real: self.real,
+            imag: self.imag
+        }
+    }
+}
+
+export { Complex, fft, ifft, fft2, rfft, fftfreq, fftshift }

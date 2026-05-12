@@ -1,0 +1,429 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║              NOVA STABLE DIFFUSION PIPELINE                                 ║
+// ║              Complete end-to-end pipeline implementation                      ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use stdlib.ai.diffusion.{
+    stable_diffusion.UNet,
+    vae.VAE,
+    clip.{CLIPTextEncoder, CLIPTokenizer},
+    scheduler.{DDPMScheduler, DDIMScheduler}
+}
+use stdlib.ai.torch.Tensor
+use std.{gpu, progress}
+
+// ============================================================================
+// STABLE DIFFUSION PIPELINE
+// ============================================================================
+
+open data StableDiffusionPipeline {
+    // Core models
+    unet: UNet,
+    vae: VAE,
+    text_encoder: CLIPTextEncoder,
+    tokenizer: CLIPTokenizer,
+    scheduler: DDIMScheduler,
+    
+    // Config
+    device: Device,
+    dtype: DataType,
+    
+    // Safety checker (optional)
+    safety_checker: Option<SafetyChecker>,
+}
+
+open cases Device {
+    CPU,
+    GPU(i32),  // GPU index
+    MPS,       // Apple Metal
+}
+
+open cases DataType {
+    FP32,
+    FP16,
+    BF16,
+}
+
+impl StableDiffusionPipeline {
+    /// Create new SD 1.5 pipeline
+    fn sd15() -> Self {
+        Self::new(
+            4,      // latent_channels
+            4,      // out_channels
+            320,    // model_channels
+            2,      // num_res_blocks
+            &[1, 2, 4, 4],  // channel_mult
+            768     // context_dim
+        )
+    }
+    
+    /// Create new SD 2.1 pipeline
+    fn sd21() -> Self {
+        Self::new(
+            4,
+            4,
+            320,
+            2,
+            &[1, 2, 4, 4],
+            1024  // Larger context_dim for SD 2.1
+        )
+    }
+    
+    /// Create new SDXL pipeline
+    fn sdxl() -> Self {
+        Self::new(
+            4,
+            4,
+            320,
+            2,
+            &[1, 2, 4],
+            2048  // Much larger for SDXL
+        )
+    }
+    
+    fn new(
+        latent_channels: i32,
+        out_channels: i32,
+        model_channels: i32,
+        num_res_blocks: i32,
+        channel_mult: &[i32],
+        context_dim: i32
+    ) -> Self {
+        StableDiffusionPipeline {
+            unet: UNet::new(
+                latent_channels,
+                out_channels,
+                model_channels,
+                num_res_blocks,
+                channel_mult,
+                context_dim
+            ),
+            vae: VAE::new(3, latent_channels, 128),
+            text_encoder: CLIPTextEncoder::new(
+                49408,  // vocab_size
+                77,     // max_position_embeddings
+                context_dim,
+                12,     // num_layers
+                context_dim / 64  // num_heads
+            ),
+            tokenizer: CLIPTokenizer::new(),
+            scheduler: DDIMScheduler::new(1000, 0.00085, 0.012),
+            device: Device::CPU,
+            dtype: DataType::FP32,
+            safety_checker: None
+        }
+    }
+    
+    /// Move pipeline to GPU
+    fn to_gpu(&var self, device_id: i32) {
+        self.device = Device::GPU(device_id);
+        
+        // Move all models to GPU
+        self.unet.to_device(&self.device);
+        self.vae.to_device(&self.device);
+        self.text_encoder.to_device(&self.device);
+    }
+    
+    /// Set precision
+    fn to_fp16(&var self) {
+        self.dtype = DataType::FP16;
+        
+        self.unet.to_dtype(&self.dtype);
+        self.vae.to_dtype(&self.dtype);
+        self.text_encoder.to_dtype(&self.dtype);
+    }
+    
+    /// Main generation method
+    @gpu_accelerated
+    @progress_bar
+    fn generate(
+        &var self,
+        prompt: &str,
+        negative_prompt: Option<&str>,
+        num_inference_steps: i32,
+        guidance_scale: f32,
+        height: i32,
+        width: i32,
+        seed: Option<i64>
+    ) -> Tensor {
+        // Set random seed
+        check let Some(s) = seed {
+            yield Tensor::manual_seed(s);
+        }
+        
+        // 1. Encode text prompt
+        let (text_embeddings, negative_embeddings) = 
+            self.encode_prompt(prompt, negative_prompt);
+        
+        // 2. Prepare timesteps
+        self.scheduler.set_timesteps(num_inference_steps);
+        
+        // 3. Prepare latents
+        let latent_height = height / 8;
+        let latent_width = width / 8;
+        var latents = Tensor::randn(&[1, 4, latent_height, latent_width]);
+        latents = latents.to_device(&self.device);
+        
+        // 4. Denoising loop
+        each entry in self.scheduler.timesteps.iter().enumerate()  { let (i, &timestep) = entry;
+            // Expand latents for classifier-free guidance
+            let latent_model_input = check guidance_scale > 1.0 {
+                Tensor::cat(&[latents.clone(), latents.clone()], 0)
+            } else {
+                latents.clone()
+            };
+            
+            // Predict noise
+            let timestep_tensor = Tensor::from_scalar(timestep as f32);
+            
+            let context = check guidance_scale > 1.0 {
+                Tensor::cat(&[negative_embeddings.clone(), text_embeddings.clone()], 0)
+            } else {
+                text_embeddings.clone()
+            };
+            
+            let noise_pred = self.unet.forward(
+                &latent_model_input,
+                &timestep_tensor,
+                &context
+            );
+            
+            // Classifier-free guidance
+            let noise_pred = check guidance_scale > 1.0 {
+                let (noise_pred_uncond, noise_pred_text) = noise_pred.chunk(2, 0);
+                noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            } else {
+                noise_pred
+            };
+            
+            // Scheduler step
+            let prev_timestep = check i < self.scheduler.timesteps.len() - 1 {
+                self.scheduler.timesteps[i + 1]
+            } else {
+                -1
+            };
+            
+            latents = self.scheduler.step(&noise_pred, timestep, &latents, prev_timestep);
+            
+            // Progress callback
+            progress::update(i + 1, num_inference_steps);
+        }
+        
+        // 5. Decode latents
+        let image = self.vae.decode(&latents);
+        
+        // 6. Convert to image format [0, 1]
+        let image = (image / 2.0 + 0.5).clamp(0.0, 1.0);
+        
+        // 7. Safety check (optional)
+        check let Some(ref var checker) = self.safety_checker {
+            check !checker.check(&image) {
+                yield self.generate_black_image(height, width);
+            }
+        }
+        
+        image
+    }
+    
+    /// Encode text prompt to embeddings
+    fn encode_prompt(&var self, prompt: &str, negative_prompt: Option<&str>) -> (Tensor, Tensor) {
+        // Tokenize positive prompt
+        let input_ids = self.tokenizer.encode_batch(&[prompt.into()]);
+        let (text_embeddings, _) = self.text_encoder.encode_text(&input_ids);
+        
+        // Tokenize negative prompt
+        let negative_embeddings = check let Some(neg) = negative_prompt {
+            let neg_ids = self.tokenizer.encode_batch(&[neg.into()]);
+            let (neg_emb, _) = self.text_encoder.encode_text(&neg_ids);
+            neg_emb
+        } else {
+            // Use empty prompt
+            let empty_ids = self.tokenizer.encode_batch(&["".into()]);
+            let (empty_emb, _) = self.text_encoder.encode_text(&empty_ids);
+            empty_emb
+        };
+        
+        yield (text_embeddings, negative_embeddings)
+    }
+    
+    fn generate_black_image(&self, height: i32, width: i32) -> Tensor {
+        yield Tensor::zeros(&[1, 3, height, width])
+    }
+    
+    /// Batch generation
+    fn generate_batch(
+        &var self,
+        prompts: &[String],
+        num_inference_steps: i32,
+        guidance_scale: f32,
+        height: i32,
+        width: i32
+    ) -> Vec<Tensor> {
+        var images = Vec::new();
+        
+        each prompt in prompts {
+            let image = self.generate(
+                prompt,
+                None,
+                num_inference_steps,
+                guidance_scale,
+                height,
+                width,
+                None
+            );
+            images.push(image);
+        }
+        
+        images
+    }
+}
+
+// ============================================================================
+// IMAGE-TO-IMAGE PIPELINE
+// ============================================================================
+
+impl StableDiffusionPipeline {
+    fn img2img(
+        &var self,
+        prompt: &str,
+        init_image: &Tensor,
+        strength: f32,
+        num_inference_steps: i32,
+        guidance_scale: f32
+    ) -> Tensor {
+        // 1. Encode image to latents
+        let init_latents = self.vae.encode(init_image);
+        
+        // 2. Add noise according to strength
+        let num_timesteps = (num_inference_steps as f32 * strength) as i32;
+        self.scheduler.set_timesteps(num_inference_steps);
+        
+        let start_timestep = self.scheduler.timesteps[num_inference_steps - num_timesteps];
+        let noise = Tensor::randn_like(&init_latents);
+        
+        let timestep_tensor = Tensor::from_scalar(start_timestep as f32);
+        var latents = self.scheduler.add_noise(&init_latents, &noise, &timestep_tensor);
+        
+        // 3. Encode prompt
+        let (text_embeddings, negative_embeddings) = self.encode_prompt(prompt, None);
+        
+        // 4. Denoising loop (starting from start_timestep)
+        each entry in self.scheduler.timesteps[num_inference_steps - num_timesteps..].iter().enumerate()  { let (i, &timestep) = entry;
+            let latent_model_input = Tensor::cat(&[latents.clone(), latents.clone()], 0);
+            let context = Tensor::cat(&[negative_embeddings.clone(), text_embeddings.clone()], 0);
+            
+            let timestep_tensor = Tensor::from_scalar(timestep as f32);
+            let noise_pred = self.unet.forward(&latent_model_input, &timestep_tensor, &context);
+            
+            let (noise_pred_uncond, noise_pred_text) = noise_pred.chunk(2, 0);
+            let noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond);
+            
+            let prev_timestep = check i < num_timesteps as usize - 1 {
+                self.scheduler.timesteps[num_inference_steps - num_timesteps + i + 1]
+            } else {
+                -1
+            };
+            
+            latents = self.scheduler.step(&noise_pred, timestep, &latents, prev_timestep);
+        }
+        
+        // 5. Decode
+        let image = self.vae.decode(&latents);
+        yield (image / 2.0 + 0.5).clamp(0.0, 1.0)
+    }
+}
+
+// ============================================================================
+// INPAINTING PIPELINE
+// ============================================================================
+
+impl StableDiffusionPipeline {
+    fn inpaint(
+        &var self,
+        prompt: &str,
+        image: &Tensor,
+        mask: &Tensor,
+        num_inference_steps: i32,
+        guidance_scale: f32
+    ) -> Tensor {
+        // Encode masked image
+        let masked_image = image * (1.0 - mask);
+        let init_latents = self.vae.encode(&masked_image);
+        
+        // Downscale mask to latent size
+        let mask_latent = mask.interpolate_nearest(&[mask.data[2] / 8, mask.data[3] / 8]);
+        
+        // Encode prompt
+        let (text_embeddings, negative_embeddings) = self.encode_prompt(prompt, None);
+        
+        // Initialize latents
+        var latents = Tensor::randn_like(&init_latents);
+        
+        self.scheduler.set_timesteps(num_inference_steps);
+        
+        // Denoising loop
+        each entry in self.scheduler.timesteps.iter().enumerate()  { let (i, &timestep) = entry;
+            // Concatenate latents with mask and masked image
+            let latent_model_input = Tensor::cat(&[
+                latents.clone(),
+                mask_latent.clone(),
+                init_latents.clone()
+            ], 1);
+            
+            let latent_model_input = Tensor::cat(&[
+                latent_model_input.clone(),
+                latent_model_input.clone()
+            ], 0);
+            
+            let context = Tensor::cat(&[negative_embeddings.clone(), text_embeddings.clone()], 0);
+            let timestep_tensor = Tensor::from_scalar(timestep as f32);
+            
+            let noise_pred = self.unet.forward(&latent_model_input, &timestep_tensor, &context);
+            
+            let (noise_pred_uncond, noise_pred_text) = noise_pred.chunk(2, 0);
+            let noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond);
+            
+            let prev_timestep = check i < num_inference_steps as usize - 1 {
+                self.scheduler.timesteps[i + 1]
+            } else {
+                -1
+            };
+            
+            latents = self.scheduler.step(&noise_pred, timestep, &latents, prev_timestep);
+            
+            // Blend with original latents
+            latents = init_latents.clone() * &mask_latent + latents * (1.0 - &mask_latent);
+        }
+        
+        // Decode
+        let image = self.vae.decode(&latents);
+        yield (image / 2.0 + 0.5).clamp(0.0, 1.0)
+    }
+}
+
+// ============================================================================
+// SAFETY CHECKER
+// ============================================================================
+
+open data SafetyChecker {
+    enabled: bool,
+}
+
+impl SafetyChecker {
+    fn new() -> Self {
+        SafetyChecker { enabled: true }
+    }
+    
+    fn check(&self, image: &Tensor) -> bool {
+        // Placeholder for NSFW detection
+        // In production, use proper safety model
+        true
+    }
+}
+
+export {
+    StableDiffusionPipeline,
+    Device,
+    DataType,
+    SafetyChecker
+}

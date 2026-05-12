@@ -1,0 +1,5 @@
+#ifndef NOVA_COMPILER_TESTS_TAGS_H
+#define NOVA_COMPILER_TESTS_TAGS_H
+
+#endif
+

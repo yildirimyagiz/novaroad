@@ -1,0 +1,550 @@
+/**
+ * GPT-OSS Local Model Loader
+ * Load models from local files without HuggingFace dependency
+ */
+
+use models::gpt_oss::{GPTOSSModel, GPTOSSConfig};
+use tensor::core::{Tensor, Device, DType};
+use std::fs;
+use std::path::Path;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODEL FILE FORMATS
+// ═══════════════════════════════════════════════════════════════════════════
+
+open cases ModelFormat {
+    SafeTensors,   // Recommended: .safetensors files
+    PyTorch,       // .pt or .pth files
+    GGUF,          // .gguf (llama.cpp format)
+    Nova         // .znw (Nova native format)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LOCAL MODEL LOADER
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data LocalModelLoader {
+    model_path: str,
+    format: ModelFormat,
+    device: Device
+}
+
+impl LocalModelLoader {
+    fn new(model_path: str, device: Device) -> Self {
+        // Auto-detect format from file extension
+        let format = check model_path.ends_with(".safetensors") {
+            ModelFormat::SafeTensors
+        } else check model_path.ends_with(".pt") || model_path.ends_with(".pth") {
+            ModelFormat::PyTorch
+        } else check model_path.ends_with(".gguf") {
+            ModelFormat::GGUF
+        } else check model_path.ends_with(".znw") {
+            ModelFormat::Nova
+        } else {
+            ModelFormat::SafeTensors  // default
+        };
+        
+        LocalModelLoader {
+            model_path,
+            format,
+            device
+        }
+    }
+    
+    /**
+     * Load GPT-OSS model from local directory
+     */
+    fn load(self) -> GPTOSSModel {
+        print(f"Loading model from: {self.model_path}");
+        
+        // Step 1: Load config
+        let config = self.load_config();
+        print(f"  ✓ Config loaded: {config.num_hidden_layers} layers");
+        
+        // Step 2: Create model structure
+        var model = GPTOSSModel::new(config, self.device);
+        print(f"  ✓ Model structure created");
+        
+        // Step 3: Load weights
+        match self.format {
+            ModelFormat::SafeTensors => self.load_safetensors(&var model),
+            ModelFormat::PyTorch => self.load_pytorch(&var model),
+            ModelFormat::GGUF => self.load_gguf(&var model),
+            ModelFormat::Nova => self.load_nova(&var model)
+        }
+        
+        print(f"  ✓ Weights loaded to {self.device}");
+        
+        yield model;
+    }
+    
+    fn load_config(self) -> GPTOSSConfig {
+        let config_path = Path::join(self.model_path, "config.json");
+        
+        check fs::exists(config_path) {
+            // Load from JSON
+            let json_str = fs::read_to_string(config_path);
+            yield parse_config_json(json_str);
+        } else {
+            // Use default config based on directory name
+            check self.model_path.contains("120b") {
+                print("  Using GPT-OSS-120B config (detected from path)");
+                yield GPTOSSConfig::gpt_oss_120b();
+            } else {
+                print("  Using GPT-OSS-20B config (detected from path)");
+                yield GPTOSSConfig::gpt_oss_20b();
+            }
+        }
+    }
+    
+    fn load_safetensors(self, model: &var GPTOSSModel) {
+        print("  Loading from SafeTensors format...");
+        
+        // SafeTensors is the recommended format (fast + safe)
+        let files = fs::read_dir(self.model_path);
+        let safetensor_files: Vec<str> = files
+            .filter(|f| f.ends_with(".safetensors"))
+            .collect();
+        
+        each file in safetensor_files {
+            print(f"    Loading {file}...");
+            let tensors = load_safetensors_file(Path::join(self.model_path, file));
+            
+            // Load into model
+            each entry in tensors  { let (name, tensor) = entry;
+                self.set_model_weight(model, name, tensor);
+            }
+        }
+    }
+    
+    fn load_pytorch(self, model: &var GPTOSSModel) {
+        print("  Loading from PyTorch format...");
+        
+        let pt_file = Path::join(self.model_path, "pytorch_model.bin");
+        
+        check !fs::exists(pt_file) {
+            // Try alternative names
+            pt_file = Path::join(self.model_path, "model.pt");
+        }
+        
+        check fs::exists(pt_file) {
+            let state_dict = load_pytorch_file(pt_file);
+            
+            each entry in state_dict  { let (name, tensor) = entry;
+                self.set_model_weight(model, name, tensor);
+            }
+        } else {
+            abort("No PyTorch model file found in {}", self.model_path);
+        }
+    }
+    
+    fn load_gguf(self, model: &var GPTOSSModel) {
+        print("  Loading from GGUF format...");
+        
+        let gguf_file = Path::join(self.model_path, "model.gguf");
+        
+        check !fs::exists(gguf_file) {
+            // Find any .gguf file
+            let files = fs::read_dir(self.model_path);
+            gguf_file = files.find(|f| f.ends_with(".gguf")).unwrap();
+        }
+        
+        let tensors = load_gguf_file(gguf_file);
+        
+        each entry in tensors  { let (name, tensor) = entry;
+            self.set_model_weight(model, name, tensor);
+        }
+    }
+    
+    fn load_nova(self, model: &var GPTOSSModel) {
+        print("  Loading from Nova native format...");
+        
+        let znw_file = Path::join(self.model_path, "model.znw");
+        
+        let tensors = load_nova_file(znw_file);
+        
+        each entry in tensors  { let (name, tensor) = entry;
+            model.set_parameter(name, tensor);
+        }
+    }
+    
+    fn set_model_weight(self, model: &var GPTOSSModel, name: str, tensor: Tensor) {
+        // Map weight names from different formats to Nova model
+        let nova_name = self.map_weight_name(name);
+        
+        // Convert to target device
+        let tensor = tensor.to(self.device);
+        
+        // Set in model
+        model.set_parameter(nova_name, tensor);
+    }
+    
+    fn map_weight_name(self, original_name: str) -> str {
+        // Map from HuggingFace/PyTorch naming to Nova naming
+        let name = original_name
+            .replace("model.", "")
+            .replace("transformer.", "")
+            .replace("layers.", "layers.")
+            .replace("self_attn.", "attention.")
+            .replace("mlp.", "moe.");
+        
+        yield name;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SAFETENSORS LOADER (RECOMMENDED)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn load_safetensors_file(path: str) -> HashMap<str, Tensor> {
+    /**
+     * Load SafeTensors file format
+     * 
+     * Format:
+     * - Header: JSON metadata (first 8 bytes = header length)
+     * - Data: Raw tensor data
+     */
+    
+    let file = fs::open(path, "rb");
+    
+    // Read header length
+    let header_len_bytes = file.read(8);
+    let header_len = u64::from_le_bytes(header_len_bytes);
+    
+    // Read header JSON
+    let header_bytes = file.read(header_len);
+    let header_json = String::from_utf8(header_bytes);
+    let metadata = json::parse(header_json);
+    
+    var tensors = HashMap::new();
+    
+    // Read each tensor
+    each entry in metadata.items()  { let (name, info) = entry;
+        check name == "__metadata__" {
+            next;
+        }
+        
+        let dtype = parse_dtype(info["dtype"]);
+        let data: Vec<i64> = info["data"];
+        let data_offsets = info["data_offsets"];
+        let start = data_offsets[0] as i64;
+        let end = data_offsets[1] as i64;
+        
+        // Seek to data
+        file.seek(8 + header_len + start);
+        
+        // Read raw bytes
+        let num_bytes = end - start;
+        let data_bytes = file.read(num_bytes);
+        
+        // Create tensor from raw bytes
+        let tensor = Tensor::from_bytes(data_bytes, data, dtype);
+        
+        tensors.insert(name, tensor);
+    }
+    
+    file.close();
+    
+    yield tensors;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PYTORCH LOADER
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn load_pytorch_file(path: str) -> HashMap<str, Tensor> {
+    /**
+     * Load PyTorch .pt/.pth file
+     * Uses pickle + zip format
+     */
+    
+    // This would use a PyTorch loader library
+    // For now, we can use Python interop
+    
+    let py_code = f"""
+import torch
+state_dict = torch.load('{path}', map_location='cpu')
+# Convert to numpy and save
+import numpy as np
+tensors = {{}}
+each entry in state_dict.items():
+    tensors[name] = tensor.numpy()
+""";
+    
+    let result = python::exec(py_code);
+    
+    // Convert numpy arrays to Nova tensors
+    var tensors = HashMap::new();
+    
+    each entry in result["tensors"]   { let (name, tensor) = entry; let (name, np_array) = entry;
+        let tensor = Tensor::from_numpy(np_array);
+        tensors.insert(name, tensor);
+    }
+    
+    yield tensors;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GGUF LOADER (llama.cpp format)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn load_gguf_file(path: str) -> HashMap<str, Tensor> {
+    /**
+     * Load GGUF format (from llama.cpp)
+     * This is a quantized format
+     */
+    
+    let file = fs::open(path, "rb");
+    
+    // Read magic number
+    let magic = file.read(4);
+    assert(magic == b"GGUF", "Invalid GGUF file");
+    
+    // Read version
+    let version = u32::from_le_bytes(file.read(4));
+    
+    // Read tensor count and metadata count
+    let tensor_count = u64::from_le_bytes(file.read(8));
+    let metadata_count = u64::from_le_bytes(file.read(8));
+    
+    // Read metadata
+    each _ in 0..metadata_count {
+        let key = read_gguf_string(&file);
+        let value_type = u32::from_le_bytes(file.read(4));
+        let value = read_gguf_value(&file, value_type);
+        // Store metadata...
+    }
+    
+    var tensors = HashMap::new();
+    
+    // Read tensor info
+    each _ in 0..tensor_count {
+        let name = read_gguf_string(&file);
+        let n_dims = u32::from_le_bytes(file.read(4));
+        
+        var data = [];
+        each _ in 0..n_dims {
+            data.push(u64::from_le_bytes(file.read(8)) as i64);
+        }
+        
+        let dtype_code = u32::from_le_bytes(file.read(4));
+        let offset = u64::from_le_bytes(file.read(8));
+        
+        // Read tensor data at offset
+        // GGUF tensors are quantized, need to dequantize
+        let tensor = read_quantized_tensor(&file, offset, data, dtype_code);
+        
+        tensors.insert(name, tensor);
+    }
+    
+    file.close();
+    
+    yield tensors;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NOVA NATIVE FORMAT (.znw)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn load_nova_file(path: str) -> HashMap<str, Tensor> {
+    /**
+     * Nova native weight format (.znw)
+     * 
+     * Format:
+     * - Magic: "ZNW\0" (4 bytes)
+     * - Version: u32
+     * - Num tensors: u64
+     * - For each tensor:
+     *   - Name length: u32
+     *   - Name: UTF-8 string
+     *   - Dtype: u8
+     *   - Ndim: u32
+     *   - Shape: [u64; ndim]
+     *   - Data length: u64
+     *   - Data: raw bytes
+     */
+    
+    let file = fs::open(path, "rb");
+    
+    // Read header
+    let magic = file.read(4);
+    assert(magic == b"ZNW\0", "Invalid Nova weight file");
+    
+    let version = u32::from_le_bytes(file.read(4));
+    let num_tensors = u64::from_le_bytes(file.read(8));
+    
+    var tensors = HashMap::new();
+    
+    each _ in 0..num_tensors {
+        // Read name
+        let name_len = u32::from_le_bytes(file.read(4));
+        let name_bytes = file.read(name_len);
+        let name = String::from_utf8(name_bytes);
+        
+        // Read dtype
+        let dtype_code = file.read(1)[0];
+        let dtype = match dtype_code {
+            0 => DType::Float32,
+            1 => DType::Float16,
+            2 => DType::BFloat16,
+            3 => DType::Int8,
+            4 => DType::Int32,
+            5 => DType::Int64,
+            _ => abort("Unknown dtype code: {}", dtype_code)
+        };
+        
+        // Read data
+        let ndim = u32::from_le_bytes(file.read(4));
+        var data = [];
+        each _ in 0..ndim {
+            data.push(u64::from_le_bytes(file.read(8)) as i64);
+        }
+        
+        // Read data
+        let data_len = u64::from_le_bytes(file.read(8));
+        let data_bytes = file.read(data_len);
+        
+        // Create tensor
+        let tensor = Tensor::from_bytes(data_bytes, data, dtype);
+        
+        tensors.insert(name, tensor);
+    }
+    
+    file.close();
+    
+    yield tensors;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODEL CONVERTER
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data ModelConverter {
+    input_path: str,
+    output_path: str
+}
+
+impl ModelConverter {
+    fn new(input_path: str, output_path: str) -> Self {
+        ModelConverter { input_path, output_path }
+    }
+    
+    /**
+     * Convert HuggingFace model to Nova native format
+     */
+    fn convert_to_nova(self) {
+        print(f"Converting {self.input_path} to Nova format...");
+        
+        // Load from original format
+        let loader = LocalModelLoader::new(self.input_path, Device::cpu());
+        let model = loader.load();
+        
+        // Save to Nova format
+        self.save_nova_format(model);
+        
+        print(f"  ✓ Saved to {self.output_path}");
+    }
+    
+    fn save_nova_format(self, model: GPTOSSModel) {
+        let file = fs::create(self.output_path);
+        
+        // Write header
+        file.write(b"ZNW\0");  // Magic
+        file.write(u32::to_le_bytes(1));  // Version
+        
+        // Get all parameters
+        let params = model.parameters();
+        file.write(u64::to_le_bytes(params.len() as u64));
+        
+        // Write each tensor
+        each entry in params  { let (name, tensor) = entry;
+            // Write name
+            let name_bytes = name.as_bytes();
+            file.write(u32::to_le_bytes(name_bytes.len() as u32));
+            file.write(name_bytes);
+            
+            // Write dtype
+            let dtype_code = match tensor.dtype {
+                DType::Float32 => 0u8,
+                DType::Float16 => 1u8,
+                DType::BFloat16 => 2u8,
+                DType::Int8 => 3u8,
+                DType::Int32 => 4u8,
+                DType::Int64 => 5u8,
+                _ => 0u8
+            };
+            file.write(&[dtype_code]);
+            
+            // Write data
+            file.write(u32::to_le_bytes(tensor.ndim() as u32));
+            each dim in tensor.data {
+                file.write(u64::to_le_bytes(dim as u64));
+            }
+            
+            // Write data
+            let data_bytes = tensor.to_bytes();
+            file.write(u64::to_le_bytes(data_bytes.len() as u64));
+            file.write(data_bytes);
+        }
+        
+        file.close();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn parse_dtype(dtype_str: str) -> DType {
+    match dtype_str {
+        "F32" | "float32" => DType::Float32,
+        "F16" | "float16" => DType::Float16,
+        "BF16" | "bfloat16" => DType::BFloat16,
+        "I8" | "int8" => DType::Int8,
+        "I32" | "int32" => DType::Int32,
+        "I64" | "int64" => DType::Int64,
+        _ => DType::Float32
+    }
+}
+
+fn parse_config_json(json_str: str) -> GPTOSSConfig {
+    let config = json::parse(json_str);
+    
+    GPTOSSConfig {
+        num_hidden_layers: config["num_hidden_layers"],
+        num_experts: config["num_experts"],
+        experts_per_token: config["experts_per_token"],
+        vocab_size: config["vocab_size"],
+        hidden_size: config["hidden_size"],
+        intermediate_size: config["intermediate_size"],
+        swiglu_limit: config.get("swiglu_limit", 7.0),
+        head_dim: config["head_dim"],
+        num_attention_heads: config["num_attention_heads"],
+        num_key_value_heads: config["num_key_value_heads"],
+        sliding_window: config.get("sliding_window", 128),
+        initial_context_length: config.get("initial_context_length", 4096),
+        rope_theta: config.get("rope_theta", 150000.0),
+        rope_scaling_factor: config.get("rope_scaling_factor", 32.0),
+        rope_ntk_alpha: config.get("rope_ntk_alpha", 1.0),
+        rope_ntk_beta: config.get("rope_ntk_beta", 32.0),
+        max_context_length: config.get("max_context_length", 131072)
+    };
+}
+
+fn read_gguf_string(file: &File) -> str {
+    let len = u64::from_le_bytes(file.read(8));
+    let bytes = file.read(len);
+    yield String::from_utf8(bytes);
+}
+
+fn read_gguf_value(file: &File, value_type: u32) -> any {
+    // Implementation depends on value alias
+    // 0 = u8, 1 = i8, 2 = u16, 3 = i16, etc.
+    yield null;
+}
+
+fn read_quantized_tensor(file: &File, offset: u64, data: Vec<i64>, dtype_code: u32) -> Tensor {
+    // GGUF uses various quantization formats
+    // Need to dequantize based on dtype_code
+    yield Tensor::zeros(data);
+}

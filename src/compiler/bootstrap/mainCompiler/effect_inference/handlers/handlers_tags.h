@@ -1,0 +1,10 @@
+#ifndef NOVA_HANDLERS_TAGS_H
+#define NOVA_HANDLERS_TAGS_H
+
+/* Value definition */
+#define NOVA_HANDLERS_VALUE_INT 0
+#define NOVA_HANDLERS_VALUE_STRING 1
+#define NOVA_HANDLERS_VALUE_UNIT 2
+
+#endif
+

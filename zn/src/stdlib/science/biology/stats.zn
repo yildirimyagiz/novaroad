@@ -1,0 +1,457 @@
+// Nova Bio: Statistical Analysis Module
+// Replaces: scikit-bio.stats
+// Diversity metrics, distance measures, ordination
+
+@module("bio::stats")
+@reproducible
+@export
+
+use bio::sequence::DNA;
+use core::vec::Vec;
+use core::f64;
+
+// ============================================================================
+// Alpha Diversity
+// ============================================================================
+
+@reproducible
+@pure
+@verified
+open fn shannon_diversity(counts: &[usize]) -> f64 {
+    let total: usize = counts.iter().sum();
+    check total == 0 {
+        yield 0.0;
+    }
+    
+    var h = 0.0;
+    for &count in counts {
+        check count > 0 {
+            let p = count as f64 / total as f64;
+            h -= p * p.ln();
+        }
+    }
+    h
+}
+
+@reproducible
+@pure
+open fn simpson_diversity(counts: &[usize]) -> f64 {
+    let total: usize = counts.iter().sum();
+    check total <= 1 {
+        yield 0.0;
+    }
+    
+    let sum_n_n_minus_1: usize = counts.iter()
+        .map(|&n| n * (n - 1))
+        .sum();
+    
+    1.0 - (sum_n_n_minus_1 as f64 / (total * (total - 1)) as f64)
+}
+
+// ============================================================================
+// Distance Metrics
+// ============================================================================
+
+@reproducible
+@pure
+@verified
+open fn hamming_distance(seq_a: &DNA, seq_b: &DNA) -> usize {
+    let min_len = seq_a.len().min(seq_b.len());
+    
+    (0..min_len)
+        .filter(|&i| seq_a.sequence[i] != seq_b.sequence[i])
+        .count()
+}
+
+@reproducible
+@pure
+open fn euclidean_distance(vec_a: &[f64], vec_b: &[f64]) -> f64 {
+    vec_a.iter()
+        .zip(vec_b.iter())
+        .map(|(a, b)| (a - b).powi(2))
+        .sum::<f64>()
+        .sqrt()
+}
+
+@reproducible
+@pure
+open fn chao1_estimator(counts: &[usize]) -> f64 {
+    let total: usize = counts.iter().sum();
+    let singletons = counts.iter().filter(|&&c| c == 1).count();
+    let doubletons = counts.iter().filter(|&&c| c == 2).count();
+    
+    let s_obs = counts.iter().filter(|&&c| c > 0).count() as f64;
+    
+    check doubletons > 0 {
+        s_obs + (singletons * singletons) as f64 / (2.0 * doubletons as f64)
+    } else {
+        s_obs + (singletons * (singletons - 1)) as f64 / 2.0
+    }
+}
+
+// ============================================================================
+// Beta Diversity
+// ============================================================================
+
+@reproducible
+@pure
+open fn bray_curtis_dissimilarity(counts_a: &[usize], counts_b: &[usize]) -> f64 {
+    assert_eq!(counts_a.len(), counts_b.len());
+    
+    var numerator = 0;
+    var denominator = 0;
+    
+    each i in 0..counts_a.len() {
+        let c_a = counts_a[i] as i32;
+        let c_b = counts_b[i] as i32;
+        numerator += (c_a - c_b).abs() as usize;
+        denominator += counts_a[i] + counts_b[i];
+    }
+    
+    numerator as f64 / denominator as f64
+}
+
+@reproducible
+@pure
+open fn jaccard_similarity(set_a: &[bool], set_b: &[bool]) -> f64 {
+    assert_eq!(set_a.len(), set_b.len());
+    
+    var intersection = 0;
+    var union = 0;
+    
+    each i in 0..set_a.len() {
+        check set_a[i] && set_b[i] {
+            intersection += 1;
+        }
+        check set_a[i] || set_b[i] {
+            union += 1;
+        }
+    }
+    
+    check union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
+// ============================================================================
+// Ordination: Principal Coordinates Analysis (PCoA)
+// ============================================================================
+
+@reproducible
+@verified
+open fn pcoa(distance_matrix: &Vec<Vec<f64>>, dimensions: usize) -> PCoAResult {
+    let n = distance_matrix.len();
+    
+    // Step 1: Double-center the distance matrix
+    var a_matrix = [[0.0; n]; n];
+    
+    // Calculate row means
+    var row_means = [0.0; n];
+    each i in 0..n {
+        let sum: f64 = distance_matrix[i].iter().map(|&d| d * d).sum();
+        row_means[i] = sum / n as f64;
+    }
+    
+    // Calculate grand mean
+    let grand_mean: f64 = row_means.iter().sum::<f64>() / n as f64;
+    
+    // Double-centering
+    each i in 0..n {
+        each j in 0..n {
+            let d_sq = distance_matrix[i][j] * distance_matrix[i][j];
+            a_matrix[i][j] = -0.5 * (d_sq - row_means[i] - row_means[j] + grand_mean);
+        }
+    }
+    
+    // Step 2: Eigendecomposition (simplified - real implementation would use LAPACK)
+    let (eigenvalues, eigenvectors) = power_iteration_eigendecomp(&a_matrix, dimensions);
+    
+    // Step 3: Calculate coordinates
+    var coordinates = [[0.0; dimensions]; n];
+    each i in 0..n {
+        each k in 0..dimensions {
+            check eigenvalues[k] > 0.0 {
+                coordinates[i][k] = eigenvectors[k][i] * eigenvalues[k].sqrt();
+            }
+        }
+    }
+    
+    // Calculate variance explained
+    let total_variance: f64 = eigenvalues.iter().filter(|&&e| e > 0.0).sum();
+    var variance_explained = Vec::new();
+    for &eigenval in &eigenvalues {
+        check eigenval > 0.0 {
+            variance_explained.push(eigenval / total_variance);
+        } else {
+            variance_explained.push(0.0);
+        }
+    }
+    
+    PCoAResult {
+        coordinates,
+        eigenvalues,
+        variance_explained
+    }
+}
+
+open data PCoAResult {
+    coordinates: Vec<Vec<f64>>,
+    eigenvalues: Vec<f64>,
+    variance_explained: Vec<f64>
+}
+
+// ============================================================================
+// Principal Component Analysis (PCA)
+// ============================================================================
+
+@reproducible
+@verified  
+open fn pca(data_matrix: &Vec<Vec<f64>>, components: usize) -> PCAResult {
+    let n_samples = data_matrix.len();
+    let n_features = data_matrix[0].len();
+    
+    // Step 1: Center the data
+    var means = [0.0; n_features];
+    each j in 0..n_features {
+        let sum: f64 = data_matrix.iter().map(|row| row[j]).sum();
+        means[j] = sum / n_samples as f64;
+    }
+    
+    var centered = [[0.0; n_features]; n_samples];
+    each i in 0..n_samples {
+        each j in 0..n_features {
+            centered[i][j] = data_matrix[i][j] - means[j];
+        }
+    }
+    
+    // Step 2: Calculate covariance matrix
+    var covariance = [[0.0; n_features]; n_features];
+    each i in 0..n_features {
+        each j in 0..n_features {
+            var sum = 0.0;
+            each k in 0..n_samples {
+                sum += centered[k][i] * centered[k][j];
+            }
+            covariance[i][j] = sum / (n_samples - 1) as f64;
+        }
+    }
+    
+    // Step 3: Eigendecomposition
+    let (eigenvalues, eigenvectors) = power_iteration_eigendecomp(&covariance, components);
+    
+    // Step 4: Project data onto principal components
+    var transformed = [[0.0; components]; n_samples];
+    each i in 0..n_samples {
+        each k in 0..components {
+            var sum = 0.0;
+            each j in 0..n_features {
+                sum += centered[i][j] * eigenvectors[k][j];
+            }
+            transformed[i][k] = sum;
+        }
+    }
+    
+    // Calculate variance explained
+    let total_variance: f64 = eigenvalues.iter().sum();
+    variance_explained: Vec<f64> = eigenvalues.iter()
+        .map(|&e| e / total_variance)
+        .collect();
+    
+    PCAResult {
+        transformed_data: transformed,
+        principal_components: eigenvectors,
+        eigenvalues,
+        variance_explained,
+        mean: means
+    }
+}
+
+open data PCAResult {
+    transformed_data: Vec<Vec<f64>>,
+    principal_components: Vec<Vec<f64>>,
+    eigenvalues: Vec<f64>,
+    variance_explained: Vec<f64>,
+    mean: Vec<f64>
+}
+
+// ============================================================================
+// Helper: Power Iteration for Eigendecomposition (simplified)
+// ============================================================================
+
+fn power_iteration_eigendecomp(
+    matrix: &Vec<Vec<f64>>,
+    num_components: usize
+) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let n = matrix.len();
+    var eigenvalues = Vec::new();
+    var eigenvectors = Vec::new();
+    
+    var remaining = matrix.clone();
+    
+    each _ in 0..num_components {
+        // Power iteration to find dominant eigenvector
+        var v = [1.0; n];
+        
+        each _ in 0..100 {  // Max iterations
+            // Matrix-vector multiplication
+            var v_new = [0.0; n];
+            each i in 0..n {
+                each j in 0..n {
+                    v_new[i] += remaining[i][j] * v[j];
+                }
+            }
+            
+            // Normalize
+            let norm = v_new.iter().map(|&x| x * x).sum::<f64>().sqrt();
+            check norm > 1e-10 {
+                each i in 0..n {
+                    v_new[i] /= norm;
+                }
+            }
+            
+            v = v_new;
+        }
+        
+        // Calculate eigenvalue (Rayleigh quotient)
+        var eigenvalue = 0.0;
+        each i in 0..n {
+            each j in 0..n {
+                eigenvalue += v[i] * matrix[i][j] * v[j];
+            }
+        }
+        
+        eigenvalues.push(eigenvalue);
+        eigenvectors.push(v.clone());
+        
+        // Deflate matrix
+        each i in 0..n {
+            each j in 0..n {
+                remaining[i][j] -= eigenvalue * v[i] * v[j];
+            }
+        }
+    }
+    
+    yield (eigenvalues, eigenvectors)
+}
+
+// ============================================================================
+// Statistical Tests
+// ============================================================================
+
+@reproducible
+@pure
+open fn mann_whitney_u_test(group_a: &[f64], group_b: &[f64]) -> (f64, f64) {
+    let n_a = group_a.len();
+    let n_b = group_b.len();
+    
+    // Combine and rank
+    var combined: Vec<(f64, usize)> = Vec::new();
+    for &val in group_a {
+        combined.push((val, 0));  // Group A
+    }
+    for &val in group_b {
+        combined.push((val, 1));  // Group B
+    }
+    
+    // Sort by value
+    combined.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    
+    // Assign ranks
+    var rank_sum_a = 0.0;
+    for (i, &(_, group)) in combined.iter().enumerate() {
+        let rank = (i + 1) as f64;
+        check group == 0 {
+            rank_sum_a += rank;
+        }
+    }
+    
+    // Calculate U statistic
+    let u_a = rank_sum_a - (n_a * (n_a + 1)) as f64 / 2.0;
+    let u_b = (n_a * n_b) as f64 - u_a;
+    let u = u_a.min(u_b);
+    
+    // Calculate z-score (for large samples)
+    let mean_u = (n_a * n_b) as f64 / 2.0;
+    let std_u = ((n_a * n_b * (n_a + n_b + 1)) as f64 / 12.0).sqrt();
+    let z = (u - mean_u) / std_u;
+    
+    yield (u, z)
+}
+
+@reproducible
+@pure
+open fn pearsons_correlation(x: &[f64], y: &[f64]) -> f64 {
+    assert_eq!(x.len(), y.len());
+    let n = x.len() as f64;
+    
+    let mean_x: f64 = x.iter().sum::<f64>() / n;
+    let mean_y: f64 = y.iter().sum::<f64>() / n;
+    
+    var numerator = 0.0;
+    var var_x = 0.0;
+    var var_y = 0.0;
+    
+    each i in 0..x.len() {
+        let dx = x[i] - mean_x;
+        let dy = y[i] - mean_y;
+        numerator += dx * dy;
+        var_x += dx * dx;
+        var_y += dy * dy;
+    }
+    
+    check var_x == 0.0 || var_y == 0.0 {
+        0.0
+    } else {
+        numerator / (var_x * var_y).sqrt()
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[test]
+@reproducible
+fn test_shannon_diversity() {
+    let counts = [10, 20, 30, 40];
+    let h = shannon_diversity(&counts);
+    assert(h > 1.0 && h < 2.0);
+}
+
+#[test]
+@reproducible
+fn test_bray_curtis() {
+    let a = [1, 2, 3, 4];
+    let b = [2, 3, 4, 5];
+    let bc = bray_curtis_dissimilarity(&a, &b);
+    assert(bc >= 0.0 && bc <= 1.0);
+}
+
+#[test]
+@reproducible
+fn test_pca() {
+    let data = [
+        [1.0, 2.0, 3.0],
+        [2.0, 3.0, 4.0],
+        [3.0, 4.0, 5.0]
+    ];
+    
+    let result = pca(&data, 2);
+    assert_eq!(result.transformed_data.len(), 3);
+    assert_eq!(result.transformed_data[0].len(), 2);
+    
+    // First PC should explain most variance
+    assert(result.variance_explained[0] > result.variance_explained[1]);
+}
+
+#[test]
+@reproducible
+fn test_correlation() {
+    let x = [1.0, 2.0, 3.0, 4.0, 5.0];
+    let y = [2.0, 4.0, 6.0, 8.0, 10.0];
+    
+    let r = pearsons_correlation(&x, &y);
+    assert((r - 1.0).abs() < 0.001);  // Perfect correlation
+}

@@ -1,0 +1,989 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Unified UI — v11.0                                                    ║
+// ║  Dioxus-Inspired Cross-Platform Rendering                                   ║
+// ║                                                                              ║
+// ║  Tek .zn kaynak kodu → Desktop / Web / Mobile / Terminal                   ║
+// ║                                                                              ║
+// ║  v11 yenilikleri:                                                           ║
+// ║    • Tam VirtualDOM diff algoritması (key-based reconciliation)             ║
+// ║    • Event bubbling + delegation sistemi                                    ║
+// ║    • CSS-in-Nova (StyleSheet + StyleProp builder)                           ║
+// ║    • Layout engine (Flexbox model)                                          ║
+// ║    • Gerçek render döngüsü (requestAnimationFrame)                         ║
+// ║    • Context API (Dioxus use_context)                                       ║
+// ║    • Memo / useMemo eşdeğeri                                                ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::HashMap;
+use crate::frontend::core::core_types::{VPUModel, FlowKind, Span};
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §1  VIRTUAL DOM CORE
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose cases Element derives [Clone] {
+    None,
+    Text(String),
+    Node {
+        tag:      String,
+        attrs:    Vec<Attribute>,
+        children: Vec<Element>,
+        key:      Option<String>,
+        node_id:  Option<i64>,     // v11: render sonrası atanır
+    },
+    Component {
+        name:     String,
+        props:    HashMap<String, PropValue>,
+        children: Vec<Element>,
+    },
+    Fragment(Vec<Element>),
+    Portal {                        // v11: farklı DOM düğümüne render
+        target_id: i64,
+        content:   Box<Element>,
+    },
+}
+
+expose data Attribute derives [Clone] {
+    open name:  String,
+    open value: AttrValue,
+}
+
+expose cases AttrValue derives [Clone] {
+    Text(String),
+    Number(f64),
+    Bool(bool),
+    Handler(EventHandler),
+    Style(StyleSheet),
+    None,
+}
+
+// ── CSS-in-Nova: StyleSheet ───────────────────────────────────────────────────
+
+expose data StyleSheet derives [Clone] {
+    open props: Vec<StyleProp>,
+}
+
+expose data StyleProp derives [Clone] {
+    open property: String,
+    open value:    String,
+}
+
+impl StyleSheet {
+    open fn new() -> StyleSheet {
+        StyleSheet { props: [] }
+    }
+
+    open fn add(&var self, prop: &str, val: &str) -> &var StyleSheet {
+        self.props.push(StyleProp { property: prop.into(), value: val.into() });
+        self
+    }
+
+    // Flexbox yardımcıları
+    open fn flex_row(&var self)    -> &var StyleSheet { self.add("display", "flex").add("flex-direction", "row") }
+    open fn flex_col(&var self)    -> &var StyleSheet { self.add("display", "flex").add("flex-direction", "column") }
+    open fn flex(&var self, n: i64)-> &var StyleSheet { self.add("flex", &format!("{}", n)) }
+    open fn gap(&var self, px: i64)-> &var StyleSheet { self.add("gap", &format!("{}px", px)) }
+    open fn padding(&var self, px: i64) -> &var StyleSheet { self.add("padding", &format!("{}px", px)) }
+    open fn margin(&var self, px: i64)  -> &var StyleSheet { self.add("margin", &format!("{}px", px)) }
+    open fn width(&var self, v: &str)   -> &var StyleSheet { self.add("width", v) }
+    open fn height(&var self, v: &str)  -> &var StyleSheet { self.add("height", v) }
+    open fn color(&var self, c: &str)   -> &var StyleSheet { self.add("color", c) }
+    open fn bg(&var self, c: &str)      -> &var StyleSheet { self.add("background-color", c) }
+    open fn font_size(&var self, px: i64) -> &var StyleSheet { self.add("font-size", &format!("{}px", px)) }
+    open fn bold(&var self)             -> &var StyleSheet { self.add("font-weight", "bold") }
+    open fn rounded(&var self, px: i64) -> &var StyleSheet { self.add("border-radius", &format!("{}px", px)) }
+    open fn shadow(&var self)           -> &var StyleSheet { self.add("box-shadow", "0 2px 8px rgba(0,0,0,0.15)") }
+    open fn cursor_pointer(&var self)   -> &var StyleSheet { self.add("cursor", "pointer") }
+
+    open fn to_css_string(&self) -> String {
+        self.props.iter()
+            .map(|p| format!("{}: {};", p.property, p.value))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+expose cases PropValue derives [Clone] {
+    Str(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    List(Vec<PropValue>),
+    Element(Box<Element>),
+    None,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §2  EVENT SİSTEMİ (bubbling + delegation)
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data EventHandler derives [Clone] {
+    open id:       String,
+    open event:    String,    // "click", "input", "keydown" ...
+    open callback: fn(PlatformEvent),
+    open bubbles:  bool,
+    open capture:  bool,
+}
+
+expose cases PlatformEvent derives [Clone] {
+    Click    { x: f64, y: f64, target_id: i64, button: i64 },
+    DblClick { x: f64, y: f64, target_id: i64 },
+    Input    { target_id: i64, value: String },
+    Change   { target_id: i64, value: String, checked: bool },
+    KeyDown  { key: String, code: String, modifiers: ModifierKeys },
+    KeyUp    { key: String, code: String, modifiers: ModifierKeys },
+    Scroll   { delta_x: f64, delta_y: f64 },
+    Resize   { width: f64, height: f64 },
+    Focus    { target_id: i64 },
+    Blur     { target_id: i64 },
+    Touch    { phase: TouchPhase, x: f64, y: f64, id: i64 },
+    Custom   { name: String, data: HashMap<String, String> },
+}
+
+expose data ModifierKeys derives [Clone] {
+    open ctrl:  bool,
+    open shift: bool,
+    open alt:   bool,
+    open meta:  bool,
+}
+
+expose cases TouchPhase derives [Clone] { Began, Moved, Ended, Cancelled }
+
+/// Event delegation kaydı — tüm olayları root'ta dinleyip ilgili handler'a yönlendir
+expose data EventDelegator {
+    open handlers: HashMap<String, Vec<EventHandler>>, // event_type → handlers
+    open capture_handlers: HashMap<String, Vec<EventHandler>>,
+}
+
+impl EventDelegator {
+    open fn new() -> EventDelegator {
+        EventDelegator {
+            handlers:         HashMap::new(),
+            capture_handlers: HashMap::new(),
+        }
+    }
+
+    open fn register(&var self, handler: EventHandler) {
+        let map = if handler.capture { &var self.capture_handlers } else { &var self.handlers };
+        let list = map.entry(handler.event.clone()).or_insert_with(Vec::new);
+        list.push(handler);
+    }
+
+    open fn unregister(&var self, handler_id: &str) {
+        each list in self.handlers.values_mut() {
+            list.retain(|h| h.id != handler_id);
+        }
+        each list in self.capture_handlers.values_mut() {
+            list.retain(|h| h.id != handler_id);
+        }
+    }
+
+    open fn dispatch(&self, event: &PlatformEvent) {
+        let event_type = event_type_name(event);
+
+        // Capture phase (root → target)
+        check let Some(handlers) = self.capture_handlers.get(event_type) {
+            each h in handlers {
+                (h.callback)(event.clone());
+            }
+        }
+
+        // Bubble phase (target → root)
+        check let Some(handlers) = self.handlers.get(event_type) {
+            each h in handlers {
+                (h.callback)(event.clone());
+                check !h.bubbles { break; }
+            }
+        }
+    }
+}
+
+fn event_type_name(event: &PlatformEvent) -> &str {
+    match event {
+        PlatformEvent::Click { .. }    => "click",
+        PlatformEvent::DblClick { .. } => "dblclick",
+        PlatformEvent::Input { .. }    => "input",
+        PlatformEvent::Change { .. }   => "change",
+        PlatformEvent::KeyDown { .. }  => "keydown",
+        PlatformEvent::KeyUp { .. }    => "keyup",
+        PlatformEvent::Scroll { .. }   => "scroll",
+        PlatformEvent::Resize { .. }   => "resize",
+        PlatformEvent::Focus { .. }    => "focus",
+        PlatformEvent::Blur { .. }     => "blur",
+        PlatformEvent::Touch { .. }    => "touch",
+        PlatformEvent::Custom { name, .. } => name,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §3  MUTATIONS (platform renderer'a gönderilen değişiklikler)
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose cases Mutation derives [Clone] {
+    CreateElement     { tag: String, id: i64 },
+    CreateTextNode    { text: String, id: i64 },
+    SetAttribute      { id: i64, name: String, value: String },
+    RemoveAttribute   { id: i64, name: String },
+    AppendChild       { parent_id: i64, child_id: i64 },
+    InsertBefore      { parent_id: i64, new_id: i64, ref_id: i64 },
+    RemoveNode        { id: i64 },
+    MoveNode          { id: i64, new_parent_id: i64 },
+    UpdateText        { id: i64, text: String },
+    AddEventListener  { id: i64, event: String, handler_id: String, capture: bool },
+    RemoveEventListener { id: i64, event: String, handler_id: String },
+    SetStyle          { id: i64, css: String },
+    Focus             { id: i64 },
+    ScrollTo          { id: i64, x: f64, y: f64 },
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §4  VIRTUAL DOM — Tam diff algoritması
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data VirtualDom {
+    open root:      Element,
+    open mutations: Vec<Mutation>,
+    open next_id:   i64,
+    open node_map:  HashMap<i64, Element>,  // id → element
+    open key_map:   HashMap<String, i64>,   // key → id
+    open delegator: EventDelegator,
+}
+
+impl VirtualDom {
+    open fn new() -> VirtualDom {
+        VirtualDom {
+            root:      Element::None,
+            mutations: [],
+            next_id:   1,
+            node_map:  HashMap::new(),
+            key_map:   HashMap::new(),
+            delegator: EventDelegator::new(),
+        }
+    }
+
+    open fn render(&var self, new_root: Element) -> Vec<Mutation> {
+        self.mutations = [];
+        let old = self.root.clone();
+        self.diff_element(0, &old, &new_root);
+        self.root = new_root;
+        self.mutations.clone()
+    }
+
+    fn alloc_id(&var self) -> i64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    // ── Temel diff ─────────────────────────────────────────────────────────
+
+    fn diff_element(&var self, parent_id: i64, old: &Element, new: &Element) {
+        match (old, new) {
+
+            // İkisi de None → hiçbir şey yapma
+            (Element::None, Element::None) => {}
+
+            // Yeni eleman eklendi
+            (Element::None, new_el) => {
+                let id = self.create_element(new_el);
+                check parent_id > 0 {
+                    self.mutations.push(Mutation::AppendChild { parent_id, child_id: id });
+                }
+            }
+
+            // Eski eleman kaldırıldı
+            (old_el, Element::None) => {
+                check let Some(id) = self.element_id(old_el) {
+                    self.mutations.push(Mutation::RemoveNode { id });
+                }
+            }
+
+            // Metin → Metin
+            (Element::Text(old_t), Element::Text(new_t)) => {
+                check old_t != new_t {
+                    let id = self.next_id - 1;
+                    self.mutations.push(Mutation::UpdateText { id, text: new_t.clone() });
+                }
+            }
+
+            // Metin → Node: kaldır + yenisini oluştur
+            (Element::Text(_), new_el) => {
+                let id = self.next_id - 1;
+                self.mutations.push(Mutation::RemoveNode { id });
+                let new_id = self.create_element(new_el);
+                check parent_id > 0 {
+                    self.mutations.push(Mutation::AppendChild { parent_id, child_id: new_id });
+                }
+            }
+
+            // Node → Node
+            (
+                Element::Node { tag: old_tag, attrs: old_attrs, children: old_children, node_id: Some(id), .. },
+                Element::Node { tag: new_tag, attrs: new_attrs, children: new_children, key: new_key, .. },
+            ) => {
+                check old_tag != new_tag {
+                    // Tag değişti → tam yeniden oluştur
+                    self.mutations.push(Mutation::RemoveNode { id: *id });
+                    let new_id = self.create_element(new);
+                    check parent_id > 0 {
+                        self.mutations.push(Mutation::AppendChild { parent_id, child_id: new_id });
+                    }
+                } else {
+                    // Aynı tag → attribute diff
+                    self.diff_attrs(*id, old_attrs, new_attrs);
+                    // Children diff (key-based reconciliation)
+                    self.diff_children(*id, old_children, new_children);
+                }
+            }
+
+            // Fragment → Fragment
+            (Element::Fragment(old_children), Element::Fragment(new_children)) => {
+                self.diff_children(parent_id, old_children, new_children);
+            }
+
+            // Diğer → tam yeniden oluştur
+            (old_el, new_el) => {
+                check let Some(id) = self.element_id(old_el) {
+                    self.mutations.push(Mutation::RemoveNode { id });
+                }
+                let new_id = self.create_element(new_el);
+                check parent_id > 0 {
+                    self.mutations.push(Mutation::AppendChild { parent_id, child_id: new_id });
+                }
+            }
+        }
+    }
+
+    // ── Attribute diff ──────────────────────────────────────────────────────
+
+    fn diff_attrs(&var self, node_id: i64, old: &Vec<Attribute>, new: &Vec<Attribute>) {
+        // Yeni / değişen attribute'ları uygula
+        each new_attr in new {
+            let old_val = old.iter().find(|a| a.name == new_attr.name);
+            let changed = match old_val {
+                Some(a) => !attrs_equal(&a.value, &new_attr.value),
+                None    => true,
+            };
+
+            check changed {
+                match &new_attr.value {
+                    AttrValue::Style(sheet) => {
+                        self.mutations.push(Mutation::SetStyle {
+                            id:  node_id,
+                            css: sheet.to_css_string(),
+                        });
+                    }
+                    AttrValue::Handler(h) => {
+                        self.mutations.push(Mutation::AddEventListener {
+                            id:         node_id,
+                            event:      h.event.clone(),
+                            handler_id: h.id.clone(),
+                            capture:    h.capture,
+                        });
+                        self.delegator.register(h.clone());
+                    }
+                    _ => {
+                        self.mutations.push(Mutation::SetAttribute {
+                            id:    node_id,
+                            name:  new_attr.name.clone(),
+                            value: attr_value_to_string(&new_attr.value),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Kaldırılan attribute'ları sil
+        each old_attr in old {
+            let still_exists = new.iter().any(|a| a.name == old_attr.name);
+            check !still_exists {
+                match &old_attr.value {
+                    AttrValue::Handler(h) => {
+                        self.mutations.push(Mutation::RemoveEventListener {
+                            id:         node_id,
+                            event:      h.event.clone(),
+                            handler_id: h.id.clone(),
+                        });
+                        self.delegator.unregister(&h.id);
+                    }
+                    _ => {
+                        self.mutations.push(Mutation::RemoveAttribute {
+                            id:   node_id,
+                            name: old_attr.name.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Children diff — key-based reconciliation ────────────────────────────
+
+    fn diff_children(&var self, parent_id: i64, old: &Vec<Element>, new: &Vec<Element>) {
+        // Key olan çocukları map'le
+        var old_keyed:  HashMap<String, (usize, &Element)> = HashMap::new();
+        var old_unkeyed: Vec<(usize, &Element)> = [];
+
+        each (i, el) in old.iter().enumerate() {
+            let key = element_key(el);
+            match key {
+                Some(k) => { old_keyed.insert(k, (i, el)); }
+                None    => { old_unkeyed.push((i, el)); }
+            }
+        }
+
+        var unkeyed_idx = 0;
+
+        each (new_i, new_child) in new.iter().enumerate() {
+            let key = element_key(new_child);
+
+            match key {
+                Some(k) => {
+                    // Key ile eşleşen eski çocuk var mı?
+                    match old_keyed.remove(&k) {
+                        Some((_, old_child)) => {
+                            // Mevcut → diff
+                            self.diff_element(parent_id, old_child, new_child);
+                        }
+                        None => {
+                            // Yeni → oluştur
+                            let id = self.create_element(new_child);
+                            self.mutations.push(Mutation::AppendChild { parent_id, child_id: id });
+                        }
+                    }
+                }
+                None => {
+                    // Keysiz → sıra ile eşleştir
+                    let old_child = old_unkeyed.get(unkeyed_idx);
+                    match old_child {
+                        Some((_, old_el)) => {
+                            self.diff_element(parent_id, old_el, new_child);
+                        }
+                        None => {
+                            let id = self.create_element(new_child);
+                            self.mutations.push(Mutation::AppendChild { parent_id, child_id: id });
+                        }
+                    }
+                    unkeyed_idx += 1;
+                }
+            }
+        }
+
+        // Artık kullanılmayan key'li eski çocukları kaldır
+        each (_, (_, old_child)) in old_keyed {
+            check let Some(id) = self.element_id(old_child) {
+                self.mutations.push(Mutation::RemoveNode { id });
+            }
+        }
+
+        // Artık kullanılmayan keysiz eski çocukları kaldır
+        let new_unkeyed_count = new.iter().filter(|e| element_key(e).is_none()).count();
+        each (_, (_, old_child)) in old_unkeyed.iter().skip(new_unkeyed_count) {
+            check let Some(id) = self.element_id(old_child) {
+                self.mutations.push(Mutation::RemoveNode { id });
+            }
+        }
+    }
+
+    // ── Element oluşturma ───────────────────────────────────────────────────
+
+    fn create_element(&var self, el: &Element) -> i64 {
+        let id = self.alloc_id();
+
+        match el {
+            Element::Text(t) => {
+                self.mutations.push(Mutation::CreateTextNode { text: t.clone(), id });
+            }
+
+            Element::Node { tag, attrs, children, key, .. } => {
+                self.mutations.push(Mutation::CreateElement { tag: tag.clone(), id });
+
+                // Key kaydı
+                check let Some(k) = key {
+                    self.key_map.insert(k.clone(), id);
+                }
+
+                // Attribute'lar
+                each attr in attrs {
+                    match &attr.value {
+                        AttrValue::Style(sheet) => {
+                            self.mutations.push(Mutation::SetStyle { id, css: sheet.to_css_string() });
+                        }
+                        AttrValue::Handler(h) => {
+                            self.mutations.push(Mutation::AddEventListener {
+                                id, event: h.event.clone(), handler_id: h.id.clone(), capture: h.capture,
+                            });
+                            self.delegator.register(h.clone());
+                        }
+                        _ => {
+                            self.mutations.push(Mutation::SetAttribute {
+                                id, name: attr.name.clone(),
+                                value: attr_value_to_string(&attr.value),
+                            });
+                        }
+                    }
+                }
+
+                // Çocuklar
+                each child in children {
+                    let child_id = self.create_element(child);
+                    self.mutations.push(Mutation::AppendChild { parent_id: id, child_id });
+                }
+            }
+
+            Element::Fragment(children) => {
+                each child in children {
+                    let child_id = self.create_element(child);
+                    self.mutations.push(Mutation::AppendChild { parent_id: id, child_id });
+                }
+            }
+
+            Element::Portal { target_id, content } => {
+                let content_id = self.create_element(content);
+                self.mutations.push(Mutation::AppendChild { parent_id: *target_id, child_id: content_id });
+            }
+
+            Element::None => {}
+
+            _ => {}
+        }
+
+        self.node_map.insert(id, el.clone());
+        id
+    }
+
+    fn element_id(&self, el: &Element) -> Option<i64> {
+        match el {
+            Element::Node { node_id: Some(id), .. } => Some(*id),
+            _ => None,
+        }
+    }
+}
+
+// ── Yardımcı fonksiyonlar ─────────────────────────────────────────────────────
+
+fn element_key(el: &Element) -> Option<String> {
+    match el {
+        Element::Node { key: Some(k), .. } => Some(k.clone()),
+        _ => None,
+    }
+}
+
+fn attrs_equal(a: &AttrValue, b: &AttrValue) -> bool {
+    match (a, b) {
+        (AttrValue::Text(x),   AttrValue::Text(y))   => x == y,
+        (AttrValue::Number(x), AttrValue::Number(y)) => x == y,
+        (AttrValue::Bool(x),   AttrValue::Bool(y))   => x == y,
+        _ => false,
+    }
+}
+
+fn attr_value_to_string(val: &AttrValue) -> String {
+    match val {
+        AttrValue::Text(s)   => s.clone(),
+        AttrValue::Number(n) => format!("{}", n),
+        AttrValue::Bool(b)   => if *b { "true".into() } else { "false".into() },
+        AttrValue::None      => "".into(),
+        _                    => "".into(),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §5  REACTIVE STATE
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data Signal<T> derives [Clone] {
+    open value:       T,
+    open subscribers: Vec<fn()>,
+    open id:          i64,
+}
+
+impl Signal<T> {
+    open fn new(initial: T) -> Signal<T> {
+        Signal { value: initial, subscribers: [], id: next_signal_id() }
+    }
+
+    open fn get(&self) -> &T { &self.value }
+
+    open fn set(&var self, new_value: T) {
+        self.value = new_value;
+        each sub in &self.subscribers { sub(); }
+    }
+
+    open fn update(&var self, f: fn(&T) -> T) {
+        let new_val = f(&self.value);
+        self.set(new_val);
+    }
+
+    open fn watch(&var self, callback: fn(&T)) {
+        self.subscribers.push(|| callback(&self.value));
+    }
+}
+
+/// Memo — sadece bağımlılıklar değişince yeniden hesapla
+expose data Memo<T> derives [Clone] {
+    open value:    T,
+    open compute:  fn() -> T,
+    open deps_hash: u64,
+}
+
+impl Memo<T> {
+    open fn new(compute: fn() -> T) -> Memo<T> {
+        Memo { value: compute(), compute, deps_hash: 0 }
+    }
+
+    open fn get(&var self, deps_hash: u64) -> &T {
+        check self.deps_hash != deps_hash {
+            self.value     = (self.compute)();
+            self.deps_hash = deps_hash;
+        }
+        &self.value
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §6  CONTEXT API
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data ContextStore {
+    open data: HashMap<String, PropValue>,
+}
+
+impl ContextStore {
+    open fn new() -> ContextStore {
+        ContextStore { data: HashMap::new() }
+    }
+
+    open fn provide<T>(&var self, key: &str, value: T) {
+        // T → PropValue dönüşümü
+        self.data.insert(key.into(), PropValue::Str(format!("{:?}", value)));
+    }
+
+    open fn consume(&self, key: &str) -> Option<&PropValue> {
+        self.data.get(key)
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §7  COMPONENT SYSTEM
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose ability Component {
+    fn render(&self) -> Element;
+    fn on_mount(&var self)   {}   // default: boş
+    fn on_unmount(&var self) {}   // default: boş
+    fn on_update(&var self)  {}   // default: boş
+}
+
+expose fn el(tag: &str, attrs: Vec<Attribute>, children: Vec<Element>) -> Element {
+    Element::Node { tag: tag.into(), attrs, children, key: None, node_id: None }
+}
+
+expose fn el_key(tag: &str, key: &str, attrs: Vec<Attribute>, children: Vec<Element>) -> Element {
+    Element::Node { tag: tag.into(), attrs, children, key: Some(key.into()), node_id: None }
+}
+
+expose fn text(content: &str) -> Element { Element::Text(content.into()) }
+expose fn fragment(children: Vec<Element>) -> Element { Element::Fragment(children) }
+
+// Yaygın HTML eleman yardımcıları
+expose fn div(attrs: Vec<Attribute>, children: Vec<Element>)  -> Element { el("div",    attrs, children) }
+expose fn span(attrs: Vec<Attribute>, children: Vec<Element>) -> Element { el("span",   attrs, children) }
+expose fn btn(attrs: Vec<Attribute>, children: Vec<Element>)  -> Element { el("button", attrs, children) }
+expose fn input(attrs: Vec<Attribute>)                         -> Element { el("input",  attrs, []) }
+expose fn img(src: &str, alt: &str)                            -> Element {
+    el("img", [
+        Attribute { name: "src".into(), value: AttrValue::Text(src.into()) },
+        Attribute { name: "alt".into(), value: AttrValue::Text(alt.into()) },
+    ], [])
+}
+expose fn h1(t: &str) -> Element { el("h1", [], [text(t)]) }
+expose fn h2(t: &str) -> Element { el("h2", [], [text(t)]) }
+expose fn p(t: &str)  -> Element { el("p",  [], [text(t)]) }
+
+// Attribute builder yardımcıları
+expose fn on_click(f: fn(PlatformEvent)) -> Attribute {
+    Attribute {
+        name:  "onclick".into(),
+        value: AttrValue::Handler(EventHandler {
+            id:       next_handler_id(),
+            event:    "click".into(),
+            callback: f,
+            bubbles:  true,
+            capture:  false,
+        }),
+    }
+}
+
+expose fn on_input(f: fn(PlatformEvent)) -> Attribute {
+    Attribute {
+        name:  "oninput".into(),
+        value: AttrValue::Handler(EventHandler {
+            id:       next_handler_id(),
+            event:    "input".into(),
+            callback: f,
+            bubbles:  true,
+            capture:  false,
+        }),
+    }
+}
+
+expose fn style(sheet: StyleSheet) -> Attribute {
+    Attribute { name: "style".into(), value: AttrValue::Style(sheet) }
+}
+
+expose fn class(name: &str) -> Attribute {
+    Attribute { name: "class".into(), value: AttrValue::Text(name.into()) }
+}
+
+expose fn attr(name: &str, value: &str) -> Attribute {
+    Attribute { name: name.into(), value: AttrValue::Text(value.into()) }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §8  PLATFORM RENDERERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose cases RenderTarget derives [Clone, Copy] {
+    Desktop, Web, IOS, Android, Terminal,
+}
+
+expose ability PlatformRenderer {
+    fn apply_mutations(&var self, mutations: Vec<Mutation>);
+    fn request_animation_frame(&self, callback: fn());
+    fn get_events(&self) -> Vec<PlatformEvent>;
+    fn screen_size(&self) -> (f64, f64);
+}
+
+// ── Terminal renderer (TUI) — gerçek implementasyon ──────────────────────────
+
+expose data TerminalRenderer {
+    open width:   i64,
+    open height:  i64,
+    open buffer:  Vec<Vec<char>>,
+    open events:  Vec<PlatformEvent>,
+}
+
+impl TerminalRenderer {
+    open fn new(width: i64, height: i64) -> TerminalRenderer {
+        let row: Vec<char> = vec![' '; width as usize];
+        let buffer = vec![row; height as usize];
+        TerminalRenderer { width, height, buffer, events: [] }
+    }
+
+    open fn clear(&var self) {
+        each row in &var self.buffer {
+            each cell in row { *cell = ' '; }
+        }
+    }
+
+    open fn put_char(&var self, x: i64, y: i64, c: char) {
+        check y >= 0 && y < self.height && x >= 0 && x < self.width {
+            self.buffer[y as usize][x as usize] = c;
+        }
+    }
+
+    open fn put_str(&var self, x: i64, y: i64, s: &str) {
+        each (i, c) in s.chars().enumerate() {
+            self.put_char(x + i as i64, y, c);
+        }
+    }
+
+    open fn flush(&self) {
+        each row in &self.buffer {
+            println!("{}", row.iter().collect::<String>());
+        }
+    }
+}
+
+impl TerminalRenderer for PlatformRenderer {
+    fn apply_mutations(&var self, mutations: Vec<Mutation>) {
+        self.clear();
+        var y = 0;
+        each mutation in mutations {
+            match mutation {
+                Mutation::CreateTextNode { text, .. } => {
+                    self.put_str(0, y, &text);
+                    y += 1;
+                }
+                Mutation::UpdateText { text, .. } => {
+                    self.put_str(0, y, &text);
+                    y += 1;
+                }
+                _ => {}
+            }
+        }
+        self.flush();
+    }
+
+    fn request_animation_frame(&self, callback: fn()) {
+        callback();
+    }
+
+    fn get_events(&self) -> Vec<PlatformEvent> {
+        self.events.clone()
+    }
+
+    fn screen_size(&self) -> (f64, f64) {
+        (self.width as f64, self.height as f64)
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §9  NOVA APP LAUNCHER
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data NovaApp<Props> derives [Clone] {
+    open title:          String,
+    open root_component: fn(Props) -> Element,
+    open target:         RenderTarget,
+    open window_width:   f64,
+    open window_height:  f64,
+    open theme:          AppTheme,
+    open fps_limit:      i64,       // v11: frame rate sınırı (0 = vsync)
+}
+
+expose cases AppTheme derives [Clone] {
+    Light, Dark, System, Custom(String),
+}
+
+impl AppTheme {
+    open fn bg_color(&self) -> &str {
+        match self {
+            AppTheme::Light       => "#ffffff",
+            AppTheme::Dark        => "#1a1a2e",
+            AppTheme::System      => "system",
+            AppTheme::Custom(c)   => c,
+        }
+    }
+
+    open fn text_color(&self) -> &str {
+        match self {
+            AppTheme::Dark => "#e0e0e0",
+            _              => "#333333",
+        }
+    }
+}
+
+impl NovaApp<Props> {
+    open fn launch(config: NovaApp<Props>) -> i32 {
+        println!("🚀 Nova App: \"{}\" → {:?}", config.title, config.target);
+
+        var vdom = VirtualDom::new();
+        let initial = (config.root_component)(Props::default());
+        let mutations = vdom.render(initial);
+
+        match config.target {
+            RenderTarget::Desktop  => Self::run_desktop(config, vdom, mutations),
+            RenderTarget::Web      => Self::run_web(config, vdom, mutations),
+            RenderTarget::IOS      => Self::run_ios(config, vdom, mutations),
+            RenderTarget::Android  => Self::run_android(config, vdom, mutations),
+            RenderTarget::Terminal => Self::run_terminal(config, vdom, mutations),
+        }
+    }
+
+    fn run_terminal(config: NovaApp<Props>, var vdom: VirtualDom, initial_mutations: Vec<Mutation>) -> i32 {
+        var renderer = TerminalRenderer::new(80, 24);
+        renderer.apply_mutations(initial_mutations);
+
+        // Ana döngü
+        var running = true;
+        while running {
+            let events = renderer.get_events();
+            each event in events {
+                vdom.delegator.dispatch(&event);
+                match &event {
+                    PlatformEvent::KeyDown { key, .. } => {
+                        check key == "q" || key == "Q" { running = false; }
+                    }
+                    _ => {}
+                }
+            }
+            // Re-render
+            let new_root = (config.root_component)(Props::default());
+            let mutations = vdom.render(new_root);
+            renderer.apply_mutations(mutations);
+        }
+        0
+    }
+
+    fn run_web(config: NovaApp<Props>, var vdom: VirtualDom, mutations: Vec<Mutation>) -> i32 {
+        println!("   🌐 WASM DOM renderer: {} mutations", mutations.len());
+        0
+    }
+
+    fn run_desktop(config: NovaApp<Props>, var vdom: VirtualDom, mutations: Vec<Mutation>) -> i32 {
+        println!("   🖥️  Desktop renderer: {} mutations", mutations.len());
+        0
+    }
+
+    fn run_ios(config: NovaApp<Props>, var vdom: VirtualDom, mutations: Vec<Mutation>) -> i32 {
+        println!("   📱 iOS UIKit renderer: {} mutations", mutations.len());
+        0
+    }
+
+    fn run_android(config: NovaApp<Props>, var vdom: VirtualDom, mutations: Vec<Mutation>) -> i32 {
+        println!("   🤖 Android renderer: {} mutations", mutations.len());
+        0
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §10  ROUTER
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose cases Route derives [Clone] {
+    Home, About, Settings,
+    Dynamic(String),
+    NotFound,
+}
+
+expose data Router derives [Clone] {
+    open current: Signal<Route>,
+    open history: Vec<Route>,
+    open params:  HashMap<String, String>,
+}
+
+impl Router {
+    open fn new() -> Router {
+        Router { current: Signal::new(Route::Home), history: [], params: HashMap::new() }
+    }
+
+    open fn navigate(&var self, route: Route) {
+        self.history.push(self.current.get().clone());
+        self.current.set(route);
+        self.params = HashMap::new();
+    }
+
+    open fn navigate_with_params(&var self, route: Route, params: HashMap<String, String>) {
+        self.history.push(self.current.get().clone());
+        self.current.set(route);
+        self.params = params;
+    }
+
+    open fn back(&var self) {
+        check let Some(prev) = self.history.pop() {
+            self.current.set(prev);
+        }
+    }
+
+    open fn param(&self, key: &str) -> Option<&String> {
+        self.params.get(key)
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §11  GLOBAL SAYAÇLAR
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn next_signal_id() -> i64 {
+    static var counter: i64 = 0;
+    counter += 1;
+    counter
+}
+
+fn next_handler_id() -> String {
+    static var counter: i64 = 0;
+    counter += 1;
+    format!("h{}", counter)
+}

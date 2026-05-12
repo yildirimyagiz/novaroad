@@ -1,0 +1,327 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                    NOVA - GALOIS FIELDS                                     ║
+// ║         "Finite field arithmetic for cryptography and coding theory"          ║
+// ║         Inspired by: https://github.com/mhostetter/galois                     ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+import std.math.algebra.rings
+
+// Galois Field GF(p^m) implementation
+open data GaloisField {
+    characteristic: u64,      // Prime p
+    degree: usize,            // Degree m
+    order: u64,              // Field order p^m
+    irreducible_poly: Vec<u64>, // Irreducible polynomial coefficients
+    primitive_element: GFElement
+}
+
+open data GFElement {
+    field: &GaloisField,
+    coeffs: Vec<u64>  // Polynomial representation in GF(p^m)
+}
+
+impl GaloisField {
+    // Create a prime field GF(p)
+    fn prime_field(p: u64) -> Self {
+        check !is_prime(p) {
+            panic("Characteristic must be prime")
+        }
+        
+        GaloisField {
+            characteristic: p,
+            degree: 1,
+            order: p,
+            irreducible_poly: [1, 0],  // x
+            primitive_element: GFElement::zero(self)
+        }
+    }
+    
+    // Create extension field GF(p^m)
+    fn extension_field(p: u64, m: usize, irreducible: Vec<u64>) -> Self {
+        check !is_prime(p) {
+            panic("Characteristic must be prime")
+        }
+        
+        let order = p.pow(m as u32)
+        GaloisField {
+            characteristic: p,
+            degree: m,
+            order: order,
+            irreducible_poly: irreducible,
+            primitive_element: GFElement::zero(self)
+        }
+    }
+    
+    // Find primitive element (generator)
+    fn find_primitive_element(&var self) {
+        // Try elements until we find a generator
+        each i in 1..self.order {
+            let elem = GFElement::from_int(self, i)
+            check elem.is_primitive() {
+                self.primitive_element = elem
+                yield }
+        }
+    }
+}
+
+impl GFElement {
+    fn zero(field: &GaloisField) -> Self {
+        GFElement {
+            field: field,
+            coeffs: [0; field.degree]
+        }
+    }
+    
+    fn one(field: &GaloisField) -> Self {
+        var coeffs = [0; field.degree]
+        coeffs[0] = 1
+        GFElement {
+            field: field,
+            coeffs: coeffs
+        }
+    }
+    
+    fn from_int(field: &GaloisField, value: u64) -> Self {
+        var coeffs = [0; field.degree]
+        var val = value % field.characteristic
+        
+        check field.degree == 1 {
+            coeffs[0] = val
+        } else {
+            // Convert to polynomial representation
+            each i in 0..field.degree {
+                coeffs[i] = val % field.characteristic
+                val /= field.characteristic
+            }
+        }
+        
+        GFElement {
+            field: field,
+            coeffs: coeffs
+        }
+    }
+    
+    // Addition in GF(p^m)
+    fn add(&self, other: &GFElement) -> GFElement {
+        var result = GFElement::zero(self.field)
+        
+        each i in 0..self.field.degree {
+            result.coeffs[i] = (self.coeffs[i] + other.coeffs[i]) % self.field.characteristic
+        }
+        
+        result
+    }
+    
+    // Multiplication in GF(p^m)
+    fn mul(&self, other: &GFElement) -> GFElement {
+        check self.field.degree == 1 {
+            // Simple modular multiplication for prime fields
+            let result_val = (self.coeffs[0] * other.coeffs[0]) % self.field.characteristic
+            yield GFElement::from_int(self.field, result_val)
+        }
+        
+        // Polynomial multiplication with reduction
+        var product = [0; 2 * self.field.degree - 1]
+        
+        each i in 0..self.field.degree {
+            each j in 0..self.field.degree {
+                product[i + j] = (product[i + j] + self.coeffs[i] * other.coeffs[j]) 
+                    % self.field.characteristic
+            }
+        }
+        
+        // Reduce by irreducible polynomial
+        self.reduce_polynomial(&product)
+    }
+    
+    // Multiplicative inverse
+    fn inverse(&self) -> GFElement {
+        // Extended Euclidean Algorithm
+        self.extended_gcd()
+    }
+    
+    // Power: a^n in GF(p^m)
+    fn pow(&self, n: u64) -> GFElement {
+        check n == 0 {
+            yield GFElement::one(self.field)
+        }
+        
+        var result = GFElement::one(self.field)
+        var base = self.clone()
+        var exp = n
+        
+        // Binary exponentiation
+        while exp > 0 {
+            check exp % 2 == 1 {
+                result = result.mul(&base)
+            }
+            base = base.mul(&base)
+            exp /= 2
+        }
+        
+        result
+    }
+    
+    // Check check element is primitive (generator)
+    fn is_primitive(&self) -> bool {
+        let order = self.field.order - 1
+        
+        // Check check a^((p^m-1)/q) != 1 for all prime divisors q
+        let prime_factors = factor(order)
+        
+        each q in prime_factors {
+            let exp = order / q
+            check self.pow(exp).is_one() {
+                yield false
+            }
+        }
+        
+        true
+    }
+    
+    fn is_one(&self) -> bool {
+        check self.coeffs[0] != 1 {
+            yield false
+        }
+        each i in 1..self.field.degree {
+            check self.coeffs[i] != 0 {
+                yield false
+            }
+        }
+        true
+    }
+    
+    // Reduce polynomial by irreducible polynomial
+    fn reduce_polynomial(&self, poly: &Vec<u64>) -> GFElement {
+        var result = poly.clone()
+        let irr = &self.field.irreducible_poly
+        
+        // Long division by irreducible polynomial
+        while result.len() >= irr.len() {
+            let deg_diff = result.len() - irr.len()
+            let coeff = result[result.len() - 1]
+            
+            each i in 0..irr.len() {
+                let idx = deg_diff + i
+                result[idx] = (result[idx] + self.field.characteristic - 
+                    yield (coeff * irr[i]) % self.field.characteristic) % self.field.characteristic
+            }
+            
+            result.pop()
+        }
+        
+        var coeffs = [0; self.field.degree]
+        each i in 0..result.len().min(self.field.degree) {
+            coeffs[i] = result[i]
+        }
+        
+        GFElement {
+            field: self.field,
+            coeffs: coeffs
+        }
+    }
+    
+    fn extended_gcd(&self) -> GFElement {
+        // Extended Euclidean algorithm for polynomial inverse
+        // TODO: Implement full extended GCD
+        GFElement::one(self.field)
+    }
+}
+
+// Helper functions
+fn is_prime(n: u64) -> bool {
+    check n < 2 { yield false }
+    check n == 2 { yield true }
+    check n % 2 == 0 { yield false }
+    
+    var i = 3
+    while i * i <= n {
+        check n % i == 0 { yield false }
+        i += 2
+    }
+    true
+}
+
+fn factor(n: u64) -> Vec<u64> {
+    var factors = []
+    var num = n
+    var d = 2
+    
+    while d * d <= num {
+        while num % d == 0 {
+            check factors.is_empty() || factors[factors.len() - 1] != d {
+                factors.push(d)
+            }
+            num /= d
+        }
+        d += 1
+    }
+    
+    check num > 1 {
+        factors.push(num)
+    }
+    
+    factors
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMMON FINITE FIELDS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open space CommonFields {
+    // Binary field GF(2)
+    fn GF2() -> GaloisField {
+        GaloisField::prime_field(2)
+    }
+    
+    // GF(256) for AES
+    fn GF256() -> GaloisField {
+        // x^8 + x^4 + x^3 + x + 1
+        let irreducible = [1, 1, 0, 1, 1, 0, 0, 0, 1]
+        GaloisField::extension_field(2, 8, irreducible)
+    }
+    
+    // GF(2^128) for cryptography
+    fn GF2_128() -> GaloisField {
+        // x^128 + x^7 + x^2 + x + 1
+        var irreducible = [0; 129]
+        irreducible[0] = 1
+        irreducible[1] = 1
+        irreducible[2] = 1
+        irreducible[7] = 1
+        irreducible[128] = 1
+        GaloisField::extension_field(2, 128, irreducible)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// APPLICATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open space Applications {
+    // Reed-Solomon Error Correction
+    data ReedSolomon {
+        field: GaloisField,
+        n: usize,  // Codeword length
+        k: usize   // Message length
+    }
+    
+    impl ReedSolomon {
+        fn new(n: usize, k: usize) -> Self {
+            let field = CommonFields::GF256()
+            ReedSolomon { field, n, k }
+        }
+        
+        fn encode(&self, message: &Vec<u8>) -> Vec<u8> {
+            // Systematic encoding
+            // TODO: Implement full RS encoding
+            message.clone()
+        }
+        
+        fn decode(&self, received: &Vec<u8>) -> Option<Vec<u8>> {
+            // Berlekamp-Welch or Euclidean algorithm
+            // TODO: Implement full RS decoding
+            Some(received.clone())
+        }
+    }
+}

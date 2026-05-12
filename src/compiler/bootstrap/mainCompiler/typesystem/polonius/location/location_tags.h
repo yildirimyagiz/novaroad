@@ -1,0 +1,5 @@
+#ifndef NOVA_LOCATION_TAGS_H
+#define NOVA_LOCATION_TAGS_H
+
+#endif
+

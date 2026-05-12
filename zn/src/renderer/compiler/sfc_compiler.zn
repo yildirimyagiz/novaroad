@@ -1,0 +1,485 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                          NOVA SFC COMPILER - END-TO-END                      ║
+// ║              Template → AST → IR → Static Patches → Runtime                 ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use crate::renderer::core::reactive::*;
+use crate::renderer::core::node::*;
+use crate::renderer::core::patcher::*;
+use crate::renderer::compiler::static_analyzer::*;
+use crate::templates::template_compiler::*;
+
+// ============================================================================
+// SFC COMPILER - COMPLETE PIPELINE
+// ============================================================================
+
+open data SFCCompiler {
+    template_parser: TemplateParser,
+    dependency_analyzer: DependencyAnalyzer,
+    static_patcher: StaticPatcher,
+    runtime_bridge: RuntimeBridge,
+}
+
+impl SFCCompiler {
+    fn new() -> Self {
+        SFCCompiler {
+            template_parser: TemplateParser::new(),
+            dependency_analyzer: DependencyAnalyzer::new(),
+            static_patcher: StaticPatcher::new(),
+            runtime_bridge: RuntimeBridge::new(),
+        }
+    }
+
+    /// Complete SFC Compilation Pipeline
+    fn compile_sfc(&var self, source: &str) -> Result<CompiledSFC, Vec<String>> {
+        // PHASE 1: Parse SFC into components
+        let sfc_components = self.parse_sfc(source)?;
+
+        // PHASE 2: Analyze dependencies
+        let dependency_graph = self.dependency_analyzer
+            .analyze_sfc(&sfc_components.template, &sfc_components.script)?;
+
+        // PHASE 3: Generate UI IR from template
+        let ui_ir = self.template_parser.parse(&sfc_components.template)?;
+
+        // PHASE 4: Generate static patches for reactive updates
+        self.static_patcher.generate_static_patches(
+            &dependency_graph.get_all_nodes().iter().map(|s| s.clone()).collect::<Vec<_>>(),
+            &ui_ir
+        );
+
+        // PHASE 5: Generate runtime bridge code
+        let runtime_code = self.runtime_bridge.generate_runtime_bridge(
+            &dependency_graph,
+            &self.static_patcher.get_static_patches()
+        );
+
+        // PHASE 6: Assemble final output
+        Ok(CompiledSFC {
+            ui_ir,
+            dependency_graph,
+            static_patches: self.static_patcher.get_static_patches().to_vec(),
+            runtime_code,
+            component_metadata: sfc_components.metadata,
+        })
+    }
+
+    fn parse_sfc(&self, source: &str) -> Result<SFCComponents, Vec<String>> {
+        let template = extract_section(source, "template")?;
+        let script = extract_section(source, "script")?;
+        let styles = [extract_section(source, "style").unwrap_or_default()];
+
+        let metadata = self.extract_component_metadata(&script)?;
+
+        Ok(SFCComponents {
+            template,
+            script,
+            styles,
+            metadata,
+        })
+    }
+
+    fn extract_component_metadata(&self, script: &str) -> Result<ComponentMetadata, Vec<String>> {
+        // Parse component name, props, etc.
+        let name = extract_component_name(script)
+            .unwrap_or("AnonymousComponent".into());
+
+        Ok(ComponentMetadata {
+            name,
+            props: [],
+            events: [],
+            reactive_fields: extract_reactive_fields(script),
+        })
+    }
+}
+
+// ============================================================================
+// COMPILED SFC OUTPUT
+// ============================================================================
+
+#[derive(Clone, Debug)]
+open data CompiledSFC {
+    ui_ir: Vec<UINode>,
+    dependency_graph: DependencyGraph,
+    static_patches: Vec<StaticPatch>,
+    runtime_code: String,
+    component_metadata: ComponentMetadata,
+}
+
+#[derive(Clone, Debug)]
+open data SFCComponents {
+    template: String,
+    script: String,
+    styles: Vec<String>,
+    metadata: ComponentMetadata,
+}
+
+#[derive(Clone, Debug)]
+open data ComponentMetadata {
+    name: String,
+    props: Vec<String>,
+    events: Vec<String>,
+    reactive_fields: Vec<String>,
+}
+
+// ============================================================================
+// RUNTIME BRIDGE - Compile-Time → Runtime Connection
+// ============================================================================
+
+open data RuntimeBridge {
+    platform: UIPlatform,
+}
+
+impl RuntimeBridge {
+    fn new() -> Self {
+        RuntimeBridge {
+            platform: get_current_platform(),
+        }
+    }
+
+    fn generate_runtime_bridge(&self, deps: &DependencyGraph, patches: &[StaticPatch]) -> String {
+        var code = String::new();
+
+        // Generate reactive state initialization
+        code.push_str(&self.generate_reactive_state_init(deps));
+
+        // Generate static patch functions
+        code.push_str(&self.generate_static_patch_functions(patches));
+
+        // Generate runtime watcher setup
+        code.push_str(&self.generate_runtime_watchers(deps));
+
+        // Generate component lifecycle
+        code.push_str(&self.generate_component_lifecycle());
+
+        code
+    }
+
+    fn generate_reactive_state_init(&self, deps: &DependencyGraph) -> String {
+        var code = String::from("// Reactive State Initialization\n");
+        code.push_str("const reactiveState = {\n");
+
+        each node in deps.get_all_nodes() {
+            code.push_str(&format("  {}: reactive({}),\n", node, "undefined"));
+        }
+
+        code.push_str("};\n\n");
+        code
+    }
+
+    fn generate_static_patch_functions(&self, patches: &[StaticPatch]) -> String {
+        var code = String::from("// Static Patch Functions\n");
+
+        each entry in patches.iter().enumerate()  { let (i, patch) = entry;
+            code.push_str(&format("function staticPatch_{}(changedValue) {{\n", i));
+
+            match patch {
+                StaticPatch::UpdateAttribute { selector, attribute, expression } => {
+                    code.push_str(&format("  const elements = document.querySelectorAll('{}');\n", selector));
+                    code.push_str(&format("  elements.forEach(el => el.setAttribute('{}', {}));\n", attribute, expression));
+                }
+                StaticPatch::UpdateText { selector, expression } => {
+                    code.push_str(&format("  const elements = document.querySelectorAll('{}');\n", selector));
+                    code.push_str(&format("  elements.forEach(el => el.textContent = {});\n", expression));
+                }
+                _ => {
+                    code.push_str("  // Complex patch implementation\n");
+                }
+            }
+
+            code.push_str("}\n\n");
+        }
+
+        code
+    }
+
+    fn generate_runtime_watchers(&self, deps: &DependencyGraph) -> String {
+        var code = String::from("// Runtime Watchers Setup\n");
+        code.push_str("function setupWatchers() {\n");
+
+        // Generate watchers for each dependency
+        each entry in deps.get_all_nodes().iter().enumerate()  { let (i, node) = entry;
+            check let Some(dependents) = deps.get_dependents(node) {
+                each dependent in dependents {
+                    code.push_str(&format("  watch(reactiveState.{}, (newVal) => {{\n", node));
+                    code.push_str(&format("    // Update {}\n", dependent));
+                    code.push_str(&format("    staticPatch_{}(newVal);\n", i % 10)); // Simplified
+                    code.push_str("  });\n");
+                }
+            }
+        }
+
+        code.push_str("}\n\n");
+        code
+    }
+
+    fn generate_component_lifecycle(&self) -> String {
+        let code = r#"
+// Component Lifecycle
+class SFCComponent {
+  constructor() {
+    this.mounted = false;
+    setupWatchers();
+  }
+
+  mount(rootElement) {
+    // Mount UI tree
+    this.renderToDOM(rootElement);
+    this.mounted = true;
+  }
+
+  update(changedFields) {
+    // Selective update based on changed fields
+    for (const field of changedFields) {
+      this.updateField(field);
+    }
+  }
+
+  unmount() {
+    // Cleanup watchers and DOM
+    this.mounted = false;
+  }
+}
+"#;
+        code.into()
+    }
+}
+
+// ============================================================================
+// SFC RUNTIME EXECUTOR
+// ============================================================================
+
+open data SFCRuntime {
+    compiled_components: HashMap<String, CompiledSFC>,
+    active_instances: HashMap<String, ComponentInstance>,
+}
+
+impl SFCRuntime {
+    fn new() -> Self {
+        SFCRuntime {
+            compiled_components: HashMap::new(),
+            active_instances: HashMap::new(),
+        }
+    }
+
+    fn register_component(&var self, name: String, compiled: CompiledSFC) {
+        self.compiled_components.insert(name, compiled);
+    }
+
+    fn instantiate_component(&var self, name: &str, props: HashMap<String, UIAttribute>)
+        -> Result<String, String> {
+
+        let compiled = self.compiled_components.get(name)
+            .ok_or_else(|| format("Component '{}' not found", name))?;
+
+        let instance_id = format("{}_{}", name, self.active_instances.len());
+
+        let instance = ComponentInstance {
+            id: instance_id.clone(),
+            component_name: name.into(),
+            reactive_state: self.initialize_reactive_state(&compiled.dependency_graph),
+            ui_tree: compiled.ui_ir.clone(),
+            patches: compiled.static_patches.clone(),
+        };
+
+        self.active_instances.insert(instance_id.clone(), instance);
+
+        Ok(instance_id)
+    }
+
+    fn update_component(&var self, instance_id: &str, updates: HashMap<String, UIValue>)
+        -> Result<(), String> {
+
+        let instance = self.active_instances.get_mut(instance_id)
+            .ok_or_else(|| format("Instance '{}' not found", instance_id))?;
+
+        // Apply updates to reactive state
+        each entry in updates  { let (field, value) = entry;
+            instance.update_field(&field, value);
+        }
+
+        // Trigger reactive updates
+        instance.process_reactive_updates();
+
+        Ok(())
+    }
+
+    fn initialize_reactive_state(&self, deps: &DependencyGraph) -> HashMap<String, Reactive<UIValue>> {
+        var state = HashMap::new();
+
+        each node in deps.get_all_nodes() {
+            state.insert(node.clone(), Reactive::new(UIValue::Null));
+        }
+
+        state
+    }
+}
+
+#[derive(Clone, Debug)]
+open data ComponentInstance {
+    id: String,
+    component_name: String,
+    reactive_state: HashMap<String, Reactive<UIValue>>,
+    ui_tree: Vec<UINode>,
+    patches: Vec<StaticPatch>,
+}
+
+impl ComponentInstance {
+    fn update_field(&var self, field: &str, value: UIValue) {
+        check let Some(reactive) = self.reactive_state.get_mut(field) {
+            reactive.set(value);
+        }
+    }
+
+    fn process_reactive_updates(&var self) {
+        // Process static patches based on reactive changes
+        // This would integrate with the patcher system
+        println("Processing reactive updates for component {}", self.id);
+    }
+
+    fn get_ui_tree(&self) -> &[UINode] {
+        &self.ui_tree
+    }
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+fn extract_section(source: &str, section_name: &str) -> Result<String, Vec<String>> {
+    let start_tag = format("<{}>", section_name);
+    let end_tag = format("</{}>", section_name);
+
+    let start = source.find(&start_tag)
+        .ok_or_else(|| [format("Missing <{}> tag", section_name)])? + start_tag.len();
+
+    let end = source.find(&end_tag)
+        .ok_or_else(|| [format("Missing </{}> tag", section_name)])?;
+
+    Ok(source[start..end].trim().into())
+}
+
+fn extract_component_name(script: &str) -> Option<String> {
+    // Simple regex-like extraction
+    check let Some(start) = script.find("export default") {
+        let after = &script[start + 14..];
+        check let Some(brace_start) = after.find('{') {
+            let name_part = &after[..brace_start].trim();
+            check let Some(name_start) = name_part.find("name:") {
+                let name_value = name_part[name_start + 5..].trim();
+                check let Some(quote_end) = name_value.find(',') {
+                    Some(name_value[..quote_end].trim_matches('"').trim_matches('\'').into());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_reactive_fields(script: &str) -> Vec<String> {
+    var fields = Vec::new();
+
+    // Extract from data() or reactive fields
+    check let Some(data_start) = script.find("data()") {
+        check let Some(brace_start) = script[data_start..].find('{') {
+            check let Some(brace_end) = script[data_start + brace_start..].find('}') {
+                let data_content = &script[data_start + brace_start + 1..data_start + brace_end];
+
+                // Simple field extraction
+                each line in data_content.lines() {
+                    let line = line.trim();
+                    check let Some(colon_pos) = line.find(':') {
+                        let field_name = line[..colon_pos].trim();
+                        check !field_name.is_empty() {
+                            fields.push(field_name.into());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fields
+}
+
+// ============================================================================
+// INTEGRATION TESTS
+// ============================================================================
+
+#[cfg(test)]
+space tests {
+    use super::*;
+
+    #[test]
+    fn test_sfc_compilation_pipeline() {
+        let sfc_source = r#"
+<template>
+  <div class="counter">
+    <h1>Count: {{count}}</h1>
+    <button @click="increment">+</button>
+    <button @click="decrement">-</button>
+  </div>
+</template>
+
+<script>
+export default {
+  name: 'Counter',
+  data() {
+    yield {
+      count: 0
+    }
+  },
+  methods: {
+    increment() {
+      this.count++;
+    },
+    decrement() {
+      this.count--;
+    }
+  }
+}
+</script>
+"#;
+
+        var compiler = SFCCompiler::new();
+        let result = compiler.compile_sfc(sfc_source);
+
+        assert(result.is_ok(), "SFC compilation should succeed");
+
+        let compiled = result.unwrap();
+        assert(!compiled.ui_ir.is_empty(), "Should generate UI IR");
+        assert(!compiled.dependency_graph.get_all_nodes().is_empty(), "Should analyze dependencies");
+        assert(!compiled.static_patches.is_empty(), "Should generate static patches");
+        assert(!compiled.runtime_code.is_empty(), "Should generate runtime code");
+    }
+
+    #[test]
+    fn test_runtime_component_instantiation() {
+        var runtime = SFCRuntime::new();
+
+        // Mock compiled SFC
+        let mock_sfc = CompiledSFC {
+            ui_ir: [UINode::Text("Hello".into())],
+            dependency_graph: {
+                var graph = DependencyGraph::new();
+                graph.add_node("count".into());
+                graph
+            },
+            static_patches: [],
+            runtime_code: "console.log('runtime');".into(),
+            component_metadata: ComponentMetadata {
+                name: "TestComponent".into(),
+                props: [],
+                events: [],
+                reactive_fields: ["count".into()],
+            },
+        };
+
+        runtime.register_component("TestComponent".into(), mock_sfc);
+
+        let instance_id = runtime.instantiate_component("TestComponent", HashMap::new());
+        assert(instance_id.is_ok(), "Should instantiate component");
+    }
+}

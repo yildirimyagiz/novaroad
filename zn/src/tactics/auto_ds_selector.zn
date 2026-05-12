@@ -1,0 +1,381 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║              A2: AUTO DATA STRUCTURE SELECTOR                                ║
+// ║                                                                               ║
+// ║  Automatically choose optimal data structure based on usage patterns         ║
+// ║  Profile-guided: learns from runtime behavior, optimizes at compile time     ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use compiler::ast::{Expression, Statement, VariableDecl}
+use compiler::analysis::{AccessPatternAnalyzer, PerformanceProfiler}
+use stdlib::collections::*
+
+// ============================================================================
+// ACCESS PATTERNS
+// ============================================================================
+
+cases AccessPattern {
+    Sequential {
+        forward: bool,          // true = iterate forward
+        read_write_ratio: f64   // >0.9 = mostly reads
+    },
+    RandomAccess {
+        unique_keys: usize,     // Number of unique keys
+        locality: f64           // 0.0 = random, 1.0 = clustered
+    },
+    SortedIteration {
+        ascending: bool,
+        range_queries: usize    // Number of range queries
+    },
+    Membership {
+        insert_rate: f64,       // insert/total ratio
+        lookup_rate: f64,       // lookup/total ratio
+        duplicates: bool        // true = multiset needed
+    },
+    FrequencyCount {
+        top_k: usize           // Track top K elements
+    },
+    Queue {
+        fifo: bool,            // true = FIFO, false = LIFO
+        priority: bool         // true = priority queue
+    }
+}
+
+// ============================================================================
+// DATA STRUCTURE RECOMMENDATIONS
+// ============================================================================
+
+cases OptimalDataStructure {
+    // Linear structures
+    Vec,                    // Dynamic array - best for sequential access
+    VecDeque,               // Double-ended queue
+    LinkedList,             // Rare - only for specific patterns
+    
+    // Hash-based
+    HashMap,                // O(1) random access
+    HashSet,                // O(1) membership testing
+    
+    // Tree-based
+    BTreeMap,               // Sorted map - O(log n) but cache-friendly
+    BTreeSet,               // Sorted set
+    
+    // Specialized
+    SmallVec(capacity: usize),      // Stack-allocated for small collections
+    ArrayVec(size: usize),          // Fixed size, no heap
+    Counter,                        // Frequency counting
+    PriorityQueue,                  // Heap-based priority queue
+    LRUCache(size: usize),          // Cache with eviction
+    BloomFilter(fpr: f64),          // Probabilistic membership
+    
+    // Auto-switching
+    AdaptiveMap,            // Switches Vec→HashMap based on size
+    AdaptiveSet             // Switches Vec→HashSet based on size
+}
+
+// ============================================================================
+// AUTO DATA STRUCTURE SELECTOR
+// ============================================================================
+
+open data AutoDataStructureSelector {
+    // Runtime profiling data
+    access_profiles: HashMap<String, AccessProfile>,
+    
+    // Compile-time analysis
+    analyzer: AccessPatternAnalyzer,
+    
+    // Configuration
+    enable_profiling: bool,
+    optimization_threshold: usize  // Min accesses before optimizing
+}
+
+data AccessProfile {
+    var_name: String,
+    total_accesses: usize,
+    read_count: usize,
+    write_count: usize,
+    pattern: AccessPattern,
+    last_access: u64
+}
+
+skill AutoDataStructureSelector {
+    fn new() -> Self {
+        AutoDataStructureSelector {
+            access_profiles: HashMap::new(),
+            analyzer: AccessPatternAnalyzer::new(),
+            enable_profiling: true,
+            optimization_threshold: 1000
+        }
+    }
+    
+    // ========================================================================
+    // PATTERN ANALYSIS
+    // ========================================================================
+    
+    @profile_guided
+    fn analyze_pattern(&self, var_name: String) -> AccessPattern {
+        let profile = self.access_profiles.get(var_name)?;
+        
+        // Calculate ratios
+        let total_ops = profile.insertions + profile.deletions + 
+                       profile.lookups + profile.iterations;
+        
+        let lookup_ratio = profile.lookups as f64 / total_ops as f64;
+        let iter_ratio = profile.iterations as f64 / total_ops as f64;
+        
+        // Detect pattern
+        check iter_ratio > 0.7 and profile.sequential_runs > 0 {
+            // Mostly iteration
+            yield AccessPattern::Sequential {
+                forward: true,
+                read_write_ratio: lookup_ratio
+            };
+        }
+        
+        check lookup_ratio > 0.6 and profile.random_accesses > 100 {
+            // Lots of random lookups
+            yield AccessPattern::RandomAccess {
+                unique_keys: self.estimate_unique_keys(profile),
+                locality: self.calculate_locality(profile)
+            };
+        }
+        
+        let insert_ratio = profile.insertions as f64 / total_ops as f64;
+        check profile.deletions == 0 and insert_ratio > 0.3 {
+            // Insertion-heavy, no deletion
+            yield AccessPattern::Membership {
+                insert_rate: insert_ratio,
+                lookup_rate: lookup_ratio,
+                duplicates: false
+            };
+        }
+        
+        // Default: balanced access
+        yield AccessPattern::RandomAccess {
+            unique_keys: 1000,
+            locality: 0.5
+        };
+    }
+    
+    // ========================================================================
+    // DATA STRUCTURE SELECTION
+    // ========================================================================
+    
+    @const_eval
+    fn select_optimal(&self, pattern: AccessPattern, 
+                           estimated_size: usize) -> OptimalDataStructure {
+        yield match pattern {
+            // Sequential access → Array-based
+            AccessPattern::Sequential { forward, read_write_ratio } => {
+                check estimated_size < 32 {
+                    OptimalDataStructure::SmallVec(capacity: estimated_size)
+                } else check read_write_ratio > 0.9 {
+                    OptimalDataStructure::Vec  // Mostly reads
+                } else {
+                    OptimalDataStructure::VecDeque  // Many modifications
+                }
+            },
+            
+            // Random access → Hash-based or Tree-based
+            AccessPattern::RandomAccess { unique_keys, locality } => {
+                check unique_keys < 100 {
+                    // Small collection - linear search is fine
+                    OptimalDataStructure::SmallVec(capacity: unique_keys)
+                } else check locality > 0.7 {
+                    // High locality - tree is cache-friendly
+                    OptimalDataStructure::BTreeMap
+                } else {
+                    // Low locality - hash is faster
+                    OptimalDataStructure::HashMap
+                }
+            },
+            
+            // Sorted iteration → BTree
+            AccessPattern::SortedIteration { ascending, range_queries } => {
+                check range_queries > 10 {
+                    OptimalDataStructure::BTreeMap  // Excellent for ranges
+                } else {
+                    OptimalDataStructure::BTreeSet
+                }
+            },
+            
+            // Membership testing → Set
+            AccessPattern::Membership { insert_rate, lookup_rate, duplicates } => {
+                check duplicates {
+                    OptimalDataStructure::Counter  // Multiset
+                } else check estimated_size > 1000000 {
+                    OptimalDataStructure::BloomFilter(fpr: 0.01)  // Large set
+                } else check estimated_size < 64 {
+                    OptimalDataStructure::SmallVec(capacity: estimated_size)
+                } else {
+                    OptimalDataStructure::HashSet
+                }
+            },
+            
+            // Frequency counting → Counter
+            AccessPattern::FrequencyCount { top_k } => {
+                OptimalDataStructure::Counter
+            },
+            
+            // Queue operations → Deque or PriorityQueue
+            AccessPattern::Queue { fifo, priority } => {
+                check priority {
+                    OptimalDataStructure::PriorityQueue
+                } else {
+                    OptimalDataStructure::VecDeque
+                }
+            }
+        };
+    }
+    
+    // ========================================================================
+    // COMPILE-TIME REWRITING
+    // ========================================================================
+    
+    @compile_time
+    fn optimize(&self, ast: TypedAST) -> Result<TypedAST> {
+        var optimized = ast;
+        
+        // Find all collection declarations
+        each decl in optimized.find_all_variable_decls() {
+            check !self.is_collection_type(decl.type_) {
+                continue;
+            }
+            
+            // Analyze usage
+            let usage = self.analyzer.analyze_usage(decl.name, optimized);
+            let pattern = self.infer_pattern(usage);
+            let estimated_size = self.estimate_size(usage);
+            
+            // Select optimal data structure
+            let optimal = self.select_optimal(pattern, estimated_size);
+            
+            // Rewrite AST check different
+            check optimal != decl.type_ {
+                optimized = self.rewrite_collection(optimized, decl.name, optimal);
+                
+                println(f"📊 Optimized {decl.name}: {decl.type_} → {optimal}");
+            }
+        }
+        
+        Ok(optimized)
+    }
+    
+    @compile_time
+    fn rewrite_collection(&self, ast: TypedAST, var_name: String, 
+                          new_type: OptimalDataStructure) -> TypedAST {
+        // AST transformation
+        var rewriter = ASTRewriter::new();
+        
+        // Change declaration
+        rewriter.rewrite_type(var_name, new_type);
+        
+        // Update all usages
+        rewriter.rewrite_operations(var_name, new_type);
+        
+        yield rewriter.impl(ast);
+    }
+}
+
+// ============================================================================
+// ADAPTIVE STRUCTURES (Runtime switching)
+// ============================================================================
+
+open data AdaptiveMap<K, V> {
+    small: Option<Vec<(K, V)>>,     // For n < threshold
+    large: Option<HashMap<K, V>>,   // For n >= threshold
+    threshold: usize
+}
+
+skill AdaptiveMap<K, V> {
+    fn new() -> Self {
+        AdaptiveMap {
+            small: Some(Vec::new()),
+            large: None,
+            threshold: 16  // Switch at 16 elements
+        }
+    }
+    
+    fn insert(&var self, key: K, value: V) {
+        check let Some(ref var vec) = self.small {
+            check vec.len() < self.threshold {
+                // Still small - use Vec
+                vec.push((key, value));
+            } else {
+                // Convert to HashMap
+                var map = HashMap::new();
+                each entry in vec {
+                    let (k, v) = entry;
+                    map.insert(k, v);
+                }
+                map.insert(key, value);
+                
+                self.small = None;
+                self.large = Some(map);
+            }
+        } else {
+            // Already using HashMap
+            self.large.unwrap().insert(key, value);
+        }
+    }
+    
+    fn get(&self, key: K) -> Option<V> {
+        check let Some(ref vec) = self.small {
+            // Linear search - fast for small n
+            each entry in vec {
+                let (k, v) = entry;
+                check k == key {
+                    yield Some(v);
+                }
+            }
+            None
+        } else {
+            // Hash lookup - fast for large n
+            yield self.large.unwrap().get(key);
+        }
+    }
+}
+
+// ============================================================================
+// EXAMPLE USAGE
+// ============================================================================
+
+fn example_auto_ds_selection():
+    // Example 1: Sequential access → Vec
+    let data = []  // Compiler detects: mostly append + iterate
+    each i in 0..1000:
+        data.push(i)
+    
+    each x in data:
+        print(x)
+    
+    // ✅ Compiler uses Vec (optimal!)
+    
+    // Example 2: Random lookups → HashMap
+    let cache = {}  // Compiler detects: random access by key
+    cache["user123"] = "Alice"
+    cache["user456"] = "Bob"
+    
+    check "user123" in cache:
+        print(cache["user123"])
+    
+    // ✅ Compiler uses HashMap (optimal!)
+    
+    // Example 3: Small collection → SmallVec
+    let coords = []  // Only 3 elements
+    coords.push((0, 0))
+    coords.push((1, 1))
+    coords.push((2, 2))
+    
+    // ✅ Compiler uses SmallVec<3> - stack allocated!
+    
+    // Example 4: Adaptive switching
+    let adaptive = AdaptiveMap::new()
+    
+    // Start with Vec (small)
+    each i in 0..10:
+        adaptive.insert(i, i * 10)
+    
+    // Automatically switches to HashMap at size 16!
+    each i in 10..100:
+        adaptive.insert(i, i * 10)
+    
+    println("✅ Auto DS Selection: Right structure, right time!")

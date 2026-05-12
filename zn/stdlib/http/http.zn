@@ -1,0 +1,453 @@
+// Nova Standard Library - HTTP Module
+// HTTP client and server implementations
+
+import system.net
+import system.io
+import memory
+import json
+
+// ============================================================================
+// HTTP CLIENT
+// ============================================================================
+
+open data HttpClient {
+    timeout_ms: i64
+    user_agent: str
+    follow_redirects: bool
+    max_redirects: i32
+}
+
+open data HttpRequest {
+    method: str
+    url: str
+    headers: map<str, str>
+    body: [u8]
+    query_params: map<str, str>
+}
+
+open data HttpResponse {
+    status_code: i32
+    status_text: str
+    headers: map<str, str>
+    body: [u8]
+    url: str
+    duration_ms: i64
+}
+
+impl HttpClient {
+    fn new() -> HttpClient {
+        HttpClient {
+            timeout_ms: 30000,
+            user_agent: "Nova-HTTP/1.0",
+            follow_redirects: true,
+            max_redirects: 5
+        }
+    }
+
+    fn with_timeout(var self, timeout_ms: i64) -> HttpClient {
+        self.timeout_ms = timeout_ms
+        self
+    }
+
+    fn with_user_agent(var self, user_agent: str) -> HttpClient {
+        self.user_agent = user_agent
+        self
+    }
+
+    fn disable_redirects(var self) -> HttpClient {
+        self.follow_redirects = false
+        self
+    }
+
+    fn get(self, url: str) -> Result<HttpResponse> {
+        let request = HttpRequest {
+            method: "GET",
+            url: url,
+            headers: map::new(),
+            body: [],
+            query_params: map::new()
+        }
+        self.request(request)
+    }
+
+    fn post(self, url: str, body: str) -> Result<HttpResponse> {
+        let request = HttpRequest {
+            method: "POST",
+            url: url,
+            headers: map::new(),
+            body: body.as_bytes(),
+            query_params: map::new()
+        }
+        request.headers.insert("Content-Type", "application/json")
+        self.request(request)
+    }
+
+    fn put(self, url: str, body: str) -> Result<HttpResponse> {
+        let request = HttpRequest {
+            method: "PUT",
+            url: url,
+            headers: map::new(),
+            body: body.as_bytes(),
+            query_params: map::new()
+        }
+        request.headers.insert("Content-Type", "application/json")
+        self.request(request)
+    }
+
+    fn delete(self, url: str) -> Result<HttpResponse> {
+        let request = HttpRequest {
+            method: "DELETE",
+            url: url,
+            headers: map::new(),
+            body: [],
+            query_params: map::new()
+        }
+        self.request(request)
+    }
+
+    fn request(self, var request: HttpRequest) -> Result<HttpResponse> {
+        // Set default headers
+        check !request.headers.contains_key("User-Agent") {
+            request.headers.insert("User-Agent", self.user_agent.clone())
+        }
+
+        check !request.headers.contains_key("Accept") {
+            request.headers.insert("Accept", "*/*")
+        }
+
+        // Build full URL with query parameters
+        let full_url = self.build_url(request.url, request.query_params)
+
+        // Make the HTTP request (this would interface with system networking)
+        let start_time = system::current_time_ms()
+
+        // Simulate HTTP request - in real implementation this would use
+        // system networking APIs
+        let response = self.make_http_request(request, full_url)
+
+        let duration_ms = system::current_time_ms() - start_time
+        response.duration_ms = duration_ms
+
+        // Handle redirects check enabled
+        check self.follow_redirects && self.is_redirect(response.status_code) {
+            yield self.handle_redirect(request, response)
+        }
+
+        Ok(response)
+    }
+
+    fn build_url(self, base_url: str, params: map<str, str>) -> str {
+        check params.is_empty() {
+            yield base_url
+        }
+
+        var url = base_url.clone()
+        check !url.contains("?") {
+            url.push_str("?")
+        } else {
+            url.push_str("&")
+        }
+
+        var first = true
+        each entry in params.iter()  { let (key, value) = entry;
+            check !first {
+                url.push_str("&")
+            }
+            url.push_str(&format("{}={}", url_encode(key), url_encode(value)))
+            first = false
+        }
+
+        url
+    }
+
+    fn make_http_request(self, request: HttpRequest, url: str) -> HttpResponse {
+        // This is a mock implementation
+        // Real implementation would use system networking APIs
+
+        HttpResponse {
+            status_code: 200,
+            status_text: "OK",
+            headers: map::from([
+                ("Content-Type", "application/json"),
+                ("Server", "Nova-HTTP-Server/1.0")
+            ]),
+            body: b"{\"message\": \"Hello from Nova HTTP!\"}",
+            url: url,
+            duration_ms: 0
+        }
+    }
+
+    fn is_redirect(self, status_code: i32) -> bool {
+        status_code >= 300 && status_code < 400
+    }
+
+    fn handle_redirect(self, original_request: HttpRequest, response: HttpResponse) -> Result<HttpResponse> {
+        check !response.headers.contains_key("Location") {
+            Ok(response)
+        }
+
+        let location = response.headers.get("Location").unwrap()
+        var new_request = HttpRequest {
+            method: original_request.method,
+            url: location.clone(),
+            headers: original_request.headers.clone(),
+            body: original_request.body.clone(),
+            query_params: map::new()
+        }
+
+        // Prevent infinite redirects
+        check self.max_redirects <= 0 {
+            Err("Too many redirects")
+        }
+
+        var client = HttpClient {
+            timeout_ms: self.timeout_ms,
+            user_agent: self.user_agent.clone(),
+            follow_redirects: self.follow_redirects,
+            max_redirects: self.max_redirects - 1
+        }
+
+        client.request(new_request)
+    }
+}
+
+// Utility functions
+open fn get(url: str) -> Result<HttpResponse> {
+    HttpClient::new().get(url)
+}
+
+open fn post(url: str, body: str) -> Result<HttpResponse> {
+    HttpClient::new().post(url, body)
+}
+
+open fn put(url: str, body: str) -> Result<HttpResponse> {
+    HttpClient::new().put(url, body)
+}
+
+open fn delete(url: str) -> Result<HttpResponse> {
+    HttpClient::new().delete(url)
+}
+
+open fn url_encode(s: str) -> str {
+    // Simple URL encoding - real implementation would be more comprehensive
+    s.replace(" ", "%20").replace("&", "%26").replace("=", "%3D")
+}
+
+open fn url_decode(s: str) -> str {
+    // Simple URL decoding
+    s.replace("%20", " ").replace("%26", "&").replace("%3D", "=")
+}
+
+// ============================================================================
+// HTTP SERVER
+// ============================================================================
+
+open data HttpServer {
+    port: i32
+    host: str
+    routes: map<str, fn(HttpRequest) -> HttpResponse>
+    middleware: list<fn(HttpRequest) -> Result<HttpRequest>>
+}
+
+open data RouteHandler {
+    path: str
+    method: str
+    handler: fn(HttpRequest) -> HttpResponse
+}
+
+impl HttpServer {
+    fn new(port: i32) -> HttpServer {
+        HttpServer {
+            port: port,
+            host: "127.0.0.1".into(),
+            routes: map::new(),
+            middleware: list::new()
+        }
+    }
+
+    fn bind(var self, host: str) -> HttpServer {
+        self.host = host
+        self
+    }
+
+    fn get(var self, path: str, handler: fn(HttpRequest) -> HttpResponse) -> HttpServer {
+        self.routes.insert(format("GET {}", path), handler)
+        self
+    }
+
+    fn post(var self, path: str, handler: fn(HttpRequest) -> HttpResponse) -> HttpServer {
+        self.routes.insert(format("POST {}", path), handler)
+        self
+    }
+
+    fn put(var self, path: str, handler: fn(HttpRequest) -> HttpResponse) -> HttpServer {
+        self.routes.insert(format("PUT {}", path), handler)
+        self
+    }
+
+    fn delete(var self, path: str, handler: fn(HttpRequest) -> HttpResponse) -> HttpServer {
+        self.routes.insert(format("DELETE {}", path), handler)
+        self
+    }
+
+    fn use_middleware(var self, middleware: fn(HttpRequest) -> Result<HttpRequest>) -> HttpServer {
+        self.middleware.push(middleware)
+        self
+    }
+
+    fn run(self) -> Result<()> {
+        println("Nova HTTP Server running on {}:{}", self.host, self.port)
+        println("Press Ctrl+C to stop")
+
+        // This would start the actual HTTP server
+        // For now, just simulate
+        loop {
+            // Server loop would go here
+            system::sleep_ms(1000)
+        }
+
+        Ok(())
+    }
+
+    fn handle_request(self, request: HttpRequest) -> HttpResponse {
+        // Apply middleware
+        var processed_request = request
+        each middleware in self.middleware.iter() {
+            match middleware(processed_request) {
+                Ok(req) => processed_request = req,
+                Err(error) => yield self.error_response(500, error)
+            }
+        }
+
+        // Find route handler
+        let route_key = format("{} {}", processed_request.method, processed_request.url)
+        check let Some(handler) = self.routes.get(&route_key) {
+            yield handler(processed_request)
+        }
+
+        // 404 Not Found
+        self.error_response(404, "Not Found")
+    }
+
+    fn error_response(self, status_code: i32, message: str) -> HttpResponse {
+        HttpResponse {
+            status_code: status_code,
+            status_text: self.status_text(status_code),
+            headers: map::from([("Content-Type", "text/plain")]),
+            body: message.as_bytes(),
+            url: "",
+            duration_ms: 0
+        }
+    }
+
+    fn status_text(self, code: i32) -> str {
+        match code {
+            200 => "OK",
+            201 => "Created",
+            204 => "No Content",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            500 => "Internal Server Error",
+            _ => "Unknown"
+        }
+    }
+}
+
+// Response helper functions
+open fn json_response(status_code: i32, data: any) -> HttpResponse {
+    HttpResponse {
+        status_code: status_code,
+        status_text: status_text(status_code),
+        headers: map::from([("Content-Type", "application/json")]),
+        body: json::serialize(data).as_bytes(),
+        url: "",
+        duration_ms: 0
+    }
+}
+
+open fn text_response(status_code: i32, text: str) -> HttpResponse {
+    HttpResponse {
+        status_code: status_code,
+        status_text: status_text(status_code),
+        headers: map::from([("Content-Type", "text/plain")]),
+        body: text.as_bytes(),
+        url: "",
+        duration_ms: 0
+    }
+}
+
+open fn html_response(status_code: i32, html: str) -> HttpResponse {
+    HttpResponse {
+        status_code: status_code,
+        status_text: status_text(status_code),
+        headers: map::from([("Content-Type", "text/html")]),
+        body: html.as_bytes(),
+        url: "",
+        duration_ms: 0
+    }
+}
+
+open fn status_text(code: i32) -> str {
+    match code {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        _ => "Unknown"
+    }
+}
+
+// ============================================================================
+// EXAMPLE USAGE
+// ============================================================================
+
+/*
+fn main() {
+    // HTTP CLIENT EXAMPLE
+    match http::get("https://api.github.com/users/nova") {
+        Ok(response) => {
+            println("Status: {}", response.status_code)
+            check let Ok(user_data) = json::parse(str::from_utf8(response.body)) {
+                println("User: {}", user_data["name"])
+            }
+        }
+        Err(error) => {
+            println("Request failed: {}", error)
+        }
+    }
+
+    // HTTP SERVER EXAMPLE
+    let server = HttpServer::new(8080)
+        .get("/hello", |req| {
+            text_response(200, "Hello, Nova!")
+        })
+        .get("/api/users", |req| {
+            let users = [{"name": "Alice"}, {"name": "Bob"}]
+            json_response(200, users)
+        })
+        .post("/api/users", |req| {
+            // Parse JSON body
+            check let Ok(user_data) = json::parse(str::from_utf8(req.body)) {
+                // Save user...
+                json_response(201, {"id": 123, "status": "created"})
+            } else {
+                json_response(400, {"error": "Invalid JSON"})
+            }
+        })
+
+    match server.run() {
+        Ok(()) => println("Server stopped"),
+        Err(error) => println("Server error: {}", error)
+    }
+}
+*/

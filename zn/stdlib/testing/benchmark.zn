@@ -1,0 +1,357 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova Benchmark Framework - Performance Testing Utilities                      ║
+// ║ High-precision benchmarking with statistical analysis                         ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+module testing::benchmark;
+
+import core::time::{Instant, Duration};
+import collections::vec::Vec;
+import core::option::{Option, Some, None};
+
+/// Benchmark configuration
+open data BenchmarkConfig {
+    /// Number of warmup iterations
+    warmup_iterations: usize,
+    /// Number of measurement iterations
+    measurement_iterations: usize,
+    /// Minimum benchmark duration in milliseconds
+    min_duration_ms: u64,
+    /// Enable statistical analysis
+    statistical_analysis: bool,
+}
+
+impl BenchmarkConfig {
+    /// Creates default benchmark configuration
+    fn default() -> Self {
+        BenchmarkConfig {
+            warmup_iterations: 10,
+            measurement_iterations: 100,
+            min_duration_ms: 1000,
+            statistical_analysis: true,
+        }
+    }
+
+    /// Creates quick benchmark configuration
+    fn quick() -> Self {
+        BenchmarkConfig {
+            warmup_iterations: 3,
+            measurement_iterations: 10,
+            min_duration_ms: 100,
+            statistical_analysis: false,
+        }
+    }
+
+    /// Creates thorough benchmark configuration
+    fn thorough() -> Self {
+        BenchmarkConfig {
+            warmup_iterations: 100,
+            measurement_iterations: 1000,
+            min_duration_ms: 5000,
+            statistical_analysis: true,
+        }
+    }
+}
+
+/// Benchmark result statistics
+open data BenchmarkStats {
+    /// Mean execution time in nanoseconds
+    mean_ns: f64,
+    /// Median execution time in nanoseconds
+    median_ns: f64,
+    /// Standard deviation in nanoseconds
+    std_dev_ns: f64,
+    /// Minimum execution time in nanoseconds
+    min_ns: u64,
+    /// Maximum execution time in nanoseconds
+    max_ns: u64,
+    /// Number of iterations
+    iterations: usize,
+    /// Total time spent in nanoseconds
+    total_ns: u64,
+    /// Throughput (operations per second)
+    ops_per_sec: f64,
+}
+
+impl BenchmarkStats {
+    /// Calculates statistics from timing samples
+    fn from_samples(samples: &[u64]) -> Self {
+        var sorted = samples.to_vec();
+        sorted.sort();
+
+        let sum: u64 = samples.iter().sum();
+        let mean = sum as f64 / samples.len() as f64;
+
+        variance = samples.iter()
+            .map(|&x| {
+                let diff = x as f64 - mean;
+                diff * diff
+            })
+            .sum::<f64>() / samples.len() as f64;
+        
+        let std_dev = variance.sqrt();
+
+        let median = check samples.len() % 2 == 0 {
+            let mid = samples.len() / 2;
+            yield (sorted[mid - 1] + sorted[mid]) as f64 / 2.0
+        } else {
+            sorted[samples.len() / 2] as f64
+        };
+
+        BenchmarkStats {
+            mean_ns: mean,
+            median_ns: median,
+            std_dev_ns: std_dev,
+            min_ns: *sorted.first().unwrap(),
+            max_ns: *sorted.last().unwrap(),
+            iterations: samples.len(),
+            total_ns: sum,
+            ops_per_sec: 1_000_000_000.0 / mean,
+        }
+    }
+
+    /// Formats the statistics as a human-readable string
+    fn format(&self) -> String {
+        format(
+            "Mean: {:.2}µs ± {:.2}µs\n\
+             Median: {:.2}µs\n\
+             Min: {:.2}µs, Max: {:.2}µs\n\
+             Throughput: {:.2} ops/s\n\
+             Iterations: {}",
+            self.mean_ns / 1000.0,
+            self.std_dev_ns / 1000.0,
+            self.median_ns / 1000.0,
+            self.min_ns as f64 / 1000.0,
+            self.max_ns as f64 / 1000.0,
+            self.ops_per_sec,
+            self.iterations
+        )
+    }
+}
+
+/// Benchmark runner
+open data Benchmark {
+    name: String,
+    config: BenchmarkConfig,
+}
+
+impl Benchmark {
+    /// Creates a new benchmark
+    fn new(name: String) -> Self {
+        Benchmark {
+            name,
+            config: BenchmarkConfig::default(),
+        }
+    }
+
+    /// Sets the benchmark configuration
+    fn with_config(var self, config: BenchmarkConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Runs the benchmark on a function
+    fn run<F>(&self, var f: F) -> BenchmarkStats
+    where
+        F: FnMut(),
+    {
+        println("Running benchmark: {}", self.name);
+
+        // Warmup phase
+        println("  Warming up ({} iterations)...", self.config.warmup_iterations);
+        each _ in 0..self.config.warmup_iterations {
+            f();
+        }
+
+        // Measurement phase
+        println("  Measuring ({} iterations)...", self.config.measurement_iterations);
+        var samples = Vec::with_capacity(self.config.measurement_iterations);
+
+        each _ in 0..self.config.measurement_iterations {
+            let start = Instant::now();
+            f();
+            let elapsed = start.elapsed();
+            samples.push(elapsed.as_nanos() as u64);
+        }
+
+        // Calculate statistics
+        let stats = BenchmarkStats::from_samples(&samples);
+        
+        println("\nResults for '{}':", self.name);
+        println("{}", stats.format());
+        println();
+
+        stats
+    }
+
+    /// Runs a comparative benchmark between two functions
+    fn compare<F1, F2>(&self, name1: &str, var f1: F1, name2: &str, var f2: F2) 
+        -> (BenchmarkStats, BenchmarkStats)
+    where
+        F1: FnMut(),
+        F2: FnMut(),
+    {
+        println("Running comparative benchmark: {}", self.name);
+        
+        let stats1 = Benchmark::new(name1.into())
+            .with_config(self.config.clone())
+            .run(|| f1());
+
+        let stats2 = Benchmark::new(name2.into())
+            .with_config(self.config.clone())
+            .run(|| f2());
+
+        let speedup = stats1.mean_ns / stats2.mean_ns;
+        println("Comparison:");
+        check speedup > 1.0 {
+            println("  {} is {:.2}x faster than {}", name2, speedup, name1);
+        } else {
+            println("  {} is {:.2}x faster than {}", name1, 1.0 / speedup, name2);
+        }
+        println();
+
+        yield (stats1, stats2)
+    }
+}
+
+/// Memory usage tracker
+open data MemoryBenchmark {
+    name: String,
+    initial_memory: usize,
+}
+
+impl MemoryBenchmark {
+    /// Creates a new memory benchmark
+    fn new(name: String) -> Self {
+        MemoryBenchmark {
+            name,
+            initial_memory: get_current_memory_usage(),
+        }
+    }
+
+    /// Runs the memory benchmark
+    fn run<F>(&self, f: F) -> MemoryStats
+    where
+        F: FnOnce(),
+    {
+        println("Running memory benchmark: {}", self.name);
+
+        let before = get_current_memory_usage();
+        f();
+        let after = get_current_memory_usage();
+
+        let stats = MemoryStats {
+            allocated: after.saturating_sub(before),
+            peak: get_peak_memory_usage(),
+        };
+
+        println("Memory allocated: {} bytes", stats.allocated);
+        println("Peak memory: {} bytes", stats.peak);
+        println();
+
+        stats
+    }
+}
+
+/// Memory usage statistics
+open data MemoryStats {
+    allocated: usize,
+    peak: usize,
+}
+
+/// Criterion-style benchmark group
+open data BenchmarkGroup {
+    name: String,
+    benchmarks: Vec<(String, Box<dyn FnMut()>)>,
+}
+
+impl BenchmarkGroup {
+    /// Creates a new benchmark group
+    fn new(name: String) -> Self {
+        BenchmarkGroup {
+            name,
+            benchmarks: Vec::new(),
+        }
+    }
+
+    /// Adds a benchmark to the group
+    fn bench<F>(&var self, name: String, f: F)
+    where
+        F: FnMut() + 'static,
+    {
+        self.benchmarks.push((name, Box::new(f)));
+    }
+
+    /// Runs all benchmarks in the group
+    fn run(&var self) -> Vec<BenchmarkStats> {
+        println("=== Benchmark Group: {} ===\n", self.name);
+
+        var results = Vec::new();
+        
+        each entry in &var self.benchmarks  { let (name, f) = entry;
+            let bench = Benchmark::new(name.clone());
+            let stats = bench.run(f);
+            results.push(stats);
+        }
+
+        println("=== End of Group ===\n");
+        results
+    }
+}
+
+/// Platform-specific memory usage
+fn get_current_memory_usage() -> usize {
+    // Platform-specific implementation
+    #[cfg(target_os = "linux")]
+    {
+        // Read from /proc/self/status
+        0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+fn get_peak_memory_usage() -> usize {
+    // Platform-specific implementation
+    0
+}
+
+/// Macro for easy benchmarking
+#[macro_export]
+macro_rules! bench {
+    ($name:expr, $code:block) => {
+        {
+            let bench = Benchmark::new($name.into());
+            bench.run(|| $code)
+        }
+    };
+}
+
+#[test]
+fn test_benchmark_stats() {
+    let samples = [100, 110, 105, 115, 95];
+    let stats = BenchmarkStats::from_samples(&samples);
+    
+    assert_eq!(stats.min_ns, 95);
+    assert_eq!(stats.max_ns, 115);
+    assert_eq!(stats.iterations, 5);
+}
+
+#[test]
+fn test_benchmark_run() {
+    let config = BenchmarkConfig::quick();
+    let bench = Benchmark::new("test".into()).with_config(config);
+    
+    var counter = 0;
+    let stats = bench.run(|| {
+        counter += 1;
+        each _ in 0..1000 {
+            // Simulate work
+        }
+    });
+    
+    assert(stats.mean_ns > 0.0);
+    assert_eq!(counter, 10); // quick config = 10 iterations
+}

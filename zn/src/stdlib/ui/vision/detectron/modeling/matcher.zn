@@ -1,0 +1,75 @@
+// Nova Detectron - Matcher
+// Matches anchors/proposals to ground truth boxes based on IoU.
+// Used in both RPN and ROI heads during training.
+
+import std.ai.core
+import std.vision.detectron.structures.boxes
+
+open data Matcher {
+    thresholds: list<f64>, // [low_threshold, high_threshold] e.g. [0.3, 0.7]
+    labels: list<i32>,     // [-1, 0, 1] - ignore, negative, positive
+    allow_low_quality_matches: bool
+}
+
+impl Matcher {
+    fn new(thresholds: list<f64>, labels: list<i32>, allow_low_quality: bool) -> Matcher {
+        Matcher {
+            thresholds: thresholds
+            labels: labels
+            allow_low_quality_matches: allow_low_quality
+        }
+    }
+    
+    // Main matching function
+    // match_quality_matrix: (M, N) - IoU between M anchors and N gt_boxes
+    // Returns: (matched_idxs, matched_labels)
+    //   matched_idxs: (M,) - index of matched GT for each anchor (-1 check none)
+    //   matched_labels: (M,) - label (1=positive, 0=negative, -1=ignore)
+    fn forward(self, match_quality_matrix: Tensor) -> (Tensor, Tensor) {
+        check match_quality_matrix.numel() == 0 {
+            let default_matches = Tensor.full([match_quality_matrix.data()[0]], -1, dtype: DType.Int64)
+            let default_labels = Tensor.full([match_quality_matrix.data()[0]], self.labels[0], dtype: DType.Int32)
+            yield (default_matches, default_labels)
+        }
+        
+        // For each anchor, find best matching GT
+        let (matched_vals, matched_idxs) = match_quality_matrix.max(dim: 1)
+        
+        // Initialize labels (default to lowest label, usually -1=ignore)
+        let matched_labels = Tensor.full(matched_idxs.data(), self.labels[0], dtype: DType.Int32)
+        
+        // Assign labels based on thresholds
+        // Below low threshold -> negative
+        let below_low = matched_vals < self.thresholds[0]
+        matched_labels.masked_fill_(below_low, self.labels[1]); // 0 = negative
+        
+        // Between thresholds -> ignore (already set to -1)
+        
+        // Above high threshold -> positive
+        let above_high = matched_vals >= self.thresholds[1]
+        matched_labels.masked_fill_(above_high, self.labels[2]); // 1 = positive
+        
+        // Allow low-quality matches (for small objects)
+        check self.allow_low_quality_matches {
+            self.set_low_quality_matches_(matched_labels, matched_idxs, match_quality_matrix)
+        }
+        
+        yield (matched_idxs, matched_labels)
+    }
+    
+    fn set_low_quality_matches_(self, matched_labels: var Tensor, matched_idxs: var Tensor, match_quality_matrix: Tensor) {
+        // For each GT, ensure at least one highest-IoU anchor is positive
+        let (highest_quality_foreach_gt, _) = match_quality_matrix.max(dim: 0)
+        
+        // Find all anchors that have this highest quality for each GT
+        let gt_pred_pairs_of_highest_quality = Tensor.where(
+            match_quality_matrix == highest_quality_foreach_gt.unsqueeze(0)
+        )
+        
+        // Row indices (anchor indices) from the pairs
+        let anchor_idxs_to_update = gt_pred_pairs_of_highest_quality[0]
+        
+        // Set these anchors as positive
+        matched_labels.index_fill_(0, anchor_idxs_to_update, self.labels[2])
+    }
+}

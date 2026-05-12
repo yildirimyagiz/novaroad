@@ -1,0 +1,441 @@
+/**
+ * GPT-OSS Triton Kernels
+ * Custom kernels for attention with sliding window and learned sinks
+ */
+
+use tensor::core::{Tensor};
+use tensor::triton::{tl};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ATTENTION WITH SLIDING WINDOW AND LEARNED SINKS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Flash Attention with Sliding Window and Learned Sinks
+ * 
+ * Based on Flash Attention v2 with extensions for:
+ * - Banded (sliding window) attention
+ * - Learned attention sinks for long-range dependencies
+ * 
+ * Reference: https://github.com/openai/gpt-oss/blob/main/gpt_oss/triton/attention.py
+ */
+
+@triton_kernel
+fn attention_with_sinks_fwd(
+    Q: *f32,
+    K: *f32,
+    V: *f32,
+    Sinks: *f32,
+    sm_scale: f32,
+    M: *var f32,
+    Out: *var f32,
+    Start_q: *i64,
+    Z: i64,
+    H: i64,
+    N_Q_CTX: i64,
+    N_KV_CTX: i64,
+    BANDWIDTH: i64,
+    HEAD_DIM: i64 = 64,
+    BLOCK_M: i64 = 64,
+    BLOCK_N: i64 = 64
+) {
+    // Load start position
+    let start_q = tl::load(Start_q).to_int32();
+    let start_m = tl::program_id(0);
+    let off_hz = tl::program_id(1);
+    let off_z = off_hz / H;
+    let off_h = off_hz % H;
+    
+    // Load attention sink for this head
+    let sink = check Sinks.is_some() {
+        tl::load(Sinks + off_h).to_float32()
+    } else {
+        0.0f32
+    };
+    
+    // Initialize offsets
+    let offs_m = start_m * BLOCK_M + tl::arange(0, BLOCK_M);
+    let offs_n = tl::arange(0, BLOCK_N);
+    
+    // Initialize running statistics for online softmax
+    var m_i = [sink; BLOCK_M];  // max value
+    var l_i = [0.0f32; BLOCK_M];  // sum of exp
+    var acc = [[0.0f32; HEAD_DIM]; BLOCK_M];  // accumulator
+    
+    // Load query block
+    let q_ptrs = Q + off_z * H * N_Q_CTX * HEAD_DIM 
+                   + off_h * N_Q_CTX * HEAD_DIM 
+                   + start_m * BLOCK_M * HEAD_DIM;
+    let q = tl::load(q_ptrs, mask=None).reshape([BLOCK_M, HEAD_DIM]);
+    
+    // Determine key range based on sliding window
+    let (lo, hi) = check BANDWIDTH > 0 {
+        let lo = max(start_q, start_q + start_m * BLOCK_M - BANDWIDTH);
+        let hi = start_q + (start_m + 1) * BLOCK_M;
+        yield (lo, hi)
+    } else {
+        // No bandwidth limit (full attention)
+        yield (start_q, start_q + (start_m + 1) * BLOCK_M)
+    };
+    
+    // Iterate over key/value blocks
+    each start_n in (lo..hi).step_by(BLOCK_N) {
+        let start_n = start_n - start_n % BLOCK_N;  // align to BLOCK_N
+        
+        // Causal mask
+        let mask = (start_n + offs_n).unsqueeze(0) > (start_q + offs_m).unsqueeze(1);
+        
+        // Sliding window mask
+        let mask = check BANDWIDTH > 0 {
+            let too_old = (start_n + offs_n).unsqueeze(0) < 
+                         (start_q + offs_m - BANDWIDTH + 1).unsqueeze(1);
+            mask | too_old
+        } else {
+            mask
+        };
+        
+        // Load K block
+        let k_ptrs = K + off_z * H * N_KV_CTX * HEAD_DIM 
+                       + off_h * N_KV_CTX * HEAD_DIM 
+                       + start_n * HEAD_DIM;
+        let k = tl::load(k_ptrs).reshape([BLOCK_N, HEAD_DIM]).transpose();
+        
+        // Compute QK^T
+        let qk = tl::dot(q, k);
+        let qk = qk * sm_scale + tl::where(mask, -1.0e6, 0.0);
+        
+        // Online softmax: update running max and sum
+        let m_ij = tl::max(qk, axis=1);
+        let m_i_new = tl::maximum(m_i, m_ij);
+        
+        // Rescale previous accumulator
+        let alpha = tl::exp(m_i - m_i_new);
+        acc = acc * alpha.unsqueeze(1);
+        
+        // Compute attention weights for this block
+        let p = tl::exp(qk - m_i_new.unsqueeze(1));
+        
+        // Load V block
+        let v_ptrs = V + off_z * H * N_KV_CTX * HEAD_DIM 
+                       + off_h * N_KV_CTX * HEAD_DIM 
+                       + start_n * HEAD_DIM;
+        let v = tl::load(v_ptrs).reshape([BLOCK_N, HEAD_DIM]).to_float32();
+        
+        // Update accumulator
+        acc = tl::dot(p, v, acc);
+        
+        // Update running sum
+        let l_ij = tl::sum(p, axis=1);
+        l_i = l_i * alpha + l_ij;
+        m_i = m_i_new;
+    }
+    
+    // Final normalization with sinks
+    let sink_contribution = tl::exp(sink - m_i);
+    let z = l_i + sink_contribution;
+    acc = acc / z.unsqueeze(1);
+    
+    // Store max values for backward pass
+    m_i = m_i + tl::log(l_i);
+    let m_ptrs = M + off_hz * N_Q_CTX + offs_m;
+    tl::store(m_ptrs, m_i);
+    
+    // Store output
+    let out_ptrs = Out + off_z * H * N_Q_CTX * HEAD_DIM 
+                       + off_h * N_Q_CTX * HEAD_DIM 
+                       + start_m * BLOCK_M * HEAD_DIM;
+    tl::store(out_ptrs, acc.flatten());
+}
+
+/**
+ * Public API for attention with sinks
+ */
+open fn attention_with_sinks(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    sinks: Tensor,
+    scale: f32,
+    sliding_window: i64,
+    start_q: i64
+) -> Tensor {
+    let [bs, n_heads, n_ctx, head_dim] = q.data;
+    let [bs, n_heads, n_kv_ctx, head_dim] = k.data;
+    
+    assert(head_dim in [16, 32, 64, 128, 256], "Head dim must be power of 2");
+    
+    // Padding to block size
+    let BLOCK_M = 64;
+    let BLOCK_N = 64;
+    
+    let m_pad = check n_ctx % BLOCK_M != 0 { BLOCK_M - n_ctx % BLOCK_M } else { 0 };
+    let n_pad = check n_kv_ctx % BLOCK_N != 0 { BLOCK_N - n_kv_ctx % BLOCK_N } else { 0 };
+    
+    let q = check m_pad > 0 { q.pad([0, 0, 0, m_pad, 0, 0, 0, 0]) } else { q };
+    let k = check n_pad > 0 { k.pad([0, 0, 0, n_pad, 0, 0, 0, 0]) } else { k };
+    let v = check n_pad > 0 { v.pad([0, 0, 0, n_pad, 0, 0, 0, 0]) } else { v };
+    
+    // Allocate output and running max
+    var output = Tensor::empty_like(q);
+    var M = Tensor::empty([bs, n_heads, n_ctx + m_pad], dtype=DType::Float32);
+    
+    // Launch kernel
+    let grid = [
+        (n_ctx + BLOCK_M - 1) / BLOCK_M,
+        bs * n_heads,
+        1
+    ];
+    
+    let start_q_tensor = Tensor::from_scalar(start_q, DType::Int64);
+    
+    triton_launch!(
+        attention_with_sinks_fwd,
+        grid: grid,
+        args: [
+            q.data, k.data, v.data, sinks.data,
+            scale, M.data, output.data, start_q_tensor.data,
+            bs, n_heads, n_ctx + m_pad, n_kv_ctx, sliding_window
+        ],
+        HEAD_DIM: head_dim,
+        BLOCK_M: BLOCK_M,
+        BLOCK_N: BLOCK_N,
+        BANDWIDTH: sliding_window
+    );
+    
+    // Remove padding
+    output = output[:, :, 0..n_ctx, :];
+    
+    yield output;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MXFP4 QUANTIZATION KERNELS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * MXFP4 (Microscaling FP4) quantization
+ * Used for MoE weights to fit gpt-oss-120b on single 80GB GPU
+ */
+
+@triton_kernel
+fn quantize_mxfp4_kernel(
+    input: *f32,
+    output: *u8,
+    scales: *f32,
+    M: i64,
+    N: i64,
+    BLOCK_SIZE: i64 = 32
+) {
+    let row = tl::program_id(0);
+    let col_block = tl::program_id(1);
+    
+    let col_start = col_block * BLOCK_SIZE;
+    let cols = col_start + tl::arange(0, BLOCK_SIZE);
+    let mask = cols < N;
+    
+    // Load values
+    let ptrs = input + row * N + cols;
+    let values = tl::load(ptrs, mask=mask, other=0.0);
+    
+    // Find max absolute value in block (for scale)
+    let abs_max = tl::max(tl::abs(values));
+    let scale = abs_max / 7.0;  // FP4 range is [-7, 7]
+    
+    // Quantize to 4-bit
+    let quantized = tl::clamp(values / scale, -7.0, 7.0);
+    let quantized_int = tl::round(quantized).to_int8();
+    
+    // Pack two 4-bit values into one byte
+    let packed = check BLOCK_SIZE % 2 == 0 {
+        let even = quantized_int[0::2];
+        let odd = quantized_int[1::2];
+        yield (even & 0x0F) | ((odd & 0x0F) << 4)
+    } else {
+        quantized_int
+    };
+    
+    // Store quantized values
+    let out_ptrs = output + row * (N / 2) + col_block * (BLOCK_SIZE / 2);
+    tl::store(out_ptrs, packed, mask=mask[0::2]);
+    
+    // Store scale
+    let scale_ptr = scales + row * ((N + BLOCK_SIZE - 1) / BLOCK_SIZE) + col_block;
+    check col_block * BLOCK_SIZE < N {
+        tl::store(scale_ptr, scale);
+    }
+}
+
+open fn quantize_mxfp4(weight: Tensor) -> (Tensor, Tensor) {
+    let [M, N] = weight.data;
+    let BLOCK_SIZE = 32;
+    
+    let num_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    
+    // Allocate output (packed 4-bit) and scales
+    let output = Tensor::empty([M, N / 2], dtype=DType::UInt8);
+    let scales = Tensor::empty([M, num_blocks], dtype=DType::Float32);
+    
+    let grid = [M, num_blocks, 1];
+    
+    triton_launch!(
+        quantize_mxfp4_kernel,
+        grid: grid,
+        args: [weight.data, output.data, scales.data, M, N],
+        BLOCK_SIZE: BLOCK_SIZE
+    );
+    
+    yield (output, scales);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MOE ROUTING KERNEL
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Efficient routing for Mixture of Experts
+ * Computes top-k experts and prepares gather/scatter indices
+ */
+
+@triton_kernel
+fn moe_routing_kernel(
+    logits: *f32,
+    expert_indices: *var i64,
+    expert_weights: *var f32,
+    batch_size: i64,
+    num_experts: i64,
+    experts_per_token: i64,
+    BLOCK_SIZE: i64 = 256
+) {
+    let token_idx = tl::program_id(0);
+    
+    check token_idx >= batch_size {
+        yield;
+    }
+    
+    // Load logits for this token
+    let logits_ptr = logits + token_idx * num_experts;
+    let token_logits = tl::load(logits_ptr + tl::arange(0, num_experts));
+    
+    // Find top-k experts
+    var top_k_indices = [-1i64; experts_per_token];
+    var top_k_values = [-f32::INFINITY; experts_per_token];
+    
+    each expert_id in 0..num_experts {
+        let value = token_logits[expert_id];
+        
+        // Insert into top-k check larger than smallest
+        each k in 0..experts_per_token {
+            check value > top_k_values[k] {
+                // Shift smaller values down
+                each j in (k+1..experts_per_token).rev() {
+                    top_k_values[j] = top_k_values[j-1];
+                    top_k_indices[j] = top_k_indices[j-1];
+                }
+                
+                top_k_values[k] = value;
+                top_k_indices[k] = expert_id;
+                abort;
+            }
+        }
+    }
+    
+    // Compute softmax over top-k
+    let max_val = top_k_values[0];
+    var sum = 0.0;
+    
+    each k in 0..experts_per_token {
+        top_k_values[k] = f32::exp(top_k_values[k] - max_val);
+        sum += top_k_values[k];
+    }
+    
+    each k in 0..experts_per_token {
+        top_k_values[k] /= sum;
+    }
+    
+    // Store results
+    let indices_ptr = expert_indices + token_idx * experts_per_token;
+    let weights_ptr = expert_weights + token_idx * experts_per_token;
+    
+    tl::store(indices_ptr + tl::arange(0, experts_per_token), top_k_indices);
+    tl::store(weights_ptr + tl::arange(0, experts_per_token), top_k_values);
+}
+
+open fn moe_routing(logits: Tensor, experts_per_token: i64) -> (Tensor, Tensor) {
+    let [batch_size, num_experts] = logits.data;
+    
+    let expert_indices = Tensor::empty([batch_size, experts_per_token], dtype=DType::Int64);
+    let expert_weights = Tensor::empty([batch_size, experts_per_token], dtype=DType::Float32);
+    
+    let grid = [batch_size, 1, 1];
+    
+    triton_launch!(
+        moe_routing_kernel,
+        grid: grid,
+        args: [
+            logits.data, expert_indices.data, expert_weights.data,
+            batch_size, num_experts, experts_per_token
+        ],
+        BLOCK_SIZE: 256
+    );
+    
+    yield (expert_indices, expert_weights);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SWIGLU FUSED KERNEL
+// ═══════════════════════════════════════════════════════════════════════════
+
+@triton_kernel
+fn swiglu_kernel(
+    x_glu: *f32,
+    x_linear: *f32,
+    output: *var f32,
+    n_elements: i64,
+    alpha: f32,
+    limit: f32,
+    BLOCK_SIZE: i64 = 1024
+) {
+    let pid = tl::program_id(0);
+    let block_start = pid * BLOCK_SIZE;
+    let offsets = block_start + tl::arange(0, BLOCK_SIZE);
+    let mask = offsets < n_elements;
+    
+    // Load inputs
+    let glu = tl::load(x_glu + offsets, mask=mask, other=0.0);
+    let linear = tl::load(x_linear + offsets, mask=mask, other=0.0);
+    
+    // Clamp for stability
+    let glu_clamped = tl::clamp(glu, -limit, limit);
+    let linear_clamped = tl::clamp(linear, -limit, limit);
+    
+    // SwiGLU: glu * sigmoid(alpha * glu) * (linear + 1)
+    let sigmoid = 1.0 / (1.0 + tl::exp(-alpha * glu_clamped));
+    let result = glu_clamped * sigmoid * (linear_clamped + 1.0);
+    
+    // Store output
+    tl::store(output + offsets, result, mask=mask);
+}
+
+open fn swiglu_triton(
+    x_glu: Tensor,
+    x_linear: Tensor,
+    alpha: f32 = 1.702,
+    limit: f32 = 7.0
+) -> Tensor {
+    assert(x_glu.data == x_linear.data);
+    
+    let n_elements = x_glu.numel();
+    let output = Tensor::empty_like(x_glu);
+    
+    let BLOCK_SIZE = 1024;
+    let grid = [(n_elements + BLOCK_SIZE - 1) / BLOCK_SIZE, 1, 1];
+    
+    triton_launch!(
+        swiglu_kernel,
+        grid: grid,
+        args: [x_glu.data, x_linear.data, output.data, n_elements, alpha, limit],
+        BLOCK_SIZE: BLOCK_SIZE
+    );
+    
+    yield output;
+}

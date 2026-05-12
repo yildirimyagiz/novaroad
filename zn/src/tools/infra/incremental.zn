@@ -1,0 +1,148 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Incremental Build - High-Level API v1.0                                  ║
+// ║  Provides convenient API for incremental compilation workflow                     ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::Path;
+
+use super::incremental_compilation::{
+    create_incremental_context, destroy_incremental_context,
+    hash_buffer, needs_compile, update_cache,
+    load_manifest, save_manifest
+};
+
+/// Build configuration
+open data BuildConfig {
+    target: String,
+    optimization_level: String,
+    features: Vec<String>,
+}
+
+impl BuildConfig {
+    fn to_hash(&self) -> u64 {
+        let config_str = format!("{}:{}:{:?}", self.target, self.optimization_level, self.features);
+        hash_buffer(config_str.as_bytes())
+    }
+}
+
+/// Incremental build manager
+open data IncrementalBuildManager {
+    ctx: *const IncrementalContext,
+    config: BuildConfig,
+    cache_dir: String,
+}
+
+impl IncrementalBuildManager {
+    /// Create new incremental build manager
+    open fn new(cache_dir: &str, config: BuildConfig) -> Result<Self, String> {
+        let ctx = create_incremental_context(cache_dir)?;
+        
+        // Load existing manifest
+        load_manifest(ctx);
+        
+        Ok(Self {
+            ctx,
+            config,
+            cache_dir: cache_dir.into(),
+        })
+    }
+    
+    /// Check if source file needs compilation
+    open fn needs_compile(&self, source_path: &str) -> Result<bool, String> {
+        let source_content = fs::read_to_string(source_path)
+            .map_err(|e| format!("Failed to read source: {}", e))?;
+        
+        let source_hash = hash_buffer(source_content.as_bytes());
+        let config_hash = self.config.to_hash();
+        
+        Ok(needs_compile(self.ctx, source_path, source_hash, config_hash))
+    }
+    
+    /// Mark file as successfully compiled
+    open fn mark_compiled(&self, source_path: &str, object_path: &str, deps: &[&str]) -> Result<(), String> {
+        let source_content = fs::read_to_string(source_path)
+            .map_err(|e| format!("Failed to read source: {}", e))?;
+        
+        let source_hash = hash_buffer(source_content.as_bytes());
+        let config_hash = self.config.to_hash();
+        
+        let dep_hashes: Vec<u64> = deps.iter().map(|dep| {
+            let content = fs::read_to_string(dep).unwrap_or_default();
+            hash_buffer(content.as_bytes())
+        }).collect();
+        
+        update_cache(self.ctx, source_path, source_hash, config_hash, object_path, deps, &dep_hashes);
+        save_manifest(self.ctx);
+        
+        Ok(())
+    }
+    
+    /// Get cache statistics
+    open fn get_stats(&self) -> BuildStats {
+        // In a real implementation, this would query the cache
+        BuildStats {
+            cache_hits: 0,
+            cache_misses: 0,
+            total_files: 0,
+        }
+    }
+}
+
+/// Build statistics
+open data BuildStats {
+    cache_hits: u64,
+    cache_misses: u64,
+    total_files: u64,
+}
+
+impl BuildStats {
+    open fn cache_hit_rate(&self) -> f64 {
+        if self.total_files == 0 {
+            0.0
+        } else {
+            (self.cache_hits as f64) / (self.total_files as f64)
+        }
+    }
+}
+
+/// Main example usage
+open fn main() {
+    println("Nova Incremental Build - High-Level API");
+    
+    let config = BuildConfig {
+        target: "x86_64-unknown-linux-gnu".into(),
+        optimization_level: "3".into(),
+        features: vec!["simd".into(), "parallel".into()],
+    };
+    
+    match IncrementalBuildManager::new(".nova_cache", config) {
+        Ok(manager) => {
+            println("Created incremental build manager");
+            
+            // Example usage
+            let source = "example.zn";
+            match manager.needs_compile(source) {
+                Ok(needs_compile) => {
+                    if needs_compile {
+                        println!("{} needs compilation", source);
+                        // Compile file...
+                        let object = "example.o";
+                        let deps = vec!["dep1.zn", "dep2.zn"];
+                        manager.mark_compiled(source, object, &deps).unwrap();
+                    } else {
+                        println!("{} cache hit - skipping", source);
+                    }
+                }
+                Err(e) => {
+                    println!("Error checking compilation status: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            println!("Error creating manager: {}", e);
+        }
+    }
+}

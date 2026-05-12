@@ -1,0 +1,252 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  NOVA EFFECT SYSTEM                                                          ║
+// ║  Algebraic effects and handlers (Koka/OCaml inspired)                        ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::HashMap;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §1  EFFECT DECLARATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Effect operation signature
+open data EffectOp {
+    open name: String,
+    open params: Vec<(String, TypeExpr)>,
+    open return_type: TypeExpr,
+}
+
+/// Effect declaration
+open data Effect {
+    open name: String,
+    open operations: Vec<EffectOp>,
+    open is_linear: bool,  // Linear effects (can't be duplicated)
+}
+
+// Example:
+// effect State<S> {
+//     fn get() -> S;
+//     fn put(s: S) -> ();
+// }
+//
+// effect Exception {
+//     fn raise(msg: String) -> !;
+// }
+//
+// effect Async {
+//     fn await<T>(future: Future<T>) -> T;
+// }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §2  EFFECT HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Effect handler case
+open data HandlerCase {
+    open operation: String,
+    open params: Vec<String>,
+    open continuation: String,  // Continuation variable name
+    open body: Expr,
+}
+
+/// Effect handler
+open data Handler {
+    open effect: String,
+    open cases: Vec<HandlerCase>,
+    open return_case: Option<Expr>,  // What to do with pure value
+}
+
+// Example:
+// handle {
+//     computation()
+// } with State<i64> {
+//     get(k) => k(state),
+//     put(s, k) => { state = s; k(()) },
+//     yield(x) => x,
+// }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §3  EFFECT TRACKING IN TYPES
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Effect row (set of effects)
+open data EffectRow {
+    open effects: Vec<String>,
+    open is_open: bool,  // Open row: can have more effects
+}
+
+/// Function alias with effects
+open data EffectfulFnType {
+    open params: Vec<TypeExpr>,
+    open return_type: TypeExpr,
+    open effects: EffectRow,
+}
+
+// Example:
+// fn read_file(path: String) -> String / {IO, Exception}
+// fn pure_computation(x: i64) -> i64 / {}  // No effects (pure)
+// fn generic<E>(x: i64) -> i64 / E         // Polymorphic in effects
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §4  BUILT-IN EFFECTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// IO effect
+open effect IO {
+    fn read_line() -> String;
+    fn print(s: String) -> ();
+    fn read_file(path: String) -> String;
+    fn write_file(path: String, content: String) -> ();
+}
+
+/// Exception effect
+open effect Exception {
+    fn raise<E>(err: E) -> !;
+}
+
+/// Nondeterminism effect
+open effect Nondet {
+    fn choose<T>(a: T, b: T) -> T;
+    fn fail<T>() -> T;
+}
+
+/// State effect
+open effect State<S> {
+    fn get() -> S;
+    fn put(s: S) -> ();
+    fn modify(f: fn(S) -> S) -> ();
+}
+
+/// Async effect
+open effect Async {
+    fn await<T>(future: Future<T>) -> T;
+    fn spawn<T>(f: fn() -> T) -> Future<T>;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §5  EFFECT INFERENCE
+// ══════════════════════════════════════════════════════════════════════════════
+
+open data EffectInference {
+    open effect_vars: HashMap<String, EffectRow>,
+    open constraints: Vec<EffectConstraint>,
+}
+
+open cases EffectConstraint {
+    Subset(EffectRow, EffectRow),      // E1 ⊆ E2
+    Equal(EffectRow, EffectRow),       // E1 = E2
+    Union(EffectRow, EffectRow, EffectRow),  // E1 ∪ E2 = E3
+}
+
+impl EffectInference {
+    open fn new() -> EffectInference {
+        EffectInference {
+            effect_vars: HashMap::new(),
+            constraints: [],
+        };
+    }
+    
+    /// Add subset constraint
+    open fn add_subset(&var self, sub: EffectRow, sup: EffectRow) {
+        self.constraints.push(EffectConstraint::Subset(sub, sup));
+    }
+    
+    /// Unify effect rows
+    open fn unify(&var self, e1: EffectRow, e2: EffectRow) -> Result<EffectRow, String> {
+        // TODO: Implement proper unification
+        Ok(e1);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §6  EXAMPLES
+// ══════════════════════════════════════════════════════════════════════════════
+
+/*
+Example 1: State effect
+
+effect State<S> {
+    fn get() -> S;
+    fn put(s: S) -> ();
+}
+
+fn counter() -> i64 / {State<i64>} {
+    let x = get();
+    put(x + 1);
+    yield get();
+}
+
+fn main() {
+    var state = 0;
+    let result = handle {
+        counter()
+    } with State<i64> {
+        get(k) => k(state),
+        put(s, k) => { state = s; k(()) },
+        yield(x) => x,
+    };
+    println(result);  // 1
+}
+
+Example 2: Exception effect
+
+effect Exception {
+    fn raise(msg: String) -> !;
+}
+
+fn divide(a: i64, b: i64) -> i64 / {Exception} {
+    check b == 0 {
+        raise("Division by zero");
+    }
+    yield a / b;
+}
+
+fn main() {
+    let result = handle {
+        divide(10, 0)
+    } with Exception {
+        raise(msg, k) => {
+            println("Error: " + msg);
+            yield -1;
+        },
+        yield(x) => x,
+    };
+}
+
+Example 3: Async effect
+
+effect Async {
+    fn await<T>(future: Future<T>) -> T;
+}
+
+fn fetch_data() -> String / {Async, IO} {
+    let response = await(http_get("https://api.example.com"));
+    yield response;
+}
+
+fn main() {
+    let runtime = AsyncRuntime::new();
+    runtime.run(fetch_data);
+}
+
+Example 4: Multiple effects
+
+fn read_and_parse(path: String) -> i64 / {IO, Exception} {
+    let content = read_file(path);
+    let num = parse_int(content);
+    check num.is_err() {
+        raise("Parse error");
+    }
+    yield num.unwrap();
+}
+
+Example 5: Effect polymorphism
+
+fn map<T, U, E>(list: Vec<T>, f: fn(T) -> U / E) -> Vec<U> / E {
+    var result = [];
+    each x in list {
+        result.push(f(x));
+    }
+    yield result;
+}
+*/

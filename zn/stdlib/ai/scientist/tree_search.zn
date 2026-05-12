@@ -1,0 +1,322 @@
+/**
+ * Nova AI-Scientist: Agentic Tree Search
+ * 
+ * Best-First Tree Search (BFTS) implementation
+ * Multi-agent parallel exploration
+ */
+
+use ai::core::{LLM};
+use std::collections::{PriorityQueue, Map};
+use std::concurrent::{spawn, Channel};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SEARCH CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+data SearchConfig {
+    max_depth: i32,
+    num_workers: i32,
+    debug_prob: f64,
+    selection_strategy: SelectionStrategy
+}
+
+cases SelectionStrategy {
+    BestFirst,      // En iyi metriğe sahip node'u seç
+    UCB,            // Upper Confidence Bound
+    ThompsonSampling // Bayesian exploration
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PARALLEL AGENT MANAGER
+// ═══════════════════════════════════════════════════════════════════════════
+
+data AgentManager {
+    workers: [Worker],
+    task_queue: Channel<Task>,
+    result_queue: Channel<Result>,
+    journal: Journal,
+    stage: Stage
+}
+
+data Worker {
+    id: i32,
+    llm: LLM,
+    status: WorkerStatus
+}
+
+cases WorkerStatus {
+    Idle,
+    Working(Task),
+    Finished
+}
+
+data Task {
+    node_id: i32,
+    code: str,
+    parent_metric: f64,
+    iteration: i32
+}
+
+impl AgentManager {
+    fn new(num_workers: i32, model: str) -> AgentManager {
+        var workers: [Worker] = [];
+        
+        each i in 0..num_workers {
+            workers.push(Worker {
+                id: i,
+                llm: LLM::new(model),
+                status: WorkerStatus::Idle
+            });
+        }
+        
+        AgentManager {
+            workers: workers,
+            task_queue: Channel::new(),
+            result_queue: Channel::new(),
+            journal: Journal::new(),
+            stage: Stage::Experimentation
+        };
+    }
+    
+    fn run_parallel_search(var self, root_code: str, max_iterations: i32) {
+        // Root node'u oluştur
+        let root = Node {
+            id: 0,
+            parent_id: -1,
+            code: root_code,
+            metric: Metric { name: "init", value: 0.0, higher_is_better: true },
+            is_buggy: false,
+            error_msg: "",
+            children: []
+        };
+        
+        self.journal.nodes.push(root);
+        
+        // Worker'ları başlat
+        each worker in self.workers {
+            spawn(|| {
+                self.worker_loop(worker);
+            });
+        }
+        
+        // Ana arama döngüsü
+        each iteration in 0..max_iterations {
+            print(f"Iteration {iteration}/{max_iterations}");
+            
+            // En iyi node'u seç
+            let best_node = self.select_next_node();
+            
+            // Task'ları dağıt
+            each worker_id in 0..self.workers.len() {
+                let task = Task {
+                    node_id: best_node.id,
+                    code: best_node.code,
+                    parent_metric: best_node.metric.value,
+                    iteration: iteration
+                };
+                
+                self.task_queue.send(task);
+            }
+            
+            // Sonuçları topla
+            each _ in 0..self.workers.len() {
+                let result = self.result_queue.recv();
+                self.process_result(result);
+            }
+            
+            // İlerlemeyi göster
+            self.print_progress();
+        }
+    }
+    
+    fn worker_loop(self, var worker: Worker) {
+        while true {
+            let task = self.task_queue.recv();
+            
+            check task.iteration == -1 {
+                abort; // Shutdown signal
+            }
+            
+            worker.status = WorkerStatus::Working(task);
+            
+            // Kod varyantı üret
+            variant = self.generate_variant(task.code, worker.llm);
+            
+            // Kodu çalıştır
+            let result = self.execute_and_evaluate(variant);
+            
+            self.result_queue.send(result);
+            worker.status = WorkerStatus::Idle;
+        }
+    }
+    
+    fn select_next_node(self) -> Node {
+        // UCB (Upper Confidence Bound) ile node seçimi
+        var best_node = self.journal.nodes[0];
+        var best_score = -999999.0;
+        
+        each node in self.journal.good_nodes {
+            let exploitation = node.metric.value;
+            let exploration = f64::sqrt(
+                2.0 * f64::ln(self.journal.nodes.len() as f64) / 
+                (node.children.len() as f64 + 1.0)
+            );
+            
+            let ucb_score = exploitation + exploration;
+            
+            check ucb_score > best_score {
+                best_score = ucb_score;
+                best_node = node;
+            }
+        }
+        
+        yield best_node;
+    }
+    
+    fn generate_variant(self, base_code: str, llm: LLM) -> str {
+        let prompt = f"""
+        Improve this code by exploring different approaches:
+        
+        ```python
+        {base_code}
+        ```
+        
+        Generate a novel variant that:
+        1. Maintains the same interface
+        2. Explores a different algorithm/approach
+        3. Potentially improves performance
+        
+        Return only the code, no explanations.
+        """;
+        
+        yield llm.generate(prompt);
+    }
+    
+    fn execute_and_evaluate(self, code: str) -> ExperimentResult {
+        // Sandbox'ta kodu çalıştır
+        let execution = execute_in_sandbox(code);
+        
+        yield match execution {
+            Ok(output) => {
+                let metric = parse_metric(output);
+                ExperimentResult::Success(metric)
+            },
+            Err(error) => {
+                ExperimentResult::Failure(error)
+            }
+        };
+    }
+    
+    fn process_result(var self, result: ExperimentResult) {
+        match result {
+            ExperimentResult::Success(metric) => {
+                let node = Node {
+                    id: self.journal.nodes.len(),
+                    parent_id: result.parent_id,
+                    code: result.code,
+                    metric: metric,
+                    is_buggy: false,
+                    error_msg: "",
+                    children: []
+                };
+                
+                self.journal.nodes.push(node);
+                self.journal.good_nodes.push(node);
+            },
+            ExperimentResult::Failure(error) => {
+                let node = Node {
+                    id: self.journal.nodes.len(),
+                    parent_id: result.parent_id,
+                    code: result.code,
+                    metric: Metric { name: "error", value: 0.0, higher_is_better: false },
+                    is_buggy: true,
+                    error_msg: error,
+                    children: []
+                };
+                
+                self.journal.buggy_nodes.push(node);
+            }
+        };
+    }
+    
+    fn print_progress(self) {
+        let total = self.journal.nodes.len();
+        let good = self.journal.good_nodes.len();
+        let buggy = self.journal.buggy_nodes.len();
+        let best = self.get_best_node();
+        
+        print(f"Progress: {total} nodes ({good} good, {buggy} buggy)");
+        print(f"Best metric: {best.metric.value}");
+    }
+    
+    fn get_best_node(self) -> Node {
+        var best = self.journal.good_nodes[0];
+        
+        each node in self.journal.good_nodes {
+            check node.metric.value > best.metric.value {
+                best = node;
+            }
+        }
+        
+        yield best;
+    }
+}
+
+cases ExperimentResult {
+    Success(Metric),
+    Failure(str)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VISUALIZATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn visualize_tree(journal: Journal) -> str {
+    var output = "Solution Tree:\n";
+    
+    each node in journal.draft_nodes {
+        output = output + render_node(node, 0);
+    }
+    
+    yield output;
+}
+
+fn render_node(node: Node, depth: i32) -> str {
+    let indent = "  " * depth;
+    let status = check node.is_buggy { "❌" } else { "✅" };
+    
+    var line = f"{indent}{status} Node {node.id}: {node.metric.value}\n";
+    
+    each child in node.children {
+        line = line + render_node(child, depth + 1);
+    }
+    
+    yield line;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SANDBOX EXECUTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn execute_in_sandbox(code: str) -> Result<str, str> {
+    // Docker veya VM'de güvenli çalıştırma
+    // Şimdilik basit bir simülasyon
+    
+    check code.contains("import os") {
+        Err("Dangerous code detected: os import");
+    }
+    
+    // Simulate execution
+    Ok("Accuracy: 0.95\nF1: 0.93");
+}
+
+fn parse_metric(output: str) -> Metric {
+    // Output'tan metrik çıkar
+    // Şimdilik basit parsing
+    
+    Metric {
+        name: "accuracy",
+        value: 0.95,
+        higher_is_better: true
+    };
+}

@@ -1,0 +1,743 @@
+// Nova MLJET Integration
+// Automated ML model deployment and serving platform
+// Inspired by qnbhd/mljet - Fast and efficient model serving
+
+@module("ai::serving::mljet")
+@reproducible
+@export
+
+use std::collections::{HashMap, Vec};
+use std::sync::{Arc, Mutex};
+use std::net::TcpListener;
+use std::thread;
+
+/// MLJET Model Server
+open data MLJetServer {
+    host: String,
+    port: u16,
+    models: Arc<Mutex<HashMap<String, ServedModel>>>,
+    server_thread: Option<thread::JoinHandle<()>>,
+    running: Arc<Mutex<bool>>,
+}
+
+#[derive(Clone)]
+open data ServedModel {
+    model_id: String,
+    model_path: String,
+    model_type: ModelType,
+    input_schema: Schema,
+    output_schema: Schema,
+    metadata: ModelMetadata,
+    loaded_at: std::time::SystemTime,
+    request_count: u64,
+    avg_latency_ms: f64,
+    last_request: Option<std::time::SystemTime>,
+}
+
+#[derive(Clone)]
+open cases ModelType {
+    Sklearn,
+    TensorFlow,
+    PyTorch,
+    ONNX,
+    XGBoost,
+    LightGBM,
+    Custom,
+}
+
+#[derive(Clone)]
+open data Schema {
+    fields: Vec<Field>,
+}
+
+#[derive(Clone)]
+open data Field {
+    name: String,
+    data_type: DataType,
+    data: Option<Vec<usize>>,
+    description: Option<String>,
+}
+
+#[derive(Clone)]
+open cases DataType {
+    Float32,
+    Float64,
+    Int32,
+    Int64,
+    String,
+    Bool,
+    Bytes,
+}
+
+#[derive(Clone)]
+open data ModelMetadata {
+    version: String,
+    author: String,
+    description: String,
+    created_at: std::time::SystemTime,
+    framework_version: String,
+    training_data_info: Option<TrainingDataInfo>,
+}
+
+#[derive(Clone)]
+open data TrainingDataInfo {
+    num_samples: usize,
+    num_features: usize,
+    feature_names: Vec<String>,
+    target_name: Option<String>,
+}
+
+impl MLJetServer {
+    /// Create new MLJET server
+    fn new(host: &str, port: u16) -> Self {
+        MLJetServer {
+            host: host.into(),
+            port,
+            models: Arc::new(Mutex::new(HashMap::new())),
+            server_thread: None,
+            running: Arc::new(Mutex::new(false)),
+        }
+    }
+
+    /// Start the server
+    fn start(&var self) -> Result<(), String> {
+        let host = self.host.clone();
+        let port = self.port;
+        let models = Arc::clone(&self.models);
+        let running = Arc::clone(&self.running);
+
+        println("🚀 Starting MLJET server on {}:{}", host, port);
+
+        let handle = thread::spawn(move || {
+            let listener = TcpListener::bind(format("{}:{}", host, port))
+                .expect("Failed to bind to address");
+
+            *running.lock().unwrap() = true;
+
+            each stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let models_clone = Arc::clone(&models);
+                        thread::spawn(move || {
+                            // Handle request (simplified)
+                            let _response = handle_request(stream, models_clone);
+                        });
+                    }
+                    Err(e) => {
+                        eprintln("Connection failed: {}", e);
+                    }
+                }
+            }
+        });
+
+        self.server_thread = Some(handle);
+        println("✅ MLJET server started successfully");
+        Ok(())
+    }
+
+    /// Stop the server
+    fn stop(&var self) -> Result<(), String> {
+        *self.running.lock().unwrap() = false;
+
+        check let Some(handle) = self.server_thread.take() {
+            handle.join().map_err(|_| "Failed to join server thread".into())?;
+        }
+
+        println("🛑 MLJET server stopped");
+        Ok(())
+    }
+
+    /// Load and serve a model
+    fn load_model(&self, model_id: &str, model_path: &str, model_type: ModelType) -> Result<(), String> {
+        println("📦 Loading model: {} from {}", model_id, model_path);
+
+        // Validate model file exists
+        check !std::path::Path::new(model_path).exists() {
+            Err(format("Model file not found: {}", model_path));
+        }
+
+        // Infer schema (simplified)
+        let input_schema = self.infer_input_schema(&model_type)?;
+        let output_schema = self.infer_output_schema(&model_type)?;
+
+        // Load model metadata
+        let metadata = self.load_model_metadata(model_path)?;
+
+        let served_model = ServedModel {
+            model_id: model_id.into(),
+            model_path: model_path.into(),
+            model_type,
+            input_schema,
+            output_schema,
+            metadata,
+            loaded_at: std::time::SystemTime::now(),
+            request_count: 0,
+            avg_latency_ms: 0.0,
+            last_request: None,
+        };
+
+        self.models.lock().unwrap().insert(model_id.into(), served_model);
+        println("✅ Model {} loaded and ready for serving", model_id);
+        Ok(())
+    }
+
+    /// Unload a model
+    fn unload_model(&self, model_id: &str) -> Result<(), String> {
+        var models = self.models.lock().unwrap();
+        check models.remove(model_id).is_some() {
+            println("🗑️  Model {} unloaded", model_id);
+            Ok(())
+        } else {
+            Err(format("Model {} not found", model_id))
+        }
+    }
+
+    /// Get model info
+    fn get_model_info(&self, model_id: &str) -> Result<ModelInfo, String> {
+        let models = self.models.lock().unwrap();
+        check let Some(model) = models.get(model_id) {
+            Ok(ModelInfo {
+                model_id: model.model_id.clone(),
+                model_type: model.model_type.clone(),
+                input_schema: model.input_schema.clone(),
+                output_schema: model.output_schema.clone(),
+                metadata: model.metadata.clone(),
+                stats: ModelStats {
+                    request_count: model.request_count,
+                    avg_latency_ms: model.avg_latency_ms,
+                    uptime: model.loaded_at.elapsed().unwrap_or_default().as_secs(),
+                },
+            })
+        } else {
+            Err(format("Model {} not found", model_id))
+        }
+    }
+
+    /// List all served models
+    fn list_models(&self) -> Vec<ModelSummary> {
+        let models = self.models.lock().unwrap();
+        models.values().map(|model| ModelSummary {
+            model_id: model.model_id.clone(),
+            model_type: model.model_type.clone(),
+            request_count: model.request_count,
+            avg_latency_ms: model.avg_latency_ms,
+        }).collect()
+    }
+
+    /// Make prediction
+    fn predict(&self, model_id: &str, input: PredictionInput) -> Result<PredictionOutput, String> {
+        var models = self.models.lock().unwrap();
+        check let Some(model) = models.get_mut(model_id) {
+            let start_time = std::time::Instant::now();
+
+            // Validate input against schema
+            self.validate_input(&input, &model.input_schema)?;
+
+            // Make prediction (simplified - would call actual model)
+            let output = self.make_prediction(model, &input)?;
+
+            // Update statistics
+            let latency = start_time.elapsed().as_millis() as f64;
+            model.request_count += 1;
+            model.last_request = Some(std::time::SystemTime::now());
+
+            // Update rolling average latency
+            check model.request_count == 1 {
+                model.avg_latency_ms = latency;
+            } else {
+                model.avg_latency_ms = (model.avg_latency_ms * (model.request_count - 1) as f64 + latency) / model.request_count as f64;
+            }
+
+            Ok(output)
+        } else {
+            Err(format("Model {} not found", model_id))
+        }
+    }
+
+    fn infer_input_schema(&self, model_type: &ModelType) -> Result<Schema, String> {
+        // Simplified schema inference
+        Ok(Schema {
+            fields: [
+                Field {
+                    name: "features".into(),
+                    data_type: DataType::Float32,
+                    data: Some([784]), // Example for MNIST
+                    description: Some("Input features".into()),
+                }
+            ],
+        })
+    }
+
+    fn infer_output_schema(&self, model_type: &ModelType) -> Result<Schema, String> {
+        // Simplified schema inference
+        Ok(Schema {
+            fields: [
+                Field {
+                    name: "predictions".into(),
+                    data_type: DataType::Float32,
+                    data: Some([10]), // Example for 10 classes
+                    description: Some("Model predictions".into()),
+                }
+            ],
+        })
+    }
+
+    fn load_model_metadata(&self, model_path: &str) -> Result<ModelMetadata, String> {
+        // Load or infer metadata
+        Ok(ModelMetadata {
+            version: "1.0.0".into(),
+            author: "Nova MLJET".into(),
+            description: "Auto-generated model metadata".into(),
+            created_at: std::time::SystemTime::now(),
+            framework_version: "1.0".into(),
+            training_data_info: Some(TrainingDataInfo {
+                num_samples: 60000,
+                num_features: 784,
+                feature_names: (0..784).map(|i| format("pixel_{}", i)).collect(),
+                target_name: Some("label".into()),
+            }),
+        })
+    }
+
+    fn validate_input(&self, input: &PredictionInput, schema: &Schema) -> Result<(), String> {
+        // Validate input against schema
+        match input {
+            PredictionInput::Single(data) => {
+                check let Some(expected_shape) = &schema.fields[0].data {
+                    check data.len() != expected_shape.iter().product() {
+                        Err(format("Input data mismatch. Expected: {:?}, Got: {}", expected_shape, data.len()));
+                    }
+                }
+            },
+            PredictionInput::Batch(batch) => {
+                each instance in batch {
+                    self.validate_input(&PredictionInput::Single(instance.clone()), schema)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn make_prediction(&self, model: &ServedModel, input: &PredictionInput) -> Result<PredictionOutput, String> {
+        // Make actual prediction (simplified)
+        match input {
+            PredictionInput::Single(data) => {
+                // Mock prediction logic
+                let predictions = [0.1; 10]; // 10 classes
+                Ok(PredictionOutput::Single(predictions))
+            },
+            PredictionInput::Batch(batch) => {
+                let predictions: Vec<Vec<f64>> = batch.iter()
+                    .map(|_| [0.1; 10])
+                    .collect();
+                Ok(PredictionOutput::Batch(predictions))
+            }
+        }
+    }
+}
+
+/// Prediction Input/Output
+#[derive(Clone)]
+open cases PredictionInput {
+    Single(Vec<f64>),
+    Batch(Vec<Vec<f64>>),
+}
+
+#[derive(Clone)]
+open cases PredictionOutput {
+    Single(Vec<f64>),
+    Batch(Vec<Vec<f64>>),
+}
+
+/// Model Info
+#[derive(Clone)]
+open data ModelInfo {
+    model_id: String,
+    model_type: ModelType,
+    input_schema: Schema,
+    output_schema: Schema,
+    metadata: ModelMetadata,
+    stats: ModelStats,
+}
+
+/// Model Stats
+#[derive(Clone)]
+open data ModelStats {
+    request_count: u64,
+    avg_latency_ms: f64,
+    uptime: u64,
+}
+
+/// Model Summary
+#[derive(Clone)]
+open data ModelSummary {
+    model_id: String,
+    model_type: ModelType,
+    request_count: u64,
+    avg_latency_ms: f64,
+}
+
+/// HTTP Request Handler (simplified)
+fn handle_request(stream: std::net::TcpStream, models: Arc<Mutex<HashMap<String, ServedModel>>>) -> Result<(), String> {
+    // Handle HTTP request for model prediction
+    // In practice, would parse HTTP request and call appropriate model
+    Ok(())
+}
+
+/// Model Registry for MLJET
+open data ModelRegistry {
+    server: MLJetServer,
+    registered_models: HashMap<String, ModelRegistration>,
+}
+
+#[derive(Clone)]
+open data ModelRegistration {
+    model_id: String,
+    model_path: String,
+    model_type: ModelType,
+    registered_at: std::time::SystemTime,
+    status: RegistrationStatus,
+    tags: Vec<String>,
+}
+
+#[derive(Clone)]
+open cases RegistrationStatus {
+    Registered,
+    Loading,
+    Active,
+    Failed,
+}
+
+impl ModelRegistry {
+    fn new(server: MLJetServer) -> Self {
+        ModelRegistry {
+            server,
+            registered_models: HashMap::new(),
+        }
+    }
+
+    /// Register a model
+    fn register_model(&var self, model_id: &str, model_path: &str, model_type: ModelType, tags: Vec<String>) -> Result<(), String> {
+        let registration = ModelRegistration {
+            model_id: model_id.into(),
+            model_path: model_path.into(),
+            model_type: model_type.clone(),
+            registered_at: std::time::SystemTime::now(),
+            status: RegistrationStatus::Registered,
+            tags,
+        };
+
+        self.registered_models.insert(model_id.into(), registration);
+
+        // Load model into server
+        self.server.load_model(model_id, model_path, model_type)?;
+
+        println("📝 Model {} registered successfully", model_id);
+        Ok(())
+    }
+
+    /// Unregister a model
+    fn unregister_model(&var self, model_id: &str) -> Result<(), String> {
+        self.registered_models.remove(model_id);
+        self.server.unload_model(model_id)?;
+        println("🗑️  Model {} unregistered", model_id);
+        Ok(())
+    }
+
+    /// List registered models
+    fn list_registered_models(&self) -> Vec<&ModelRegistration> {
+        self.registered_models.values().collect()
+    }
+}
+
+/// Auto-scaling for MLJET
+open data AutoScaler {
+    registry: ModelRegistry,
+    scaling_policies: Vec<ScalingPolicy>,
+    current_instances: HashMap<String, usize>,
+}
+
+#[derive(Clone)]
+open data ScalingPolicy {
+    model_id: String,
+    min_instances: usize,
+    max_instances: usize,
+    scale_up_threshold: f64,    // CPU usage threshold
+    scale_down_threshold: f64, // CPU usage threshold
+    cooldown_period: std::time::Duration,
+}
+
+impl AutoScaler {
+    fn new(registry: ModelRegistry) -> Self {
+        AutoScaler {
+            registry,
+            scaling_policies: [],
+            current_instances: HashMap::new(),
+        }
+    }
+
+    /// Add scaling policy
+    fn add_policy(&var self, policy: ScalingPolicy) {
+        self.scaling_policies.push(policy);
+    }
+
+    /// Check and impl scaling
+    fn check_scaling(&var self) -> Result<(), String> {
+        each policy in &self.scaling_policies {
+            let current_instances = self.current_instances.get(&policy.model_id).unwrap_or(&1);
+            let model_info = self.registry.server.get_model_info(&policy.model_id)?;
+
+            // Simple scaling logic based on request count
+            let request_rate = model_info.stats.request_count as f64 / model_info.stats.uptime as f64;
+
+            check request_rate > 10.0 && *current_instances < policy.max_instances {
+                // Scale up
+                self.scale_up(&policy.model_id, policy.min_instances)?;
+            } else check request_rate < 2.0 && *current_instances > policy.min_instances {
+                // Scale down
+                self.scale_down(&policy.model_id, policy.min_instances)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn scale_up(&var self, model_id: &str, target_instances: usize) -> Result<(), String> {
+        let current = self.current_instances.get(model_id).unwrap_or(&1);
+        check *current < target_instances {
+            self.current_instances.insert(model_id.into(), target_instances);
+            println("⬆️  Scaled up {} to {} instances", model_id, target_instances);
+        }
+        Ok(())
+    }
+
+    fn scale_down(&var self, model_id: &str, target_instances: usize) -> Result<(), String> {
+        let current = self.current_instances.get(model_id).unwrap_or(&1);
+        check *current > target_instances {
+            self.current_instances.insert(model_id.into(), target_instances);
+            println("⬇️  Scaled down {} to {} instances", model_id, target_instances);
+        }
+        Ok(())
+    }
+}
+
+/// Model Monitoring for MLJET
+open data ModelMonitor {
+    registry: ModelRegistry,
+    alert_thresholds: HashMap<String, AlertThreshold>,
+    performance_history: HashMap<String, Vec<PerformanceSnapshot>>,
+}
+
+#[derive(Clone)]
+open data AlertThreshold {
+    max_latency_ms: f64,
+    min_accuracy: f64,
+    max_error_rate: f64,
+}
+
+#[derive(Clone)]
+open data PerformanceSnapshot {
+    timestamp: std::time::SystemTime,
+    request_count: u64,
+    avg_latency_ms: f64,
+    error_count: u64,
+}
+
+impl ModelMonitor {
+    fn new(registry: ModelRegistry) -> Self {
+        ModelMonitor {
+            registry,
+            alert_thresholds: HashMap::new(),
+            performance_history: HashMap::new(),
+        }
+    }
+
+    /// Set alert thresholds for a model
+    fn set_alert_thresholds(&var self, model_id: &str, thresholds: AlertThreshold) {
+        self.alert_thresholds.insert(model_id.into(), thresholds);
+    }
+
+    /// Record performance snapshot
+    fn record_snapshot(&var self, model_id: &str, snapshot: PerformanceSnapshot) {
+        self.performance_history.entry(model_id.into())
+            .or_insert_with(Vec::new)
+            .push(snapshot);
+    }
+
+    /// Check for alerts
+    fn check_alerts(&self) -> Vec<ModelAlert> {
+        var alerts = [];
+
+        each entry in &self.performance_history  { let (model_id, history) = entry;
+            check let Some(latest) = history.last() {
+                check let Some(thresholds) = self.alert_thresholds.get(model_id) {
+                    check latest.avg_latency_ms > thresholds.max_latency_ms {
+                        alerts.push(ModelAlert {
+                            model_id: model_id.clone(),
+                            alert_type: AlertType::HighLatency,
+                            message: format("Latency {:.2f}ms exceeds threshold {:.2f}ms",
+                                           latest.avg_latency_ms, thresholds.max_latency_ms),
+                            severity: AlertSeverity::Warning,
+                        });
+                    }
+
+                    let error_rate = latest.error_count as f64 / latest.request_count as f64;
+                    check error_rate > thresholds.max_error_rate {
+                        alerts.push(ModelAlert {
+                            model_id: model_id.clone(),
+                            alert_type: AlertType::HighErrorRate,
+                            message: format("Error rate {:.2%} exceeds threshold {:.2%}",
+                                           error_rate, thresholds.max_error_rate),
+                            severity: AlertSeverity::Error,
+                        });
+                    }
+                }
+            }
+        }
+
+        alerts
+    }
+}
+
+/// Model Alert
+#[derive(Clone)]
+open data ModelAlert {
+    model_id: String,
+    alert_type: AlertType,
+    message: String,
+    severity: AlertSeverity,
+}
+
+/// Alert Types
+#[derive(Clone)]
+open cases AlertType {
+    HighLatency,
+    HighErrorRate,
+    ModelDrift,
+    DataDrift,
+    SystemFailure,
+}
+
+/// Alert Severity
+#[derive(Clone)]
+open cases AlertSeverity {
+    Info,
+    Warning,
+    Error,
+    Critical,
+}
+
+/// MLJET CLI
+open data MLJetCLI {
+    server: MLJetServer,
+    registry: ModelRegistry,
+}
+
+impl MLJetCLI {
+    fn new() -> Self {
+        let server = MLJetServer::new("127.0.0.1", 8080);
+        let registry = ModelRegistry::new(server.clone());
+
+        MLJetCLI { server, registry }
+    }
+
+    fn run_command(&var self, args: Vec<String>) -> Result<(), String> {
+        check args.is_empty() {
+            self.print_help();
+            Ok(());
+        }
+
+        match args[0].as_str() {
+            "start" => {
+                self.server.start()?;
+            },
+            "stop" => {
+                self.server.stop()?;
+            },
+            "load" => {
+                check args.len() < 3 {
+                    Err("Usage: load <model_id> <model_path>".into());
+                }
+                let model_id = &args[1];
+                let model_path = &args[2];
+                self.server.load_model(model_id, model_path, ModelType::Sklearn)?;
+            },
+            "unload" => {
+                check args.len() < 2 {
+                    Err("Usage: unload <model_id>".into());
+                }
+                self.server.unload_model(&args[1])?;
+            },
+            "list" => {
+                let models = self.server.list_models();
+                println("Served Models:");
+                each model in models {
+                    println("  {} ({:?}) - {} requests, {:.2f}ms avg latency",
+                           model.model_id, model.model_type,
+                           model.request_count, model.avg_latency_ms);
+                }
+            },
+            "register" => {
+                check args.len() < 3 {
+                    Err("Usage: register <model_id> <model_path>".into());
+                }
+                self.registry.register_model(&args[1], &args[2], ModelType::Sklearn, [])?;
+            },
+            _ => {
+                self.print_help();
+            }
+        }
+
+        Ok(())
+    }
+
+    fn print_help(&self) {
+        println("🚀 MLJET - Fast ML Model Serving");
+        println("Usage:");
+        println("  start                    - Start server");
+        println("  stop                     - Stop server");
+        println("  load <id> <path>         - Load model");
+        println("  unload <id>              - Unload model");
+        println("  list                     - List models");
+        println("  register <id> <path>     - Register model");
+        println("  help                     - Show this help");
+    }
+}
+
+/// Example usage
+open fn example_mljet_workflow() {
+    // Create MLJET server
+    var server = MLJetServer::new("127.0.0.1", 8080);
+
+    // Start server
+    server.start().unwrap();
+
+    // Load a model
+    server.load_model("sentiment_classifier", "./models/sentiment.pkl", ModelType::Sklearn).unwrap();
+
+    // Make predictions
+    let input = PredictionInput::Single([0.1, 0.5, 0.8, 0.2]); // Example features
+    let prediction = server.predict("sentiment_classifier", input).unwrap();
+
+    match prediction {
+        PredictionOutput::Single(preds) => {
+            println("Prediction: {:?}", preds);
+        },
+        PredictionOutput::Batch(preds) => {
+            println("Batch predictions: {:?}", preds.len());
+        }
+    }
+
+    // Create model registry
+    var registry = ModelRegistry::new(server.clone());
+
+    // Register model
+    registry.register_model("sentiment_v1", "./models/sentiment.pkl", ModelType::Sklearn,
+                           ["production".into(), "sentiment".into()]).unwrap();
+
+    // List registered models
+    let registered = registry.list_registered_models();
+    println("Registered models: {}", registered.len());
+
+    println("🎉 MLJET workflow completed successfully!");
+}

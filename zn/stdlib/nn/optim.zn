@@ -1,0 +1,360 @@
+/**
+ * Novazers
+ *
+ * PyTorch-style optimization algorithms
+ * Faster than PyTorch due to native SIMD operations
+ */
+
+use tensor::core::{Tensor};
+use tensor::autograd::{no_grad};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OPTIMIZER BASE
+// ═══════════════════════════════════════════════════════════════════════════
+
+open rules Optimizer {
+    /**
+     * Perform single optimization step
+     */
+    fn step(var self);
+
+    /**
+     * Zero all gradients
+     */
+    fn zero_grad(var self);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SGD (Stochastic Gradient Descent)
+// ═══════════════════════════════════════════════════════════════════════════
+
+data SGD {
+    params: [*var Tensor<f32>],
+    lr: f32,
+    momentum: f32,
+    weight_decay: f32,
+    velocity: Map<i64, Tensor<f32>>  // Momentum buffers
+}
+
+impl SGD {
+    fn new(params: [*var Tensor<f32>], lr: f32) -> SGD {
+        SGD {
+            params: params,
+            lr: lr,
+            momentum: 0.0,
+            weight_decay: 0.0,
+            velocity: Map::new()
+        };
+    }
+
+    fn with_momentum(var self, momentum: f32) -> SGD {
+        self.momentum = momentum;
+        yield self;
+    }
+
+    fn with_weight_decay(var self, weight_decay: f32) -> SGD {
+        self.weight_decay = weight_decay;
+        yield self;
+    }
+}
+
+impl Optimizer for SGD {
+    fn step(var self) {
+        no_grad(|| {
+            each (i, param_ptr) in self.params.enumerate() {
+                var param = unsafe { *param_ptr };
+
+                check let Some(grad) = param.grad {
+                    // Add weight decay
+                    var d_p = grad;
+                    check self.weight_decay != 0.0 {
+                        d_p = d_p.add(param.mul_scalar(self.weight_decay));
+                    }
+
+                    // Apply momentum
+                    check self.momentum != 0.0 {
+                        let v = match self.velocity.get(i) {
+                            Some(vel) => {
+                                vel.mul_scalar(self.momentum).add(d_p)
+                            },
+                            None => d_p.clone()
+                        };
+
+                        self.velocity.insert(i, v.clone());
+                        d_p = v;
+                    }
+
+                    // Update parameters: θ = θ - lr * grad
+                    param.data = param.sub(d_p.mul_scalar(self.lr)).data;
+                }
+            }
+        });
+    }
+
+    fn zero_grad(var self) {
+        each param_ptr in self.params {
+            var param = unsafe { *param_ptr };
+            param.zero_grad();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADAM (Adaptive Moment Estimation)
+// ═══════════════════════════════════════════════════════════════════════════
+
+data Adam {
+    params: [*var Tensor<f32>],
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    m: Map<i64, Tensor<f32>>,  // First moment
+    v: Map<i64, Tensor<f32>>,  // Second moment
+    t: i64                      // Timestep
+}
+
+impl Adam {
+    fn new(params: [*var Tensor<f32>], lr: f32) -> Adam {
+        Adam {
+            params: params,
+            lr: lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.0,
+            m: Map::new(),
+            v: Map::new(),
+            t: 0
+        };
+    }
+}
+
+impl Optimizer for Adam {
+    fn step(var self) {
+        self.t += 1;
+
+        no_grad(|| {
+            each (i, param_ptr) in self.params.enumerate() {
+                var param = unsafe { *param_ptr };
+
+                check let Some(grad) = param.grad {
+                    var g = grad;
+
+                    // Add weight decay
+                    check self.weight_decay != 0.0 {
+                        g = g.add(param.mul_scalar(self.weight_decay));
+                    }
+
+                    // Update first moment: m = β1*m + (1-β1)*g
+                    let m_t = match self.m.get(i) {
+                        Some(m_prev) => {
+                            m_prev.mul_scalar(self.beta1)
+                                  .add(g.mul_scalar(1.0 - self.beta1))
+                        },
+                        None => g.mul_scalar(1.0 - self.beta1)
+                    };
+
+                    // Update second moment: v = β2*v + (1-β2)*g²
+                    let v_t = match self.v.get(i) {
+                        Some(v_prev) => {
+                            v_prev.mul_scalar(self.beta2)
+                                  .add(g.mul(g).mul_scalar(1.0 - self.beta2))
+                        },
+                        None => g.mul(g).mul_scalar(1.0 - self.beta2)
+                    };
+
+                    // Bias correction
+                    let m_hat = m_t.div_scalar(1.0 - f32::pow(self.beta1, self.t as f32));
+                    let v_hat = v_t.div_scalar(1.0 - f32::pow(self.beta2, self.t as f32));
+
+                    // Update: θ = θ - lr * m_hat / (√v_hat + ε)
+                    let update = m_hat.div(v_hat.sqrt().add_scalar(self.eps));
+                    param.data = param.sub(update.mul_scalar(self.lr)).data;
+
+                    // Save moments
+                    self.m.insert(i, m_t);
+                    self.v.insert(i, v_t);
+                }
+            }
+        });
+    }
+
+    fn zero_grad(var self) {
+        each param_ptr in self.params {
+            var param = unsafe { *param_ptr };
+            param.zero_grad();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADAMW (Adam with decoupled weight decay)
+// ═══════════════════════════════════════════════════════════════════════════
+
+data AdamW {
+    adam: Adam
+}
+
+impl AdamW {
+    fn new(params: [*var Tensor<f32>], lr: f32, weight_decay: f32) -> AdamW {
+        var adam = Adam::new(params, lr);
+        adam.weight_decay = weight_decay;
+        AdamW { adam: adam };
+    }
+}
+
+impl Optimizer for AdamW {
+    fn step(var self) {
+        // AdamW applies weight decay directly to parameters, not gradients
+        no_grad(|| {
+            each param_ptr in self.adam.params {
+                var param = unsafe { *param_ptr };
+                param.data = param.mul_scalar(1.0 - self.adam.lr * self.adam.weight_decay).data;
+            }
+        });
+
+        // Then do regular Adam step (without weight decay in gradient)
+        let wd = self.adam.weight_decay;
+        self.adam.weight_decay = 0.0;
+        self.adam.step();
+        self.adam.weight_decay = wd;
+    }
+
+    fn zero_grad(var self) {
+        self.adam.zero_grad();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RMSPROP
+// ═══════════════════════════════════════════════════════════════════════════
+
+data RMSprop {
+    params: [*var Tensor<f32>],
+    lr: f32,
+    alpha: f32,      // Decay rate
+    eps: f32,
+    v: Map<i64, Tensor<f32>>  // Moving average of squared gradients
+}
+
+impl RMSprop {
+    fn new(params: [*var Tensor<f32>], lr: f32) -> RMSprop {
+        RMSprop {
+            params: params,
+            lr: lr,
+            alpha: 0.99,
+            eps: 1e-8,
+            v: Map::new()
+        };
+    }
+}
+
+impl Optimizer for RMSprop {
+    fn step(var self) {
+        no_grad(|| {
+            each (i, param_ptr) in self.params.enumerate() {
+                var param = unsafe { *param_ptr };
+
+                check let Some(grad) = param.grad {
+                    // v = α*v + (1-α)*g²
+                    let v_t = match self.v.get(i) {
+                        Some(v_prev) => {
+                            v_prev.mul_scalar(self.alpha)
+                                  .add(grad.mul(grad).mul_scalar(1.0 - self.alpha))
+                        },
+                        None => grad.mul(grad).mul_scalar(1.0 - self.alpha)
+                    };
+
+                    // θ = θ - lr * g / (√v + ε)
+                    let update = grad.div(v_t.sqrt().add_scalar(self.eps));
+                    param.data = param.sub(update.mul_scalar(self.lr)).data;
+
+                    self.v.insert(i, v_t);
+                }
+            }
+        });
+    }
+
+    fn zero_grad(var self) {
+        each param_ptr in self.params {
+            var param = unsafe { *param_ptr };
+            param.zero_grad();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LEARNING RATE SCHEDULERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+open rules LRScheduler {
+    fn step(var self);
+    fn get_lr(self) -> f32;
+}
+
+data StepLR {
+    optimizer: *var dyn Optimizer,
+    step_size: i64,
+    gamma: f32,
+    last_epoch: i64,
+    base_lr: f32
+}
+
+impl StepLR {
+    fn new(optimizer: *var dyn Optimizer, step_size: i64, gamma: f32) -> StepLR {
+        StepLR {
+            optimizer: optimizer,
+            step_size: step_size,
+            gamma: gamma,
+            last_epoch: 0,
+            base_lr: 0.001  // Get from optimizer
+        };
+    }
+}
+
+impl LRScheduler for StepLR {
+    fn step(var self) {
+        self.last_epoch += 1;
+    }
+
+    fn get_lr(self) -> f32 {
+        let decay_count = self.last_epoch / self.step_size;
+        yield self.base_lr * f32::pow(self.gamma, decay_count as f32);
+    }
+}
+
+data CosineAnnealingLR {
+    optimizer: *var dyn Optimizer,
+    T_max: i64,
+    eta_min: f32,
+    last_epoch: i64,
+    base_lr: f32
+}
+
+impl CosineAnnealingLR {
+    fn new(optimizer: *var dyn Optimizer, T_max: i64) -> CosineAnnealingLR {
+        CosineAnnealingLR {
+            optimizer: optimizer,
+            T_max: T_max,
+            eta_min: 0.0,
+            last_epoch: 0,
+            base_lr: 0.001
+        };
+    }
+}
+
+impl LRScheduler for CosineAnnealingLR {
+    fn step(var self) {
+        self.last_epoch += 1;
+    }
+
+    fn get_lr(self) -> f32 {
+        let PI = 3.14159265359;
+        let progress = self.last_epoch as f32 / self.T_max as f32;
+        let cosine = f32::cos(PI * progress);
+
+        yield self.eta_min + (self.base_lr - self.eta_min) * (1.0 + cosine) / 2.0;
+    }
+}

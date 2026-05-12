@@ -1,0 +1,1618 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova  —  PARSER  v10.0                                              ║
+// ║                                                                              ║
+// ║  v10'da parser'ın en önemli yenilikleri:                                    ║
+// ║                                                                              ║
+// ║  1. TİP İFADESİ PARSER'I (parse_type)                                       ║
+// ║     String döndürmek yerine TypeExpr node'u üretir.                         ║
+// ║     Bu sayede qty<f64, m/s²> ve tensor<f32>[batch, seq] doğru parse edilir. ║
+// ║                                                                              ║
+// ║  2. BİRİMLİ LİTERAL PARSER'I                                                ║
+// ║     "5.0:kg" formatındaki encoded token'ları MeasuredLit'e çevirir.         ║
+// ║                                                                              ║
+// ║  3. SÖZLEŞME PARSER'I (require/ensure/assert)                               ║
+// ║     Fonksiyon gövdesinden önce/sonra koşullar parse edilir.                 ║
+// ║                                                                              ║
+// ║  4. FLOW İFADESİ PARSER'I                                                   ║
+// ║     signal(), stream(), spawn {} → FlowConstruct node'ları                  ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use crate::frontend::tokens::{Token, TokenKind};
+use crate::frontend::ast::*;
+use crate::frontend::errors::ParseError;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §1  PARSER DURUMU
+// ══════════════════════════════════════════════════════════════════════════════
+
+open data Parser {
+    tokens: Vec<Token>,
+    pos:    i64,
+}
+
+impl Parser {
+
+    open fn new(tokens: Vec<Token>) -> Parser {
+        Parser { tokens, pos: 0 }
+    }
+
+    // ── İmleç Yardımcıları ────────────────────────────────────────────────────
+
+    open fn cur(&self) -> &Token {
+        let idx = (self.pos as usize).min(self.tokens.len() - 1);
+        &self.tokens[idx]
+    }
+
+    open fn peek_at(&self, offset: i64) -> &Token {
+        let idx = ((self.pos + offset) as usize).min(self.tokens.len() - 1);
+        &self.tokens[idx]
+    }
+
+    open fn at(&self, kind: TokenKind) -> bool { self.cur().kind == kind }
+
+    open fn any_of(&self, kinds: &[TokenKind]) -> bool {
+        kinds.iter().any(|k| *k == self.cur().kind)
+    }
+
+    open fn advance(&var self) -> Token {
+        let tok = self.tokens[self.pos as usize].clone();
+        check (self.pos as usize) < self.tokens.len() - 1 {
+            self.pos = self.pos + 1;
+        }
+        yield tok;
+    }
+
+    open fn expect(&var self, kind: TokenKind) -> Result<Token, ParseError> {
+        let tok = self.cur().clone();
+        check tok.kind != kind {
+            Err(ParseError::new(
+                format("Beklenen {:?}, gelen {:?} '{}'", kind, tok.kind, tok.lexeme),
+                tok.line, tok.col,
+            ));
+        }
+        self.advance();
+        Ok(tok);
+    }
+
+    open fn eat(&var self, kind: TokenKind) -> bool {
+        check self.at(kind) { self.advance(); yield true; }
+        yield false;
+    }
+
+    open fn cur_span(&self) -> Span { Span::at(self.cur().line, self.cur().col) }
+
+    open fn err(&self, msg: &str) -> ParseError {
+        ParseError::new(msg.into(), self.cur().line, self.cur().col)
+    }
+
+    // ── Attribute Parsing  #[name(args)]  ─────────────────────────────────────
+
+    open fn parse_attrs(&var self) -> Result<Vec<Attr>, ParseError> {
+        var attrs = [];
+        while self.at(TokenKind::Hash) {
+            let span = self.cur_span();
+            self.advance();
+            self.expect(TokenKind::LBrack)?;
+            let name = self.expect(TokenKind::Ident)?.lexeme;
+            var args: Vec<Expr> = [];
+            check self.eat(TokenKind::LParen) {
+                while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                    args.push(self.parse_expr()?);
+                    self.eat(TokenKind::Comma);
+                }
+                self.expect(TokenKind::RParen)?;
+            }
+            self.expect(TokenKind::RBrack)?;
+            attrs.push(Attr { name, args, span });
+        }
+        Ok(attrs);
+    }
+
+    // ── Generic Parametreleri  <T: Clone, U: Debug>  ──────────────────────────
+
+    open fn parse_generics(&var self) -> Result<Vec<GenericParam>, ParseError> {
+        var params = [];
+        check !self.at(TokenKind::Lt) { yield Ok(params); }
+        self.advance();
+        while !self.at(TokenKind::Gt) && !self.at(TokenKind::Eof) {
+            let name = self.expect(TokenKind::Ident)?.lexeme;
+            var constraints: Vec<TypeExpr> = [];
+            check self.eat(TokenKind::Colon) {
+                loop {
+                    constraints.push(self.parse_type()?);
+                    check !self.eat(TokenKind::Plus) { abort; }
+                }
+            }
+            params.push(GenericParam { name, constraints });
+            self.eat(TokenKind::Comma);
+        }
+        self.expect(TokenKind::Gt)?;
+        Ok(params);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // §2  TİP İFADESİ PARSER'I  (YENİ — artık String değil TypeExpr)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    open fn parse_type(&var self) -> Result<TypeExpr, ParseError> {
+        yield self.parse_type_inner();
+    }
+
+    open fn parse_type_inner(&var self) -> Result<TypeExpr, ParseError> {
+
+        // Referans:  &T  veya  &var T
+        check self.eat(TokenKind::BitAnd) {
+            let mutable = self.eat(TokenKind::Var);
+            let inner   = self.parse_type()?;
+            Ok(TypeExpr::Ref(Box::new(inner), mutable));
+        }
+
+        // Dyn:  dyn Rules
+        check self.eat(TokenKind::Dyn) {
+            var traits = [self.expect(TokenKind::Ident)?.lexeme];
+            while self.eat(TokenKind::Plus) {
+                traits.push(self.expect(TokenKind::Ident)?.lexeme);
+            }
+            Ok(TypeExpr::DynRules(traits));
+        }
+
+        // Tuple:  (T, U, V)
+        check self.at(TokenKind::LParen) {
+            self.advance();
+            check self.eat(TokenKind::RParen) {
+                Ok(TypeExpr::Prim("()".into())); // unit alias
+            }
+            var types = [self.parse_type()?];
+            while self.eat(TokenKind::Comma) {
+                check self.at(TokenKind::RParen) { abort; }
+                types.push(self.parse_type()?);
+            }
+            self.expect(TokenKind::RParen)?;
+            check types.len() == 1 { yield Ok(types.remove(0)); }
+            Ok(TypeExpr::Tuple(types));
+        }
+
+        // Placeholder:  _
+        check self.eat(TokenKind::Underscore) {
+            Ok(TypeExpr::Infer);
+        }
+
+        // Fonksiyon tipi:  fn(A, B) -> C
+        check self.eat(TokenKind::Fn) {
+            self.expect(TokenKind::LParen)?;
+            var params = [];
+            while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                params.push(self.parse_type()?);
+                self.eat(TokenKind::Comma);
+            }
+            self.expect(TokenKind::RParen)?;
+            let ret = check self.eat(TokenKind::Arrow) {
+                self.parse_type()?
+            } else {
+                TypeExpr::Prim("()".into())
+            };
+            Ok(TypeExpr::FnPtr(params, Box::new(ret)));
+        }
+
+        // YENİ: Miktarlı Tip:  qty<f64, kg>  veya  qty<f64, m/s>
+        check self.at(TokenKind::Qty) {
+            self.advance();
+            self.expect(TokenKind::Lt)?;
+            let scalar = self.parse_type()?;
+            self.expect(TokenKind::Comma)?;
+            let dim = self.parse_dim_expr()?;
+            self.expect(TokenKind::Gt)?;
+            Ok(TypeExpr::Qty(Box::new(scalar), dim));
+        }
+
+        // YENİ: Tensor Tipi:  tensor<f32>[batch=32, seq=512, d=768]
+        check self.at(TokenKind::Tensor) {
+            self.advance();
+            self.expect(TokenKind::Lt)?;
+            let dtype = self.parse_type()?;
+            self.expect(TokenKind::Gt)?;
+            let dims = self.parse_tensor_dims()?;
+            Ok(TypeExpr::Tensor(Box::new(dtype), dims));
+        }
+
+        // YENİ: Flow Tipi:  Signal<T>  Stream<T>  Task<T>  Chan<T>
+        let flow_kind = match self.cur().lexeme.as_str() {
+            "Signal" => Some(FlowKind::Signal),
+            "Stream" => Some(FlowKind::Stream),
+            "Task"   => Some(FlowKind::Task),
+            "Chan"   => Some(FlowKind::Chan),
+            _        => None,
+        };
+        check let Some(fk) = flow_kind {
+            self.advance();
+            self.expect(TokenKind::Lt)?;
+            let inner = self.parse_type()?;
+            self.expect(TokenKind::Gt)?;
+            Ok(TypeExpr::Flow(fk, Box::new(inner)));
+        }
+
+        // Temel tip veya generic:  i32, Vec<T>, Option<String>
+        let name = self.expect(TokenKind::Ident)?.lexeme;
+
+        // Path tipi:  std::io::Error
+        check self.at(TokenKind::ColonColon) {
+            var segments = [name];
+            while self.eat(TokenKind::ColonColon) {
+                segments.push(self.expect(TokenKind::Ident)?.lexeme);
+            }
+            Ok(TypeExpr::Path(segments));
+        }
+
+        // Generic argümanlar:  Vec<T>  HashMap<K, V>
+        check self.at(TokenKind::Lt) {
+            self.advance();
+            var args = [self.parse_type()?];
+            while self.eat(TokenKind::Comma) {
+                check self.at(TokenKind::Gt) { abort; }
+                args.push(self.parse_type()?);
+            }
+            self.expect(TokenKind::Gt)?;
+            Ok(TypeExpr::Generic(name, args));
+        }
+
+        Ok(TypeExpr::Prim(name));
+    }
+
+    // YENİ: Boyut İfadesi  kg  m/s  m/s²  m/s³
+    open fn parse_dim_expr(&var self) -> Result<DimExpr, ParseError> {
+        let name = self.expect(TokenKind::Ident)?.lexeme;
+        var numer = [name];
+        var denom: Vec<String> = [];
+
+        // Bölme işareti `/`
+        check self.eat(TokenKind::Slash) {
+            var base = self.expect(TokenKind::Ident)?.lexeme;
+            // ² veya ³ üst simgesi: sonraki token lexeme başlıyorsa işle
+            // Lexer is_unit_char ile ² ve ³ karakterlerini birim içine dahil eder,
+            // bu nedenle "s²" tek bir identifier olarak gelir.
+            // Eğer paydaki identifier içinde üst simge varsa, çarpanı tekrarla.
+            let exp = check base.ends_with('²') {
+                base = base.trim_end_matches('²').into();
+                2
+            } else check base.ends_with('³') {
+                base = base.trim_end_matches('³').into();
+                3
+            } else {
+                1
+            };
+            each _ in 0..exp {
+                denom.push(base.clone());
+            }
+        }
+
+        Ok(DimExpr { numer, denom });
+    }
+
+    // YENİ: Tensor Boyutları  [batch=32, seq=512, _]
+    open fn parse_tensor_dims(&var self) -> Result<Vec<(Option<String>, DimSize)>, ParseError> {
+        var dims = [];
+        check !self.at(TokenKind::LBrack) { yield Ok(dims); }
+        self.advance();
+
+        while !self.at(TokenKind::RBrack) && !self.at(TokenKind::Eof) {
+            check self.eat(TokenKind::Underscore) {
+                dims.push((None, DimSize::Any));
+            } else check self.at(TokenKind::Ident) && self.peek_at(1).kind == TokenKind::Assign {
+                // İsimli boyut: batch=32
+                let name = self.advance().lexeme;
+                self.advance(); // `=`
+                let size = self.expect(TokenKind::LitInt)?.lexeme.parse::<i64>().unwrap_or(0);
+                dims.push((Some(name), DimSize::Known(size)));
+            } else check self.at(TokenKind::Ident) {
+                // Sembolik boyut: batch
+                let name = self.advance().lexeme;
+                dims.push((None, DimSize::Named(name)));
+            } else check self.at(TokenKind::LitInt) {
+                // Bilinen boyut: 784
+                let size = self.advance().lexeme.parse::<i64>().unwrap_or(0);
+                dims.push((None, DimSize::Known(size)));
+            } else {
+                Err(self.err("Geçersiz tensor boyutu"));
+            }
+            self.eat(TokenKind::Comma);
+        }
+
+        self.expect(TokenKind::RBrack)?;
+        Ok(dims);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // §3  ÜST DÜZEYLEYELİ PARSE
+    // ══════════════════════════════════════════════════════════════════════════
+
+    open fn parse(&var self) -> Result<Program, ParseError> {
+        var prog = Program::new("".into());
+
+        while !self.at(TokenKind::Eof) {
+            let attrs = self.parse_attrs()?;
+            let is_open = self.eat(TokenKind::Open);
+
+            let item = match self.cur().kind {
+
+                TokenKind::Use    => TopLevel::Use(self.parse_use()?),
+                TokenKind::Fn     => TopLevel::Fn(self.parse_fn(attrs, is_open)?),
+                TokenKind::Data   => TopLevel::Data(self.parse_data(attrs, is_open)?),
+                TokenKind::Cases  => TopLevel::Cases(self.parse_cases(attrs, is_open)?),
+                TokenKind::Rules  => TopLevel::Rules(self.parse_rules(attrs, is_open)?),
+                TokenKind::Skill  => TopLevel::Skill(self.parse_skill()?),
+                TokenKind::Flow   => TopLevel::Flow(self.parse_flow_def(attrs, is_open)?),
+                TokenKind::Unit   => TopLevel::Unit(self.parse_unit_family(attrs)?),
+                TokenKind::Qty    => TopLevel::Qty(self.parse_qty_def(attrs, is_open)?),
+                TokenKind::Tensor => TopLevel::Tensor(self.parse_tensor_def(attrs)?),
+                TokenKind::Alias  => TopLevel::Alias(self.parse_alias()?),
+                TokenKind::Given  => TopLevel::Given(self.parse_given()?),
+                TokenKind::Space  => TopLevel::Space(self.parse_space(attrs)?),
+                TokenKind::Proof  => TopLevel::Proof(self.parse_proof_block()?),
+                TokenKind::Molecule => TopLevel::Molecule(self.parse_molecule()?),
+                TokenKind::React  => TopLevel::Reaction(self.parse_reaction()?),
+                TokenKind::Seq    => TopLevel::Seq(self.parse_seq()?),
+                TokenKind::Kernel => TopLevel::Kernel(self.parse_kernel(attrs)?),
+
+                _ => yield Err(self.err(&format(
+                    "Beklenmeyen üst seviye token: {:?}", self.cur().kind))),
+            };
+
+            prog.items.push(item);
+        }
+
+        Ok(prog);
+    }
+
+    // ── use ──────────────────────────────────────────────────────────────────
+
+    open fn parse_use(&var self) -> Result<UseDecl, ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::Use)?;
+
+        var path: Vec<String> = [];
+        path.push(self.expect(TokenKind::Ident)?.lexeme);
+        while self.eat(TokenKind::ColonColon) {
+            check self.at(TokenKind::LBrace) { abort; }
+            path.push(self.expect(TokenKind::Ident)?.lexeme);
+        }
+
+        var items: Vec<String> = [];
+        check self.at(TokenKind::ColonColon) {
+            // Henüz consume etmedik, tekrar dene
+        }
+        check self.eat(TokenKind::LBrace) {
+            while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                items.push(self.expect(TokenKind::Ident)?.lexeme);
+                self.eat(TokenKind::Comma);
+            }
+            self.expect(TokenKind::RBrace)?;
+        }
+
+        let alias = check self.eat(TokenKind::As) {
+            Some(self.expect(TokenKind::Ident)?.lexeme)
+        } else { yield None };
+
+        self.eat(TokenKind::Semi);
+        Ok(UseDecl { path, items, alias, span });
+    }
+
+    // ── fn ───────────────────────────────────────────────────────────────────
+
+    open fn parse_fn(&var self, attrs: Vec<Attr>, is_open: bool) -> Result<FnDef, ParseError> {
+        let span = self.cur_span();
+        let is_async = self.eat(TokenKind::Async);
+        self.expect(TokenKind::Fn)?;
+        let name     = self.expect(TokenKind::Ident)?.lexeme;
+        let generics = self.parse_generics()?;
+
+        self.expect(TokenKind::LParen)?;
+        var params: Vec<Param> = [];
+        while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+            params.push(self.parse_param()?);
+            self.eat(TokenKind::Comma);
+        }
+        self.expect(TokenKind::RParen)?;
+
+        let return_ty = check self.eat(TokenKind::Arrow) {
+            Some(self.parse_type()?)
+        } else { yield None };
+
+        // YENİ: Sözleşmeler — fonksiyon başından önce
+        let (requires, ensures) = self.parse_contracts()?;
+
+        let vpu_model = check self.eat(TokenKind::On) {
+            Some(self.parse_vpu_model()?)
+        } else { yield None };
+
+        let body = self.parse_block()?;
+
+        Ok(FnDef {
+            name, generics, params, return_ty,
+            requires, ensures, body, vpu_model,
+            is_open, is_async, attrs, span,
+        });
+    }
+
+    // YENİ: Sözleşme parse — `require cond` ve `ensure cond` blokları
+    open fn parse_contracts(&var self) -> Result<(Vec<ContractStmt>, Vec<ContractStmt>), ParseError> {
+        var requires = [];
+        var ensures  = [];
+        loop {
+            check self.at(TokenKind::Require) {
+                let span = self.cur_span();
+                self.advance();
+                let cond = self.parse_expr()?;
+                let msg = check self.eat(TokenKind::Comma) {
+                    Some(self.parse_expr()?)
+                } else { yield None };
+                self.eat(TokenKind::Semi);
+                requires.push(ContractStmt { cond, message: msg, span });
+            } else check self.at(TokenKind::Ensure) {
+                let span = self.cur_span();
+                self.advance();
+                let cond = self.parse_expr()?;
+                let msg = check self.eat(TokenKind::Comma) {
+                    Some(self.parse_expr()?)
+                } else { yield None };
+                self.eat(TokenKind::Semi);
+                ensures.push(ContractStmt { cond, message: msg, span });
+            } else {
+                abort;
+            }
+        }
+        Ok((requires, ensures));
+    }
+
+    open fn parse_param(&var self) -> Result<Param, ParseError> {
+        let span = self.cur_span();
+        check self.eat(TokenKind::BitAnd) {
+            // `&self` veya `&var self`
+            self.eat(TokenKind::Var);
+            self.expect(TokenKind::SelfVal)?;
+            Ok(Param { name: "&self".into(), ty: None, span });
+        }
+        check self.eat(TokenKind::SelfVal) {
+            Ok(Param { name: "self".into(), ty: None, span });
+        }
+        let name = self.expect(TokenKind::Ident)?.lexeme;
+        let ty   = check self.eat(TokenKind::Colon) {
+            Some(self.parse_type()?)
+        } else { yield None };
+        Ok(Param { name, ty, span });
+    }
+
+    // ── data ─────────────────────────────────────────────────────────────────
+
+    open fn parse_data(&var self, attrs: Vec<Attr>, is_open: bool) -> Result<DataDef, ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::Data)?;
+        let name     = self.expect(TokenKind::Ident)?.lexeme;
+        let generics = self.parse_generics()?;
+        self.expect(TokenKind::LBrace)?;
+        var fields = [];
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            fields.push(self.parse_field_def()?);
+            self.eat(TokenKind::Comma);
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(DataDef { name, generics, fields, is_open, attrs, span });
+    }
+
+    open fn parse_field_def(&var self) -> Result<FieldDef, ParseError> {
+        let span = self.cur_span();
+        let is_open = self.eat(TokenKind::Open);
+        let name = self.expect(TokenKind::Ident)?.lexeme;
+        self.expect(TokenKind::Colon)?;
+        let ty = self.parse_type()?;
+        let default = check self.eat(TokenKind::Assign) {
+            Some(self.parse_expr()?)
+        } else { yield None };
+        Ok(FieldDef { name, ty, is_open, default, span });
+    }
+
+    // ── cases ─────────────────────────────────────────────────────────────────
+
+    open fn parse_cases(&var self, attrs: Vec<Attr>, is_open: bool) -> Result<CasesDef, ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::Cases)?;
+        let name     = self.expect(TokenKind::Ident)?.lexeme;
+        let generics = self.parse_generics()?;
+        self.expect(TokenKind::LBrace)?;
+        variants = [];
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            variants.push(self.parse_variant()?);
+            self.eat(TokenKind::Comma);
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(CasesDef { name, generics, variants, is_open, attrs, span });
+    }
+
+    open fn parse_variant(&var self) -> Result<VariantDef, ParseError> {
+        let span    = self.cur_span();
+        let attrs   = self.parse_attrs()?;
+        let name    = self.expect(TokenKind::Ident)?.lexeme;
+        let payload = check self.at(TokenKind::LParen) {
+            // Tuple payload: Some(T)
+            self.advance();
+            var types = [];
+            while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                types.push(self.parse_type()?);
+                self.eat(TokenKind::Comma);
+            }
+            self.expect(TokenKind::RParen)?;
+            VariantPayload::Tuple(types)
+        } else check self.at(TokenKind::LBrace) {
+            // Record payload: Point { x: f64, y: f64 }
+            self.advance();
+            var fields = [];
+            while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                fields.push(self.parse_field_def()?);
+                self.eat(TokenKind::Comma);
+            }
+            self.expect(TokenKind::RBrace)?;
+            VariantPayload::Record(fields)
+        } else {
+            VariantPayload::Empty
+        };
+        Ok(VariantDef { name, payload, attrs, span });
+    }
+
+    // ── rules ─────────────────────────────────────────────────────────────────
+
+    open fn parse_rules(&var self, attrs: Vec<Attr>, is_open: bool) -> Result<RulesDef, ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::Rules)?;
+        let name     = self.expect(TokenKind::Ident)?.lexeme;
+        let generics = self.parse_generics()?;
+
+        var requires_types: Vec<TypeExpr> = [];
+        check self.at(TokenKind::Require) {
+            self.advance();
+            requires_types.push(self.parse_type()?);
+            while self.eat(TokenKind::Plus) {
+                requires_types.push(self.parse_type()?);
+            }
+        }
+
+        self.expect(TokenKind::LBrace)?;
+        var methods  = [];
+        var defaults = [];
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let m_attrs  = self.parse_attrs()?;
+            let m_open   = self.eat(TokenKind::Open);
+            let m_async  = self.eat(TokenKind::Async);
+            self.expect(TokenKind::Fn)?;
+            let m_name   = self.expect(TokenKind::Ident)?.lexeme;
+            let m_gen    = self.parse_generics()?;
+            let m_span   = self.cur_span();
+
+            self.expect(TokenKind::LParen)?;
+            var m_params = [];
+            while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                m_params.push(self.parse_param()?);
+                self.eat(TokenKind::Comma);
+            }
+            self.expect(TokenKind::RParen)?;
+            let m_ret = check self.eat(TokenKind::Arrow) { yield Some(self.parse_type()?)} else { yield None };
+            let (m_req, m_ens) = self.parse_contracts()?;
+
+            check self.at(TokenKind::LBrace) {
+                // Varsayılan implementasyon var
+                let body = self.parse_block()?;
+                defaults.push(FnDef {
+                    name: m_name, generics: m_gen, params: m_params,
+                    return_ty: m_ret, requires: m_req, ensures: m_ens,
+                    body, is_open: m_open, is_async: m_async,
+                    attrs: m_attrs, span: m_span,
+                });
+            } else {
+                self.eat(TokenKind::Semi);
+                methods.push(FnSig {
+                    name: m_name, generics: m_gen, params: m_params,
+                    return_ty: m_ret, requires: m_req, ensures: m_ens,
+                    span: m_span,
+                });
+            }
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(RulesDef { name, generics, requires: requires_types, methods, defaults, is_open, attrs, span });
+    }
+
+    // ── impl ─────────────────────────────────────────────────────────────────
+
+    open fn parse_skill(&var self) -> Result<SkillBlock, ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::Skill)?;
+        let generics = self.parse_generics()?;
+        let target   = self.parse_type()?;
+        let for_rules = check self.eat(TokenKind::For) {
+            Some(self.parse_type()?)
+        } else { yield None };
+        self.expect(TokenKind::LBrace)?;
+        var methods = [];
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let m_attrs = self.parse_attrs()?;
+            let m_open  = self.eat(TokenKind::Open);
+            methods.push(self.parse_fn(m_attrs, m_open)?);
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(SkillBlock { target, generics, for_rules, methods, span });
+    }
+
+    // ── YENİ: flow tanımı ─────────────────────────────────────────────────────
+
+    open fn parse_flow_def(&var self, attrs: Vec<Attr>, is_open: bool) -> Result<FlowDef, ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::Flow)?;
+        let name     = self.expect(TokenKind::Ident)?.lexeme;
+        let generics = self.parse_generics()?;
+        self.expect(TokenKind::Assign)?;
+        let (kind, inner) = self.parse_flow_type()?;
+        self.eat(TokenKind::Semi);
+        Ok(FlowDef { name, generics, kind, inner, is_open, attrs, span });
+    }
+
+    open fn parse_flow_type(&var self) -> Result<(FlowKind, TypeExpr), ParseError> {
+        let kind = match self.cur().lexeme.as_str() {
+            "Signal" => FlowKind::Signal,
+            "Stream" => FlowKind::Stream,
+            "Task"   => FlowKind::Task,
+            "Chan"   => FlowKind::Chan,
+            _        => yield Err(self.err("Beklenen flow tipi: Signal, Stream, Task, Chan")),
+        };
+        self.advance();
+        self.expect(TokenKind::Lt)?;
+        let inner = self.parse_type()?;
+        self.expect(TokenKind::Gt)?;
+        Ok((kind, inner));
+    }
+
+    // ── YENİ: unit family ─────────────────────────────────────────────────────
+    //
+    //  unit Mass {
+    //      base: kg
+    //      g  = kg * 0.001
+    //      lb = kg * 0.453592
+    //  }
+
+    open fn parse_unit_family(&var self, attrs: Vec<Attr>) -> Result<UnitFamilyDef, ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::Unit)?;
+        let name = self.expect(TokenKind::Ident)?.lexeme;
+        self.expect(TokenKind::LBrace)?;
+
+        // base: kg
+        self.expect(TokenKind::Ident)?; // "base"
+        self.expect(TokenKind::Colon)?;
+        let base_unit = self.expect(TokenKind::Ident)?.lexeme;
+        self.eat(TokenKind::Semi);
+
+        var conversions = [];
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let conv_span = self.cur_span();
+            let from_unit = self.expect(TokenKind::Ident)?.lexeme;
+            self.expect(TokenKind::Assign)?;
+            let to_base = self.parse_expr()?;
+            self.eat(TokenKind::Semi);
+            conversions.push(UnitConversion { from_unit, to_base, span: conv_span });
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(UnitFamilyDef { name, base_unit, conversions, dim_exponent: 1, attrs, span });
+    }
+
+    // ── YENİ: qty alias ──────────────────────────────────────────────────────
+    //  qty Speed = f64 in m/s
+
+    open fn parse_qty_def(&var self, attrs: Vec<Attr>, is_open: bool) -> Result<QtyDef, ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::Qty)?;
+        let name   = self.expect(TokenKind::Ident)?.lexeme;
+        self.expect(TokenKind::Assign)?;
+        let scalar = self.parse_type()?;
+        self.expect(TokenKind::In)?;
+        let dim    = self.parse_dim_expr()?;
+        self.eat(TokenKind::Semi);
+        Ok(QtyDef { name, scalar, dim, is_open, attrs, span });
+    }
+
+    // ── tensor tanımı ────────────────────────────────────────────────────────
+
+    open fn parse_tensor_def(&var self, attrs: Vec<Attr>) -> Result<TensorDef, ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::Tensor)?;
+        let name = self.expect(TokenKind::Ident)?.lexeme;
+        self.expect(TokenKind::Colon)?;
+        let dtype = self.parse_type()?; // Parse alias directly instead of expecting another Tensor
+        let dims = self.parse_tensor_dims()?;
+        self.eat(TokenKind::Semi);
+        Ok(TensorDef { name, dtype, dims, init: None, attrs, span });
+    }
+
+    // ── alias & given ─────────────────────────────────────────────────────────
+
+    open fn parse_alias(&var self) -> Result<(String, TypeExpr, Span), ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::Alias)?;
+        let name = self.expect(TokenKind::Ident)?.lexeme;
+        self.expect(TokenKind::Assign)?;
+        let ty = self.parse_type()?;
+        self.eat(TokenKind::Semi);
+        Ok((name, ty, span));
+    }
+
+    open fn parse_given(&var self) -> Result<(String, TypeExpr, Expr, Span), ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::Given)?;
+        let name = self.expect(TokenKind::Ident)?.lexeme;
+        self.expect(TokenKind::Colon)?;
+        let ty = self.parse_type()?;
+        self.expect(TokenKind::Assign)?;
+        let value = self.parse_expr()?;
+        self.eat(TokenKind::Semi);
+        Ok((name, ty, value, span));
+    }
+
+    // ── space ─────────────────────────────────────────────────────────────────
+
+    open fn parse_space(&var self, attrs: Vec<Attr>) -> Result<SpaceDef, ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::Space)?;
+        let name = self.expect(TokenKind::Ident)?.lexeme;
+        self.expect(TokenKind::LBrace)?;
+        var items = [];
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            // Recursive parse — space içinde her şey olabilir
+            let i_attrs  = self.parse_attrs()?;
+            let i_open   = self.eat(TokenKind::Open);
+            let item = match self.cur().kind {
+                TokenKind::Fn    => TopLevel::Fn(self.parse_fn(i_attrs, i_open)?),
+                TokenKind::Data  => TopLevel::Data(self.parse_data(i_attrs, i_open)?),
+                TokenKind::Cases => TopLevel::Cases(self.parse_cases(i_attrs, i_open)?),
+                TokenKind::Rules => TopLevel::Rules(self.parse_rules(i_attrs, i_open)?),
+                TokenKind::Skill => TopLevel::Skill(self.parse_skill()?),
+                _                => yield Err(self.err("Beklenmeyen space içeriği")),
+            };
+            items.push(item);
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(SpaceDef { name, items, span });
+    }
+
+    // ── proof bloğu ──────────────────────────────────────────────────────────
+
+    open fn parse_proof_block(&var self) -> Result<ProofBlock, ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::Proof)?;
+        let name = check self.at(TokenKind::Ident) {
+            Some(self.advance().lexeme)
+        } else { yield None };
+        self.expect(TokenKind::LBrace)?;
+        var assumes = [];
+        var steps   = [];
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            check self.at(TokenKind::Assume) {
+                let a_span = self.cur_span();
+                self.advance();
+                let cond = self.parse_expr()?;
+                self.eat(TokenKind::Semi);
+                assumes.push(ContractStmt { cond, message: None, span: a_span });
+            } else {
+                steps.push(self.parse_stmt()?);
+            }
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(ProofBlock { name, assumes, steps, span });
+    }
+
+    // ── Scentific domain ───────────────────────────────────────────────────────
+
+    open fn parse_molecule(&var self) -> Result<MoleculeDef, ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::Molecule)?;
+        let name = self.expect(TokenKind::Ident)?.lexeme;
+        self.expect(TokenKind::LBrace)?;
+        var composition = HashMap::new();
+        var charge: i64 = 0;
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let elem = self.expect(TokenKind::Ident)?.lexeme;
+            self.expect(TokenKind::Colon)?;
+            let count = self.expect(TokenKind::LitInt)?.lexeme.parse::<i64>().unwrap_or(1);
+            composition.insert(elem, count);
+            self.eat(TokenKind::Comma);
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(MoleculeDef { name, composition, charge, span });
+    }
+
+    open fn parse_reaction(&var self) -> Result<ReactionDef, ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::React)?;
+        let name = self.expect(TokenKind::Ident)?.lexeme;
+        self.expect(TokenKind::LBrace)?;
+        var reactants = [];
+        var products  = [];
+        var conditions: Vec<String> = [];
+        // Basit: `2 H2 + 1 O2 -> 2 H2O`
+        // Ayrıştırma: önce reaktanlar, `->` sonra ürünler
+        var reading_products = false;
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            check self.eat(TokenKind::Arrow) {
+                reading_products = true;
+                next;
+            }
+            let coeff = check self.at(TokenKind::LitInt) {
+                self.advance().lexeme.parse::<i64>().unwrap_or(1)
+            } else { 1 };
+            let mol = self.expect(TokenKind::Ident)?.lexeme;
+            check reading_products {
+                products.push((coeff, mol));
+            } else {
+                reactants.push((coeff, mol));
+            }
+            self.eat(TokenKind::Plus);
+            self.eat(TokenKind::Comma);
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(ReactionDef { name, reactants, products, conditions, span });
+    }
+
+    open fn parse_seq(&var self) -> Result<SeqDef, ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::Seq)?;
+        let kind = self.expect(TokenKind::Ident)?.lexeme; // dna | rna | protein
+        let name = self.expect(TokenKind::Ident)?.lexeme;
+        self.expect(TokenKind::Assign)?;
+        let data = self.expect(TokenKind::LitStr)?.lexeme;
+        self.eat(TokenKind::Semi);
+        Ok(SeqDef { kind, name, data, span });
+    }
+
+    open fn parse_kernel(&var self, attrs: Vec<Attr>) -> Result<KernelDef, ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::Kernel)?;
+        let name     = self.expect(TokenKind::Ident)?.lexeme;
+        let generics = self.parse_generics()?;
+        self.expect(TokenKind::LParen)?;
+        var params = [];
+        while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+            params.push(self.parse_param()?);
+            self.eat(TokenKind::Comma);
+        }
+        self.expect(TokenKind::RParen)?;
+        self.expect(TokenKind::Arrow)?;
+        let result = self.parse_type()?;
+        
+        self.expect(TokenKind::On)?;
+        let vpu_model = self.parse_vpu_model()?;
+
+        let body   = self.parse_block()?;
+        Ok(KernelDef { name, generics, params, result, vpu_model, body, attrs, span });
+    }
+
+    open fn parse_vpu_model(&var self) -> Result<VPUModel, ParseError> {
+        let tok = self.advance();
+        match tok.kind {
+            TokenKind::Silicon_Vpu => yield Ok(VPUModel::Silicon),
+            TokenKind::Kernel_Vpu  => yield Ok(VPUModel::Kernel),
+            TokenKind::Web_Nexus   => yield Ok(VPUModel::Web),
+            TokenKind::Mesh_Vpu    => yield Ok(VPUModel::Mesh),
+            _ => yield Err(self.err("Beklenen VPU modeli: silicon_vpu, kernel_vpu, web_nexus veya mesh_vpu")),
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // §4  İFADE (STMT) PARSE
+    // ══════════════════════════════════════════════════════════════════════════
+
+    open fn parse_block(&var self) -> Result<Block, ParseError> {
+        let span = self.cur_span();
+        self.expect(TokenKind::LBrace)?;
+        var stmts = [];
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            stmts.push(self.parse_stmt()?);
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(Block { stmts, span });
+    }
+
+    open fn parse_stmt(&var self) -> Result<Stmt, ParseError> {
+        let span = self.cur_span();
+
+        match self.cur().kind {
+
+            // let x = expr
+            // let x: T = expr
+            // let (a, b) = expr  — destructuring
+            TokenKind::Let => {
+                self.advance();
+                let pattern = self.parse_pattern()?;
+                let ty = check self.eat(TokenKind::Colon) { yield Some(self.parse_type()?)} else { yield None };
+                let init = check self.eat(TokenKind::Assign) { yield Some(self.parse_expr()?)} else { yield None };
+                self.eat(TokenKind::Semi);
+                Ok(Stmt::Let(LetStmt { pattern, ty, init, span }));
+            }
+
+            // var x = expr
+            TokenKind::Var => {
+                self.advance();
+                let name = self.expect(TokenKind::Ident)?.lexeme;
+                let ty = check self.eat(TokenKind::Colon) { yield Some(self.parse_type()?)} else { yield None };
+                let init = check self.eat(TokenKind::Assign) { yield Some(self.parse_expr()?)} else { yield None };
+                self.eat(TokenKind::Semi);
+                Ok(Stmt::Var(VarStmt { name, ty, init, span }));
+            }
+
+            // yield expr
+            TokenKind::Yield => {
+                self.advance();
+                let value = check !self.at(TokenKind::Semi) && !self.at(TokenKind::RBrace) {
+                    Some(self.parse_expr()?)
+                } else { yield None };
+                self.eat(TokenKind::Semi);
+                Ok(Stmt::Yield(YieldStmt { value, span }));
+            }
+
+            // abort
+            TokenKind::Abort => { self.advance(); self.eat(TokenKind::Semi); yield Ok(Stmt::Abort(span)); }
+
+            // next
+            TokenKind::Next => { self.advance(); self.eat(TokenKind::Semi); yield Ok(Stmt::Next(span)); }
+
+            // require cond
+            TokenKind::Require => {
+                self.advance();
+                let cond = self.parse_expr()?;
+                let msg  = check self.eat(TokenKind::Comma) { yield Some(self.parse_expr()?)} else { yield None };
+                self.eat(TokenKind::Semi);
+                Ok(Stmt::Require(ContractStmt { cond, message: msg, span }));
+            }
+
+            // ensure cond
+            TokenKind::Ensure => {
+                self.advance();
+                let cond = self.parse_expr()?;
+                let msg  = check self.eat(TokenKind::Comma) { yield Some(self.parse_expr()?)} else { yield None };
+                self.eat(TokenKind::Semi);
+                Ok(Stmt::Ensure(ContractStmt { cond, message: msg, span }));
+            }
+
+            // match statement
+            TokenKind::Match => {
+                self.advance();
+                let value = self.parse_expr()?;
+                self.expect(TokenKind::LBrace)?;
+                var arms = [];
+                while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                    let a_span   = self.cur_span();
+                    let pattern  = self.parse_pattern()?;
+                    let guard    = check self.eat(TokenKind::Check) {
+                        Some(Box::new(self.parse_expr()?))
+                    } else { yield None };
+                    self.expect(TokenKind::FatArrow)?;
+                    let body = self.parse_expr()?;
+                    self.eat(TokenKind::Comma);
+                    arms.push(MatchArm { pattern, guard, body: Box::new(body), span: a_span });
+                }
+                self.expect(TokenKind::RBrace)?;
+                self.eat(TokenKind::Semi);
+                Ok(Stmt::Match(MatchStmt { value: Box::new(value), arms, span }));
+            }
+
+            // Herşey else → ifade ifadesi
+            _ => {
+                let expr = self.parse_expr()?;
+                self.eat(TokenKind::Semi);
+                Ok(Stmt::Expr(ExprStmt { expr, span }));
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // §5  İFADE (EXPR) PARSE
+    // ══════════════════════════════════════════════════════════════════════════
+    //
+    //  Öncelik sırası (düşükten yükseğe):
+    //  1. Pipeline   |>
+    //  2. Atama      =  +=  -=  *=  /=
+    //  3. Mantıksal  ||  &&
+    //  4. Karşılaştırma  ==  !=  <  >  <=  >=  ~
+    //  5. Bit        |  ^  &
+    //  6. Shift      <<  >>
+    //  7. Toplama    +  -
+    //  8. Çarpma     *  /  %
+    //  9. Üs         **
+    // 10. Unary      !  -  &  *
+    // 11. Postfix    .  []  ()
+    // 12. Primary    literal, ident, (expr)
+
+    open fn parse_expr(&var self) -> Result<Expr, ParseError> {
+        yield self.parse_pipe();
+    }
+
+    open fn parse_pipe(&var self) -> Result<Expr, ParseError> {
+        var stages = [self.parse_assign()?];
+        let span   = self.cur_span();
+        while self.eat(TokenKind::Pipe) {
+            stages.push(self.parse_assign()?);
+        }
+        check stages.len() == 1 { yield Ok(stages.remove(0)); }
+        Ok(Expr::Pipe(PipeExpr { stages, span }));
+    }
+
+    open fn parse_assign(&var self) -> Result<Expr, ParseError> {
+        let left = self.parse_logic_or()?;
+        let span  = self.cur_span();
+
+        let op = match self.cur().kind {
+            TokenKind::Assign   => Some(None),
+            TokenKind::PlusEq   => Some(Some(BinOp::Add)),
+            TokenKind::MinusEq  => Some(Some(BinOp::Sub)),
+            TokenKind::StarEq   => Some(Some(BinOp::Mul)),
+            TokenKind::SlashEq  => Some(Some(BinOp::Div)),
+            _                   => None,
+        };
+
+        check let Some(compound) = op {
+            self.advance();
+            let right = self.parse_assign()?;
+            let rhs = match compound {
+                None    => right,
+                Some(op) => Expr::Binary(BinaryExpr {
+                    left: Box::new(left.clone()), op, right: Box::new(right), span
+                }),
+            };
+            Ok(Expr::Binary(BinaryExpr {
+                left: Box::new(left), op: BinOp::Assign, right: Box::new(rhs), span,
+            }));
+        }
+        Ok(left);
+    }
+
+    open fn parse_logic_or(&var self) -> Result<Expr, ParseError> {
+        var lhs = self.parse_logic_and()?;
+        while self.at(TokenKind::Or) {
+            let span = self.cur_span();
+            self.advance();
+            let rhs = self.parse_logic_and()?;
+            lhs = Expr::Binary(BinaryExpr { left: Box::new(lhs), op: BinOp::Or, right: Box::new(rhs), span });
+        }
+        Ok(lhs);
+    }
+
+    open fn parse_logic_and(&var self) -> Result<Expr, ParseError> {
+        var lhs = self.parse_compare()?;
+        while self.at(TokenKind::And) {
+            let span = self.cur_span();
+            self.advance();
+            let rhs = self.parse_compare()?;
+            lhs = Expr::Binary(BinaryExpr { left: Box::new(lhs), op: BinOp::And, right: Box::new(rhs), span });
+        }
+        Ok(lhs);
+    }
+
+    open fn parse_compare(&var self) -> Result<Expr, ParseError> {
+        var lhs = self.parse_add()?;
+        let op_kind = match self.cur().kind {
+            TokenKind::EqEq  => Some(BinOp::Eq),
+            TokenKind::NotEq => Some(BinOp::Ne),
+            TokenKind::Lt    => Some(BinOp::Lt),
+            TokenKind::Gt    => Some(BinOp::Gt),
+            TokenKind::Lte   => Some(BinOp::Le),
+            TokenKind::Gte   => Some(BinOp::Ge),
+            TokenKind::Tilde => Some(BinOp::Approx),  // YENİ: yaklaşık eşitlik
+            _                => None,
+        };
+        check let Some(op) = op_kind {
+            let span = self.cur_span();
+            self.advance();
+            let rhs = self.parse_add()?;
+            lhs = Expr::Binary(BinaryExpr { left: Box::new(lhs), op, right: Box::new(rhs), span });
+        }
+        Ok(lhs);
+    }
+
+    open fn parse_add(&var self) -> Result<Expr, ParseError> {
+        var lhs = self.parse_mul()?;
+        while self.any_of(&[TokenKind::Plus, TokenKind::Minus]) {
+            let span = self.cur_span();
+            let op   = check self.advance().kind == TokenKind::Plus { BinOp::Add } else { BinOp::Sub };
+            let rhs  = self.parse_mul()?;
+            lhs = Expr::Binary(BinaryExpr { left: Box::new(lhs), op, right: Box::new(rhs), span });
+        }
+        Ok(lhs);
+    }
+
+    open fn parse_mul(&var self) -> Result<Expr, ParseError> {
+        var lhs = self.parse_pow()?;
+        while self.any_of(&[TokenKind::Star, TokenKind::Slash, TokenKind::Percent, TokenKind::At]) {
+            let span = self.cur_span();
+            let op   = match self.advance().kind {
+                TokenKind::Star    => BinOp::Mul,
+                TokenKind::Slash   => BinOp::Div,
+                TokenKind::Percent => BinOp::Rem,
+                _                  => BinOp::MatMul,
+            };
+            let rhs = self.parse_pow()?;
+            lhs = Expr::Binary(BinaryExpr { left: Box::new(lhs), op, right: Box::new(rhs), span });
+        }
+        Ok(lhs);
+    }
+
+    open fn parse_pow(&var self) -> Result<Expr, ParseError> {
+        let base = self.parse_unary()?;
+        check self.at(TokenKind::Power) {
+            let span = self.cur_span();
+            self.advance();
+            let exp = self.parse_pow()?;  // sağ birleşmeli
+            Ok(Expr::Binary(BinaryExpr { left: Box::new(base), op: BinOp::Pow, right: Box::new(exp), span }));
+        }
+        Ok(base);
+    }
+
+    open fn parse_unary(&var self) -> Result<Expr, ParseError> {
+        let span = self.cur_span();
+        let op = match self.cur().kind {
+            TokenKind::Minus  => Some(UnaryOp::Neg),
+            TokenKind::Not    => Some(UnaryOp::Not),
+            TokenKind::BitAnd => Some(UnaryOp::Ref),
+            TokenKind::Star   => Some(UnaryOp::Deref),
+            _                 => None,
+        };
+        check let Some(op) = op {
+            self.advance();
+            let operand = self.parse_unary()?;
+            Ok(Expr::Unary(UnaryExpr { op, operand: Box::new(operand), span }));
+        }
+        yield self.parse_postfix();
+    }
+
+    open fn parse_postfix(&var self) -> Result<Expr, ParseError> {
+        var expr = self.parse_primary()?;
+
+        loop {
+            let span = self.cur_span();
+            match self.cur().kind {
+
+                // Metod çağrısı: expr.method(args)
+                TokenKind::Dot => {
+                    self.advance();
+                    let field = self.expect(TokenKind::Ident)?.lexeme;
+                    check self.at(TokenKind::LParen) {
+                        self.advance();
+                        var args = [];
+                        while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                            args.push(self.parse_expr()?);
+                            self.eat(TokenKind::Comma);
+                        }
+                        self.expect(TokenKind::RParen)?;
+                        expr = Expr::Method(MethodExpr {
+                            receiver: Box::new(expr), method: field,
+                            args, type_args: [], span,
+                        });
+                    } else {
+                        expr = Expr::Field(FieldExpr { base: Box::new(expr), field, span });
+                    }
+                }
+
+                // Fonksiyon çağrısı: expr(args)
+                TokenKind::LParen => {
+                    self.advance();
+                    var args = [];
+                    while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                        args.push(self.parse_expr()?);
+                        self.eat(TokenKind::Comma);
+                    }
+                    self.expect(TokenKind::RParen)?;
+                    expr = Expr::Call(CallExpr { callee: Box::new(expr), args, type_args: [], span });
+                }
+
+                // İndex: expr[i]
+                TokenKind::LBrack => {
+                    self.advance();
+                    var indices = [];
+                    while !self.at(TokenKind::RBrack) && !self.at(TokenKind::Eof) {
+                        indices.push(self.parse_expr()?);
+                        self.eat(TokenKind::Comma);
+                    }
+                    self.expect(TokenKind::RBrack)?;
+                    expr = Expr::Index(IndexExpr { base: Box::new(expr), indices, span });
+                }
+
+                // YENİ: Birim dönüşümü: expr in lb
+                TokenKind::In => {
+                    self.advance();
+                    let dim = self.parse_dim_expr()?;
+                    expr = Expr::UnitConvert(Box::new(expr), dim);
+                }
+
+                // Aralık: expr..end  veya  expr..=end
+                TokenKind::DotDot => {
+                    self.advance();
+                    let end = self.parse_unary()?;
+                    expr = Expr::Range(RangeExpr { start: Box::new(expr), end: Box::new(end), inclusive: false, span });
+                }
+                TokenKind::DotDotEq => {
+                    self.advance();
+                    let end = self.parse_unary()?;
+                    expr = Expr::Range(RangeExpr { start: Box::new(expr), end: Box::new(end), inclusive: true, span });
+                }
+
+                // Tip dönüşümü: expr as Type
+                TokenKind::As => {
+                    self.advance();
+                    let ty = self.parse_type()?;
+                    expr = Expr::Cast(Box::new(expr), ty);
+                }
+
+                _ => abort,
+            };
+        }
+
+        Ok(expr);
+    }
+
+    open fn parse_primary(&var self) -> Result<Expr, ParseError> {
+        let span = self.cur_span();
+
+        match self.cur().kind {
+
+            // Tam sayı
+            TokenKind::LitInt => {
+                let tok = self.advance();
+                let v   = tok.lexeme.parse::<i64>().unwrap_or(0);
+                Ok(Expr::Int(IntLit { value: v, span }));
+            }
+
+            // Float veya birimli literal (`5.0:kg`)
+            TokenKind::LitFloat => {
+                let tok = self.advance();
+                // YENİ: birimli literal decode
+                check tok.lexeme.contains(':') {
+                    let parts: Vec<&str> = tok.lexeme.splitn(2, ':').collect();
+                    let value = parts[0].parse::<f64>().unwrap_or(0.0);
+                    let unit_str = parts[1].into();
+                    let dim = DimExpr::named(unit_str.clone());
+                    Ok(Expr::Measured(MeasuredLit { value, unit: dim, unit_str, span }));
+                }
+                let v = tok.lexeme.parse::<f64>().unwrap_or(0.0);
+                Ok(Expr::Float(FloatLit { value: v, span }));
+            }
+
+            TokenKind::LitStr  => {
+                let v = self.advance().lexeme;
+                Ok(Expr::Str(StrLit { value: v, span }));
+            }
+            TokenKind::LitTrue  => { self.advance(); yield Ok(Expr::Bool(BoolLit { value: true,  span })); }
+            TokenKind::LitFalse => { self.advance(); yield Ok(Expr::Bool(BoolLit { value: false, span })); }
+
+            // Birim değer: ()
+            TokenKind::LParen => {
+                self.advance();
+                check self.eat(TokenKind::RParen) { yield Ok(Expr::Unit); }
+                var elements = [self.parse_expr()?];
+                while self.eat(TokenKind::Comma) {
+                    check self.at(TokenKind::RParen) { abort; }
+                    elements.push(self.parse_expr()?);
+                }
+                self.expect(TokenKind::RParen)?;
+                check elements.len() == 1 { yield Ok(elements.remove(0)); }
+                Ok(Expr::Tuple(TupleExpr { elements, span }));
+            }
+
+            // Dizi: [a, b, c]
+            TokenKind::LBrack => {
+                self.advance();
+                var elements = [];
+                while !self.at(TokenKind::RBrack) && !self.at(TokenKind::Eof) {
+                    elements.push(self.parse_expr()?);
+                    self.eat(TokenKind::Comma);
+                }
+                self.expect(TokenKind::RBrack)?;
+                Ok(Expr::Array(ArrayExpr { elements, span }));
+            }
+
+            // Blok: { stmts }
+            TokenKind::LBrace => {
+                let block = self.parse_block()?;
+                Ok(Expr::Block(block));
+            }
+
+            // Lambda: |x, y| expr  veya  |x: T| -> R { body }
+            TokenKind::BitOr => {
+                self.advance();
+                var params = [];
+                while !self.at(TokenKind::BitOr) && !self.at(TokenKind::Eof) {
+                    let p_span = self.cur_span();
+                    let name   = self.expect(TokenKind::Ident)?.lexeme;
+                    let ty     = check self.eat(TokenKind::Colon) { yield Some(self.parse_type()?)} else { yield None };
+                    params.push(Param { name, ty, span: p_span });
+                    self.eat(TokenKind::Comma);
+                }
+                self.expect(TokenKind::BitOr)?;
+                let return_ty = check self.eat(TokenKind::Arrow) { yield Some(self.parse_type()?)} else { yield None };
+                let body = self.parse_expr()?;
+                Ok(Expr::Lambda(LambdaExpr { params, return_ty, body: Box::new(body), span }));
+            }
+
+            // check ifadesi
+            TokenKind::Check => {
+                self.advance();
+                let cond = self.parse_expr()?;
+                let then = self.parse_block()?;
+                let els  = check self.eat(TokenKind::Else) {
+                    Some(Box::new(Expr::Block(self.parse_block()?)))
+                } else { yield None };
+                Ok(Expr::Check(CheckExpr {
+                    cond: Box::new(cond),
+                    then: Box::new(Expr::Block(then)),
+                    els, span,
+                }));
+            }
+
+            // match ifadesi
+            TokenKind::Match => {
+                self.advance();
+                let value = self.parse_expr()?;
+                self.expect(TokenKind::LBrace)?;
+                var arms = [];
+                while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                    let a_span   = self.cur_span();
+                    let pattern  = self.parse_pattern()?;
+                    let guard    = check self.eat(TokenKind::Check) {
+                        Some(Box::new(self.parse_expr()?))
+                    } else { yield None };
+                    self.expect(TokenKind::FatArrow)?;
+                    let body = self.parse_expr()?;
+                    self.eat(TokenKind::Comma);
+                    arms.push(MatchArm { pattern, guard, body: Box::new(body), span: a_span });
+                }
+                self.expect(TokenKind::RBrace)?;
+                Ok(Expr::Match(MatchExpr { value: Box::new(value), arms, span }));
+            }
+
+            // each döngüsü
+            TokenKind::Each => {
+                self.advance();
+                var_name = self.expect(TokenKind::Ident)?.lexeme;
+                self.expect(TokenKind::In)?;
+                let iterable = self.parse_expr()?;
+                let body     = self.parse_block()?;
+                Ok(Expr::Each(EachExpr { var: var_name, iterable: Box::new(iterable), body, span }));
+            }
+
+            // while döngüsü
+            TokenKind::While => {
+                self.advance();
+                let cond = self.parse_expr()?;
+                let body = self.parse_block()?;
+                Ok(Expr::While(WhileExpr { cond: Box::new(cond), body, span }));
+            }
+
+            // loop
+            TokenKind::Loop => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Expr::Loop(LoopExpr { body, span }));
+            }
+
+            // try { } catch e { }
+            TokenKind::Try => {
+                self.advance();
+                let body     = self.parse_block()?;
+                self.expect(TokenKind::Catch)?;
+                let err_var  = self.expect(TokenKind::Ident)?.lexeme;
+                let handler  = self.parse_block()?;
+                Ok(Expr::Catch(CatchExpr { body, err_var, handler, span }));
+            }
+
+            // YENİ: Matematik operatörleri
+            TokenKind::Grad | TokenKind::Diff | TokenKind::Integral
+            | TokenKind::Sum | TokenKind::Prod | TokenKind::Limit | TokenKind::Solve => {
+                let op = match self.advance().kind {
+                    TokenKind::Grad     => MathOp::Grad,
+                    TokenKind::Diff     => MathOp::Diff,
+                    TokenKind::Integral => MathOp::Integral,
+                    TokenKind::Sum      => MathOp::Sum,
+                    TokenKind::Prod     => MathOp::Prod,
+                    TokenKind::Limit    => MathOp::Limit,
+                    _                   => MathOp::Solve,
+                };
+                self.expect(TokenKind::LParen)?;
+                var args = [];
+                var wrt: Option<Box<Expr>> = None;
+                // grad(f, x) → f=args[0], x=wrt
+                while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                    args.push(self.parse_expr()?);
+                    self.eat(TokenKind::Comma);
+                }
+                self.expect(TokenKind::RParen)?;
+                // Eğer 2. argüman varsa, o `wrt`'dir
+                check args.len() >= 2 {
+                    wrt = Some(Box::new(args.remove(1)));
+                }
+                Ok(Expr::Math(MathExpr { op, args, wrt, bounds: None, span }));
+            }
+
+            // YENİ: Flow yapıcılar
+            TokenKind::Ident check self.cur().lexeme == "signal" => {
+                self.advance();
+                self.expect(TokenKind::LParen)?;
+                let init = self.parse_expr()?;
+                self.expect(TokenKind::RParen)?;
+                Ok(Expr::FlowExpr(FlowConstruct::Signal(Box::new(init))));
+            }
+            TokenKind::Ident check self.cur().lexeme == "stream" => {
+                self.advance();
+                self.expect(TokenKind::LParen)?;
+                let source = self.parse_expr()?;
+                self.expect(TokenKind::RParen)?;
+                Ok(Expr::FlowExpr(FlowConstruct::Stream(Box::new(source))));
+            }
+            TokenKind::Spawn => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Expr::FlowExpr(FlowConstruct::Spawn(body)));
+            }
+
+            // assert
+            TokenKind::Assert => {
+                self.advance();
+                self.expect(TokenKind::LParen)?;
+                let cond = self.parse_expr()?;
+                let msg  = check self.eat(TokenKind::Comma) { yield Some(Box::new(self.parse_expr()?))} else { yield None };
+                self.expect(TokenKind::RParen)?;
+                Ok(Expr::Assert(Box::new(cond), msg));
+            }
+
+            // YENİ: Tensor inşası:  tensor<f32>[32, 512] { zeros }
+            TokenKind::Tensor => {
+                self.advance();
+                self.expect(TokenKind::Lt)?;
+                let dtype = self.parse_type()?;
+                self.expect(TokenKind::Gt)?;
+                let dims = self.parse_tensor_dims()?;
+                let init = check self.at(TokenKind::LBrace) {
+                    self.advance();
+                    let kind_str = self.expect(TokenKind::Ident)?.lexeme;
+                    let init_kind = match kind_str.as_str() {
+                        "zeros" => TensorInit::Zeros,
+                        "ones"  => TensorInit::Ones,
+                        _       => TensorInit::Zeros,
+                    };
+                    self.expect(TokenKind::RBrace)?;
+                    init_kind
+                } else { TensorInit::Zeros };
+                Ok(Expr::TensorInit(TensorInitExpr { dtype, dims, init, span }));
+            }
+
+            // Tanımlayıcı veya path
+            TokenKind::Ident => {
+                let name = self.advance().lexeme;
+                // Path: a::b::c
+                check self.at(TokenKind::ColonColon) {
+                    var segments = [name];
+                    while self.eat(TokenKind::ColonColon) {
+                        segments.push(self.expect(TokenKind::Ident)?.lexeme);
+                    }
+                    Ok(Expr::Path(PathExpr { segments, span }));
+                }
+                // Record inşası: Name { field: val }
+                check self.at(TokenKind::LBrace) && name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                    self.advance();
+                    var fields = [];
+                    while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                        let f_name = self.expect(TokenKind::Ident)?.lexeme;
+                        self.expect(TokenKind::Colon)?;
+                        let f_val  = self.parse_expr()?;
+                        fields.push((f_name, f_val));
+                        self.eat(TokenKind::Comma);
+                    }
+                    self.expect(TokenKind::RBrace)?;
+                    Ok(Expr::Record(RecordExpr { name: Some(name), fields, span }));
+                }
+                Ok(Expr::Ident(IdentExpr { name, span }));
+            }
+
+            _ => yield Err(self.err(&format("Beklenmeyen token: {:?}", self.cur().kind))),
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // §6  PATERN PARSE
+    // ══════════════════════════════════════════════════════════════════════════
+
+    open fn parse_pattern(&var self) -> Result<Pattern, ParseError> {
+        var patterns = [self.parse_pattern_single()?];
+        while self.eat(TokenKind::BitOr) {
+            patterns.push(self.parse_pattern_single()?);
+        }
+        check patterns.len() == 1 { yield Ok(patterns.remove(0)); }
+        Ok(Pattern::Or(patterns));
+    }
+
+    open fn parse_pattern_single(&var self) -> Result<Pattern, ParseError> {
+        match self.cur().kind {
+
+            // Wildcard: _
+            TokenKind::Underscore => { self.advance(); yield Ok(Pattern::Wildcard); }
+
+            // Rest: ..
+            TokenKind::DotDot => { self.advance(); yield Ok(Pattern::Rest); }
+
+            // Literal: sayı, string, bool
+            TokenKind::LitInt | TokenKind::LitFloat | TokenKind::LitStr
+            | TokenKind::LitTrue | TokenKind::LitFalse => {
+                Ok(Pattern::Lit(Box::new(self.parse_primary()?)));
+            }
+
+            // Tuple: (a, b, c)
+            TokenKind::LParen => {
+                self.advance();
+                var pats = [];
+                while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                    pats.push(self.parse_pattern()?);
+                    self.eat(TokenKind::Comma);
+                }
+                self.expect(TokenKind::RParen)?;
+                Ok(Pattern::Tuple(pats));
+            }
+
+            // Array: [head, ..tail]
+            TokenKind::LBrack => {
+                self.advance();
+                var pats = [];
+                while !self.at(TokenKind::RBrack) && !self.at(TokenKind::Eof) {
+                    pats.push(self.parse_pattern()?);
+                    self.eat(TokenKind::Comma);
+                }
+                self.expect(TokenKind::RBrack)?;
+                Ok(Pattern::Array(pats));
+            }
+
+            // Tanımlayıcı: bağlama veya varyant
+            TokenKind::Ident => {
+                let name = self.advance().lexeme;
+                // Büyük harf → varyant veya record
+                check name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                    check self.at(TokenKind::LBrace) {
+                        // Record pattern: Point { x: px, y: py }
+                        self.advance();
+                        var fields = [];
+                        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                            let f_name = self.expect(TokenKind::Ident)?.lexeme;
+                            self.expect(TokenKind::Colon)?;
+                            let f_pat  = self.parse_pattern()?;
+                            fields.push((f_name, f_pat));
+                            self.eat(TokenKind::Comma);
+                        }
+                        self.expect(TokenKind::RBrace)?;
+                        Ok(Pattern::Record(name, fields));
+                    }
+                    check self.at(TokenKind::LParen) {
+                        // Tuple varyant: Some(x)
+                        self.advance();
+                        var pats = [];
+                        while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                            pats.push(self.parse_pattern()?);
+                            self.eat(TokenKind::Comma);
+                        }
+                        self.expect(TokenKind::RParen)?;
+                        Ok(Pattern::Variant(name, pats));
+                    }
+                    Ok(Pattern::Variant(name, []));
+                }
+                Ok(Pattern::Bind(name));
+            }
+
+            _ => yield Err(self.err("Geçersiz örüntü")),
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §7  GİRİŞ NOKTASI
+// ══════════════════════════════════════════════════════════════════════════════
+
+open fn parse(tokens: Vec<Token>) -> Result<Program, ParseError> {
+    Parser::new(tokens).parse()
+}

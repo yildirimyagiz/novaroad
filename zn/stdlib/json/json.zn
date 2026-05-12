@@ -1,0 +1,465 @@
+// Nova Standard Library - JSON Module
+// JSON parsing and serialization
+
+import memory
+import system
+
+// ============================================================================
+// JSON VALUE TYPES
+// ============================================================================
+
+open cases JsonValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(str),
+    Array(list<JsonValue>),
+    Object(map<str, JsonValue>)
+}
+
+// ============================================================================
+// JSON PARSING
+// ============================================================================
+
+open data JsonParser {
+    input: str
+    position: usize
+}
+
+impl JsonParser {
+    fn new(input: str) -> JsonParser {
+        JsonParser {
+            input: input,
+            position: 0
+        }
+    }
+
+    fn parse(var self) -> Result<JsonValue> {
+        self.skip_whitespace()
+        let result = self.parse_value()
+        self.skip_whitespace()
+
+        check self.position < self.input.len() {
+            Err("Unexpected characters after JSON value")
+        }
+
+        result
+    }
+
+    fn parse_value(var self) -> Result<JsonValue> {
+        check self.position >= self.input.len() {
+            Err("Unexpected end of input")
+        }
+
+        let ch = self.input.chars().nth(self.position).unwrap()
+
+        match ch {
+            'n' => self.parse_null(),
+            't' | 'f' => self.parse_bool(),
+            '"' => self.parse_string(),
+            '0'..='9' | '-' => self.parse_number(),
+            '[' => self.parse_array(),
+            '{' => self.parse_object(),
+            _ => Err(format("Unexpected character: {}", ch))
+        }
+    }
+
+    fn parse_null(var self) -> Result<JsonValue> {
+        check self.input[self.position..].starts_with("null") {
+            self.position += 4
+            Ok(JsonValue::Null)
+        } else {
+            Err("Expected 'null'")
+        }
+    }
+
+    fn parse_bool(var self) -> Result<JsonValue> {
+        check self.input[self.position..].starts_with("true") {
+            self.position += 4
+            Ok(JsonValue::Bool(true))
+        } else check self.input[self.position..].starts_with("false") {
+            self.position += 5
+            Ok(JsonValue::Bool(false))
+        } else {
+            Err("Expected 'true' or 'false'")
+        }
+    }
+
+    fn parse_number(var self) -> Result<JsonValue> {
+        let start = self.position
+        var has_dot = false
+
+        while self.position < self.input.len() {
+            let ch = self.input.chars().nth(self.position).unwrap()
+            check ch.is_digit(10) || ch == '-' || ch == '+' || ch == 'e' || ch == 'E' {
+                self.position += 1
+            } else check ch == '.' && !has_dot {
+                has_dot = true
+                self.position += 1
+            } else {
+                break
+            }
+        }
+
+        let num_str = &self.input[start..self.position]
+        match num_str.parse::<f64>() {
+            Ok(num) => Ok(JsonValue::Number(num)),
+            Err(_) => Err(format("Invalid number: {}", num_str))
+        }
+    }
+
+    fn parse_string(var self) -> Result<JsonValue> {
+        self.position += 1 // Skip opening quote
+        let start = self.position
+
+        while self.position < self.input.len() {
+            let ch = self.input.chars().nth(self.position).unwrap()
+            check ch == '"' {
+                let result = self.input[start..self.position].into()
+                self.position += 1
+                Ok(JsonValue::String(result))
+            } else check ch == '\\' {
+                // Handle escape sequences
+                self.position += 2 // Skip \ and next char
+            } else {
+                self.position += 1
+            }
+        }
+
+        Err("Unterminated string")
+    }
+
+    fn parse_array(var self) -> Result<JsonValue> {
+        self.position += 1 // Skip [
+        var array = list::new()
+
+        self.skip_whitespace()
+        check self.peek() == ']' {
+            self.position += 1
+            Ok(JsonValue::Array(array))
+        }
+
+        loop {
+            let value = self.parse_value()?
+            array.push(value)
+
+            self.skip_whitespace()
+            let ch = self.peek()
+            check ch == ',' {
+                self.position += 1
+                self.skip_whitespace()
+            } else check ch == ']' {
+                self.position += 1
+                break
+            } else {
+                Err("Expected ',' or ']' in array")
+            }
+        }
+
+        Ok(JsonValue::Array(array))
+    }
+
+    fn parse_object(var self) -> Result<JsonValue> {
+        self.position += 1 // Skip {
+        var object = map::new()
+
+        self.skip_whitespace()
+        check self.peek() == '}' {
+            self.position += 1
+            Ok(JsonValue::Object(object))
+        }
+
+        loop {
+            // Parse key
+            self.skip_whitespace()
+            check self.peek() != '"' {
+                Err("Expected string key in object")
+            }
+
+            let key_value = self.parse_string()?
+            let key = match key_value {
+                JsonValue::String(s) => s,
+                _ => yield Err("Object key must be string")
+            }
+
+            self.skip_whitespace()
+            check self.peek() != ':' {
+                Err("Expected ':' after object key")
+            }
+            self.position += 1
+
+            // Parse value
+            let value = self.parse_value()?
+            object.insert(key, value)
+
+            self.skip_whitespace()
+            let ch = self.peek()
+            check ch == ',' {
+                self.position += 1
+                self.skip_whitespace()
+            } else check ch == '}' {
+                self.position += 1
+                break
+            } else {
+                Err("Expected ',' or '}' in object")
+            }
+        }
+
+        Ok(JsonValue::Object(object))
+    }
+
+    fn skip_whitespace(var self) {
+        while self.position < self.input.len() {
+            let ch = self.input.chars().nth(self.position).unwrap()
+            check ch.is_whitespace() {
+                self.position += 1
+            } else {
+                break
+            }
+        }
+    }
+
+    fn peek(self) -> char {
+        check self.position < self.input.len() {
+            self.input.chars().nth(self.position).unwrap()
+        } else {
+            '\0'
+        }
+    }
+}
+
+// ============================================================================
+// JSON SERIALIZATION
+// ============================================================================
+
+open data JsonSerializer {
+    indent: i32
+    current_indent: i32
+}
+
+impl JsonSerializer {
+    fn new() -> JsonSerializer {
+        JsonSerializer {
+            indent: 0,
+            current_indent: 0
+        }
+    }
+
+    fn pretty(var self) -> JsonSerializer {
+        self.indent = 2
+        self
+    }
+
+    fn serialize(self, value: JsonValue) -> str {
+        self.serialize_value(value, 0)
+    }
+
+    fn serialize_value(self, value: JsonValue, depth: i32) -> str {
+        match value {
+            JsonValue::Null => "null".into(),
+            JsonValue::Bool(b) => check b { "true" } else { "false" }.into(),
+            JsonValue::Number(n) => format("{}", n),
+            JsonValue::String(s) => format("\"{}\"", self.escape_string(s)),
+            JsonValue::Array(arr) => self.serialize_array(arr, depth),
+            JsonValue::Object(obj) => self.serialize_object(obj, depth)
+        }
+    }
+
+    fn serialize_array(self, arr: list<JsonValue>, depth: i32) -> str {
+        check arr.is_empty() {
+            yield "[]".into()
+        }
+
+        var result = "[".into()
+
+        check self.indent > 0 {
+            result.push_str("\n")
+            let indent_str = " ".repeat((depth + 1) * self.indent)
+            result.push_str(&indent_str)
+        }
+
+        each entry in arr.iter().enumerate()  { let (i, item) = entry;
+            check i > 0 {
+                result.push_str(",")
+                check self.indent > 0 {
+                    result.push_str("\n")
+                    let indent_str = " ".repeat((depth + 1) * self.indent)
+                    result.push_str(&indent_str)
+                } else {
+                    result.push_str(" ")
+                }
+            }
+            result.push_str(&self.serialize_value(item.clone(), depth + 1))
+        }
+
+        check self.indent > 0 {
+            result.push_str("\n")
+            let indent_str = " ".repeat(depth * self.indent)
+            result.push_str(&indent_str)
+        }
+
+        result.push_str("]")
+        result
+    }
+
+    fn serialize_object(self, obj: map<str, JsonValue>, depth: i32) -> str {
+        check obj.is_empty() {
+            yield "{}".into()
+        }
+
+        var result = "{".into()
+
+        check self.indent > 0 {
+            result.push_str("\n")
+            let indent_str = " ".repeat((depth + 1) * self.indent)
+            result.push_str(&indent_str)
+        }
+
+        var first = true
+        each entry in obj.iter()  { let (key, value) = entry;
+            check !first {
+                result.push_str(",")
+            }
+
+            check self.indent > 0 {
+                check !first {
+                    result.push_str("\n")
+                    let indent_str = " ".repeat((depth + 1) * self.indent)
+                    result.push_str(&indent_str)
+                }
+            } else check !first {
+                result.push_str(" ")
+            }
+
+            result.push_str(&format("\"{}\":{}", self.escape_string(key), self.serialize_value(value.clone(), depth + 1)))
+            first = false
+        }
+
+        check self.indent > 0 {
+            result.push_str("\n")
+            let indent_str = " ".repeat(depth * self.indent)
+            result.push_str(&indent_str)
+        }
+
+        result.push_str("}")
+        result
+    }
+
+    fn escape_string(self, s: str) -> str {
+        // Basic string escaping
+        s.replace("\\", "\\\\")
+         .replace("\"", "\\\"")
+         .replace("\n", "\\n")
+         .replace("\r", "\\r")
+         .replace("\t", "\\t")
+    }
+}
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+open fn parse(json_str: str) -> Result<JsonValue> {
+    let parser = JsonParser::new(json_str)
+    parser.parse()
+}
+
+open fn serialize(value: JsonValue) -> str {
+    JsonSerializer::new().serialize(value)
+}
+
+open fn serialize_pretty(value: JsonValue) -> str {
+    JsonSerializer::new().pretty().serialize(value)
+}
+
+// Type conversion helpers
+open fn to_bool(value: JsonValue) -> Result<bool> {
+    match value {
+        JsonValue::Bool(b) => Ok(b),
+        _ => Err("Value is not a boolean")
+    }
+}
+
+open fn to_number(value: JsonValue) -> Result<f64> {
+    match value {
+        JsonValue::Number(n) => Ok(n),
+        _ => Err("Value is not a number")
+    }
+}
+
+open fn to_string(value: JsonValue) -> Result<str> {
+    match value {
+        JsonValue::String(s) => Ok(s),
+        _ => Err("Value is not a string")
+    }
+}
+
+open fn to_array(value: JsonValue) -> Result<list<JsonValue>> {
+    match value {
+        JsonValue::Array(arr) => Ok(arr),
+        _ => Err("Value is not an array")
+    }
+}
+
+open fn to_object(value: JsonValue) -> Result<map<str, JsonValue>> {
+    match value {
+        JsonValue::Object(obj) => Ok(obj),
+        _ => Err("Value is not an object")
+    }
+}
+
+// ============================================================================
+// EXAMPLE USAGE
+// ============================================================================
+
+/*
+fn main() {
+    // PARSING JSON
+    let json_str = "{
+        \"name\": \"Alice\",
+        \"age\": 30,
+        \"hobbies\": [\"reading\", \"coding\"],
+        \"active\": true
+    }"
+
+    match json::parse(json_str) {
+        Ok(data) => {
+            println("Parsed successfully!")
+
+            // Access object fields
+            check let Ok(obj) = json::to_object(data) {
+                check let Some(name_val) = obj.get("name") {
+                    check let Ok(name) = json::to_string(name_val.clone()) {
+                        println("Name: {}", name)
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            println("Parse error: {}", error)
+        }
+    }
+
+    // CREATING AND SERIALIZING JSON
+    var person = map::new()
+    person.insert("name", JsonValue::String("Bob"))
+    person.insert("age", JsonValue::Number(25.0))
+    person.insert("active", JsonValue::Bool(true))
+
+    let hobbies = list::from([
+        JsonValue::String("gaming"),
+        JsonValue::String("music")
+    ])
+    person.insert("hobbies", JsonValue::Array(hobbies))
+
+    let person_json = JsonValue::Object(person)
+
+    // Compact serialization
+    let compact = json::serialize(person_json.clone())
+    println("Compact: {}", compact)
+
+    // Pretty serialization
+    let pretty = json::serialize_pretty(person_json)
+    println("Pretty:\n{}", pretty)
+}
+*/

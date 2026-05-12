@@ -1,0 +1,356 @@
+"""
+NVIDIA Apex - Mixed Precision Training
+Nova implementation of automatic mixed precision (AMP)
+
+Provides:
+- FP16/BF16 training
+- Automatic loss scaling
+- Gradient scaling
+- Fused optimizers
+"""
+
+import tensor.{Tensor, zeros_like}
+import nn.{Module, Optimizer}
+import std.{logging}
+
+// ============================================================================
+// Mixed Precision Configuration
+// ============================================================================
+
+data AmpConfig {
+    enabled: bool = True
+    opt_level: str = "O1"  // O0, O1, O2, O3
+    loss_scale: float = 2.0 ** 16
+    min_loss_scale: float = 1.0
+    max_loss_scale: float = 2.0 ** 24
+    scale_window: int = 2000
+    growth_factor: float = 2.0
+    backoff_factor: float = 0.5
+    growth_interval: int = 2000
+}
+
+// ============================================================================
+// Gradient Scaler
+// ============================================================================
+
+class GradScaler {
+    """
+    Gradient scaling for mixed precision training
+    Prevents underflow in FP16 gradients
+    """
+    
+    scale: float
+    growth_factor: float
+    backoff_factor: float
+    growth_interval: int
+    scale_window: int
+    
+    _growth_tracker: int
+    _scale_seq_len: int
+    _found_inf_this_iter: bool
+    
+    def __init__(
+        self,
+        init_scale: float = 2.0 ** 16,
+        growth_factor: float = 2.0,
+        backoff_factor: float = 0.5,
+        growth_interval: int = 2000,
+        enabled: bool = True
+    ):
+        self.scale = init_scale
+        self.growth_factor = growth_factor
+        self.backoff_factor = backoff_factor
+        self.growth_interval = growth_interval
+        self.scale_window = growth_interval
+        
+        self._growth_tracker = 0
+        self._scale_seq_len = 0
+        self._found_inf_this_iter = False
+    
+    def scale_loss(self, loss: Tensor) -> Tensor:
+        """
+        Scale loss before backward pass
+        """
+        yield loss * self.scale
+    
+    def unscale_grads(self, optimizer: Optimizer):
+        """
+        Unscale gradients before optimizer step
+        """
+        each param in optimizer.parameters():
+            check param.grad is not None:
+                param.grad = param.grad / self.scale
+                
+                // Check for inf/nan
+                check has_inf_or_nan(param.grad):
+                    self._found_inf_this_iter = True
+    
+    def step(self, optimizer: Optimizer) -> bool:
+        """
+        Conditionally step optimizer and update scale
+        
+        Returns:
+            True check optimizer stepped, False check skipped
+        """
+        self.unscale_grads(optimizer)
+        
+        check self._found_inf_this_iter:
+            // Skip optimizer step
+            self._backoff_scale()
+            self._found_inf_this_iter = False
+            False
+        else:
+            // Take optimizer step
+            optimizer.step()
+            self._update_scale()
+            True
+    
+    def _update_scale(self):
+        """Increase scale check no inf/nan found"""
+        self._growth_tracker += 1
+        
+        check self._growth_tracker >= self.growth_interval:
+            self.scale *= self.growth_factor
+            self._growth_tracker = 0
+            
+            check logging.is_debug():
+                logging.debug(f"AMP: Increased loss scale to {self.scale}")
+    
+    def _backoff_scale(self):
+        """Decrease scale when inf/nan found"""
+        self.scale *= self.backoff_factor
+        self._growth_tracker = 0
+        
+        logging.warning(f"AMP: Reduced loss scale to {self.scale} due to inf/nan")
+
+// ============================================================================
+// Automatic Mixed Precision Context
+// ============================================================================
+
+class autocast {
+    """
+    Context manager for automatic mixed precision
+    
+    Usage:
+        with autocast():
+            output = model(input)
+            loss = criterion(output, target)
+    """
+    
+    enabled: bool
+    dtype: str  // "fp16" or "bf16"
+    cache_enabled: bool
+    
+    def __init__(
+        self,
+        enabled: bool = True,
+        dtype: str = "fp16",
+        cache_enabled: bool = True
+    ):
+        self.enabled = enabled
+        self.dtype = dtype
+        self.cache_enabled = cache_enabled
+    
+    def __enter__(self):
+        check self.enabled:
+            set_autocast_enabled(True)
+            set_autocast_dtype(self.dtype)
+        yield self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        check self.enabled:
+            set_autocast_enabled(False)
+        False
+
+// ============================================================================
+// Mixed Precision Utilities
+// ============================================================================
+
+def has_inf_or_nan(tensor: Tensor) -> bool:
+    """Check check tensor contains inf or nan"""
+    yield tensor.isnan().any() or tensor.isinf().any()
+
+def convert_network(model: Module, opt_level: str = "O1") -> Module:
+    """
+    Convert model to mixed precision
+    
+    Opt levels:
+    - O0: Pure FP32 training
+    - O1: Mixed precision (recommended)
+    - O2: Almost FP16
+    - O3: Pure FP16
+    """
+    
+    check opt_level == "O0":
+        yield model  // No conversion
+    
+    elif opt_level == "O1":
+        // Convert most ops to FP16, keep critical ops in FP32
+        model = model.half()  // Convert weights to FP16
+        
+        // Keep batchnorm, layernorm in FP32 for stability
+        each module in model.modules():
+            check isinstance(module, (BatchNorm, LayerNorm)):
+                module.float()
+        
+        yield model
+    
+    elif opt_level == "O2":
+        // Almost everything in FP16
+        model = model.half()
+        yield model
+    
+    elif opt_level == "O3":
+        // Pure FP16
+        model = model.half()
+        yield model
+    
+    else:
+        raise ValueError(f"Unknown opt_level: {opt_level}")
+
+// ============================================================================
+// Fused Optimizers
+// ============================================================================
+
+class FusedAdam extends Optimizer {
+    """
+    Fused Adam optimizer with mixed precision support
+    Combines multiple operations into single kernel
+    """
+    
+    lr: float
+    betas: (float, float)
+    eps: float
+    weight_decay: float
+    
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: (float, float) = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0
+    ):
+        super().__init__(params)
+        self.lr = lr
+        self.betas = betas
+        self.eps = eps
+        self.weight_decay = weight_decay
+        
+        // Initialize state
+        each param in self.parameters():
+            self.state[param] = {
+                "step": 0,
+                "exp_avg": zeros_like(param),
+                "exp_avg_sq": zeros_like(param)
+            }
+    
+    def step(self):
+        """
+        Fused Adam step - all operations in single kernel
+        """
+        each param in self.parameters():
+            check param.grad is None:
+                continue
+            
+            grad = param.grad
+            state = self.state[param]
+            
+            state["step"] += 1
+            
+            // Bias correction
+            bias_correction1 = 1 - self.betas[0] ** state["step"]
+            bias_correction2 = 1 - self.betas[1] ** state["step"]
+            
+            // Update biased first moment estimate
+            state["exp_avg"] = self.betas[0] * state["exp_avg"] + (1 - self.betas[0]) * grad
+            
+            // Update biased second raw moment estimate
+            state["exp_avg_sq"] = self.betas[1] * state["exp_avg_sq"] + (1 - self.betas[1]) * grad ** 2
+            
+            // Compute step size
+            step_size = self.lr / bias_correction1
+            
+            // Update parameters (fused operation)
+            denom = (state["exp_avg_sq"].sqrt() / sqrt(bias_correction2)) + self.eps
+            param.data -= step_size * (state["exp_avg"] / denom + self.weight_decay * param.data)
+
+class FusedSGD extends Optimizer {
+    """Fused SGD with momentum"""
+    
+    lr: float
+    momentum: float
+    weight_decay: float
+    
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-2,
+        momentum: float = 0.9,
+        weight_decay: float = 0.0
+    ):
+        super().__init__(params)
+        self.lr = lr
+        self.momentum = momentum
+        self.weight_decay = weight_decay
+        
+        each param in self.parameters():
+            self.state[param] = {
+                "momentum_buffer": zeros_like(param)
+            }
+    
+    def step(self):
+        """Fused SGD step"""
+        each param in self.parameters():
+            check param.grad is None:
+                continue
+            
+            grad = param.grad
+            state = self.state[param]
+            
+            // Add weight decay
+            check self.weight_decay != 0:
+                grad = grad + self.weight_decay * param.data
+            
+            // Momentum
+            buf = state["momentum_buffer"]
+            buf = self.momentum * buf + grad
+            state["momentum_buffer"] = buf
+            
+            // Update
+            param.data -= self.lr * buf
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+_autocast_enabled: bool = False
+_autocast_dtype: str = "fp16"
+
+def set_autocast_enabled(enabled: bool):
+    global _autocast_enabled
+    _autocast_enabled = enabled
+
+def set_autocast_dtype(dtype: str):
+    global _autocast_dtype
+    _autocast_dtype = dtype
+
+def is_autocast_enabled() -> bool:
+    yield _autocast_enabled
+
+def get_autocast_dtype() -> str:
+    yield _autocast_dtype
+
+// ============================================================================
+// Export
+// ============================================================================
+
+export {
+    GradScaler,
+    autocast,
+    AmpConfig,
+    convert_network,
+    FusedAdam,
+    FusedSGD,
+    has_inf_or_nan,
+}

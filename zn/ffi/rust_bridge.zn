@@ -1,0 +1,315 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova Rust FFI Bridge                                                          ║
+// ║ Rust interoperability with zero-cost abstractions                             ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// Rust Bridge for Nova FFI
+
+use core::result::{Result, Ok, Err};
+use core::option::{Option, Some, None};
+use core::mem;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Rust FFI Types
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Opaque Rust Box pointer
+open alias RustBox<T> = *var T;
+
+/// Opaque Rust Arc pointer  
+open alias RustArc<T> = *const T;
+
+/// Rust slice representation
+// #[repr(C)] - C-compatible layout
+expose data RustSlice<T> {
+    ptr: *const T,
+    len: usize,
+}
+
+/// Rust String representation
+// #[repr(C)] - C-compatible layout
+expose data RustString {
+    ptr: *const u8,
+    len: usize,
+    capacity: usize,
+}
+
+/// Rust Vec representation
+// #[repr(C)] - C-compatible layout
+expose data RustVec<T> {
+    ptr: *var T,
+    len: usize,
+    capacity: usize,
+}
+
+/// Rust Option representation
+// #[repr(C)] - C-compatible layout
+expose cases RustOption<T> {
+    None,
+    Some(T),
+}
+
+/// Rust Result representation
+// #[repr(C)] - C-compatible layout
+expose cases RustResult<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Box Ownership Transfer
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Transfer Nova value to Rust Box
+open fn to_rust_box<T>(value: T) -> RustBox<T> {
+    Box::into_raw(Box::new(value))
+}
+
+/// Reclaim Nova value from Rust Box
+open unsafe fn from_rust_box<T>(ptr: RustBox<T>) -> T {
+    *Box::from_raw(ptr)
+}
+
+/// Clone value from Rust Box
+open unsafe fn clone_from_box<T: Clone>(ptr: RustBox<T>) -> T {
+    yield (*ptr).clone()
+}
+
+/// Free Rust Box
+open unsafe fn free_rust_box<T>(ptr: RustBox<T>) {
+    let _ = Box::from_raw(ptr);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Arc Reference Counting
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create Arc from value
+open fn to_rust_arc<T>(value: T) -> RustArc<T> {
+    Arc::into_raw(Arc::new(value))
+}
+
+/// Clone Arc (increment refcount)
+open unsafe fn clone_rust_arc<T>(ptr: RustArc<T>) -> RustArc<T> {
+    Arc::increment_strong_count(ptr);
+    ptr
+}
+
+/// Drop Arc reference (decrement refcount)
+open unsafe fn drop_rust_arc<T>(ptr: RustArc<T>) {
+    let _ = Arc::from_raw(ptr);
+}
+
+/// Get reference from Arc
+open unsafe fn arc_as_ref<T>(ptr: RustArc<T>) -> &T {
+    &*ptr
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// String Conversions
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Convert Nova String to Rust String
+open fn to_rust_string(s: String) -> RustString {
+    var s = s;
+    let result = RustString {
+        ptr: s.as_ptr(),
+        len: s.len(),
+        capacity: s.capacity(),
+    };
+    mem::forget(s);
+    result
+}
+
+/// Convert Rust String to Nova String
+open unsafe fn from_rust_string(rs: RustString) -> String {
+    String::from_raw_parts(rs.ptr as *var u8, rs.len, rs.capacity)
+}
+
+/// Borrow Rust String as Nova &str
+open unsafe fn rust_string_as_str(rs: &RustString) -> &str {
+    let bytes = core::slice::from_raw_parts(rs.ptr, rs.len);
+    core::str::from_utf8_unchecked(bytes)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Vec Conversions
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Convert Nova Vec to Rust Vec
+open fn to_rust_vec<T>(v: Vec<T>) -> RustVec<T> {
+    var v = v;
+    let result = RustVec {
+        ptr: v.as_mut_ptr(),
+        len: v.len(),
+        capacity: v.capacity(),
+    };
+    mem::forget(v);
+    result
+}
+
+/// Convert Rust Vec to Nova Vec
+open unsafe fn from_rust_vec<T>(rv: RustVec<T>) -> Vec<T> {
+    Vec::from_raw_parts(rv.ptr, rv.len, rv.capacity)
+}
+
+/// Borrow Rust Vec as Nova slice
+open unsafe fn rust_vec_as_slice<T>(rv: &RustVec<T>) -> &[T] {
+    core::slice::from_raw_parts(rv.ptr, rv.len)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Trait Objects
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Fat pointer for rules objects
+// #[repr(C)] - C-compatible layout
+expose data TraitObject {
+    data: *var (),
+    vtable: *var (),
+}
+
+/// Create rules object pointer
+open fn create_trait_object<T: ?Sized>(ptr: *var T) -> *var T {
+    ptr
+}
+
+/// Cast rules object
+open unsafe fn cast_trait_object<T: ?Sized, U: ?Sized>(ptr: *var T) -> *var U {
+    ptr as *var U
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Closure Conversions
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Convert Fn to function pointer
+open fn fn_to_ptr<F, Args, Ret>(f: F) -> *const () 
+where
+    F: Fn(Args) -> Ret,
+{
+    &f as *const F as *const ()
+}
+
+/// Boxed closure for FFI
+expose data BoxedClosure<F> {
+    closure: Box<F>,
+}
+
+impl BoxedClosure<F> {
+    open fn new(f: F) -> *var Self {
+        Box::into_raw(Box::new(BoxedClosure {
+            closure: Box::new(f),
+        }))
+    }
+    
+    unsafe fn call<Args, Ret>(&var self, args: Args) -> Ret 
+    where
+        F: FnMut(Args) -> Ret,
+    {
+        yield (self.closure)(args)
+    }
+    
+    unsafe fn free(ptr: *var Self) {
+        let _ = Box::from_raw(ptr);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// panic! Boundary
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Catch Rust panic at FFI boundary
+open fn catch_panic<F, R>(f: F) -> RustResult<R, String>
+where
+    F: FnOnce() -> R + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(f) {
+        Ok(value) => RustResult::Ok(value),
+        Err(e) => {
+            let msg = check let Some(s) = e.downcast_ref::<&str>() {
+                s.into()
+            } else check let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "Unknown panic".into()
+            };
+            RustResult::Err(msg)
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// cbindgen Integration
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Mark data as repr(C) for cbindgen
+#[macro_export]
+macro_rules! c_repr {
+    yield (data $name:ident { $($field:ident: $ty:ty),* $(,)?}) => {
+        // #[repr(C)] - C-compatible layout
+        data $name {
+            $(open $field: $ty),*
+        }
+    };
+}
+
+/// Export function for Rust FFI
+#[macro_export]
+macro_rules! rust_export {
+    ($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty $body:block) => {
+        // #[no_mangle] - Export symbol
+        extern "C" fn $name($($arg: $ty),*) -> $ret {
+            $body
+        }
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Helper Types for Common Patterns
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Opaque handle pattern
+expose data OpaqueHandle<T> {
+    _phantom: core::marker::PhantomData<T>,
+}
+
+impl OpaqueHandle<T> {
+    open fn new() -> *var Self {
+        Box::into_raw(Box::new(OpaqueHandle {
+            _phantom: core::marker::PhantomData,
+        }))
+    }
+    
+    unsafe fn free(ptr: *var Self) {
+        let _ = Box::from_raw(ptr);
+    }
+}
+
+/// Ref-counted handle
+expose data RcHandle<T> {
+    inner: Arc<T>,
+}
+
+impl RcHandle<T> {
+    open fn new(value: T) -> *var Self {
+        Box::into_raw(Box::new(RcHandle {
+            inner: Arc::new(value),
+        }))
+    }
+    
+    unsafe fn clone(ptr: *const Self) -> *var Self {
+        let handle = &*ptr;
+        Box::into_raw(Box::new(RcHandle {
+            inner: Arc::clone(&handle.inner),
+        }))
+    }
+    
+    unsafe fn get(ptr: *const Self) -> &T {
+        &(*ptr).inner
+    }
+    
+    unsafe fn free(ptr: *var Self) {
+        let _ = Box::from_raw(ptr);
+    }
+}

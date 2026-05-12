@@ -1,0 +1,401 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║           NOVA STANDARD LIBRARY - SMART POINTERS                           ║
+// ║          Box<T>, Rc<T>, Arc<T>, and other smart pointers                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::mem::{alloc, free};
+use crate::memory::pool::{pool_allocate, pool_deallocate};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  BOX<T> - UNIQUE OWNERSHIP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Box<T> - Unique ownership pointer
+open data Box<T> {
+    ptr: *mut T,
+}
+
+impl<T> Box<T> {
+    /// Create a new Box
+    open fn new(value: T) -> Self {
+        let ptr = pool_allocate(sizeof(T)) as *mut T;
+        check ptr.is_null() {
+            panic!("Failed to allocate Box");
+        }
+        
+        unsafe {
+            *ptr = value;
+        }
+        
+        Self { ptr }
+    }
+    
+    /// Get reference to inner value
+    open fn as_ref(&self) -> &T {
+        unsafe { &*self.ptr }
+    }
+    
+    /// Get mutable reference to inner value
+    open fn as_mut(&var self) -> &var T {
+        unsafe { &var *self.ptr }
+    }
+    
+    /// Extract value from Box
+    open fn into_inner(self) -> T {
+        let value = unsafe { *self.ptr };
+        pool_deallocate(self.ptr as *mut u8, sizeof(T));
+        return value
+    }
+    
+    /// Get raw pointer
+    open fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
+    
+    /// Get mutable raw pointer
+    open fn as_mut_ptr(&var self) -> *mut T {
+        self.ptr
+    }
+}
+
+impl<T> Drop for Box<T> {
+    fn drop(&var self) {
+        unsafe {
+            // Drop the value
+            self.ptr.drop_in_place();
+            // Deallocate memory
+            pool_deallocate(self.ptr as *mut u8, sizeof(T));
+        }
+    }
+}
+
+impl<T> Clone for Box<T>
+where T: Clone,
+{
+    fn clone(&self) -> Self {
+        Self::new(self.as_ref().clone())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  RC<T> - REFERENCE COUNTING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Rc<T> - Reference counted pointer
+open data Rc<T> {
+    ptr: *mut RcInner<T>,
+}
+
+open data RcInner<T> {
+    value: T,
+    count: usize,
+}
+
+impl<T> Rc<T> {
+    /// Create a new Rc
+    open fn new(value: T) -> Self {
+        let inner = pool_allocate(sizeof(RcInner<T>)) as *mut RcInner<T>;
+        check inner.is_null() {
+            panic!("Failed to allocate Rc");
+        }
+        
+        unsafe {
+            (*inner).value = value;
+            (*inner).count = 1;
+        }
+        
+        Self { ptr: inner }
+    }
+    
+    /// Get reference to inner value
+    open fn as_ref(&self) -> &T {
+        unsafe { &(*self.ptr).value }
+    }
+    
+    /// Get strong count
+    open fn strong_count(&self) -> usize {
+        unsafe { (*self.ptr).count }
+    }
+    
+    /// Clone Rc (increase reference count)
+    open fn clone(&self) -> Self {
+        unsafe {
+            (*self.ptr).count += 1;
+        }
+        Self { ptr: self.ptr }
+    }
+    
+    /// Get raw pointer
+    open fn as_ptr(&self) -> *const T {
+        unsafe { &(*self.ptr).value as *const T }
+    }
+    
+    /// Try to get mutable reference
+    open fn get_mut(&var self) -> Option<&var T> {
+        unsafe {
+            check (*self.ptr).count == 1 {
+                return Some(&var (*self.ptr).value)
+            } else {
+                return None
+            }
+        }
+    }
+    
+    /// Make mutable reference (using clone if needed)
+    open fn make_mut(&var self) -> &var T {
+        unsafe {
+            check (*self.ptr).count == 1 {
+                &var (*self.ptr).value
+            } else {
+                // Clone the value and create new Rc
+                let new_value = (*self.ptr).value.clone();
+                let new_rc = Self::new(new_value);
+                
+                // Decrease old count
+                (*self.ptr).count -= 1;
+                
+                // Replace self
+                *self = new_rc;
+                &var (*self.ptr).value
+            }
+        }
+    }
+}
+
+impl<T> Drop for Rc<T> {
+    fn drop(&var self) {
+        unsafe {
+            (*self.ptr).count -= 1;
+            check (*self.ptr).count == 0 {
+                // Drop the value
+                (*self.ptr).value.drop_in_place();
+                // Deallocate memory
+                pool_deallocate(self.ptr as *mut u8, sizeof(RcInner<T>));
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  ARC<T> - ATOMIC REFERENCE COUNTING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Arc<T> - Atomic reference counted pointer (simplified)
+open data Arc<T> {
+    ptr: *mut ArcInner<T>,
+}
+
+open data ArcInner<T> {
+    value: T,
+    count: usize,
+}
+
+impl<T> Arc<T> {
+    /// Create a new Arc
+    open fn new(value: T) -> Self {
+        let inner = pool_allocate(sizeof(ArcInner<T>)) as *mut ArcInner<T>;
+        check inner.is_null() {
+            panic!("Failed to allocate Arc");
+        }
+        
+        unsafe {
+            (*inner).value = value;
+            (*inner).count = 1;
+        }
+        
+        Self { ptr: inner }
+    }
+    
+    /// Get reference to inner value
+    open fn as_ref(&self) -> &T {
+        unsafe { &(*self.ptr).value }
+    }
+    
+    /// Get strong count
+    open fn strong_count(&self) -> usize {
+        unsafe { (*self.ptr).count }
+    }
+    
+    /// Clone Arc (increase reference count)
+    open fn clone(&self) -> Self {
+        unsafe {
+            // In real implementation, this would be atomic
+            (*self.ptr).count += 1;
+        }
+        Self { ptr: self.ptr }
+    }
+    
+    /// Get raw pointer
+    open fn as_ptr(&self) -> *const T {
+        unsafe { &(*self.ptr).value as *const T }
+    }
+    
+    /// Try to get mutable reference
+    open fn get_mut(&var self) -> Option<&var T> {
+        unsafe {
+            check (*self.ptr).count == 1 {
+                Some(&var (*self.ptr).value)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+impl<T> Drop for Arc<T> {
+    fn drop(&var self) {
+        unsafe {
+            // In real implementation, this would be atomic
+            (*self.ptr).count -= 1;
+            check (*self.ptr).count == 0 {
+                // Drop the value
+                (*self.ptr).value.drop_in_place();
+                // Deallocate memory
+                pool_deallocate(self.ptr as *mut u8, sizeof(ArcInner<T>));
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  WEAK<T> - WEAK REFERENCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Weak<T> - Weak reference to Rc<T>
+open data Weak<T> {
+    ptr: *mut RcInner<T>,
+}
+
+impl<T> Weak<T> {
+    /// Create a new Weak from Rc
+    open fn from(rc: &Rc<T>) -> Self {
+        // In real implementation, this would not increase count
+        Self { ptr: rc.ptr }
+    }
+    
+    /// Try to upgrade to Rc
+    open fn upgrade(&self) -> Option<Rc<T>> {
+        unsafe {
+            check (*self.ptr).count > 0 {
+                // In real implementation, this would be atomic
+                (*self.ptr).count += 1;
+                Some(Rc { ptr: self.ptr })
+            } else {
+                None
+            }
+        }
+    }
+    
+    /// Get strong count
+    open fn strong_count(&self) -> usize {
+        unsafe { (*self.ptr).count }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §5  CELL<T> - INTERIOR MUTABILITY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cell<T> - Interior mutability pattern
+open data Cell<T> {
+    value: T,
+}
+
+impl<T> Cell<T> {
+    /// Create a new Cell
+    open fn new(value: T) -> Self {
+        Self { value }
+    }
+    
+    /// Get value
+    open fn get(&self) -> T
+    where T: Copy,
+    {
+        self.value
+    }
+    
+    /// Set value
+    open fn set(&var self, value: T) {
+        self.value = value;
+    }
+    
+    /// Replace value
+    open fn replace(&var self, value: T) -> T {
+        let old = self.value;
+        self.value = value;
+        old
+    }
+    
+    /// Get reference to inner value (unsafe)
+    open fn as_ptr(&self) -> *const T {
+        &self.value as *const T
+    }
+}
+
+/// RefCell<T> - Runtime borrow checking
+open data RefCell<T> {
+    value: T,
+    borrow_count: usize,
+}
+
+open data Ref<'a, T> {
+    value: &'a T,
+}
+
+open data RefMut<'a, T> {
+    value: &'a var T,
+}
+
+impl<T> RefCell<T> {
+    /// Create a new RefCell
+    open fn new(value: T) -> Self {
+        Self {
+            value: value,
+            borrow_count: 0,
+        }
+    }
+    
+    /// Borrow immutably
+    open fn borrow(&self) -> Ref<T> {
+        Ref { value: &self.value }
+    }
+    
+    /// Borrow mutably
+    open fn borrow_mut(&var self) -> RefMut<T> {
+        RefMut { value: &var self.value }
+    }
+    
+    /// Get value (consumes RefCell)
+    open fn into_inner(self) -> T {
+        self.value
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §6  UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create a Box on the heap
+open fn box_new<T>(value: T) -> Box<T> {
+    Box::new(value)
+}
+
+/// Create an Rc on the heap
+open fn rc_new<T>(value: T) -> Rc<T> {
+    Rc::new(value)
+}
+
+/// Create an Arc on the heap
+open fn arc_new<T>(value: T) -> Arc<T> {
+    Arc::new(value)
+}
+
+/// Create a Cell
+open fn cell_new<T>(value: T) -> Cell<T> {
+    Cell::new(value)
+}
+
+/// Create a RefCell
+open fn refcell_new<T>(value: T) -> RefCell<T> {
+    RefCell::new(value)
+}

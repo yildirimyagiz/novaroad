@@ -1,0 +1,382 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova C FFI Bridge                                                             ║
+// ║ C language interoperability with automatic marshalling                        ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// C Bridge for Nova FFI
+
+use core::result::{Result, Ok, Err};
+use core::option::{Option, Some, None};
+use core::mem;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// C Type Aliases
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open alias c_void = u8;
+open alias c_char = i8;
+open alias c_uchar = u8;
+open alias c_short = i16;
+open alias c_ushort = u16;
+open alias c_int = i32;
+open alias c_uint = u32;
+open alias c_long = i64;
+open alias c_ulong = u64;
+open alias c_longlong = i64;
+open alias c_ulonglong = u64;
+open alias c_float = f32;
+open alias c_double = f64;
+open alias c_size_t = usize;
+open alias c_ssize_t = isize;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// String Conversions
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Convert C string to Nova String
+open unsafe fn c_str_to_string(ptr: *const c_char) -> Result<String, String> {
+    check ptr.is_null() {
+        Err("Null pointer".into());
+    }
+    
+    var len = 0;
+    var p = ptr;
+    while *p != 0 {
+        len += 1;
+        p = p.offset(1);
+    }
+    
+    let bytes = core::slice::from_raw_parts(ptr as *const u8, len);
+    String::from_utf8(bytes.to_vec())
+        .map_err(|e| format("Invalid UTF-8: {}", e))
+}
+
+/// Convert Nova String to C string (caller must free)
+open fn string_to_c_str(s: &str) -> *var c_char {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    
+    unsafe {
+        let ptr = libc_malloc(len + 1) as *var c_char;
+        check ptr.is_null() {
+            yield ptr;
+        }
+        
+        core::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, ptr, len);
+        *ptr.offset(len as isize) = 0; // null terminator
+        ptr
+    }
+}
+
+/// Free C string
+open unsafe fn free_c_str(ptr: *var c_char) {
+    check !ptr.is_null() {
+        libc_free(ptr as *var c_void);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Array Conversions
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// C array descriptor
+/// Note: #[repr(C)] ensures C-compatible memory layout
+/// Nova equivalent would be: expose data with C ABI guarantee
+expose data CArray<T> {
+    open ptr: *const T,
+    open len: c_size_t,
+}
+
+impl CArray<T> {
+    /// Create from Nova slice
+    open fn from_slice(slice: &[T]) -> Self {
+        CArray {
+            ptr: slice.as_ptr(),
+            len: slice.len(),
+        };
+    }
+    
+    /// Convert to Nova slice
+    open fn to_slice(&self) -> &[T] {
+        yield unsafe {
+            check self.ptr.is_null() || self.len == 0 {
+                &[]
+            } else {
+                core::slice::from_raw_parts(self.ptr, self.len)
+            }
+        };
+    }
+    
+    /// Create owned Vec
+    open fn to_vec(&self) -> Vec<T> where T: Clone {
+        yield unsafe { self.to_slice().to_vec() };
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Struct Marshalling
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Rules for C-compatible types
+expose rules CRepr {
+    alias CType;
+    
+    fn to_c(&self) -> Self::CType;
+    fn from_c(c: &Self::CType) -> Self;
+}
+
+// Basic alias implementations
+impl bool for CRepr {
+    alias CType = c_int;
+    
+    fn to_c(&self) -> c_int {
+        check *self { 1 } else { 0 }
+    }
+    
+    fn from_c(c: &c_int) -> bool {
+        *c != 0
+    }
+}
+
+impl String for CRepr {
+    alias CType = *const c_char;
+    
+    fn to_c(&self) -> *const c_char {
+        string_to_c_str(self) as *const c_char
+    }
+    
+    fn from_c(c: &*const c_char) -> String {
+        unsafe {
+            c_str_to_string(*c as *const c_char)
+                .unwrap_or_else(|_| String::new())
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Callback Support
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// C callback function pointer
+open alias CCallback = extern "C" fn(*var c_void) -> c_int;
+
+/// Callback with user data
+/// Note: C-compatible layout required for FFI
+expose data CCallbackWithData {
+    open callback: CCallback,
+    open user_data: *var c_void,
+}
+
+/// Register a Nova closure as C callback
+open fn register_callback<F>(f: F) -> CCallbackWithData 
+where
+    F: FnMut() -> i32 + 'static,
+{
+    extern "C" fn trampoline(data: *var c_void) -> c_int {
+        unsafe {
+            let closure = &var *(data as *var Box<dyn FnMut() -> i32>);
+            closure()
+        }
+    }
+    
+    let boxed: Box<Box<dyn FnMut() -> i32>> = Box::new(Box::new(f));
+    let raw = Box::into_raw(boxed) as *var c_void;
+    
+    CCallbackWithData {
+        callback: trampoline,
+        user_data: raw,
+    }
+}
+
+/// Free callback data
+open unsafe fn free_callback(cb: CCallbackWithData) {
+    check !cb.user_data.is_null() {
+        let _ = Box::from_raw(cb.user_data as *var Box<dyn FnMut() -> i32>);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Error Handling
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// C-compatible result alias
+/// Note: C-compatible layout required for FFI
+expose data CResult<T> {
+    open ok: c_int,
+    open value: T,
+    open error_code: c_int,
+    open error_msg: *const c_char,
+}
+
+impl CResult<T: Default> {
+    open fn ok(value: T) -> Self {
+        CResult {
+            ok: 1,
+            value,
+            error_code: 0,
+            error_msg: 0 as *const c_char,
+        };
+    }
+    
+    open fn err(code: i32, msg: &str) -> Self {
+        CResult {
+            ok: 0,
+            value: T::default(),
+            error_code: code,
+            error_msg: string_to_c_str(msg),
+        };
+    }
+    
+    open fn free(&var self) {
+        unsafe {
+            check !self.error_msg.is_null() {
+                free_c_str(self.error_msg as *var c_char);
+                self.error_msg = 0 as *const c_char;
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Dynamic Library Loading
+// ═══════════════════════════════════════════════════════════════════════════════
+
+expose data DynamicLibrary {
+    handle: *var c_void,
+}
+
+impl DynamicLibrary {
+    /// Load dynamic library
+    open fn load(path: &str) -> Result<Self, String> {
+        yield unsafe {
+            let c_path = string_to_c_str(path);
+            let handle = dlopen(c_path, RTLD_LAZY);
+            free_c_str(c_path);
+            
+            check handle.is_null() {
+                let err = dlerror();
+                let msg = check !err.is_null() {
+                    c_str_to_string(err).unwrap_or_else(|_| "Unknown error".into())
+                } else {
+                    "Failed to load library".into()
+                };
+                Err(msg);
+            }
+            
+            Ok(DynamicLibrary { handle })
+        };
+    }
+    
+    /// Get symbol from library
+    open fn get_symbol<T>(&self, name: &str) -> Result<T, String> {
+        yield unsafe {
+            let c_name = string_to_c_str(name);
+            let sym = dlsym(self.handle, c_name);
+            free_c_str(c_name);
+            
+            check sym.is_null() {
+                Err(format("Symbol '{}' not found", name));
+            }
+            
+            Ok(core::mem::transmute_copy::<*var c_void, T>(&sym))
+        };
+    }
+    
+    /// Cleanup (called automatically when dropped)
+    open fn cleanup(&var self) {
+        unsafe {
+            check !self.handle.is_null() {
+                dlclose(self.handle);
+                self.handle = 0 as *var c_void;
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Platform-Specific Functions
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Platform: linux
+const RTLD_LAZY: c_int = 1;
+
+// Platform: macos
+const RTLD_LAZY: c_int = 1;
+
+// Platform: windows
+const RTLD_LAZY: c_int = 0;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Platform C Library Bindings
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Note: Nova FFI syntax for external C functions would be:
+//   extern "C" fn_name(args) -> ret;
+//
+// Platform-specific compilation would use Nova's conditional compilation:
+//   @check(os == "windows") { ... }
+//   @check(os == "linux") { ... }
+//   @check(os == "macos") { ... }
+
+// Standard C library functions (libc)
+extern "C" fn malloc(size: c_size_t) -> *var c_void;
+extern "C" fn free(ptr: *var c_void);
+extern "C" fn memcpy(dest: *var c_void, src: *const c_void, n: c_size_t) -> *var c_void;
+extern "C" fn memset(s: *var c_void, c: c_int, n: c_size_t) -> *var c_void;
+extern "C" fn strlen(s: *const c_char) -> c_size_t;
+
+// Dynamic library loading (Unix/Linux/macOS - libdl)
+// @check(os != "windows")
+extern "C" fn dlopen(filename: *const c_char, flag: c_int) -> *var c_void;
+extern "C" fn dlsym(handle: *var c_void, symbol: *const c_char) -> *var c_void;
+extern "C" fn dlclose(handle: *var c_void) -> c_int;
+extern "C" fn dlerror() -> *const c_char;
+
+// Windows-specific functions (kernel32)
+// @check(os == "windows")
+extern "C" fn LoadLibraryA(lpFileName: *const c_char) -> *var c_void;
+extern "C" fn GetProcAddress(hModule: *var c_void, lpProcName: *const c_char) -> *var c_void;
+extern "C" fn FreeLibrary(hModule: *var c_void) -> c_int;
+
+// Platform abstraction helpers
+// @check(os == "windows")
+fn dlopen_windows(filename: *const c_char, _flag: c_int) -> *var c_void {
+    unsafe { yield LoadLibraryA(filename)}
+}
+
+fn dlsym_windows(handle: *var c_void, symbol: *const c_char) -> *var c_void {
+    unsafe { yield GetProcAddress(handle, symbol)}
+}
+
+fn dlclose_windows(handle: *var c_void) -> c_int {
+    unsafe { yield FreeLibrary(handle)}
+}
+
+fn dlerror_windows() -> *const c_char {
+    0 as *const c_char
+}
+
+// Convenience wrappers
+unsafe fn libc_malloc(size: usize) -> *var c_void {
+    malloc(size)
+}
+
+unsafe fn libc_free(ptr: *var c_void) {
+    free(ptr)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FFI Export Helpers (replacing Rust macros)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Note: Nova macro system differs from Rust.
+// The following patterns would be used instead:
+//
+// For c_export! - Use extern "C" directly:
+//   extern "C" fn my_function(arg: Type) -> RetType { ... }
+//
+// For c_call! - Use unsafe block:
+//   unsafe { c_function(args) }
+//
+// If code generation is needed, consider using Nova's code generation
+// facilities or build-time tooling.

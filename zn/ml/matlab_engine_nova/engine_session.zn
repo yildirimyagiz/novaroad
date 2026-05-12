@@ -1,0 +1,107 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  matlab::engine::engine_session                                             ║
+// ║  Mirrors Python: enginesession.py                                          ║
+// ║                                                                             ║
+// ║  Manages the global registry of active MatlabEngine instances and          ║
+// ║  shared-session bookkeeping.  Registered cleanup runs at process exit.     ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use from crate::engine_error::EngineTerminatedError;
+use from crate::engine_helper;
+
+// ---------------------------------------------------------------------------
+//  SharedSession — a named MATLAB session visible to other processes
+// ---------------------------------------------------------------------------
+
+/// Metadata for a MATLAB session that was shared via `matlab.engine.shareEngine`.
+open data SharedSession {
+    name:   str,
+    pid:    i64,        // OS process ID of the MATLAB instance
+    host:   str,        // hostname (for remote sessions)
+    port:   i32,        // IPC port
+}
+
+impl SharedSession {
+    fn new(name: str, pid: i64, host: str, port: i32) -> SharedSession {
+        SharedSession { name, pid, host, port }
+    }
+
+    fn display(self) -> str {
+        f"SharedSession({self.name}, pid={self.pid}, {self.host}:{self.port})"
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  EngineRegistry — process-wide singleton
+// ---------------------------------------------------------------------------
+
+/// Thread-safe registry of every live MatlabEngine in this process.
+/// On process exit the Novae calls `shutdown_all()` automatically.
+open data EngineRegistry {
+    /// Map from engine handle → name (empty string for unnamed engines).
+    engines: Vec<(i64, str)>,
+    lock:    i64,           // native mutex handle from engine_helper
+}
+
+impl EngineRegistry {
+    fn new() -> EngineRegistry {
+        EngineRegistry {
+            engines: [],
+            lock:    engine_helper::create_mutex(),
+        }
+    }
+
+    /// Register a newly created engine.
+    fn register(var self, handle: i64, name: str) {
+        engine_helper::lock(self.lock);
+        self.engines.push((handle, name));
+        engine_helper::unlock(self.lock);
+    }
+
+    /// Deregister an engine that has been quit.
+    fn deregister(var self, handle: i64) {
+        engine_helper::lock(self.lock);
+        self.engines = self.engines
+            .iter()
+            .filter(|(h, _)| *h != handle)
+            .collect();
+        engine_helper::unlock(self.lock);
+    }
+
+    /// Terminate every registered engine.  Called at process exit via defer.
+    fn shutdown_all(var self) {
+        engine_helper::lock(self.lock);
+        each (handle, _name) in self.engines.iter() {
+            engine_helper::terminate_engine(*handle);
+        }
+        self.engines = [];
+        engine_helper::unlock(self.lock);
+    }
+
+    /// Number of currently active engines.
+    fn count(self) -> i64 {
+        engine_helper::lock(self.lock);
+        let n = self.engines.len() as i64;
+        engine_helper::unlock(self.lock);
+        n
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Global registry — initialised once, cleaned up at exit
+// ---------------------------------------------------------------------------
+
+/// Lazily-initialised process-wide engine registry.
+open fn global_registry() -> EngineRegistry {
+    // Nova(static-site-data) for thread-safe lazy init
+    ssd REGISTRY: EngineRegistry = EngineRegistry::new();
+    REGISTRY
+}
+
+/// Register a shutdown hook so all engines exit cleanly when the Nova
+/// runtime calls process teardown.
+open fn register_shutdown_hook() {
+    defer {
+        global_registry().shutdown_all();
+    }
+}

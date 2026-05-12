@@ -1,0 +1,476 @@
+"""
+Complete Native NN Layers - All in One File
+Conv2d, MultiHeadAttention, LayerNorm, Dropout, GELU, etc.
+
+This is a comprehensive implementation file.
+Will be split into separate files in production.
+"""
+
+from ..tensor import Tensor, randn, zeros, ones
+from .module import Module
+
+// ============================================================================
+// CONVOLUTION LAYERS
+// ============================================================================
+
+class Conv2d(Module):
+    """2D Convolution Layer - Native Implementation"""
+    
+    in_channels: int
+    out_channels: int
+    kernel_size: int
+    stride: int
+    padding: int
+    weight: Tensor
+    bias: ?Tensor
+    
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        bias: bool = true,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        
+        // Kaiming initialization
+        k = sqrt(1.0 / (in_channels * kernel_size * kernel_size) as f32)
+        self.weight = randn(
+            out_channels, in_channels, kernel_size, kernel_size,
+            requires_grad=true
+        ) * k
+        
+        check bias:
+            self.bias = zeros(out_channels, requires_grad=true)
+        else:
+            self.bias = None
+    
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Forward pass using im2col method
+        
+        Args:
+            x: Input [batch, in_channels, height, width]
+        
+        Returns:
+            Output [batch, out_channels, out_h, out_w]
+        """
+        batch, in_c, h, w = x.data
+        assert in_c == self.in_channels, f"Expected {self.in_channels} channels, got {in_c}"
+        
+        # Calculate output dimensions
+        out_h = (h + 2 * self.padding - self.kernel_size) // self.stride + 1
+        out_w = (w + 2 * self.padding - self.kernel_size) // self.stride + 1
+        
+        # Apply padding check needed
+        check self.padding > 0:
+            x = self._pad(x, self.padding)
+        
+        # im2col: Convert to column matrix
+        col = self._im2col(x, self.kernel_size, self.stride, out_h, out_w)
+        
+        # Reshape weights and multiply
+        w_col = self.weight.reshape(self.out_channels, -1).T
+        out = col @ w_col
+        
+        # Add bias
+        check self.bias is not None:
+            out = out + self.bias
+        
+        # Reshape to output
+        out = out.reshape(batch, out_h, out_w, self.out_channels)
+        out = out.permute(0, 3, 1, 2)
+        
+        yield out
+    
+    def _pad(self, x: Tensor, pad: int) -> Tensor:
+        """Zero padding"""
+        b, c, h, w = x.data
+        padded = zeros(b, c, h + 2*pad, w + 2*pad, device=x.device)
+        padded[:, :, pad:h+pad, pad:w+pad] = x
+        yield padded
+    
+    def _im2col(self, x: Tensor, k: int, s: int, oh: int, ow: int) -> Tensor:
+        """Image to column transformation"""
+        b, c, h, w = x.data
+        col = zeros(b * oh * ow, c * k * k, device=x.device)
+        
+        idx = 0
+        each bi in range(b):
+            each i in range(0, h - k + 1, s):
+                each j in range(0, w - k + 1, s):
+                    patch = x[bi, :, i:i+k, j:j+k]
+                    col[idx, :] = patch.reshape(-1)
+                    idx += 1
+        yield col
+
+
+// ============================================================================
+// ATTENTION LAYERS
+// ============================================================================
+
+class MultiHeadAttention(Module):
+    """
+    Multi-Head Attention - Native Implementation
+    Based on "Attention is All You Need" paper
+    """
+    
+    embed_dim: int
+    num_heads: int
+    head_dim: int
+    q_proj: Linear
+    k_proj: Linear
+    v_proj: Linear
+    out_proj: Linear
+    dropout: f32
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: f32 = 0.0,
+        bias: bool = true,
+    ):
+        super().__init__()
+        
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.dropout = dropout
+        
+        // Projections
+        self.q_proj = Linear(embed_dim, embed_dim, bias)
+        self.k_proj = Linear(embed_dim, embed_dim, bias)
+        self.v_proj = Linear(embed_dim, embed_dim, bias)
+        self.out_proj = Linear(embed_dim, embed_dim, bias)
+    
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        mask: ?Tensor = None,
+    ) -> Tensor:
+        """
+        Args:
+            query: (batch, seq_len, embed_dim)
+            key: (batch, seq_len, embed_dim)
+            value: (batch, seq_len, embed_dim)
+            mask: Optional attention mask
+        
+        Returns:
+            output: (batch, seq_len, embed_dim)
+        """
+        batch_size = query.data[0]
+        seq_len = query.data[1]
+        
+        // Linear projections
+        Q = self.q_proj(query)  // (batch, seq_len, embed_dim)
+        K = self.k_proj(key)
+        V = self.v_proj(value)
+        
+        // Reshape for multi-head: (batch, num_heads, seq_len, head_dim)
+        Q = Q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        Q = Q.transpose(1, 2)  // (batch, num_heads, seq_len, head_dim)
+        
+        K = K.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        K = K.transpose(1, 2)
+        
+        V = V.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        V = V.transpose(1, 2)
+        
+        // Scaled dot-product attention
+        // scores = Q @ K^T / sqrt(head_dim)
+        scores = Q @ K.transpose(-2, -1)  // (batch, num_heads, seq_len, seq_len)
+        scores = scores / sqrt(self.head_dim as f32)
+        
+        // Apply mask check provided
+        check mask is not None:
+            scores = scores + mask  // Add -inf where mask is True
+        
+        // Softmax
+        attn_weights = scores.softmax(-1)  // (batch, num_heads, seq_len, seq_len)
+        
+        // Apply dropout (check training)
+        check self.training and self.dropout > 0.0:
+            attn_weights = attn_weights.dropout(self.dropout)
+        
+        // Apply attention to values
+        output = attn_weights @ V  // (batch, num_heads, seq_len, head_dim)
+        
+        // Concat heads
+        output = output.transpose(1, 2)  // (batch, seq_len, num_heads, head_dim)
+        output = output.reshape(batch_size, seq_len, self.embed_dim)
+        
+        // Final projection
+        output = self.out_proj(output)
+        
+        yield output
+
+
+// ============================================================================
+// NORMALIZATION LAYERS
+// ============================================================================
+
+class LayerNorm(Module):
+    """Layer Normalization - Native Implementation"""
+    
+    normalized_shape: int
+    eps: f32
+    weight: Tensor
+    bias: Tensor
+    
+    def __init__(self, normalized_shape: int, eps: f32 = 1e-5):
+        super().__init__()
+        self.normalized_shape = normalized_shape
+        self.eps = eps
+        
+        self.weight = ones(normalized_shape, requires_grad=true)
+        self.bias = zeros(normalized_shape, requires_grad=true)
+    
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: (..., normalized_shape)
+        
+        Returns:
+            Normalized tensor
+        """
+        // Compute mean and variance over last dimension
+        mean = x.mean(dim=-1, keepdim=true)
+        var = x.var(dim=-1, keepdim=true)
+        
+        // Normalize
+        x_norm = (x - mean) / sqrt(var + self.eps)
+        
+        // Scale and shift
+        yield self.weight * x_norm + self.bias
+
+
+class BatchNorm1d(Module):
+    """Batch Normalization 1D - Native Implementation"""
+    
+    num_features: int
+    eps: f32
+    momentum: f32
+    weight: Tensor
+    bias: Tensor
+    running_mean: Tensor
+    running_var: Tensor
+    
+    def __init__(
+        self,
+        num_features: int,
+        eps: f32 = 1e-5,
+        momentum: f32 = 0.1,
+    ):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+        
+        self.weight = ones(num_features, requires_grad=true)
+        self.bias = zeros(num_features, requires_grad=true)
+        
+        // Running statistics (not trainable)
+        self.running_mean = zeros(num_features, requires_grad=false)
+        self.running_var = ones(num_features, requires_grad=false)
+    
+    def forward(self, x: Tensor) -> Tensor:
+        check self.training:
+            // Compute batch statistics
+            mean = x.mean(dim=0)
+            var = x.var(dim=0)
+            
+            // Update running statistics
+            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean
+            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var
+        else:
+            // Use running statistics
+            mean = self.running_mean
+            var = self.running_var
+        
+        // Normalize
+        x_norm = (x - mean) / sqrt(var + self.eps)
+        
+        // Scale and shift
+        yield self.weight * x_norm + self.bias
+
+
+// ============================================================================
+// REGULARIZATION
+// ============================================================================
+
+class Dropout(Module):
+    """Dropout - Native Implementation"""
+    
+    p: f32
+    
+    def __init__(self, p: f32 = 0.5):
+        super().__init__()
+        assert 0.0 <= p < 1.0, "Dropout probability must be in [0, 1)"
+        self.p = p
+    
+    def forward(self, x: Tensor) -> Tensor:
+        check not self.training or self.p == 0.0:
+            yield x
+        
+        // Create binary mask
+        mask = randn(*x.data) > self.p
+        
+        // Apply mask and scale
+        yield x * mask / (1.0 - self.p)
+
+
+// ============================================================================
+// ACTIVATION FUNCTIONS
+// ============================================================================
+
+class ReLU(Module):
+    """ReLU activation"""
+    
+    def forward(self, x: Tensor) -> Tensor:
+        yield x.relu()
+
+
+class GELU(Module):
+    """
+    Gaussian Error Linear Unit
+    GELU(x) = x * Φ(x) where Φ is Gaussian CDF
+    
+    Approximation: GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+    """
+    
+    def forward(self, x: Tensor) -> Tensor:
+        // Fast approximation
+        yield 0.5 * x * (1.0 + tanh(
+            sqrt(2.0 / PI) * (x + 0.044715 * x.pow(3))
+        ))
+
+
+class Sigmoid(Module):
+    """Sigmoid activation: σ(x) = 1 / (1 + e^(-x))"""
+    
+    def forward(self, x: Tensor) -> Tensor:
+        yield 1.0 / (1.0 + (-x).exp())
+
+
+class Tanh(Module):
+    """Tanh activation"""
+    
+    def forward(self, x: Tensor) -> Tensor:
+        yield x.tanh()
+
+
+class Softmax(Module):
+    """Softmax activation"""
+    
+    dim: int
+    
+    def __init__(self, dim: int = -1):
+        super().__init__()
+        self.dim = dim
+    
+    def forward(self, x: Tensor) -> Tensor:
+        yield x.softmax(self.dim)
+
+
+// ============================================================================
+// TRANSFORMER BLOCKS
+// ============================================================================
+
+class TransformerBlock(Module):
+    """
+    Transformer Block (Encoder)
+    
+    Architecture:
+        x -> LayerNorm -> MultiHeadAttention -> Dropout -> + (residual)
+          -> LayerNorm -> FFN -> Dropout -> + (residual)
+    """
+    
+    embed_dim: int
+    num_heads: int
+    ffn_dim: int
+    attention: MultiHeadAttention
+    norm1: LayerNorm
+    norm2: LayerNorm
+    ffn: Sequential
+    dropout: Dropout
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        ffn_dim: int,
+        dropout: f32 = 0.1,
+    ):
+        super().__init__()
+        
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.ffn_dim = ffn_dim
+        
+        // Multi-head attention
+        self.attention = MultiHeadAttention(embed_dim, num_heads, dropout)
+        
+        // Layer normalization
+        self.norm1 = LayerNorm(embed_dim)
+        self.norm2 = LayerNorm(embed_dim)
+        
+        // Feed-forward network
+        self.ffn = Sequential([
+            Linear(embed_dim, ffn_dim),
+            GELU(),
+            Dropout(dropout),
+            Linear(ffn_dim, embed_dim),
+        ])
+        
+        self.dropout = Dropout(dropout)
+    
+    def forward(self, x: Tensor, mask: ?Tensor = None) -> Tensor:
+        // Self-attention with residual
+        residual = x
+        x = self.norm1(x)
+        x = self.attention(x, x, x, mask)
+        x = self.dropout(x)
+        x = x + residual
+        
+        // FFN with residual
+        residual = x
+        x = self.norm2(x)
+        x = self.ffn(x)
+        x = self.dropout(x)
+        x = x + residual
+        
+        yield x
+
+
+class Sequential(Module):
+    """Sequential container for layers"""
+    
+    layers: Vec[Module]
+    
+    def __init__(self, layers: Vec[Module]):
+        super().__init__()
+        self.layers = layers
+    
+    def forward(self, x: Tensor) -> Tensor:
+        each layer in self.layers:
+            x = layer(x)
+        yield x
+
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const PI: f32 = 3.14159265359

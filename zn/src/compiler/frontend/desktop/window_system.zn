@@ -1,0 +1,682 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                    Nova DESKTOP WINDOW SYSTEM                          ║
+// ║                Cross-Platform Window Management & Event Loop                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// Desktop window system for Nova applications
+// Provides unified window management across Windows, macOS, and Linux
+
+use std::collections::HashMap;
+use crate::frontend::ast::*;
+
+// ============================================================================
+// WINDOW MANAGEMENT
+// ============================================================================
+
+/// Main window representation
+expose data Window {
+    id: WindowId,
+    title: Signal<String>,
+    position: Signal<Point>,
+    size: Signal<Size>,
+    visible: Signal<bool>,
+    focused: Signal<bool>,
+    fullscreen: Signal<bool>,
+    minimized: Signal<bool>,
+    maximized: Signal<bool>,
+    resizable: Signal<bool>,
+    decorated: Signal<bool>,
+    always_on_top: Signal<bool>,
+    opacity: Signal<f32>,
+    background_color: Signal<Color>,
+    cursor: Signal<CursorType>,
+    event_handlers: HashMap<EventType, Vec<EventHandler>>,
+}
+
+/// Window identifier
+expose data WindowId(i64);
+
+/// 2D point
+expose data Point {
+    x: i32,
+    y: i32,
+}
+
+/// Size dimensions
+expose data Size {
+    width: i32,
+    height: i32,
+}
+
+/// RGBA color
+expose data Color {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+}
+
+/// Cursor types
+expose cases CursorType {
+    Arrow,
+    IBeam,
+    Crosshair,
+    Hand,
+    HResize,
+    VResize,
+    NWResize,
+    NEResize,
+    SWResize,
+    SEResize,
+    Wait,
+    None,
+}
+
+/// Window configuration
+expose data WindowConfig {
+    title: String,
+    position: Option<Point>,
+    size: Size,
+    resizable: bool,
+    decorated: bool,
+    transparent: bool,
+    always_on_top: bool,
+    fullscreen: bool,
+    vsync: bool,
+    multisampling: Option<i32>,
+    icon: Option<Icon>,
+}
+
+/// Window icon
+expose data Icon {
+    width: i32,
+    height: i32,
+    pixels: Vec<u8>, // RGBA pixels
+}
+
+// ============================================================================
+// EVENT SYSTEM
+// ============================================================================
+
+/// Event types
+expose cases EventType {
+    WindowClose,
+    WindowResize,
+    WindowMove,
+    WindowFocus,
+    WindowBlur,
+    KeyPress,
+    KeyRelease,
+    MouseMove,
+    MouseButtonPress,
+    MouseButtonRelease,
+    MouseScroll,
+    TextInput,
+    FileDrop,
+    Custom(String),
+}
+
+/// Event data
+expose cases EventData {
+    WindowEvent(WindowEventData),
+    KeyboardEvent(KeyboardEventData),
+    MouseEvent(MouseEventData),
+    TextEvent(String),
+    FileDropEvent(Vec<String>),
+    CustomEvent(HashMap<String, String>),
+}
+
+/// Window events
+expose data WindowEventData {
+    window_id: WindowId,
+    event_type: WindowEventType,
+    size: Option<Size>,
+    position: Option<Point>,
+}
+
+expose cases WindowEventType {
+    Closed,
+    Resized,
+    Moved,
+    Focused,
+    Blurred,
+    Minimized,
+    Maximized,
+    Restored,
+}
+
+/// Keyboard events
+expose data KeyboardEventData {
+    key: Key,
+    scancode: i32,
+    modifiers: KeyModifiers,
+    repeat: bool,
+}
+
+expose cases Key {
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
+    Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9,
+    Escape, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+    PrintScreen, ScrollLock, Pause,
+    Insert, Delete, Home, End, PageUp, PageDown,
+    Left, Right, Up, Down,
+    Backspace, Tab, Return, Space,
+    LShift, RShift, LCtrl, RCtrl, LAlt, RAlt, LSuper, RSuper,
+    Menu, CapsLock, NumLock,
+}
+
+expose data KeyModifiers {
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    super: bool, // Windows key / Command key
+}
+
+/// Mouse events
+expose data MouseEventData {
+    button: MouseButton,
+    position: Point,
+    delta: Option<Point>, // For mouse move delta
+    scroll_delta: Option<Point>, // For scroll
+}
+
+expose cases MouseButton {
+    Left,
+    Right,
+    Middle,
+    X1,
+    X2,
+}
+
+/// Event handler rules
+expose ability EventHandler {
+    fn handle_event(&var self, event: EventData) -> EventResult;
+}
+
+expose cases EventResult {
+    Continue,
+    Handled,
+    StopPropagation,
+}
+
+// ============================================================================
+// APPLICATION LIFECYCLE
+// ============================================================================
+
+/// Desktop application
+expose data DesktopApp {
+    windows: HashMap<WindowId, Window>,
+    event_loop: EventLoop,
+    running: Signal<bool>,
+    fps: Signal<f32>,
+    frame_time: Signal<f64>,
+}
+
+/// Event loop
+expose data EventLoop {
+    running: bool,
+}
+
+/// Application configuration
+expose data AppConfig {
+    name: String,
+    version: String,
+    organization: String,
+    window_configs: Vec<WindowConfig>,
+    event_capacity: usize,
+    max_fps: Option<f32>,
+}
+
+// ============================================================================
+// WINDOW OPERATIONS
+// ============================================================================
+
+impl Window {
+    fn new(config: WindowConfig) -> Result<Window, WindowError> {
+        unsafe {
+            let window_id = window_create(
+                config.title.as_ptr(),
+                config.title.len(),
+                config.size.width,
+                config.size.height,
+                config.resizable as i32,
+                config.decorated as i32,
+                config.transparent as i32,
+                config.always_on_top as i32,
+                config.fullscreen as i32,
+            );
+
+            check window_id < 0 {
+                Err(WindowError::CreationFailed);
+            }
+
+            var window = Window {
+                id: WindowId(window_id as i64),
+                title: Signal::new(config.title),
+                position: Signal::new(Point { x: 100, y: 100 }),
+                size: Signal::new(config.size),
+                visible: Signal::new(true),
+                focused: Signal::new(true),
+                fullscreen: Signal::new(config.fullscreen),
+                minimized: Signal::new(false),
+                maximized: Signal::new(false),
+                resizable: Signal::new(config.resizable),
+                decorated: Signal::new(config.decorated),
+                always_on_top: Signal::new(config.always_on_top),
+                opacity: Signal::new(1.0),
+                background_color: Signal::new(Color { r: 255, g: 255, b: 255, a: 255 }),
+                cursor: Signal::new(CursorType::Arrow),
+                event_handlers: HashMap::new(),
+            };
+
+            // Set up reactive bindings
+            window.title.watch(|title| unsafe {
+                window_set_title(window_id, title.as_ptr(), title.len());
+            });
+
+            window.position.watch(|pos| unsafe {
+                window_set_position(window_id, pos.x, pos.y);
+            });
+
+            window.size.watch(|size| unsafe {
+                window_set_size(window_id, size.width, size.height);
+            });
+
+            Ok(window)
+        }
+    }
+
+    fn show(&self) {
+        unsafe {
+            window_show(self.id.0 as i64);
+        }
+        self.visible.set(true);
+    }
+
+    fn hide(&self) {
+        unsafe {
+            window_hide(self.id.0 as i64);
+        }
+        self.visible.set(false);
+    }
+
+    fn close(&self) {
+        unsafe {
+            window_close(self.id.0 as i64);
+        }
+    }
+
+    fn focus(&self) {
+        unsafe {
+            window_focus(self.id.0 as i64);
+        }
+        self.focused.set(true);
+    }
+
+    fn set_title(&var self, title: String) {
+        self.title.set(title);
+    }
+
+    fn set_position(&var self, position: Point) {
+        self.position.set(position);
+    }
+
+    fn set_size(&var self, size: Size) {
+        self.size.set(size);
+    }
+
+    fn center_on_screen(&self) {
+        unsafe {
+            window_center_on_screen(self.id.0 as i64);
+        }
+    }
+
+    fn add_event_handler(&var self, event_type: EventType, handler: Box<dyn EventHandler>) {
+        self.event_handlers.entry(event_type).or_insert(Vec::new()).push(handler);
+    }
+
+    fn remove_event_handler(&var self, event_type: EventType, index: usize) {
+        check let Some(handlers) = self.event_handlers.get_mut(&event_type) {
+            check index < handlers.len() {
+                handlers.remove(index);
+            }
+        }
+    }
+
+    fn request_redraw(&self) {
+        unsafe {
+            window_request_redraw(self.id.0 as i64);
+        }
+    }
+
+    fn set_cursor(&var self, cursor: CursorType) {
+        self.cursor.set(cursor);
+        unsafe {
+            window_set_cursor(self.id.0 as i64, cursor as i32);
+        }
+    }
+}
+
+// ============================================================================
+// DESKTOP APPLICATION
+// ============================================================================
+
+impl DesktopApp {
+    fn new(config: AppConfig) -> Result<DesktopApp, AppError> {
+        unsafe {
+            let result = app_init(
+                config.name.as_ptr(),
+                config.name.len(),
+                config.version.as_ptr(),
+                config.version.len(),
+                config.organization.as_ptr(),
+                config.organization.len(),
+            );
+
+            check result != 0 {
+                Err(AppError::InitializationFailed);
+            }
+
+            var app = DesktopApp {
+                windows: HashMap::new(),
+                event_loop: EventLoop { running: true },
+                running: Signal::new(true),
+                fps: Signal::new(60.0),
+                frame_time: Signal::new(0.016),
+            };
+
+            // Create initial windows
+            each window_config in config.window_configs {
+                match Window::new(window_config) {
+                    Ok(window) => {
+                        app.windows.insert(window.id, window);
+                    }
+                    Err(_) => {
+                        Err(AppError::WindowCreationFailed);
+                    }
+                }
+            }
+
+            Ok(app)
+        }
+    }
+
+    fn run(&var self) -> Result<(), AppError> {
+        println("🚀 Starting Desktop Application...");
+
+        while *self.running.get() {
+            // Process events
+            self.process_events();
+
+            // Update application state
+            self.update();
+
+            // Render
+            self.render();
+
+            // Sleep to maintain target FPS
+            unsafe {
+                app_sleep_for_frame();
+            }
+        }
+
+        println("👋 Desktop Application shutting down...");
+        Ok(())
+    }
+
+    fn process_events(&var self) {
+        unsafe {
+            loop {
+                let event = app_poll_event();
+                check event.event_type == 0 { // No more events
+                    abort;
+                }
+
+                // Convert C event to Rust event
+                let event_data = self.convert_c_event(event);
+
+                // Dispatch to appropriate window
+                check let Some(window) = self.windows.get_mut(&WindowId(event.window_id as i64)) {
+                    self.dispatch_event_to_window(window, event_data);
+                }
+
+                // Handle application-level events
+                self.handle_app_event(event_data);
+            }
+        }
+    }
+
+    fn update(&var self) {
+        // Update application logic
+        unsafe {
+            let delta_time = app_get_delta_time();
+            self.frame_time.set(delta_time);
+            self.fps.set(1.0 / delta_time);
+        }
+    }
+
+    fn render(&self) {
+        // Render all windows
+        each window in self.windows.values() {
+            window.request_redraw();
+        }
+    }
+
+    fn quit(&var self) {
+        self.running.set(false);
+    }
+
+    fn create_window(&var self, config: WindowConfig) -> Result<WindowId, WindowError> {
+        match Window::new(config) {
+            Ok(window) => {
+                let id = window.id;
+                self.windows.insert(id, window);
+                Ok(id)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn get_window(&self, id: WindowId) -> Option<&Window> {
+        self.windows.get(&id)
+    }
+
+    fn get_window_mut(&var self, id: WindowId) -> Option<&var Window> {
+        self.windows.get_mut(&id)
+    }
+
+    fn destroy_window(&var self, id: WindowId) {
+        check let Some(window) = self.windows.remove(&id) {
+            window.close();
+        }
+    }
+
+    fn get_primary_monitor(&self) -> MonitorInfo {
+        unsafe {
+            let info = app_get_primary_monitor();
+            MonitorInfo {
+                name: std::ffi::CStr::from_ptr(info.name).to_string_lossy().into(),
+                position: Point { x: info.x, y: info.y },
+                size: Size { width: info.width, height: info.height },
+                refresh_rate: info.refresh_rate,
+            }
+        }
+    }
+
+    fn get_monitors(&self) -> Vec<MonitorInfo> {
+        unsafe {
+            let count = app_get_monitor_count();
+            var monitors = Vec::new();
+
+            each i in 0..count {
+                let info = app_get_monitor(i);
+                monitors.push(MonitorInfo {
+                    name: std::ffi::CStr::from_ptr(info.name).to_string_lossy().into(),
+                    position: Point { x: info.x, y: info.y },
+                    size: Size { width: info.width, height: info.height },
+                    refresh_rate: info.refresh_rate,
+                });
+            }
+
+            monitors
+        }
+    }
+
+    // Private methods
+    fn convert_c_event(&self, c_event: CEvent) -> EventData {
+        // Convert C event structure to Rust EventData
+        // Implementation details...
+        EventData::CustomEvent(HashMap::new()) // Placeholder
+    }
+
+    fn dispatch_event_to_window(&self, window: &var Window, event: EventData) {
+        check let Some(handlers) = window.event_handlers.get_mut(&self.get_event_type(&event)) {
+            each handler in handlers.iter_mut() {
+                match handler.handle_event(event.clone()) {
+                    EventResult::StopPropagation => abort,
+                    _ => continue,
+                }
+            }
+        }
+    }
+
+    fn handle_app_event(&var self, event: EventData) {
+        match event {
+            EventData::WindowEvent(data) => {
+                check let WindowEventType::Closed = data.event_type {
+                    check self.windows.is_empty() {
+                        self.quit();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn get_event_type(&self, event: &EventData) -> EventType {
+        match event {
+            EventData::WindowEvent(_) => EventType::WindowClose,
+            EventData::KeyboardEvent(_) => EventType::KeyPress,
+            EventData::MouseEvent(_) => EventType::MouseMove,
+            EventData::TextEvent(_) => EventType::TextInput,
+            EventData::FileDropEvent(_) => EventType::FileDrop,
+            EventData::CustomEvent(_) => EventType::Custom("unknown".into()),
+        }
+    }
+}
+
+// ============================================================================
+// MONITOR INFORMATION
+// ============================================================================
+
+expose data MonitorInfo {
+    name: String,
+    position: Point,
+    size: Size,
+    refresh_rate: i32,
+}
+
+// ============================================================================
+// ERROR TYPES
+// ============================================================================
+
+expose cases WindowError {
+    CreationFailed,
+    InvalidConfig,
+    PlatformError,
+}
+
+expose cases AppError {
+    InitializationFailed,
+    WindowCreationFailed,
+    EventLoopError,
+}
+
+// ============================================================================
+// FFI DECLARATIONS
+// ============================================================================
+
+extern "C" {
+    // Window management
+    fn window_create(title: *const u8, title_len: usize, width: i32, height: i32,
+                    resizable: i32, decorated: i32, transparent: i32, always_on_top: i32,
+                    fullscreen: i32) -> i64;
+    fn window_show(window_id: i64);
+    fn window_hide(window_id: i64);
+    fn window_close(window_id: i64);
+    fn window_focus(window_id: i64);
+    fn window_set_title(window_id: i64, title: *const u8, len: usize);
+    fn window_set_position(window_id: i64, x: i32, y: i32);
+    fn window_set_size(window_id: i64, width: i32, height: i32);
+    fn window_center_on_screen(window_id: i64);
+    fn window_set_cursor(window_id: i64, cursor: i32);
+    fn window_request_redraw(window_id: i64);
+
+    // Application lifecycle
+    fn app_init(name: *const u8, name_len: usize, version: *const u8, version_len: usize,
+               org: *const u8, org_len: usize) -> i32;
+    fn app_poll_event() -> CEvent;
+    fn app_sleep_for_frame();
+    fn app_get_delta_time() -> f64;
+    fn app_get_primary_monitor() -> CMonitorInfo;
+    fn app_get_monitor_count() -> i32;
+    fn app_get_monitor(index: i32) -> CMonitorInfo;
+}
+
+// C-compatible structures
+expose data CEvent {
+    event_type: i32,
+    window_id: i64,
+    // ... other fields
+}
+
+expose data CMonitorInfo {
+    name: *var i8,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    refresh_rate: i32,
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+fn init_desktop_app() -> DesktopApp {
+    println("🖥️  Initializing Desktop Window System...");
+
+    let config = AppConfig {
+        name: "Nova Application".into(),
+        version: "1.0.0".into(),
+        organization: "NovaLang".into(),
+        window_configs: [
+            WindowConfig {
+                title: "Nova App".into(),
+                position: None,
+                size: Size { width: 800, height: 600 },
+                resizable: true,
+                decorated: true,
+                transparent: false,
+                always_on_top: false,
+                fullscreen: false,
+                vsync: true,
+                multisampling: None,
+                icon: None,
+            }
+        ],
+        event_capacity: 1024,
+        max_fps: Some(60.0),
+    };
+
+    match DesktopApp::new(config) {
+        Ok(app) => {
+            println("   ✅ Desktop Window System Ready");
+            app
+        }
+        Err(e) => {
+            println("   ❌ Desktop Window System Failed: {:?}", e);
+            abort("Desktop initialization failed");
+        }
+    }
+}

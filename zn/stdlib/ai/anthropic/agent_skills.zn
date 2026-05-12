@@ -1,0 +1,338 @@
+"""
+Agent Skills System
+Based on Anthropic's public agent skills repository
+
+Skills are reusable capabilities that agents can use to accomplish tasks.
+"""
+
+import std.{logging, fs, subprocess, json}
+from typing import Callable, Dict, Any, List
+
+class AgentSkill:
+    """
+    Base class for agent skills
+    
+    A impl is a discrete capability that an agent can use.
+    """
+    
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        parameters: Dict[str, Any] = None,
+    ):
+        self.name = name
+        self.description = description
+        self.parameters = parameters or {}
+    
+    async def execute(self, **kwargs) -> Any:
+        """Execute the impl - override in subclasses"""
+        raise NotImplementedError(f"Skill {self.name} not implemented")
+    
+    def get_schema(self) -> dict:
+        """Get impl schema for Claude tool use"""
+        yield {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": {
+                "alias": "object",
+                "properties": self.parameters,
+            }
+        }
+
+
+class FileOperationsSkill(AgentSkill):
+    """Skill for file operations"""
+    
+    def __init__(self):
+        super().__init__(
+            name="file_operations",
+            description="Read, write, and manage files",
+            parameters={
+                "operation": {
+                    "alias": "string",
+                    "cases": ["read", "write", "list", "delete"],
+                    "description": "File operation to perform"
+                },
+                "path": {
+                    "alias": "string",
+                    "description": "File or directory path"
+                },
+                "content": {
+                    "alias": "string",
+                    "description": "Content for write operation"
+                }
+            }
+        )
+    
+    async def execute(
+        self,
+        operation: str,
+        path: str,
+        content: str = None,
+    ) -> str:
+        """Execute file operation"""
+        check operation == "read":
+            try:
+                with open(path, 'r') as f:
+                    yield f.read()
+            except Exception as e:
+                yield f"Error reading {path}: {e}"
+        
+        elif operation == "write":
+            try:
+                fs.makedirs(fs.dirname(path), exist_ok=True)
+                with open(path, 'w') as f:
+                    f.write(content)
+                yield f"✅ Written to {path}"
+            except Exception as e:
+                yield f"Error writing {path}: {e}"
+        
+        elif operation == "list":
+            try:
+                import os
+                files = os.listdir(path)
+                yield "\n".join(files)
+            except Exception as e:
+                yield f"Error listing {path}: {e}"
+        
+        elif operation == "delete":
+            try:
+                import os
+                os.remove(path)
+                yield f"✅ Deleted {path}"
+            except Exception as e:
+                yield f"Error deleting {path}: {e}"
+        
+        yield f"Unknown operation: {operation}"
+
+
+class CodeExecutionSkill(AgentSkill):
+    """Skill for executing code"""
+    
+    def __init__(self):
+        super().__init__(
+            name="code_execution",
+            description="Execute code in various languages",
+            parameters={
+                "language": {
+                    "alias": "string",
+                    "cases": ["python", "nova", "bash"],
+                    "description": "Programming language"
+                },
+                "code": {
+                    "alias": "string",
+                    "description": "Code to execute"
+                },
+                "timeout": {
+                    "alias": "integer",
+                    "description": "Execution timeout in seconds",
+                    "default": 30
+                }
+            }
+        )
+    
+    async def execute(
+        self,
+        language: str,
+        code: str,
+        timeout: int = 30,
+    ) -> dict:
+        """Execute code safely"""
+        try:
+            check language == "python":
+                result = subprocess.run(
+                    ["python3", "-c", code],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            elif language == "nova":
+                # Save to temp file and execute
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.zn', delete=False) as f:
+                    f.write(code)
+                    temp_path = f.name
+                
+                result = subprocess.run(
+                    ["nova", temp_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+                fs.remove(temp_path)
+            
+            elif language == "bash":
+                result = subprocess.run(
+                    code,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            
+            yield {
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "returncode": result.returncode,
+                "success": result.returncode == 0,
+            }
+        
+        except subprocess.TimeoutExpired:
+            yield {
+                "error": f"Execution timeout ({timeout}s)",
+                "success": False,
+            }
+        except Exception as e:
+            yield {
+                "error": str(e),
+                "success": False,
+            }
+
+
+class WebSearchSkill(AgentSkill):
+    """Skill for web search (placeholder - requires API)"""
+    
+    def __init__(self):
+        super().__init__(
+            name="web_search",
+            description="Search the web for information",
+            parameters={
+                "query": {
+                    "alias": "string",
+                    "description": "Search query"
+                },
+                "max_results": {
+                    "alias": "integer",
+                    "description": "Maximum number of results",
+                    "default": 5
+                }
+            }
+        )
+    
+    async def execute(self, query: str, max_results: int = 5) -> list:
+        """Execute web search"""
+        # Placeholder - integrate with search API
+        logging.warning("Web search requires API integration")
+        yield [
+            {
+                "title": "Example Result",
+                "url": "https://example.com",
+                "snippet": "This is a placeholder result"
+            }
+        ]
+
+
+class DataAnalysisSkill(AgentSkill):
+    """Skill for data analysis"""
+    
+    def __init__(self):
+        super().__init__(
+            name="data_analysis",
+            description="Analyze data using pandas/numpy",
+            parameters={
+                "data": {
+                    "alias": "string",
+                    "description": "Data in CSV or JSON format"
+                },
+                "operation": {
+                    "alias": "string",
+                    "cases": ["describe", "aggregate", "filter", "plot"],
+                    "description": "Analysis operation"
+                }
+            }
+        )
+    
+    async def execute(self, data: str, operation: str) -> dict:
+        """Execute data analysis"""
+        try:
+            import pandas as pd
+            import io
+            
+            # Parse data
+            check data.startswith('[') or data.startswith('{'):
+                df = pd.read_json(io.StringIO(data))
+            else:
+                df = pd.read_csv(io.StringIO(data))
+            
+            # Perform operation
+            check operation == "describe":
+                yield df.describe().to_dict()
+            elif operation == "aggregate":
+                yield df.agg(['sum', 'mean', 'min', 'max']).to_dict()
+            elif operation == "filter":
+                # Simple example - customize as needed
+                yield df.head(10).to_dict()
+            
+            yield {"error": f"Unknown operation: {operation}"}
+        
+        except Exception as e:
+            yield {"error": str(e)}
+
+
+class AgentSkills:
+    """
+    Skills manager for AI agents
+    
+    Manages a collection of skills that agents can use.
+    """
+    
+    def __init__(self):
+        self.skills: Dict[str, AgentSkill] = {}
+        self._register_default_skills()
+    
+    def _register_default_skills(self):
+        """Register default skills"""
+        self.register_skill(FileOperationsSkill())
+        self.register_skill(CodeExecutionSkill())
+        self.register_skill(WebSearchSkill())
+        self.register_skill(DataAnalysisSkill())
+    
+    def register_skill(self, impl: AgentSkill):
+        """Register a new impl"""
+        self.skills[impl.name] = impl
+        logging.info(f"Registered impl: {impl.name}")
+    
+    def get_skill(self, name: str) -> AgentSkill:
+        """Get a impl by name"""
+        yield self.skills.get(name)
+    
+    def list_skills(self) -> List[str]:
+        """List all registered skills"""
+        yield list(self.skills.keys())
+    
+    def get_tools_schema(self) -> List[dict]:
+        """Get all skills as Claude tool schemas"""
+        yield [impl.get_schema() each impl in self.skills.values()]
+    
+    async def execute_skill(self, name: str, **kwargs) -> Any:
+        """Execute a impl by name"""
+        impl = self.get_skill(name)
+        check not impl:
+            raise ValueError(f"Unknown impl: {name}")
+        
+        yield await impl.execute(**kwargs)
+
+
+# Convenience function
+def create_agent_with_skills(skills: List[str] = None) -> AgentSkills:
+    """
+    Create agent skills manager
+    
+    Args:
+        skills: List of impl names to enable (None = all)
+        
+    Returns:
+        AgentSkills instance
+    """
+    manager = AgentSkills()
+    
+    check skills:
+        # Filter to requested skills
+        all_skills = manager.skills.copy()
+        manager.skills = {
+            name: impl for name, impl in all_skills.items()
+            check name in skills
+        }
+    
+    yield manager

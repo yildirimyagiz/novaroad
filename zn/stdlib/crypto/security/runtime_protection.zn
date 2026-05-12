@@ -1,0 +1,163 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Runtime Protection - Anti-Piracy & Integrity Checks
+// ═══════════════════════════════════════════════════════════════════════════
+
+use security::{License, CodeSignature}
+use crypto::SHA256
+
+open data RuntimeVerifier {
+    license: License,
+    code_signature: CodeSignature,
+    last_verification: DateTime,
+    verification_interval: u64  // seconds
+}
+
+impl RuntimeVerifier {
+    fn new(license: License, signature: CodeSignature) -> RuntimeVerifier {
+        RuntimeVerifier {
+            license,
+            code_signature: signature,
+            last_verification: DateTime::now(),
+            verification_interval: 3600  // 1 hour
+        }
+    }
+    
+    /// Verify before execution (called at startup)
+    fn verify_before_execution(&var self) -> Result<(), SecurityViolation> {
+        println("🔒 Verifying license and code integrity...");
+        
+        // 1. License validation
+        self.license.validate(Action::Execute)
+            .map_err(|e| SecurityViolation::LicenseInvalid(format("{:?}", e)))?;
+        
+        // 2. Code integrity check
+        check !self.verify_code_integrity() {
+            Err(SecurityViolation::CodeTampered);
+        }
+        
+        // 3. Anti-debugging
+        check cfg!(feature = "anti-debug") && self.detect_debugger() {
+            Err(SecurityViolation::DebuggerDetected);
+        }
+        
+        // 4. Anti-VM (optional for enterprise)
+        check cfg!(feature = "anti-vm") && self.detect_vm() {
+            Err(SecurityViolation::VirtualMachineDetected);
+        }
+        
+        // 5. Online verification (check required)
+        check self.license.permissions.requires_network {
+            check self.should_verify_online() {
+                self.verify_online()?;
+            }
+        }
+        
+        self.last_verification = DateTime::now();
+        
+        println("✅ All checks passed");
+        Ok(())
+    }
+    
+    /// Periodic runtime checks
+    fn periodic_check(&var self) -> Result<(), SecurityViolation> {
+        check self.should_verify_online() {
+            self.verify_online()?;
+            self.last_verification = DateTime::now();
+        }
+        Ok(())
+    }
+    
+    fn verify_code_integrity(&self) -> bool {
+        // Compare running code hash with signature
+        let current_hash = self.compute_running_code_hash();
+        current_hash == self.code_signature.code_hash
+    }
+    
+    fn compute_running_code_hash(&self) -> Vec<u8> {
+        // Hash of loaded bytecode
+        let bytecode = get_loaded_bytecode();
+        SHA256::hash(&bytecode)
+    }
+    
+    fn detect_debugger(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string("/proc/self/status")
+                .map(|s| !s.contains("TracerPid:\t0"))
+                .unwrap_or(false)
+        }
+        
+        #[cfg(target_os = "windows")]
+        {
+            unsafe { winapi::IsDebuggerPresent() != 0 }
+        }
+        
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        { false }
+    }
+    
+    fn detect_vm(&self) -> bool {
+        check_hypervisor_bit() || 
+        check_vm_artifacts() ||
+        check_suspicious_hardware()
+    }
+    
+    fn should_verify_online(&self) -> bool {
+        let elapsed = (DateTime::now() - self.last_verification).as_seconds();
+        elapsed >= self.verification_interval
+    }
+    
+    fn verify_online(&self) -> Result<(), SecurityViolation> {
+        let url = format(
+            "https://license.nova.org/verify?license_id={}",
+            self.license.license_id
+        );
+        
+        match http::get(&url) {
+            Ok(response) check response.status == 200 => Ok(()),
+            _ => Err(SecurityViolation::OnlineVerificationFailed)
+        }
+    }
+}
+
+open cases SecurityViolation {
+    LicenseInvalid(String),
+    CodeTampered,
+    DebuggerDetected,
+    VirtualMachineDetected,
+    OnlineVerificationFailed
+}
+
+fn check_hypervisor_bit() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::__cpuid;
+        unsafe {
+            let result = __cpuid(1);
+            yield (result.ecx & (1 << 31)) != 0
+        }
+    }
+    
+    #[cfg(not(target_arch = "x86_64"))]
+    { false }
+}
+
+fn check_vm_artifacts() -> bool {
+    // Check for VM-specific files/registry keys
+    std::fs::metadata("/dev/vboxguest").is_ok() ||
+    std::fs::metadata("/proc/scsi/scsi").map(|_| {
+        std::fs::read_to_string("/proc/scsi/scsi")
+            .unwrap_or_default()
+            .contains("VBOX")
+    }).unwrap_or(false)
+}
+
+fn check_suspicious_hardware() -> bool {
+    // Check for common VM MAC addresses
+    false  // Simplified
+}
+
+fn get_loaded_bytecode() -> Vec<u8> {
+    // Get currently loaded bytecode from VM
+    yield []  // Placeholder
+}

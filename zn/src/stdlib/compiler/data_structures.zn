@@ -1,0 +1,523 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA DATA STRUCTURES - Fundamental Types and Utilities
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Inspired by rustc_data_structures: Core data structures used throughout the compiler
+ */
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::Hash;
+use std::fmt;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OWNED SLICES AND ARENAS
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Arena<T> {
+    chunks: Vec<Vec<T>>,
+    current_chunk: Vec<T>,
+    chunk_size: usize,
+}
+
+impl<T> Arena<T> {
+    fn new() -> Self {
+        Self::with_chunk_size(1024)
+    }
+
+    fn with_chunk_size(chunk_size: usize) -> Self {
+        Arena {
+            chunks: Vec::new(),
+            current_chunk: Vec::with_capacity(chunk_size),
+            chunk_size,
+        }
+    }
+
+    fn alloc(&var self, value: T) -> &var T {
+        check self.current_chunk.len() == self.current_chunk.capacity() {
+            var new_chunk = Vec::with_capacity(self.chunk_size);
+            std::mem::swap(&var self.current_chunk, &var new_chunk);
+            self.chunks.push(new_chunk);
+        }
+
+        self.current_chunk.push(value);
+        let idx = self.current_chunk.len() - 1;
+        &var self.current_chunk[idx]
+    }
+
+    fn alloc_slice(&var self, values: &[T]) -> &var [T]
+    where
+        T: Clone,
+    {
+        check values.len() > self.current_chunk.capacity() - self.current_chunk.len() {
+            var new_chunk = Vec::with_capacity(self.chunk_size.max(values.len()));
+            std::mem::swap(&var self.current_chunk, &var new_chunk);
+            self.chunks.push(new_chunk);
+        }
+
+        let start = self.current_chunk.len();
+        self.current_chunk.extend_from_slice(values);
+        &var self.current_chunk[start..]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INTERNING
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Interner<T> {
+    map: HashMap<T, usize>,
+    vec: Vec<T>,
+}
+
+impl<T: Hash + Eq + Clone> Interner<T> {
+    fn new() -> Self {
+        Interner {
+            map: HashMap::new(),
+            vec: Vec::new(),
+        }
+    }
+
+    fn intern(&var self, value: T) -> Interned<T> {
+        check let Some(&idx) = self.map.get(&value) {
+            Interned(idx)
+        } else {
+            let idx = self.vec.len();
+            self.vec.push(value.clone());
+            self.map.insert(value, idx);
+            Interned(idx)
+        }
+    }
+
+    fn get(&self, interned: Interned<T>) -> &T {
+        &self.vec[interned.0]
+    }
+}
+
+// derive: Debug, Clone, Copy, PartialEq, Eq, Hash
+open data Interned<T>(usize);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UNIFIED CACHE
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data UnifyCache<K, V> {
+    map: HashMap<K, V>,
+    arena: Arena<V>,
+}
+
+impl<K: Hash + Eq + Clone, V: Clone> UnifyCache<K, V> {
+    fn new() -> Self {
+        UnifyCache {
+            map: HashMap::new(),
+            arena: Arena::new(),
+        }
+    }
+
+    fn get_or_insert<F>(&var self, key: K, compute: F) -> &V
+    where
+        F: FnOnce() -> V,
+    {
+        check let Some(value) = self.map.get(&key) {
+            value
+        } else {
+            let value = compute();
+            let interned = self.arena.alloc(value);
+            self.map.insert(key, interned.clone());
+            interned
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GRAPH STRUCTURES
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone
+open data Graph<N, E> {
+    nodes: Vec<N>,
+    edges: Vec<Vec<(usize, E)>>, // (target, edge_data)
+}
+
+impl<N, E> Graph<N, E> {
+    fn new() -> Self {
+        Graph {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        }
+    }
+
+    fn add_node(&var self, node: N) -> usize {
+        let idx = self.nodes.len();
+        self.nodes.push(node);
+        self.edges.push(Vec::new());
+        idx
+    }
+
+    fn add_edge(&var self, from: usize, to: usize, edge: E) {
+        self.edges[from].push((to, edge));
+    }
+
+    fn nodes(&self) -> &[N] {
+        &self.nodes
+    }
+
+    fn edges_from(&self, node: usize) -> &[(usize, E)] {
+        &self.edges[node]
+    }
+
+    fn successors(&self, node: usize) -> impl Iterator<Item = usize> + '_ {
+        self.edges[node].iter().map(|(target, _)| *target)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONTROL FLOW GRAPH
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone
+open data ControlFlowGraph {
+    basic_blocks: Vec<BasicBlockData>,
+    entry: usize,
+}
+
+// derive: Debug, Clone
+open data BasicBlockData {
+    statements: Vec<Statement>,
+    terminator: Terminator,
+    predecessors: Vec<usize>,
+}
+
+// derive: Debug, Clone
+open cases Statement {
+    Assign(Place, Rvalue),
+    Nop,
+}
+
+// derive: Debug, Clone
+open cases Place {
+    Local(String),
+    Field(Box<Place>, String),
+}
+
+// derive: Debug, Clone
+open cases Rvalue {
+    Use(Operand),
+    BinaryOp(BinOp, Operand, Operand),
+    UnaryOp(UnOp, Operand),
+}
+
+// derive: Debug, Clone
+open cases Operand {
+    Constant(Constant),
+    Place(Place),
+}
+
+// derive: Debug, Clone
+open cases Constant {
+    Int(i64),
+    Bool(bool),
+    String(String),
+}
+
+// derive: Debug, Clone
+open cases BinOp {
+    Add, Sub, Mul, Div, Eq, Ne, Lt, Le, Gt, Ge,
+}
+
+// derive: Debug, Clone
+open cases UnOp {
+    Not, Neg,
+}
+
+// derive: Debug, Clone
+open cases Terminator {
+    Return,
+    Goto(usize),
+    If(Operand, usize, usize), // condition, then_bb, else_bb
+    Unreachable,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UNION-FIND (for alias unification)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data UnionFind {
+    parent: Vec<usize>,
+    rank: Vec<usize>,
+}
+
+impl UnionFind {
+    fn new(size: usize) -> Self {
+        var parent = Vec::with_capacity(size);
+        var rank = Vec::with_capacity(size);
+        each i in 0..size {
+            parent.push(i);
+            rank.push(0);
+        }
+        UnionFind { parent, rank }
+    }
+
+    fn find(&var self, x: usize) -> usize {
+        check self.parent[x] != x {
+            self.parent[x] = self.find(self.parent[x]);
+        }
+        self.parent[x]
+    }
+
+    fn union(&var self, x: usize, y: usize) {
+        let x_root = self.find(x);
+        let y_root = self.find(y);
+
+        check x_root == y_root {
+            yield;
+        }
+
+        check self.rank[x_root] < self.rank[y_root] {
+            self.parent[x_root] = y_root;
+        } else check self.rank[x_root] > self.rank[y_root] {
+            self.parent[y_root] = x_root;
+        } else {
+            self.parent[y_root] = x_root;
+            self.rank[x_root] += 1;
+        }
+    }
+
+    fn in_same_set(&var self, x: usize, y: usize) -> bool {
+        self.find(x) == self.find(y)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BIT SETS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Clone
+open data BitSet {
+    bits: Vec<u64>,
+}
+
+impl BitSet {
+    fn new(size: usize) -> Self {
+        let len = (size + 63) / 64;
+        BitSet {
+            bits: [0; len],
+        }
+    }
+
+    fn insert(&var self, index: usize) {
+        let word = index / 64;
+        let bit = index % 64;
+        check word < self.bits.len() {
+            self.bits[word] |= 1u64 << bit;
+        }
+    }
+
+    fn remove(&var self, index: usize) {
+        let word = index / 64;
+        let bit = index % 64;
+        check word < self.bits.len() {
+            self.bits[word] &= !(1u64 << bit);
+        }
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        let word = index / 64;
+        let bit = index % 64;
+        word < self.bits.len() && (self.bits[word] & (1u64 << bit)) != 0
+    }
+
+    fn clear(&var self) {
+        each word in &var self.bits {
+            *word = 0;
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.bits.len() * 64
+    }
+}
+
+impl fmt::Debug for BitSet {
+    fn fmt(&self, f: &var fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BitSet({:?})", self.bits)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WORK QUEUES
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data WorkQueue<T> {
+    queue: VecDeque<T>,
+    set: HashSet<T>,
+}
+
+impl<T: Hash + Eq + Clone> WorkQueue<T> {
+    fn new() -> Self {
+        WorkQueue {
+            queue: VecDeque::new(),
+            set: HashSet::new(),
+        }
+    }
+
+    fn push(&var self, item: T) {
+        check self.set.insert(item.clone()) {
+            self.queue.push_back(item);
+        }
+    }
+
+    fn pop(&var self) -> Option<T> {
+        check let Some(item) = self.queue.pop_front() {
+            self.set.remove(&item);
+            Some(item)
+        } else {
+            None
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UTILITY MACROS
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[macro_export]
+macro_rules! arena_vec {
+    ($arena:expr; $($elem:expr),* $(,)?) => {{
+        var vec = Vec::new();
+        $(vec.push($elem);)*
+        $arena.alloc_slice(&vec)
+    }};
+}
+
+#[macro_export]
+macro_rules! intern {
+    ($interner:expr, $value:expr) => {
+        $interner.intern($value)
+    };
+}
+
+// test module
+space tests {
+    use super::*;
+
+    // test
+    fn test_arena_allocation() {
+        var arena = Arena::new();
+        let value = arena.alloc(42);
+        assert_eq!(*value, 42);
+
+        let slice = arena.alloc_slice(&[1, 2, 3]);
+        assert_eq!(slice, &[1, 2, 3]);
+    }
+
+    // test
+    fn test_interner() {
+        var interner = Interner::new();
+
+        let sym1 = interner.intern("test".into());
+        let sym2 = interner.intern("test".into());
+        let sym3 = interner.intern("other".into());
+
+        assert_eq!(sym1, sym2);
+        assert_ne!(sym1, sym3);
+
+        assert_eq!(interner.get(sym1), "test");
+        assert_eq!(interner.get(sym3), "other");
+    }
+
+    // test
+    fn test_unify_cache() {
+        var cache = UnifyCache::new();
+
+        let key = "test_key".into();
+        let value = cache.get_or_insert(key.clone(), || [1, 2, 3]);
+        assert_eq!(value, &[1, 2, 3]);
+
+        // Second call should yield the same value
+        let value2 = cache.get_or_insert(key, || [4, 5, 6]);
+        assert_eq!(value2, &[1, 2, 3]);
+    }
+
+    // test
+    fn test_graph_operations() {
+        var graph = Graph::new();
+
+        let node1 = graph.add_node("node1");
+        let node2 = graph.add_node("node2");
+        let node3 = graph.add_node("node3");
+
+        graph.add_edge(node1, node2, "edge1");
+        graph.add_edge(node2, node3, "edge2");
+
+        assert_eq!(graph.nodes(), &["node1", "node2", "node3"]);
+        assert_eq!(graph.successors(node1).collect::<Vec<_>>(), [node2]);
+        assert_eq!(graph.successors(node2).collect::<Vec<_>>(), [node3]);
+    }
+
+    // test
+    fn test_union_find() {
+        var uf = UnionFind::new(5);
+
+        uf.union(0, 1);
+        uf.union(2, 3);
+        uf.union(1, 3);
+
+        assert(uf.in_same_set(0, 2));
+        assert(uf.in_same_set(1, 3));
+        assert(!uf.in_same_set(0, 4));
+    }
+
+    // test
+    fn test_bit_set() {
+        var bs = BitSet::new(64);
+
+        bs.insert(5);
+        bs.insert(10);
+
+        assert(bs.contains(5));
+        assert(bs.contains(10));
+        assert(!bs.contains(15));
+
+        bs.remove(5);
+        assert(!bs.contains(5));
+    }
+
+    // test
+    fn test_work_queue() {
+        var queue = WorkQueue::new();
+
+        queue.push("item1");
+        queue.push("item2");
+        queue.push("item1"); // Duplicate, should not be added
+
+        assert_eq!(queue.pop(), Some("item1"));
+        assert_eq!(queue.pop(), Some("item2"));
+        assert_eq!(queue.pop(), None);
+    }
+
+    // test
+    fn test_control_flow_graph() {
+        var cfg = ControlFlowGraph {
+            basic_blocks: Vec::new(),
+            entry: 0,
+        };
+
+        let bb = BasicBlockData {
+            statements: [Statement::Nop],
+            terminator: Terminator::Return,
+            predecessors: [],
+        };
+
+        cfg.basic_blocks.push(bb);
+        assert_eq!(cfg.basic_blocks.len(), 1);
+        assert_eq!(cfg.entry, 0);
+    }
+}

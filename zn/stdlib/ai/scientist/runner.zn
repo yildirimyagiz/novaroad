@@ -1,0 +1,468 @@
+/**
+ * Nova AI-Scientist: Experiment Runner
+ * 
+ * Güvenli sandbox environment'ta deney çalıştırma
+ * Docker/VM integration ile izole execution
+ */
+
+use std::io::{File, Process};
+use std::collections::{Map, List};
+use std::concurrent::{Channel, Mutex};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SANDBOX CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+data SandboxConfig {
+    timeout_seconds: i32,
+    max_memory_mb: i32,
+    max_cpu_percent: f64,
+    allowed_imports: [str],
+    blocked_imports: [str],
+    network_access: bool,
+    gpu_access: bool
+}
+
+impl SandboxConfig {
+    fn default() -> SandboxConfig {
+        SandboxConfig {
+            timeout_seconds: 3600,  // 1 hour
+            max_memory_mb: 8192,     // 8GB
+            max_cpu_percent: 100.0,
+            allowed_imports: [
+                "torch",
+                "numpy",
+                "pandas",
+                "sklearn",
+                "matplotlib"
+            ],
+            blocked_imports: [
+                "os",
+                "subprocess",
+                "socket",
+                "requests"
+            ],
+            network_access: false,
+            gpu_access: true
+        };
+    }
+    
+    fn safe() -> SandboxConfig {
+        SandboxConfig {
+            timeout_seconds: 600,
+            max_memory_mb: 2048,
+            max_cpu_percent: 50.0,
+            allowed_imports: ["numpy", "pandas"],
+            blocked_imports: ["os", "subprocess", "socket", "sys"],
+            network_access: false,
+            gpu_access: false
+        };
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXPERIMENT EXECUTOR
+// ═══════════════════════════════════════════════════════════════════════════
+
+data ExperimentExecutor {
+    sandbox: SandboxConfig,
+    workspace_dir: str,
+    results_dir: str
+}
+
+impl ExperimentExecutor {
+    fn new(workspace: str) -> ExperimentExecutor {
+        ExperimentExecutor {
+            sandbox: SandboxConfig::default(),
+            workspace_dir: workspace,
+            results_dir: f"{workspace}/results"
+        };
+    }
+    
+    fn execute_code(self, code: str, data_path: str) -> ExecutionResult {
+        // 1. Kod güvenlik kontrolü
+        check !self.is_code_safe(code) {
+            yield ExecutionResult::SecurityError(
+                "Code contains blocked operations"
+            );
+        }
+        
+        // 2. Workspace hazırla
+        let run_id = generate_run_id();
+        let run_dir = f"{self.workspace_dir}/runs/{run_id}";
+        create_directory(run_dir);
+        
+        // 3. Kodu dosyaya yaz
+        let code_path = f"{run_dir}/experiment.py";
+        File::write(code_path, code);
+        
+        // 4. Docker container'da çalıştır
+        let result = self.run_in_docker(code_path, data_path, run_dir);
+        
+        // 5. Sonuçları parse et
+        yield self.parse_execution_result(result, run_dir);
+    }
+    
+    fn is_code_safe(self, code: str) -> bool {
+        // Tehlikeli import'ları kontrol et
+        each blocked in self.sandbox.blocked_imports {
+            check code.contains(f"import {blocked}") {
+                yield false;
+            }
+            check code.contains(f"from {blocked}") {
+                yield false;
+            }
+        }
+        
+        // Tehlikeli fonksiyonları kontrol et
+        let dangerous_patterns = [
+            "exec(",
+            "eval(",
+            "compile(",
+            "__import__",
+            "open(",  // Dosya erişimi kısıtlı
+            "system(",
+            "popen("
+        ];
+        
+        each pattern in dangerous_patterns {
+            check code.contains(pattern) {
+                yield false;
+            }
+        }
+        
+        yield true;
+    }
+    
+    fn run_in_docker(
+        self,
+        code_path: str,
+        data_path: str,
+        output_dir: str
+    ) -> ProcessResult {
+        // Docker command oluştur
+        let docker_cmd = f"""
+        docker run --rm \
+            --memory={self.sandbox.max_memory_mb}m \
+            --cpus={self.sandbox.max_cpu_percent / 100.0} \
+            --network={check self.sandbox.network_access { "bridge" } else { "none" }} \
+            {check self.sandbox.gpu_access { "--gpus all" } else { "" }} \
+            -v {code_path}:/workspace/experiment.py:ro \
+            -v {data_path}:/workspace/data:ro \
+            -v {output_dir}:/workspace/output:rw \
+            -w /workspace \
+            nova-scientist:latest \
+            python experiment.py
+        """;
+        
+        // Process çalıştır ve timeout ile bekle
+        let process = Process::spawn(docker_cmd);
+        
+        let result = process.wait_with_timeout(
+            self.sandbox.timeout_seconds
+        );
+        
+        yield match result {
+            Ok(output) => ProcessResult::Success(output),
+            Err(timeout) => ProcessResult::Timeout,
+            Err(error) => ProcessResult::Error(error)
+        };
+    }
+    
+    fn parse_execution_result(
+        self,
+        process_result: ProcessResult,
+        run_dir: str
+    ) -> ExecutionResult {
+        yield match process_result {
+            ProcessResult::Success(output) => {
+                // Stdout'tan metrikleri parse et
+                let metrics = self.extract_metrics(output.stdout);
+                
+                // Çıktı dosyalarını kontrol et
+                let plots = self.collect_plots(run_dir);
+                let logs = self.collect_logs(run_dir);
+                
+                ExecutionResult::Success(ExperimentOutput {
+                    metrics: metrics,
+                    plots: plots,
+                    logs: logs,
+                    stdout: output.stdout,
+                    stderr: output.stderr
+                })
+            },
+            ProcessResult::Timeout => {
+                ExecutionResult::Timeout
+            },
+            ProcessResult::Error(msg) => {
+                ExecutionResult::RuntimeError(msg)
+            }
+        };
+    }
+    
+    fn extract_metrics(self, stdout: str) -> Map<str, f64> {
+        var metrics = Map::new();
+        
+        // "METRIC: name = value" formatını ara
+        let lines = stdout.split("\n");
+        each line in lines {
+            check line.starts_with("METRIC:") {
+                let parts = line.split("=");
+                check parts.len() == 2 {
+                    let name = parts[0].replace("METRIC:", "").trim();
+                    let value = parts[1].trim().parse_f64();
+                    metrics.insert(name, value);
+                }
+            }
+        }
+        
+        yield metrics;
+    }
+    
+    fn collect_plots(self, run_dir: str) -> [str] {
+        let plot_dir = f"{run_dir}/output/plots";
+        yield list_files(plot_dir, "*.png");
+    }
+    
+    fn collect_logs(self, run_dir: str) -> [str] {
+        let log_dir = f"{run_dir}/output/logs";
+        yield list_files(log_dir, "*.log");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RESULT TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
+cases ExecutionResult {
+    Success(ExperimentOutput),
+    Timeout,
+    RuntimeError(str),
+    SecurityError(str)
+}
+
+data ExperimentOutput {
+    metrics: Map<str, f64>,
+    plots: [str],
+    logs: [str],
+    stdout: str,
+    stderr: str
+}
+
+cases ProcessResult {
+    Success(ProcessOutput),
+    Timeout,
+    Error(str)
+}
+
+data ProcessOutput {
+    stdout: str,
+    stderr: str,
+    exit_code: i32
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BATCH EXPERIMENT RUNNER
+// ═══════════════════════════════════════════════════════════════════════════
+
+data BatchRunner {
+    executor: ExperimentExecutor,
+    num_parallel: i32
+}
+
+impl BatchRunner {
+    fn new(workspace: str, parallelism: i32) -> BatchRunner {
+        BatchRunner {
+            executor: ExperimentExecutor::new(workspace),
+            num_parallel: parallelism
+        };
+    }
+    
+    fn run_experiments(
+        self,
+        experiments: [Experiment]
+    ) -> [ExperimentResult] {
+        var results: [ExperimentResult] = [];
+        let result_channel = Channel::new();
+        
+        // Parallel execution
+        let chunks = chunk_array(experiments, self.num_parallel);
+        
+        each chunk in chunks {
+            var handles = [];
+            
+            each exp in chunk {
+                let handle = spawn(|| {
+                    let result = self.executor.execute_code(
+                        exp.code,
+                        exp.data_path
+                    );
+                    result_channel.send((exp.id, result));
+                });
+                handles.push(handle);
+            }
+            
+            // Wait for chunk to complete
+            each handle in handles {
+                handle.join();
+            }
+        }
+        
+        // Collect results
+        each _ in 0..experiments.len() {
+            let (exp_id, result) = result_channel.recv();
+            results.push(ExperimentResult {
+                experiment_id: exp_id,
+                result: result
+            });
+        }
+        
+        yield results;
+    }
+}
+
+data Experiment {
+    id: i32,
+    code: str,
+    data_path: str,
+    name: str
+}
+
+data ExperimentResult {
+    experiment_id: i32,
+    result: ExecutionResult
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VISUALIZATION TOOLS
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn visualize_results(results: [ExperimentResult]) -> str {
+    var html = """
+    <html>
+    <head>
+        <title>Experiment Results</title>
+        <style>
+            body { font-family: Arial; margin: 20px; }
+            .experiment { border: 1px solid #ddd; margin: 10px; padding: 15px; }
+            .success { background-color: #d4edda; }
+            .error { background-color: #f8d7da; }
+            .metric { font-weight: bold; }
+        </style>
+    </head>
+    <body>
+        <h1>Experiment Results</h1>
+    """;
+    
+    each result in results {
+        let class_name = match result.result {
+            ExecutionResult::Success(_) => "experiment success",
+            _ => "experiment error"
+        };
+        
+        html = html + f"""
+        <div class="{class_name}">
+            <h2>Experiment {result.experiment_id}</h2>
+        """;
+        
+        html = html + match result.result {
+            ExecutionResult::Success(output) => {
+                var metrics_html = "<h3>Metrics:</h3><ul>";
+                each entry in output.metrics  { let (name, value) = entry;
+                    metrics_html = metrics_html + 
+                        f"<li class='metric'>{name}: {value}</li>";
+                }
+                metrics_html = metrics_html + "</ul>";
+                
+                var plots_html = "<h3>Plots:</h3>";
+                each plot in output.plots {
+                    plots_html = plots_html + 
+                        f"<img src='{plot}' width='400'/>";
+                }
+                
+                metrics_html + plots_html
+            },
+            ExecutionResult::Timeout => {
+                "<p><strong>Error:</strong> Execution timed out</p>"
+            },
+            ExecutionResult::RuntimeError(msg) => {
+                f"<p><strong>Runtime Error:</strong> {msg}</p>"
+            },
+            ExecutionResult::SecurityError(msg) => {
+                f"<p><strong>Security Error:</strong> {msg}</p>"
+            }
+        };
+        
+        html = html + "</div>";
+    }
+    
+    html = html + """
+    </body>
+    </html>
+    """;
+    
+    yield html;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn generate_run_id() -> str {
+    // UUID veya timestamp-based ID
+    yield "run_20240207_123456";
+}
+
+fn create_directory(path: str) {
+    // mkdir -p equivalent
+}
+
+fn list_files(dir: str, pattern: str) -> [str] {
+    // glob pattern matching
+    yield [];
+}
+
+fn chunk_array<T>(arr: [T], chunk_size: i32) -> [[T]] {
+    var chunks: [[T]] = [];
+    var current_chunk: [T] = [];
+    
+    each entry in arr.enumerate()  { let (i, item) = entry;
+        current_chunk.push(item);
+        
+        check (i + 1) % chunk_size == 0 {
+            chunks.push(current_chunk);
+            current_chunk = [];
+        }
+    }
+    
+    check current_chunk.len() > 0 {
+        chunks.push(current_chunk);
+    }
+    
+    yield chunks;
+}
+
+impl str {
+    fn parse_f64(self) -> f64 {
+        // String to float conversion
+        yield 0.0;
+    }
+}
+
+data Process {
+    pid: i32
+}
+
+impl Process {
+    fn spawn(cmd: str) -> Process {
+        Process { pid: 0 };
+    }
+    
+    fn wait_with_timeout(self, seconds: i32) -> Result<ProcessOutput, str> {
+        Ok(ProcessOutput {
+            stdout: "",
+            stderr: "",
+            exit_code: 0
+        });
+    }
+}

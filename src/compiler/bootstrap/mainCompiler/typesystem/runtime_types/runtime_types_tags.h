@@ -1,0 +1,5 @@
+#ifndef NOVA_RUNTIME_TYPES_TAGS_H
+#define NOVA_RUNTIME_TYPES_TAGS_H
+
+#endif
+

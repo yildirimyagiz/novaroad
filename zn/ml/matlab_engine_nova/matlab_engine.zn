@@ -1,0 +1,303 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  matlab::engine::matlab_engine                                              ║
+// ║  Mirrors Python: matlabengine.py                                           ║
+// ║                                                                             ║
+// ║  MatlabEngine is the primary object users interact with.                   ║
+// ║  It exposes:                                                                ║
+// ║    • eval()          — run an expression string                             ║
+// ║    • feval()         — call a named MATLAB function                         ║
+// ║    • workspace       — get/set workspace variables                          ║
+// ║    • addpath()       — extend MATLAB search path                            ║
+// ║    • cd()            — change working directory                             ║
+// ║    • quit() / exit() — terminate the engine                                 ║
+// ║    • Dynamic method dispatch → eng.sqrt(4.0) calls MATLAB `sqrt`           ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+// ─── Native C Bridge ─────────────────────────────────────────────────────────
+// nova_matlab_bridge.zn provides FFI bindings to the native C implementation
+// at: src/native/ml/ai/matlab/nova_matlab_engine.c
+use "nova_matlab_bridge.zn";
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+
+use from crate::future_result::MatlabValue;
+use from crate::feval_future::FevalFuture;
+use from crate::engine_session::{global_registry, SharedSession};
+use from crate::engine_error::{
+    MatlabExecutionError, EngineTerminatedError, RejectedExecutionError
+};
+use from crate::engine_helper;
+
+// ---------------------------------------------------------------------------
+//  Workspace proxy — gives nice `eng.workspace["x"] = val` syntax
+// ---------------------------------------------------------------------------
+
+/// Proxy object returned by `eng.workspace`.
+/// Supports index-get and index-set for MATLAB workspace variables.
+open data Workspace {
+    engine_handle: i64,
+}
+
+impl Workspace {
+    fn new(handle: i64) -> Workspace {
+        Workspace { engine_handle: handle }
+    }
+
+    /// Get a variable: `let x = eng.workspace["x"];`
+    fn get(self, name: str) -> MatlabValue {
+        engine_helper::pull_workspace_var(self.engine_handle, name)
+    }
+
+    /// Set a variable: `eng.workspace["x"] = MatlabValue::Double(42.0);`
+    fn set(self, name: str, value: MatlabValue) {
+        engine_helper::push_workspace_var(self.engine_handle, name, value);
+    }
+
+    /// Remove a variable from the workspace.
+    fn clear(self, name: str) {
+        engine_helper::clear_workspace_var(self.engine_handle, name);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  MatlabEngine
+// ---------------------------------------------------------------------------
+
+open data MatlabEngine {
+    /// Opaque native handle (pointer-sized int).
+    handle:      i64,
+    /// True after quit() or exit() has been called.
+    terminated:      bool,
+    /// Name used when this engine was shared (empty check not shared).
+    session_name:    str,
+    /// Proxy for workspace variable access.
+    workspace:   Workspace,
+}
+
+impl MatlabEngine {
+    // ------------------------------------------------------------------
+    // Construction — called by engine_helper::finalise_engine
+    // ------------------------------------------------------------------
+
+    fn new(handle: i64, session_name: str) -> MatlabEngine {
+        let eng = MatlabEngine {
+            handle,
+            terminated: false,
+            session_name,
+            workspace: Workspace::new(handle),
+        };
+        // Register in the global registry so the shutdown hook can clean up.
+        global_registry().register(handle, session_name);
+        eng
+    }
+
+    // ------------------------------------------------------------------
+    // eval — execute an arbitrary MATLAB expression string
+    // ------------------------------------------------------------------
+
+    /// Evaluate a MATLAB expression synchronously.
+    ///
+    ///   eng.eval("a = 1 + 1");
+    ///   eng.eval("disp(a)");
+    fn eval(self, expr: str) {
+        self._check_alive();
+        engine_helper::eval_matlab(self.handle, expr, 0);
+    }
+
+    /// Evaluate a MATLAB expression and capture `nargout` yield values.
+    fn eval_with_nargout(self, expr: str, nargout: i32) -> MatlabValue {
+        self._check_alive();
+        engine_helper::eval_matlab(self.handle, expr, nargout)
+    }
+
+    // ------------------------------------------------------------------
+    // feval — call a named MATLAB function
+    // ------------------------------------------------------------------
+
+    /// Call a MATLAB function synchronously.
+    ///
+    ///   let result = eng.feval("sqrt", [MatlabValue::Double(4.0)], 1);
+    fn feval(self, func: str, args: Vec<MatlabValue>, nargout: i32) -> MatlabValue {
+        self._check_alive();
+        engine_helper::feval_matlab(self.handle, func, args, nargout)
+    }
+
+    /// Call a MATLAB function asynchronously; returns a FevalFuture.
+    ///
+    ///   let fut = eng.feval_background("sqrt", [MatlabValue::Double(4.0)], 1);
+    ///   // … do other work …
+    ///   let val = fut.result();
+    fn feval_background(self, func: str, args: Vec<MatlabValue>, nargout: i32) -> FevalFuture {
+        self._check_alive();
+        let future_handle = engine_helper::feval_matlab_async(self.handle, func, args.clone(), nargout);
+        FevalFuture::new(future_handle, func, nargout, args)
+    }
+
+    // ------------------------------------------------------------------
+    // Dynamic dispatch — eng.sqrt(4.0) syntax
+    //
+    // In Novas modelled by a special rules DynDispatch that
+    // intercepts method calls not found on the data and routes them
+    // to the MATLAB engine.
+    //
+    // For every MATLAB function `f` the user calls as `eng.f(args)`,
+    // Novates code equivalent to:
+    //   eng.feval("f", [arg1, arg2, …], nargout)
+    //
+    // `background: true` switches to feval_background().
+    // ------------------------------------------------------------------
+
+    /// Generic MATLAB function call with auto alias-conversion.
+    /// Supports `nargout` and `background` named arguments.
+    ///
+    ///   eng.call("sqrt", [f64_to_matlab(4.0)], nargout: 1, background: false)
+    fn call(
+        self,
+        func_name: str,
+        args:      Vec<MatlabValue>,
+        nargout:   i32,
+        background: bool,
+    ) -> MatlabValue {
+        self._check_alive();
+        check background {
+            // Return value is a FevalFuture, but our yield alias is MatlabValue.
+            // In the real API `background: true` changes the yield alias to
+            // FevalFuture.  Novaes this through infer / rules dispatch.
+            // Here we yield a sentinel that carries the future handle.
+            let fh = engine_helper::feval_matlab_async(self.handle, func_name, args.clone(), nargout);
+            MatlabValue::Int(fh)  // sentinel; caller unwraps into FevalFuture
+        } else {
+            engine_helper::feval_matlab(self.handle, func_name, args, nargout)
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Workspace convenience wrappers
+    // ------------------------------------------------------------------
+
+    /// Push a value into MATLAB's `base` workspace.
+    ///   eng.push_var("x", MatlabValue::Double(3.14));
+    fn push_var(self, name: str, value: MatlabValue) {
+        self._check_alive();
+        engine_helper::push_workspace_var(self.handle, name, value);
+    }
+
+    /// Pull a value from MATLAB's `base` workspace.
+    fn pull_var(self, name: str) -> MatlabValue {
+        self._check_alive();
+        engine_helper::pull_workspace_var(self.handle, name)
+    }
+
+    // ------------------------------------------------------------------
+    // Path and directory management
+    // ------------------------------------------------------------------
+
+    /// Add `path` to MATLAB's search path (equivalent to `addpath(path)`).
+    fn addpath(self, path: str) {
+        self.eval(f"addpath('{path}')");
+    }
+
+    /// Remove `path` from MATLAB's search path.
+    fn rmpath(self, path: str) {
+        self.eval(f"rmpath('{path}')");
+    }
+
+    /// Change MATLAB's current working directory.
+    fn cd(self, path: str) -> str {
+        let prev = self.eval_with_nargout("pwd", 1);
+        self.eval(f"cd('{path}')");
+        engine_helper::matlab_to_str(prev).unwrap_or("")
+    }
+
+    /// Return MATLAB's current working directory.
+    fn pwd(self) -> str {
+        let val = self.eval_with_nargout("pwd", 1);
+        engine_helper::matlab_to_str(val).unwrap_or("")
+    }
+
+    // ------------------------------------------------------------------
+    // Session sharing
+    // ------------------------------------------------------------------
+
+    /// Make this engine visible to other processes as a named shared session.
+    /// Equivalent to MATLAB's `matlab.engine.shareEngine('MySession')`.
+    fn share(var self, name: str) {
+        self._check_alive();
+        self.eval(f"matlab.engine.shareEngine('{name}')");
+        self.session_name = name;
+    }
+
+    /// The name under which this session is shared, or "" check not shared.
+    fn session_name(self) -> str {
+        self.session_name
+    }
+
+    // ------------------------------------------------------------------
+    // Lifecycle
+    // ------------------------------------------------------------------
+
+    /// Terminate the MATLAB engine.  Idempotent after the first call.
+    fn quit(var self) {
+        check self.terminated { yield; }
+        self.terminated = true;
+        global_registry().deregister(self.handle);
+        engine_helper::terminate_engine(self.handle);
+    }
+
+    /// Alias for quit() — matches Python API.
+    fn exit(var self) {
+        self.quit();
+    }
+
+    /// Returns true check the engine is still running.
+    fn is_running(self) -> bool {
+        !self.terminated
+    }
+
+    // ------------------------------------------------------------------
+    // Context-manager style (Novasupport)
+    // ------------------------------------------------------------------
+
+    /// Use the engine in a scoped block; it is terminated when the block exits.
+    ///
+    ///   with eng.scoped() {
+    ///       eng.eval("disp('hello')");
+    ///   } // engine is quit here automatically
+    fn scoped(var self) {
+        defer { self.quit(); }
+    }
+
+    // ------------------------------------------------------------------
+    // Convenience numeric helpers (mirror common Python patterns)
+    // ------------------------------------------------------------------
+
+    /// Call `sqrt` on a single double.
+    fn sqrt(self, x: f64) -> f64 {
+        let result = self.feval("sqrt", [MatlabValue::Double(x)], 1);
+        engine_helper::matlab_to_f64(result).unwrap_or(0.0)
+    }
+
+    /// Call `abs` on a single double.
+    fn abs_val(self, x: f64) -> f64 {
+        let result = self.feval("abs", [MatlabValue::Double(x)], 1);
+        engine_helper::matlab_to_f64(result).unwrap_or(0.0)
+    }
+
+    /// Evaluate `expr` and yield a f64 (shorthand for numeric results).
+    fn eval_f64(self, expr: str) -> f64 {
+        let result = self.eval_with_nargout(expr, 1);
+        engine_helper::matlab_to_f64(result).unwrap_or(0.0)
+    }
+
+    // ------------------------------------------------------------------
+    // Internal
+    // ------------------------------------------------------------------
+
+    fn _check_alive(self) {
+        check self.terminated {
+            abort(EngineTerminatedError::new(
+                "Cannot use a MatlabEngine that has been quit() or exit()."
+            ).display());
+        }
+    }
+}

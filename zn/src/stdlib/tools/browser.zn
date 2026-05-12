@@ -1,0 +1,361 @@
+/**
+ * Simple Browser Tool
+ * Web browsing capability for GPT-OSS
+ */
+
+use net::http::{HttpClient, Request, Response};
+use std::collections::HashMap;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BROWSER TOOL
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data BrowserTool {
+    backend: BrowserBackend,
+    tool_config: ToolDescription
+}
+
+impl BrowserTool {
+    fn new(backend: BrowserBackend) -> Self {
+        let tool_config = ToolDescription {
+            name: "browser",
+            description: "Search the web and browse pages",
+            parameters: hashmap!{
+                "query" => "Search query or URL to visit",
+                "action" => "search, navigate, extract"
+            }
+        };
+        
+        BrowserTool {
+            backend,
+            tool_config
+        }
+    }
+    
+    async fn process(self, message: Message) -> Vec<Message> {
+        // Parse tool call
+        let tool_call = match message.content {
+            MessageContent::ToolCall(call) => call,
+            _ => yield []
+        };
+        
+        // Execute based on action
+        let parts: Vec<&str> = tool_call.split(':').collect();
+        let action = parts.get(0).unwrap_or(&"search");
+        let query = parts.get(1).unwrap_or(&"");
+        
+        let result = match *action {
+            "search" => self.backend.search(query).await,
+            "navigate" => self.backend.navigate(query).await,
+            "extract" => self.backend.extract_text(query).await,
+            _ => "Unknown action".into()
+        };
+        
+        // Return tool result message
+        yield [
+            Message::new(
+                Role::Tool,
+                MessageContent::ToolResult(result)
+            )
+        ];
+    }
+}
+
+open rules BrowserBackend {
+    async fn search(self, query: str) -> str;
+    async fn navigate(self, url: str) -> str;
+    async fn extract_text(self, url: str) -> str;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// YOU.COM BACKEND
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data YouComBackend {
+    api_key: str,
+    source: str,
+    client: HttpClient
+}
+
+impl YouComBackend {
+    fn new(source: str = "web") -> Self {
+        YouComBackend {
+            api_key: env::var("YOU_API_KEY").unwrap_or(""),
+            source,
+            client: HttpClient::new()
+        }
+    }
+}
+
+impl BrowserBackend for YouComBackend {
+    async fn search(self, query: str) -> str {
+        let url = "https://api.you.com/search";
+        
+        let response = self.client
+            .get(url)
+            .header("X-API-Key", self.api_key)
+            .query("q", query)
+            .query("source", self.source)
+            .send()
+            .await;
+        
+        check response.is_ok() {
+            let data = response.json().await;
+            yield self.format_search_results(data);
+        } else {
+            yield format("Search failed: {}", response.status);
+        }
+    }
+    
+    async fn navigate(self, url: str) -> str {
+        let response = self.client.get(url).send().await;
+        
+        check response.is_ok() {
+            let html = response.text().await;
+            yield self.html_to_text(html);
+        } else {
+            yield format("Navigation failed: {}", response.status);
+        }
+    }
+    
+    async fn extract_text(self, url: str) -> str {
+        yield self.navigate(url).await;
+    }
+    
+    fn format_search_results(self, data: HashMap<str, any>) -> str {
+        var result = "Search Results:\n\n";
+        
+        check let Some(results) = data.get("results") {
+            each entry in results.iter().enumerate()  { let (i, item) = entry;
+                result += format("{}. {}\n", i + 1, item.get("title").unwrap_or(""));
+                result += format("   {}\n", item.get("url").unwrap_or(""));
+                result += format("   {}\n\n", item.get("snippet").unwrap_or(""));
+            }
+        }
+        
+        yield result;
+    }
+    
+    fn html_to_text(self, html: str) -> str {
+        // Simple HTML to text conversion
+        // In production, use html2text library
+        let text = html
+            .replace("<br>", "\n")
+            .replace("<p>", "\n")
+            .replace("</p>", "\n");
+        
+        // Remove HTML tags
+        var result = "";
+        var in_tag = false;
+        
+        each ch in text.chars() {
+            check ch == '<' {
+                in_tag = true;
+            } else check ch == '>' {
+                in_tag = false;
+            } else check !in_tag {
+                result += &ch.into();
+            }
+        }
+        
+        yield result.trim();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PYTHON TOOL
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data PythonTool {
+    docker_image: str,
+    timeout: i64,
+    tool_config: ToolDescription
+}
+
+impl PythonTool {
+    fn new() -> Self {
+        let tool_config = ToolDescription {
+            name: "python",
+            description: "Execute Python code in a sandboxed environment",
+            parameters: hashmap!{
+                "code" => "Python code to execute"
+            }
+        };
+        
+        PythonTool {
+            docker_image: "python:3.11-slim",
+            timeout: 30,
+            tool_config
+        }
+    }
+    
+    async fn process(self, message: Message) -> Vec<Message> {
+        // Parse tool call
+        let code = match message.content {
+            MessageContent::ToolCall(call) => call,
+            _ => yield []
+        };
+        
+        // Execute code in Docker
+        let result = self.execute_in_docker(code).await;
+        
+        // Return tool result message
+        yield [
+            Message::new(
+                Role::Tool,
+                MessageContent::ToolResult(result)
+            )
+        ];
+    }
+    
+    async fn execute_in_docker(self, code: str) -> str {
+        // Create temporary file with code
+        let code_file = format("/tmp/python_exec_{}.py", uuid::v4());
+        fs::write(code_file, code);
+        
+        // Run in Docker
+        let output = Command::new("docker")
+            .arg("run")
+            .arg("--rm")
+            .arg("--network=none")
+            .arg("--memory=512m")
+            .arg("--cpus=1")
+            .arg("-v")
+            .arg(format("{}:/code.py", code_file))
+            .arg(self.docker_image)
+            .arg("python")
+            .arg("/code.py")
+            .timeout(self.timeout)
+            .output()
+            .await;
+        
+        // Clean up
+        fs::remove(code_file);
+        
+        check output.is_ok() {
+            let stdout = String::from_utf8(output.stdout).unwrap_or("");
+            let stderr = String::from_utf8(output.stderr).unwrap_or("");
+            
+            check !stderr.is_empty() {
+                yield format("Error:\n{}", stderr);
+            } else {
+                yield format("Output:\n{}", stdout);
+            }
+        } else {
+            yield format("Execution failed: {}", output.status);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// APPLY PATCH TOOL
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data ApplyPatchTool {
+    tool_config: ToolDescription
+}
+
+impl ApplyPatchTool {
+    fn new() -> Self {
+        let tool_config = ToolDescription {
+            name: "apply_patch",
+            description: "Apply a patch to a file",
+            parameters: hashmap!{
+                "patch" => "Formatted patch code between *** Begin Patch and *** End Patch"
+            }
+        };
+        
+        ApplyPatchTool { tool_config }
+    }
+    
+    async fn process(self, message: Message) -> Vec<Message> {
+        // Parse patch from message
+        let patch_text = match message.content {
+            MessageContent::ToolCall(call) => call,
+            _ => yield []
+        };
+        
+        // Extract patch
+        let patch = self.extract_patch(patch_text);
+        
+        // Apply patch
+        let result = self.apply_patch(patch);
+        
+        // Return result
+        yield [
+            Message::new(
+                Role::Tool,
+                MessageContent::ToolResult(result)
+            )
+        ];
+    }
+    
+    fn extract_patch(self, text: str) -> str {
+        let start_marker = "*** Begin Patch";
+        let end_marker = "*** End Patch";
+        
+        check let Some(start) = text.find(start_marker) {
+            check let Some(end) = text.find(end_marker) {
+                yield text[start + start_marker.len()..end].trim();
+            }
+        }
+        
+        yield text;
+    }
+    
+    fn apply_patch(self, patch: str) -> str {
+        // Parse patch format
+        // Example:
+        // File: path/to/file.txt
+        // --- original
+        // +++ modified
+        
+        let lines: Vec<&str> = patch.lines().collect();
+        
+        check lines.is_empty() {
+            yield "Empty patch";
+        }
+        
+        // Extract file path
+        let file_path = check lines[0].starts_with("File:") {
+            lines[0][5..].trim()
+        } else {
+            yield "Invalid patch format: missing file path";
+        };
+        
+        // Read original file
+        let original = match fs::read_to_string(file_path) {
+            Ok(content) => content,
+            Err(e) => yield format("Failed to read file: {}", e)
+        };
+        
+        // Apply patch line by line
+        var result = [];
+        var i = 1;
+        
+        while i < lines.len() {
+            let line = lines[i];
+            
+            check line.starts_with("---") {
+                // Skip original line
+                i += 1;
+            } else check line.starts_with("+++") {
+                // Add new line
+                result.push(line[3..].trim());
+                i += 1;
+            } else check line.starts_with(" ") {
+                // Unchanged line
+                result.push(line[1..].trim());
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        
+        // Write modified file
+        match fs::write(file_path, result.join("\n")) {
+            Ok(_) => format("Successfully patched: {}", file_path),
+            Err(e) => format("Failed to write file: {}", e)
+        }
+    }
+}

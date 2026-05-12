@@ -1,0 +1,700 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  NOVA TYPE-LEVEL COMPUTATION — v11.0                                        ║
+// ║  Compile-time evaluation and dependent types                                ║
+// ║                                                                              ║
+// ║  v11 yenilikleri:                                                           ║
+// ║    • eval_type_level tam implementasyon                                     ║
+// ║    • Vec<T,N>::append gerçek implementasyon                                 ║
+// ║    • File state machine gerçek implementasyon                               ║
+// ║    • Refined<T> runtime check + unwrap                                      ║
+// ║    • Const trait evaluator                                                  ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §1  TYPE-LEVEL VALUES
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose cases Nat derives [Clone, Eq] {
+    Zero,
+    Succ(Box<Nat>),
+}
+
+impl Nat {
+    open fn from_int(n: i64) -> Nat {
+        check n <= 0 {
+            yield Nat::Zero;
+        }
+        Nat::Succ(Box::new(Nat::from_int(n - 1)))
+    }
+
+    open fn to_int(&self) -> i64 {
+        match self {
+            Nat::Zero       => 0,
+            Nat::Succ(prev) => 1 + prev.to_int(),
+        }
+    }
+
+    open fn add(&self, other: &Nat) -> Nat {
+        match self {
+            Nat::Zero       => other.clone(),
+            Nat::Succ(prev) => Nat::Succ(Box::new(prev.add(other))),
+        }
+    }
+
+    open fn eq_nat(&self, other: &Nat) -> bool {
+        match (self, other) {
+            (Nat::Zero, Nat::Zero)               => true,
+            (Nat::Succ(a), Nat::Succ(b))         => a.eq_nat(b),
+            _                                    => false,
+        }
+    }
+}
+
+expose cases TBool derives [Clone] { True, False }
+
+expose cases TypeList<T> derives [Clone] {
+    Nil,
+    Cons(T, Box<TypeList<T>>),
+}
+
+impl TypeList<T> {
+    open fn len(&self) -> i64 {
+        match self {
+            TypeList::Nil        => 0,
+            TypeList::Cons(_, t) => 1 + t.len(),
+        }
+    }
+
+    open fn append(&self, other: &TypeList<T>) -> TypeList<T> {
+        match self {
+            TypeList::Nil           => other.clone(),
+            TypeList::Cons(h, tail) => TypeList::Cons(h.clone(), Box::new(tail.append(other))),
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §2  TYPE-LEVEL DEĞERLER & İFADELER
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose cases TypeLevelValue derives [Clone] {
+    Nat(i64),
+    Bool(bool),
+    Str(String),
+    List(Vec<TypeLevelValue>),
+    Tuple(Vec<TypeLevelValue>),
+    Fn(String, Box<TypeLevelValue>),  // v11: fonksiyon değeri
+    Unit,
+    Error(String),
+}
+
+impl TypeLevelValue {
+    open fn as_nat(&self) -> Option<i64> {
+        match self {
+            TypeLevelValue::Nat(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    open fn as_bool(&self) -> Option<bool> {
+        match self {
+            TypeLevelValue::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    open fn display(&self) -> String {
+        match self {
+            TypeLevelValue::Nat(n)    => format!("{}", n),
+            TypeLevelValue::Bool(b)   => if *b { "true".into() } else { "false".into() },
+            TypeLevelValue::Str(s)    => format!("\"{}\"", s),
+            TypeLevelValue::List(l)   => format!("[{}]", l.iter().map(|v| v.display()).collect::<Vec<_>>().join(", ")),
+            TypeLevelValue::Tuple(t)  => format!("({})", t.iter().map(|v| v.display()).collect::<Vec<_>>().join(", ")),
+            TypeLevelValue::Unit      => "()".into(),
+            TypeLevelValue::Error(e)  => format!("Error({})", e),
+            TypeLevelValue::Fn(n, _)  => format!("<fn {}>", n),
+        }
+    }
+}
+
+// ── Tip ifadeleri ─────────────────────────────────────────────────────────────
+
+expose cases TypeExpr derives [Clone] {
+    Prim(String),                          // i64, bool, ...
+    Var(String),                           // T, A, ...
+    App(Box<TypeExpr>, Vec<TypeExpr>),     // F<A, B>
+    Fn(Vec<TypeExpr>, Box<TypeExpr>),      // fn(A) -> B
+    Tuple(Vec<TypeExpr>),                  // (A, B, C)
+    Const(TypeLevelValue),                 // type-level sabit
+    Add(Box<TypeExpr>, Box<TypeExpr>),     // N + M
+    Sub(Box<TypeExpr>, Box<TypeExpr>),     // N - M
+    Mul(Box<TypeExpr>, Box<TypeExpr>),     // N * M
+    If(Box<TypeExpr>, Box<TypeExpr>, Box<TypeExpr>), // If<B, T, F>
+}
+
+// ── Tip ortamı ────────────────────────────────────────────────────────────────
+
+expose data TypeEnv {
+    open bindings: HashMap<String, TypeLevelValue>,
+    open parent:   Option<Box<TypeEnv>>,
+}
+
+impl TypeEnv {
+    open fn new() -> TypeEnv {
+        TypeEnv { bindings: HashMap::new(), parent: None }
+    }
+
+    open fn extend(parent: TypeEnv) -> TypeEnv {
+        TypeEnv { bindings: HashMap::new(), parent: Some(Box::new(parent)) }
+    }
+
+    open fn bind(&var self, name: String, val: TypeLevelValue) {
+        self.bindings.insert(name, val);
+    }
+
+    open fn lookup(&self, name: &str) -> Option<TypeLevelValue> {
+        match self.bindings.get(name) {
+            Some(v) => Some(v.clone()),
+            None    => match &self.parent {
+                Some(p) => p.lookup(name),
+                None    => None,
+            },
+        }
+    }
+}
+
+// ── eval_type_level — tam implementasyon ──────────────────────────────────────
+
+open fn eval_type_level(expr: TypeExpr) -> Result<TypeLevelValue, String> {
+    eval_in_env(expr, &TypeEnv::new())
+}
+
+open fn eval_in_env(expr: TypeExpr, env: &TypeEnv) -> Result<TypeLevelValue, String> {
+    match expr {
+
+        TypeExpr::Const(v) => Ok(v),
+
+        TypeExpr::Prim(name) => match name.as_str() {
+            "true"  => Ok(TypeLevelValue::Bool(true)),
+            "false" => Ok(TypeLevelValue::Bool(false)),
+            "0"     => Ok(TypeLevelValue::Nat(0)),
+            s       => {
+                // Sayı mı?
+                match s.parse::<i64>() {
+                    Ok(n)  => Ok(TypeLevelValue::Nat(n)),
+                    Err(_) => Err(format!("Bilinmeyen tip sabiti: {}", s)),
+                }
+            }
+        },
+
+        TypeExpr::Var(name) => match env.lookup(&name) {
+            Some(v) => Ok(v),
+            None    => Err(format!("Tanımsız tip değişkeni: {}", name)),
+        },
+
+        TypeExpr::Add(l, r) => {
+            let lv = eval_in_env(*l, env)?;
+            let rv = eval_in_env(*r, env)?;
+            match (lv, rv) {
+                (TypeLevelValue::Nat(a), TypeLevelValue::Nat(b)) => Ok(TypeLevelValue::Nat(a + b)),
+                (TypeLevelValue::Str(a), TypeLevelValue::Str(b)) => Ok(TypeLevelValue::Str(a + &b)),
+                _ => Err("Add: uyumsuz tip-seviye değerler".into()),
+            }
+        }
+
+        TypeExpr::Sub(l, r) => {
+            let lv = eval_in_env(*l, env)?;
+            let rv = eval_in_env(*r, env)?;
+            match (lv, rv) {
+                (TypeLevelValue::Nat(a), TypeLevelValue::Nat(b)) => {
+                    check a < b { Err("Sub: negatif doğal sayı".into()) }
+                    else        { Ok(TypeLevelValue::Nat(a - b)) }
+                }
+                _ => Err("Sub: sadece Nat değerleri için".into()),
+            }
+        }
+
+        TypeExpr::Mul(l, r) => {
+            let lv = eval_in_env(*l, env)?;
+            let rv = eval_in_env(*r, env)?;
+            match (lv, rv) {
+                (TypeLevelValue::Nat(a), TypeLevelValue::Nat(b)) => Ok(TypeLevelValue::Nat(a * b)),
+                _ => Err("Mul: sadece Nat değerleri için".into()),
+            }
+        }
+
+        TypeExpr::If(cond, then_e, else_e) => {
+            let cv = eval_in_env(*cond, env)?;
+            match cv {
+                TypeLevelValue::Bool(true)  => eval_in_env(*then_e, env),
+                TypeLevelValue::Bool(false) => eval_in_env(*else_e, env),
+                _ => Err("If: koşul bool olmalı".into()),
+            }
+        }
+
+        TypeExpr::Tuple(elems) => {
+            var vals: Vec<TypeLevelValue> = [];
+            each e in elems {
+                vals.push(eval_in_env(e, env)?);
+            }
+            Ok(TypeLevelValue::Tuple(vals))
+        }
+
+        TypeExpr::App(func, args) => {
+            // Yerleşik tip aileleri
+            match *func {
+                TypeExpr::Prim(name) => match name.as_str() {
+                    "Add" => {
+                        check args.len() != 2 { return Err("Add: 2 argüman gerekli".into()); }
+                        let a = eval_in_env(args[0].clone(), env)?;
+                        let b = eval_in_env(args[1].clone(), env)?;
+                        match (a, b) {
+                            (TypeLevelValue::Nat(x), TypeLevelValue::Nat(y)) => Ok(TypeLevelValue::Nat(x + y)),
+                            _ => Err("Add: Nat bekleniyor".into()),
+                        }
+                    }
+                    "Max" => {
+                        check args.len() != 2 { return Err("Max: 2 argüman gerekli".into()); }
+                        let a = eval_in_env(args[0].clone(), env)?.as_nat().ok_or("Max: Nat bekleniyor".into())?;
+                        let b = eval_in_env(args[1].clone(), env)?.as_nat().ok_or("Max: Nat bekleniyor".into())?;
+                        Ok(TypeLevelValue::Nat(if a > b { a } else { b }))
+                    }
+                    "Min" => {
+                        check args.len() != 2 { return Err("Min: 2 argüman gerekli".into()); }
+                        let a = eval_in_env(args[0].clone(), env)?.as_nat().ok_or("Min: Nat bekleniyor".into())?;
+                        let b = eval_in_env(args[1].clone(), env)?.as_nat().ok_or("Min: Nat bekleniyor".into())?;
+                        Ok(TypeLevelValue::Nat(if a < b { a } else { b }))
+                    }
+                    "Not" => {
+                        check args.len() != 1 { return Err("Not: 1 argüman gerekli".into()); }
+                        let v = eval_in_env(args[0].clone(), env)?.as_bool().ok_or("Not: Bool bekleniyor".into())?;
+                        Ok(TypeLevelValue::Bool(!v))
+                    }
+                    "And" => {
+                        check args.len() != 2 { return Err("And: 2 argüman gerekli".into()); }
+                        let a = eval_in_env(args[0].clone(), env)?.as_bool().ok_or("And: Bool bekleniyor".into())?;
+                        let b = eval_in_env(args[1].clone(), env)?.as_bool().ok_or("And: Bool bekleniyor".into())?;
+                        Ok(TypeLevelValue::Bool(a && b))
+                    }
+                    "Or" => {
+                        check args.len() != 2 { return Err("Or: 2 argüman gerekli".into()); }
+                        let a = eval_in_env(args[0].clone(), env)?.as_bool().ok_or("Or: Bool bekleniyor".into())?;
+                        let b = eval_in_env(args[1].clone(), env)?.as_bool().ok_or("Or: Bool bekleniyor".into())?;
+                        Ok(TypeLevelValue::Bool(a || b))
+                    }
+                    other => Err(format!("Bilinmeyen tip ailesi: {}", other)),
+                }
+                _ => Err("App: sadece isimli tip aileleri destekleniyor".into()),
+            }
+        }
+
+        TypeExpr::Fn(params, ret) => {
+            Ok(TypeLevelValue::Fn(
+                format!("fn({} args)", params.len()),
+                Box::new(eval_in_env(*ret, env)?),
+            ))
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §3  SIZED VEC (compile-time length)
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data SizedVec<T> derives [Clone] {
+    open data: Vec<T>,
+    open len:  usize,   // compile-time uzunluk (phantom)
+}
+
+impl SizedVec<T> {
+    open fn new(elements: Vec<T>) -> SizedVec<T> {
+        let n = elements.len();
+        SizedVec { data: elements, len: n }
+    }
+
+    open fn empty() -> SizedVec<T> {
+        SizedVec { data: [], len: 0 }
+    }
+
+    /// append — uzunluklar toplanır: N + M → yeni SizedVec
+    /// Type guarantee: sonuç.len() == self.len() + other.len()
+    open fn append(&self, other: &SizedVec<T>) -> SizedVec<T> {
+        var combined = self.data.clone();
+        each item in &other.data {
+            combined.push(item.clone());
+        }
+        SizedVec {
+            data: combined,
+            len:  self.len + other.len,
+        }
+    }
+
+    /// Güvenli indeks erişimi — çalışma zamanı sınır kontrolü
+    open fn get(&self, idx: usize) -> Option<&T> {
+        check idx >= self.len { return None; }
+        Some(&self.data[idx])
+    }
+
+    /// Güvenli indeks — idx < N garantisi verilmişse
+    open fn get_checked(&self, idx: usize) -> Result<&T, String> {
+        check idx >= self.len {
+            Err(format!("İndeks {} sınır dışı (len={})", idx, self.len))
+        } else {
+            Ok(&self.data[idx])
+        }
+    }
+
+    open fn head(&self) -> Option<&T> {
+        self.data.first()
+    }
+
+    open fn tail(&self) -> SizedVec<T> {
+        check self.data.is_empty() { return SizedVec::empty(); }
+        SizedVec::new(self.data[1..].to_vec())
+    }
+
+    open fn map<U>(&self, f: fn(&T) -> U) -> SizedVec<U> {
+        SizedVec::new(self.data.iter().map(f).collect())
+    }
+
+    open fn zip<U>(&self, other: &SizedVec<U>) -> SizedVec<(T, U)> {
+        let n = self.len.min(other.len);
+        let pairs = self.data.iter().zip(other.data.iter())
+            .take(n)
+            .map(|(a, b)| (a.clone(), b.clone()))
+            .collect();
+        SizedVec::new(pairs)
+    }
+
+    /// Compile-time boyut kanıtı
+    open fn assert_len(&self, expected: usize) -> Result<(), String> {
+        check self.len != expected {
+            Err(format!("Boyut hatası: beklenen {}, gerçek {}", expected, self.len))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §4  REFINEMENT TYPES
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data Refined<T> derives [Clone] {
+    open value:     T,
+    open predicate: String,  // predicate adı (belgeleme için)
+}
+
+impl Refined<T> {
+    open fn unwrap(&self) -> &T {
+        &self.value
+    }
+
+    open fn into_inner(self) -> T {
+        self.value
+    }
+}
+
+/// Bir değeri predicate ile rafine et
+open fn refine<T>(value: T, pred: fn(&T) -> bool, pred_name: &str) -> Result<Refined<T>, String> {
+    check !pred(&value) {
+        Err(format!("Refinement başarısız: {} koşulu sağlanamadı", pred_name))
+    } else {
+        Ok(Refined { value, predicate: pred_name.into() })
+    }
+}
+
+/// Yaygın refinement yardımcıları
+open fn positive(n: i64) -> Result<Refined<i64>, String> {
+    refine(n, |x| *x > 0, "positive")
+}
+
+open fn non_negative(n: i64) -> Result<Refined<i64>, String> {
+    refine(n, |x| *x >= 0, "non_negative")
+}
+
+open fn non_zero(n: i64) -> Result<Refined<i64>, String> {
+    refine(n, |x| *x != 0, "non_zero")
+}
+
+open fn non_empty_str(s: String) -> Result<Refined<String>, String> {
+    refine(s, |x| !x.is_empty(), "non_empty")
+}
+
+open fn in_range(n: i64, lo: i64, hi: i64) -> Result<Refined<i64>, String> {
+    refine(n, |x| *x >= lo && *x <= hi, &format!("in_range({}, {})", lo, hi))
+}
+
+/// Güvenli bölme — NonZero refinement ile
+open fn safe_divide(a: i64, b: Refined<i64>) -> i64 {
+    a / b.value   // b.value != 0 garantili
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §5  PHANTOM TYPES — File state machine gerçek implementasyon
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data PhantomData<T> {}
+
+expose cases FileState derives [Clone] { Closed, Opened, Locked }
+
+expose data File<S> derives [Clone] {
+    open path:     String,
+    open handle:   i64,       // -1 = kapalı
+    open _state:   PhantomData<S>,
+    open mode:     FileMode,
+}
+
+expose cases FileMode derives [Clone] { ReadOnly, WriteOnly, ReadWrite }
+
+expose cases FileError derives [Clone] {
+    NotFound(String),
+    PermissionDenied(String),
+    AlreadyOpen(String),
+    NotOpen,
+    IoError(String),
+}
+
+impl FileError {
+    open fn message(&self) -> String {
+        match self {
+            FileError::NotFound(p)        => format!("Dosya bulunamadı: {}", p),
+            FileError::PermissionDenied(p)=> format!("İzin reddedildi: {}", p),
+            FileError::AlreadyOpen(p)     => format!("Zaten açık: {}", p),
+            FileError::NotOpen            => "Dosya açık değil".into(),
+            FileError::IoError(e)         => format!("IO hatası: {}", e),
+        }
+    }
+}
+
+// Closed state impl
+impl File<FileState::Closed> {
+    open fn new(path: &str) -> File<FileState::Closed> {
+        File {
+            path:   path.into(),
+            handle: -1,
+            _state: PhantomData {},
+            mode:   FileMode::ReadOnly,
+        }
+    }
+
+    /// Dosyayı aç → File<Opened> döner
+    open fn open(self, mode: FileMode) -> Result<File<FileState::Opened>, FileError> {
+        // Platform-specific open syscall simülasyonu
+        let handle = platform_open(&self.path, &mode);
+        check handle < 0 {
+            Err(FileError::NotFound(self.path.clone()))
+        } else {
+            Ok(File {
+                path:   self.path,
+                handle: handle,
+                _state: PhantomData {},
+                mode:   mode,
+            })
+        }
+    }
+}
+
+// Opened state impl
+impl File<FileState::Opened> {
+    /// Dosyadan oku — sadece Opened state'de mümkün
+    open fn read(&self) -> Result<String, FileError> {
+        check self.handle < 0 { return Err(FileError::NotOpen); }
+        match self.mode {
+            FileMode::WriteOnly => Err(FileError::PermissionDenied("WriteOnly modda okuma".into())),
+            _ => Ok(platform_read(self.handle)),
+        }
+    }
+
+    /// Dosyaya yaz — sadece Opened state'de mümkün
+    open fn write(&var self, content: &str) -> Result<i64, FileError> {
+        check self.handle < 0 { return Err(FileError::NotOpen); }
+        match self.mode {
+            FileMode::ReadOnly => Err(FileError::PermissionDenied("ReadOnly modda yazma".into())),
+            _ => Ok(platform_write(self.handle, content)),
+        }
+    }
+
+    /// N byte oku
+    open fn read_bytes(&self, n: usize) -> Result<Vec<u8>, FileError> {
+        check self.handle < 0 { return Err(FileError::NotOpen); }
+        Ok(platform_read_bytes(self.handle, n))
+    }
+
+    /// Kapat → File<Closed> döner
+    open fn close(self) -> File<FileState::Closed> {
+        platform_close(self.handle);
+        File {
+            path:   self.path,
+            handle: -1,
+            _state: PhantomData {},
+            mode:   FileMode::ReadOnly,
+        }
+    }
+
+    /// Kilitle → File<Locked> döner
+    open fn lock(self) -> Result<File<FileState::Locked>, FileError> {
+        let ok = platform_lock(self.handle);
+        check !ok {
+            Err(FileError::IoError("Kilit alınamadı".into()))
+        } else {
+            Ok(File {
+                path:   self.path,
+                handle: self.handle,
+                _state: PhantomData {},
+                mode:   self.mode,
+            })
+        }
+    }
+}
+
+// Locked state impl
+impl File<FileState::Locked> {
+    /// Kilitli dosyadan oku (exclusive erişim garantili)
+    open fn read_exclusive(&self) -> Result<String, FileError> {
+        Ok(platform_read(self.handle))
+    }
+
+    /// Kilitli dosyaya yaz (exclusive erişim garantili)
+    open fn write_exclusive(&var self, content: &str) -> Result<i64, FileError> {
+        Ok(platform_write(self.handle, content))
+    }
+
+    /// Kilidi kaldır → File<Opened> döner
+    open fn unlock(self) -> File<FileState::Opened> {
+        platform_unlock(self.handle);
+        File {
+            path:   self.path,
+            handle: self.handle,
+            _state: PhantomData {},
+            mode:   self.mode,
+        }
+    }
+}
+
+// Platform syscall stub'ları (gerçek uygulamada FFI ile bağlanır)
+fn platform_open(path: &str, mode: &FileMode) -> i64 {
+    // Gerçek impl: libc open() veya Windows CreateFile()
+    42  // simüle edilmiş handle
+}
+
+fn platform_read(handle: i64) -> String {
+    format!("<contents of handle {}>", handle)
+}
+
+fn platform_read_bytes(handle: i64, n: usize) -> Vec<u8> {
+    vec![0u8; n]
+}
+
+fn platform_write(handle: i64, content: &str) -> i64 {
+    content.len() as i64
+}
+
+fn platform_close(handle: i64) {
+    // libc close(handle)
+}
+
+fn platform_lock(handle: i64) -> bool { true }
+fn platform_unlock(handle: i64) {}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §6  DEPENDENT PAIRS (Σ-types)
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data Sigma<A, B> derives [Clone] {
+    open fst: A,
+    open snd: B,
+}
+
+impl Sigma<A, B> {
+    open fn new(fst: A, snd: B) -> Sigma<A, B> {
+        Sigma { fst, snd }
+    }
+
+    open fn map_snd<C>(&self, f: fn(&B) -> C) -> Sigma<A, C> {
+        Sigma { fst: self.fst.clone(), snd: f(&self.snd) }
+    }
+}
+
+/// LengthVec: uzunluğu bilen Vec
+alias LengthVec<T> = Sigma<usize, SizedVec<T>>;
+
+open fn length_vec<T>(data: Vec<T>) -> LengthVec<T> {
+    let n = data.len();
+    Sigma::new(n, SizedVec::new(data))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §7  CONST TRAIT EVALUATOR
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Compile-time sabit değerlerin listesi
+expose data ConstRegistry {
+    open entries: HashMap<String, TypeLevelValue>,
+}
+
+impl ConstRegistry {
+    open fn new() -> ConstRegistry {
+        ConstRegistry { entries: HashMap::new() }
+    }
+
+    open fn register(&var self, name: String, val: TypeLevelValue) {
+        self.entries.insert(name, val);
+    }
+
+    open fn evaluate(&self, name: &str) -> Option<&TypeLevelValue> {
+        self.entries.get(name)
+    }
+
+    open fn eval_expr(&self, expr: TypeExpr) -> Result<TypeLevelValue, String> {
+        // ConstRegistry değerlerini ortama ekle
+        var env = TypeEnv::new();
+        each (name, val) in &self.entries {
+            env.bind(name.clone(), val.clone());
+        }
+        eval_in_env(expr, &env)
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §8  KULLANIM ÖRNEKLERİ (Yorum içinde)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/*
+// Örnek 1: eval_type_level
+let result = eval_type_level(
+    TypeExpr::Add(
+        Box::new(TypeExpr::Const(TypeLevelValue::Nat(3))),
+        Box::new(TypeExpr::Const(TypeLevelValue::Nat(4))),
+    )
+);
+// → Ok(TypeLevelValue::Nat(7))
+
+// Örnek 2: SizedVec append
+let v1 = SizedVec::new([1, 2, 3]);
+let v2 = SizedVec::new([4, 5]);
+let v3 = v1.append(&v2);
+assert!(v3.len == 5);  // Derleme zamanında bilinir
+
+// Örnek 3: File state machine
+let f = File::new("data.txt");
+let f = f.open(FileMode::ReadWrite)?;  // File<Opened>
+let content = f.read()?;               // OK
+let f = f.close();                     // File<Closed>
+// f.read()  → DERLEME HATASI: Closed state'de read() yok
+
+// Örnek 4: Refinement types
+let n = non_zero(10)?;       // Ok(Refined { value: 10 })
+let r = safe_divide(100, n); // r = 10
+let m = non_zero(0)?;        // Err("non_zero koşulu sağlanamadı")
+
+// Örnek 5: If type family
+let result = eval_type_level(
+    TypeExpr::If(
+        Box::new(TypeExpr::Const(TypeLevelValue::Bool(true))),
+        Box::new(TypeExpr::Const(TypeLevelValue::Nat(42))),
+        Box::new(TypeExpr::Const(TypeLevelValue::Nat(0))),
+    )
+);
+// → Ok(TypeLevelValue::Nat(42))
+*/

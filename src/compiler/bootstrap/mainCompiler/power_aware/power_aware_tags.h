@@ -1,0 +1,5 @@
+#ifndef NOVA_POWER_AWARE_TAGS_H
+#define NOVA_POWER_AWARE_TAGS_H
+
+#endif
+

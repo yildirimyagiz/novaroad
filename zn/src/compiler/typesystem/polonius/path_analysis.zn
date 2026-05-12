@@ -1,0 +1,216 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Polonius - Path-Sensitive Analysis                                    ║
+// ║  Track conditions affecting borrows and data flow                           ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use super::location::Location;
+use super::loan::{LocalId, Path};
+use super::cfg::{CFG, BlockId};
+
+/// Path-sensitive analysis for precise borrow checking
+expose data PathAnalysis {
+    /// Conditions at each program point
+    conditions: HashMap<u64, Vec<Condition>>,
+    
+    /// Path predicates (conditions that must hold on a path)
+    path_predicates: HashMap<(u32, u32), Vec<Predicate>>,
+    
+    /// Nullable analysis (which variables might be null)
+    nullable: HashMap<u32, NullableInfo>,
+}
+
+/// A condition in the program
+expose data Condition {
+    location: Location,
+    kind: ConditionKind,
+}
+
+expose cases ConditionKind {
+    /// check x { ... }
+    IsTrue(LocalId),
+    
+    /// check !x { ... }
+    IsFalse(LocalId),
+    
+    /// check x == y { ... }
+    Equals(LocalId, LocalId),
+    
+    /// check x != y { ... }
+    NotEquals(LocalId, LocalId),
+    
+    /// check x.is_some() { ... }
+    IsSome(LocalId),
+    
+    /// check x.is_none() { ... }
+    IsNone(LocalId),
+}
+
+/// A predicate that must hold on a path
+expose data Predicate {
+    variable: LocalId,
+    kind: PredicateKind,
+}
+
+expose cases PredicateKind {
+    NonNull,
+    Initialized,
+    Moved,
+    Borrowed,
+}
+
+/// Nullability information
+expose data NullableInfo {
+    variable: LocalId,
+    may_be_null: bool,
+    may_be_moved: bool,
+}
+
+impl PathAnalysis {
+    open fn new() -> PathAnalysis {
+        PathAnalysis {
+            conditions: HashMap::new(),
+            path_predicates: HashMap::new(),
+            nullable: HashMap::new(),
+        }
+    }
+    
+    /// Analyze paths in CFG
+    open fn analyze(&var self, cfg: &CFG) {
+        // Traverse CFG and collect conditions
+        each entry in &cfg.blocks  { let (&block_id, block) = entry;
+            self.analyze_block(block_id, block, cfg);
+        }
+        
+        // Propagate predicates along paths
+        self.propagate_predicates(cfg);
+    }
+    
+    /// Analyze a single basic block
+    open fn analyze_block(&var self, block_id: u32, block: &super::cfg::BasicBlock, cfg: &CFG) {
+        // Check check this block has conditional successors
+        check block.successors.len() > 1 {
+            // This is a branch point - extract conditions
+            each location in &block.locations {
+                // In a real implementation, we'd examine the terminator instruction
+                // For now, placeholder
+            }
+        }
+    }
+    
+    /// Propagate predicates along all paths
+    open fn propagate_predicates(&var self, cfg: &CFG) {
+        // For each pair of blocks (from, to)
+        each entry in &cfg.blocks  { let (&from_id, from_block) = entry;
+            each to in &from_block.successors {
+                // Compute predicates that must hold on path from -> to
+                var predicates = Vec::new();
+                
+                // Add predicates based on conditions at from
+                check let Some(conditions) = self.conditions.get(&(from_id as u64)) {
+                    each condition in conditions {
+                        match condition.kind {
+                            ConditionKind::IsTrue(var) => {
+                                predicates.push(Predicate {
+                                    variable: var,
+                                    kind: PredicateKind::NonNull,
+                                });
+                            }
+                            ConditionKind::IsSome(var) => {
+                                predicates.push(Predicate {
+                                    variable: var,
+                                    kind: PredicateKind::NonNull,
+                                });
+                                predicates.push(Predicate {
+                                    variable: var,
+                                    kind: PredicateKind::Initialized,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                
+                self.path_predicates.insert((from_id, to.id), predicates);
+            }
+        }
+    }
+    
+    /// Check check a variable is definitely non-null on path from block1 to block2
+    open fn is_non_null_on_path(&self, from: u32, to: u32, variable: LocalId) -> bool {
+        check let Some(predicates) = self.path_predicates.get(&(from, to)) {
+            predicates.iter().any(|p| {
+                p.variable.id == variable.id && matches!(p.kind, PredicateKind::NonNull)
+            })
+        } else {
+            false
+        }
+    }
+    
+    /// Check check a variable is definitely initialized on path
+    open fn is_initialized_on_path(&self, from: u32, to: u32, variable: LocalId) -> bool {
+        check let Some(predicates) = self.path_predicates.get(&(from, to)) {
+            predicates.iter().any(|p| {
+                p.variable.id == variable.id && matches!(p.kind, PredicateKind::Initialized)
+            })
+        } else {
+            false
+        }
+    }
+    
+    /// Add a condition at a location
+    open fn add_condition(&var self, location: Location, kind: ConditionKind) {
+        let condition = Condition { location, kind };
+        self.conditions.entry(location.unique_id())
+            .or_insert_with(Vec::new)
+            .push(condition);
+    }
+    
+    /// Mark variable as potentially null
+    open fn mark_nullable(&var self, variable: LocalId) {
+        self.nullable.insert(variable.id, NullableInfo {
+            variable,
+            may_be_null: true,
+            may_be_moved: false,
+        });
+    }
+    
+    /// Mark variable as moved
+    open fn mark_moved(&var self, variable: LocalId) {
+        self.nullable.entry(variable.id)
+            .and_modify(|info| info.may_be_moved = true)
+            .or_insert(NullableInfo {
+                variable,
+                may_be_null: false,
+                may_be_moved: true,
+            });
+    }
+    
+    /// Check check variable may be null
+    open fn may_be_null(&self, variable: LocalId) -> bool {
+        self.nullable.get(&variable.id)
+            .map(|info| info.may_be_null)
+            .unwrap_or(false)
+    }
+    
+    /// Check check variable may be moved
+    open fn may_be_moved(&self, variable: LocalId) -> bool {
+        self.nullable.get(&variable.id)
+            .map(|info| info.may_be_moved)
+            .unwrap_or(false)
+    }
+}
+
+#[test]
+fn test_path_analysis() {
+    var analysis = PathAnalysis::new();
+    
+    var = LocalId { id: 0 };
+    
+    // Mark as nullable
+    analysis.mark_nullable(var);
+    assert(analysis.may_be_null(var));
+    
+    // Mark as moved
+    analysis.mark_moved(var);
+    assert(analysis.may_be_moved(var));
+}

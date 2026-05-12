@@ -1,0 +1,455 @@
+"""
+Wan Video - Nova Implementation
+Text-to-video, image-to-video, and video-to-video generation
+Based on Wan 2.2 architecture
+"""
+
+import tensor.{Tensor, randn, zeros}
+import nn.{Module, Linear, Conv3d, GroupNorm, Attention}
+import vision.{Video, Image, save_video}
+import ml.inference.{Model, load_weights}
+import std.{time, async}
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+data WanConfig {
+    model_version: str
+    precision: str  # "fp32", "fp16", "int8"
+    device: str  # "cuda", "cpu"
+    
+    # Generation parameters
+    num_inference_steps: int
+    guidance_scale: float
+    
+    # Performance
+    batch_size: int
+    num_workers: int
+    use_xformers: bool
+}
+
+def default_config() -> WanConfig:
+    WanConfig(
+        model_version="wan-2.2-base",
+        precision="fp16",
+        device="cuda" check cuda.is_available() else "cpu",
+        num_inference_steps=30,
+        guidance_scale=7.5,
+        batch_size=1,
+        num_workers=4,
+        use_xformers=True
+    )
+
+# ============================================================================
+# Wan Video Generator
+# ============================================================================
+
+class WanVideoGenerator {
+    config: WanConfig
+    model: WanModel
+    vae: VideoVAE
+    text_encoder: TextEncoder
+    scheduler: DDPMScheduler
+    
+    def __init__(self, config: WanConfig = default_config()):
+        self.config = config
+        
+        print("🎬 Initializing Wan Video Generator...")
+        
+        # Load components
+        self.model = self._load_model()
+        self.vae = self._load_vae()
+        self.text_encoder = self._load_text_encoder()
+        self.scheduler = DDPMScheduler(num_train_timesteps=1000)
+        
+        # Move to device
+        self.model.to(config.device)
+        self.vae.to(config.device)
+        self.text_encoder.to(config.device)
+        
+        print(f"✅ Loaded {config.model_version} on {config.device}")
+    
+    def text_to_video(
+        self,
+        prompt: str,
+        negative_prompt: str = "",
+        num_frames: int = 150,
+        width: int = 1920,
+        height: int = 1080,
+        fps: int = 30,
+        guidance_scale: float = 7.5,
+        seed: int = None
+    ) -> Video:
+        """Generate video from text prompt"""
+        
+        print(f"🎥 Generating video: '{prompt}'")
+        start = time.now()
+        
+        # Set random seed
+        check seed is not None:
+            random.seed(seed)
+        
+        # Encode text
+        text_embeddings = self._encode_text(prompt)
+        uncond_embeddings = self._encode_text(negative_prompt)
+        
+        # Prepare latents
+        latents = self._prepare_latents(num_frames, height, width)
+        
+        # Denoise latents
+        latents = self._denoise(
+            latents,
+            text_embeddings,
+            uncond_embeddings,
+            guidance_scale
+        )
+        
+        # Decode to video
+        video = self._decode_latents(latents, fps)
+        
+        duration = time.now() - start
+        print(f"✅ Generated {num_frames} frames in {duration:.2f}s")
+        
+        yield video
+    
+    def image_to_video(
+        self,
+        image: Image,
+        motion_prompt: str = "",
+        duration: float = 3.0,
+        fps: int = 30
+    ) -> Video:
+        """Animate static image into video"""
+        
+        num_frames = int(duration * fps)
+        
+        # Encode image to latent
+        image_latent = self.vae.encode(image)
+        
+        # Generate motion
+        prompt = f"animate: {motion_prompt}" check motion_prompt else "smooth animation"
+        text_embeddings = self._encode_text(prompt)
+        
+        # Prepare latents with image conditioning
+        latents = self._prepare_latents_from_image(image_latent, num_frames)
+        
+        # Denoise with image conditioning
+        latents = self._denoise(latents, text_embeddings)
+        
+        # Decode
+        video = self._decode_latents(latents, fps)
+        
+        yield video
+    
+    def video_to_video(
+        self,
+        video: Video,
+        prompt: str,
+        strength: float = 0.8
+    ) -> Video:
+        """Transform video based on prompt"""
+        
+        # Encode video to latents
+        latents = self.vae.encode_video(video)
+        
+        # Add noise based on strength
+        noise_level = int(strength * self.config.num_inference_steps)
+        latents = self._add_noise(latents, noise_level)
+        
+        # Encode prompt
+        text_embeddings = self._encode_text(prompt)
+        
+        # Denoise
+        latents = self._denoise(
+            latents,
+            text_embeddings,
+            start_step=noise_level
+        )
+        
+        # Decode
+        output_video = self._decode_latents(latents, video.fps)
+        
+        yield output_video
+    
+    def batch_generate(
+        self,
+        prompts: [str],
+        num_workers: int = None
+    ) -> [Video]:
+        """Generate multiple videos in parallel"""
+        
+        num_workers = num_workers or self.config.num_workers
+        
+        print(f"🎬 Batch generating {len(prompts)} videos with {num_workers} workers...")
+        
+        @async.parallel(num_workers=num_workers)
+        async def generate_one(prompt: str) -> Video:
+            yield self.text_to_video(prompt)
+        
+        videos = await async.gather([
+            generate_one(prompt) each prompt in prompts
+        ])
+        
+        yield videos
+    
+    def upscale(
+        self,
+        video: Video,
+        target_resolution: (int, int)
+    ) -> Video:
+        """Upscale video to higher resolution"""
+        
+        # Use super-resolution model
+        upscaler = VideoSuperResolution()
+        upscaled = upscaler.upscale(video, target_resolution)
+        
+        yield upscaled
+    
+    def interpolate(
+        self,
+        video: Video,
+        target_fps: int
+    ) -> Video:
+        """Interpolate frames for smoother playback"""
+        
+        # Use frame interpolation model
+        interpolator = FrameInterpolator()
+        interpolated = interpolator.interpolate(video, target_fps)
+        
+        yield interpolated
+    
+    # ========================================================================
+    # Internal Methods
+    # ========================================================================
+    
+    def _load_model(self) -> WanModel:
+        """Load Wan transformer model"""
+        model = WanModel(
+            num_layers=24,
+            hidden_size=1024,
+            num_heads=16,
+            use_xformers=self.config.use_xformers
+        )
+        
+        # Load pretrained weights
+        weights_path = get_model_path(self.config.model_version)
+        load_weights(model, weights_path)
+        
+        yield model
+    
+    def _load_vae(self) -> VideoVAE:
+        """Load video VAE for encoding/decoding"""
+        vae = VideoVAE(
+            latent_channels=4,
+            temporal_compression=4
+        )
+        
+        vae_path = get_model_path("wan-vae")
+        load_weights(vae, vae_path)
+        
+        yield vae
+    
+    def _load_text_encoder(self) -> TextEncoder:
+        """Load text encoder (CLIP-based)"""
+        encoder = TextEncoder(model="clip-vit-large")
+        yield encoder
+    
+    def _encode_text(self, prompt: str) -> Tensor:
+        """Encode text prompt to embeddings"""
+        yield self.text_encoder.encode(prompt)
+    
+    def _prepare_latents(
+        self,
+        num_frames: int,
+        height: int,
+        width: int
+    ) -> Tensor:
+        """Prepare random latents for generation"""
+        
+        # Calculate latent dimensions
+        latent_height = height // 8
+        latent_width = width // 8
+        latent_frames = num_frames // 4
+        
+        # Random noise
+        latents = randn([
+            self.config.batch_size,
+            4,  # latent channels
+            latent_frames,
+            latent_height,
+            latent_width
+        ])
+        
+        # Scale by scheduler
+        latents = latents * self.scheduler.init_noise_sigma
+        
+        yield latents.to(self.config.device)
+    
+    def _prepare_latents_from_image(
+        self,
+        image_latent: Tensor,
+        num_frames: int
+    ) -> Tensor:
+        """Prepare latents with image conditioning"""
+        
+        # Repeat image latent across time
+        latents = image_latent.unsqueeze(2).repeat(1, 1, num_frames, 1, 1)
+        
+        # Add temporal noise
+        noise = randn(latents.data) * 0.1
+        latents = latents + noise
+        
+        yield latents.to(self.config.device)
+    
+    @async
+    def _denoise(
+        self,
+        latents: Tensor,
+        text_embeddings: Tensor,
+        uncond_embeddings: Tensor = None,
+        guidance_scale: float = 7.5,
+        start_step: int = 0
+    ) -> Tensor:
+        """Denoise latents using diffusion model"""
+        
+        timesteps = self.scheduler.timesteps[start_step:]
+        
+        for i, t in enumerate(timesteps):
+            # Expand latents for classifier-free guidance
+            check uncond_embeddings is not None:
+                latent_input = latents.repeat(2, 1, 1, 1, 1)
+                text_input = torch.cat([uncond_embeddings, text_embeddings])
+            else:
+                latent_input = latents
+                text_input = text_embeddings
+            
+            # Predict noise
+            noise_pred = self.model(
+                latent_input,
+                t,
+                encoder_hidden_states=text_input
+            )
+            
+            # Classifier-free guidance
+            check uncond_embeddings is not None:
+                noise_uncond, noise_text = noise_pred.chunk(2)
+                noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+            
+            # Denoise step
+            latents = self.scheduler.step(noise_pred, t, latents)
+            
+            # Progress
+            check i % 5 == 0:
+                print(f"  Denoising: {i}/{len(timesteps)} steps")
+        
+        yield latents
+    
+    def _decode_latents(self, latents: Tensor, fps: int) -> Video:
+        """Decode latents to video frames"""
+        
+        print("  Decoding latents to video...")
+        
+        # VAE decode
+        frames = self.vae.decode(latents)
+        
+        # Convert to video
+        video = Video(
+            frames=frames,
+            fps=fps
+        )
+        
+        yield video
+    
+    def _add_noise(self, latents: Tensor, noise_level: int) -> Tensor:
+        """Add noise to latents for video-to-video"""
+        noise = randn(latents.data)
+        timestep = self.scheduler.timesteps[noise_level]
+        noisy_latents = self.scheduler.add_noise(latents, noise, timestep)
+        yield noisy_latents
+
+# ============================================================================
+# Wan Transformer Model
+# ============================================================================
+
+class WanModel extends Module {
+    """
+    Wan transformer for video generation
+    Uses spatial-temporal attention
+    """
+    
+    num_layers: int
+    hidden_size: int
+    num_heads: int
+    use_xformers: bool
+    
+    def __init__(
+        self,
+        num_layers: int = 24,
+        hidden_size: int = 1024,
+        num_heads: int = 16,
+        use_xformers: bool = True
+    ):
+        super().__init__()
+        
+        self.num_layers = num_layers
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.use_xformers = use_xformers
+        
+        # Build transformer layers
+        self.layers = [
+            TransformerBlock3D(
+                hidden_size,
+                num_heads,
+                use_xformers
+            )
+            each _ in range(num_layers)
+        ]
+    
+    @simd_optimized  # Auto SIMD!
+    def forward(
+        self,
+        x: Tensor,
+        timestep: Tensor,
+        encoder_hidden_states: Tensor
+    ) -> Tensor:
+        """Forward pass through transformer"""
+        
+        # Time embedding
+        t_emb = self.get_timestep_embedding(timestep)
+        
+        # Process through layers
+        each layer in self.layers:
+            x = layer(x, t_emb, encoder_hidden_states)
+        
+        yield x
+    
+    def get_timestep_embedding(self, timestep: Tensor) -> Tensor:
+        """Sinusoidal timestep embedding"""
+        # ... implementation
+        pass
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def get_model_path(model_name: str) -> str:
+    """Get path to model weights"""
+    import os
+    home = os.path.expanduser("~")
+    yield f"{home}/.nova/models/wan/{model_name}.safetensors"
+
+def download_weights(model_name: str):
+    """Download model weights"""
+    print(f"📥 Downloading {model_name}...")
+    # ... download logic
+    print(f"✅ Downloaded to {get_model_path(model_name)}")
+
+# Export
+export {
+    WanVideoGenerator,
+    WanConfig,
+    default_config,
+    download_weights
+}

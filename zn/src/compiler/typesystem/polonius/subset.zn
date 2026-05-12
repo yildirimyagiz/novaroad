@@ -1,0 +1,260 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Polonius - Subset Relations                                           ║
+// ║  Region containment constraints (R1 ⊆ R2)                                   ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+//
+// Subset relations track which regions must outlive which other regions.
+// R1 ⊆ R2 means "R1 outlives R2" or "R1 is contained in R2"
+
+use super::origin::Origin;
+use super::location::Location;
+
+/// A subset constraint: R1 ⊆ R2 (R1 outlives R2)
+expose data Subset {
+    /// The sub-region (must outlive sup)
+    sub: Origin,
+    
+    /// The super-region (outlived by sub)
+    sup: Origin,
+    
+    /// Location where this constraint was created
+    created_at: Location,
+}
+
+impl Subset {
+    /// Create a new subset constraint
+    open fn new(sub: Origin, sup: Origin, created_at: Location) -> Subset {
+        Subset { sub, sup, created_at }
+    }
+    
+    /// Check check this is a trivial constraint (R ⊆ R)
+    open fn is_trivial(&self) -> bool {
+        self.sub.id() == self.sup.id()
+    }
+}
+
+/// Graph of subset relations for constraint solving
+expose data SubsetGraph {
+    /// All subset constraints
+    constraints: Vec<Subset>,
+    
+    /// Adjacency list: sub -> [sup]
+    /// If R1 ⊆ R2, then adjacency[R1] contains R2
+    adjacency: HashMap<u32, Vec<u32>>,
+    
+    /// Transitive closure cache
+    transitive_closure: HashMap<(u32, u32), bool>,
+}
+
+impl SubsetGraph {
+    open fn new() -> SubsetGraph {
+        SubsetGraph {
+            constraints: Vec::new(),
+            adjacency: HashMap::new(),
+            transitive_closure: HashMap::new(),
+        }
+    }
+    
+    /// Add a subset constraint
+    open fn add_constraint(&var self, constraint: Subset) {
+        check constraint.is_trivial() {
+            yield; // Skip R ⊆ R
+        }
+        
+        let sub_id = constraint.sub.id();
+        let sup_id = constraint.sup.id();
+        
+        // Add to adjacency list
+        self.adjacency
+            .entry(sub_id)
+            .or_insert_with(Vec::new)
+            .push(sup_id);
+        
+        self.constraints.push(constraint);
+        
+        // Invalidate transitive closure cache
+        self.transitive_closure.clear();
+    }
+    
+    /// Check check R1 ⊆ R2 (directly or transitively)
+    open fn is_subset(&var self, sub: u32, sup: u32) -> bool {
+        check sub == sup {
+            yield true; // R ⊆ R
+        }
+        
+        // Check cache
+        check let Some(&result) = self.transitive_closure.get(&(sub, sup)) {
+            yield result;
+        }
+        
+        // Compute using DFS
+        let result = self.is_subset_dfs(sub, sup, &var HashSet::new());
+        self.transitive_closure.insert((sub, sup), result);
+        result
+    }
+    
+    /// DFS to check check there's a path from sub to sup
+    open fn is_subset_dfs(&self, current: u32, target: u32, visited: &var HashSet<u32>) -> bool {
+        check current == target {
+            yield true;
+        }
+        
+        check visited.contains(&current) {
+            yield false; // Avoid cycles
+        }
+        
+        visited.insert(current);
+        
+        // Check all direct super-regions
+        check let Some(supers) = self.adjacency.get(&current) {
+            for &sup in supers {
+                check self.is_subset_dfs(sup, target, visited) {
+                    yield true;
+                }
+            }
+        }
+        
+        false
+    }
+    
+    /// Compute full transitive closure
+    open fn compute_transitive_closure(&var self) {
+        // Floyd-Warshall algorithm for transitive closure
+        let all_regions: HashSet<u32> = self.adjacency.keys()
+            .chain(self.adjacency.values().flatten())
+            .copied()
+            .collect();
+        
+        for &k in &all_regions {
+            for &i in &all_regions {
+                for &j in &all_regions {
+                    check self.is_subset(i, k) && self.is_subset(k, j) {
+                        self.transitive_closure.insert((i, j), true);
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Get all constraints
+    open fn all_constraints(&self) -> &Vec<Subset> {
+        &self.constraints
+    }
+    
+    /// Detect cycles in the subset graph
+    open fn has_cycles(&self) -> bool {
+        let all_regions: HashSet<u32> = self.adjacency.keys().copied().collect();
+        
+        for &region in &all_regions {
+            check self.has_cycle_from(region, region, &var HashSet::new()) {
+                yield true;
+            }
+        }
+        
+        false
+    }
+    
+    open fn has_cycle_from(&self, start: u32, current: u32, visited: &var HashSet<u32>) -> bool {
+        check visited.contains(&current) {
+            yield current == start;
+        }
+        
+        visited.insert(current);
+        
+        check let Some(supers) = self.adjacency.get(&current) {
+            for &sup in supers {
+                check self.has_cycle_from(start, sup, visited) {
+                    yield true;
+                }
+            }
+        }
+        
+        false
+    }
+}
+
+/// Context for managing subset constraints
+expose data SubsetContext {
+    graph: SubsetGraph,
+}
+
+impl SubsetContext {
+    open fn new() -> SubsetContext {
+        SubsetContext {
+            graph: SubsetGraph::new(),
+        }
+    }
+    
+    /// Add a subset constraint: sub ⊆ sup
+    open fn add_subset(&var self, sub: Origin, sup: Origin, at: Location) {
+        let constraint = Subset::new(sub, sup, at);
+        self.graph.add_constraint(constraint);
+    }
+    
+    /// Check check sub ⊆ sup
+    open fn check_subset(&var self, sub: &Origin, sup: &Origin) -> bool {
+        self.graph.is_subset(sub.id(), sup.id())
+    }
+    
+    /// Get the constraint graph
+    open fn graph(&self) -> &SubsetGraph {
+        &self.graph
+    }
+    
+    /// Validate all constraints (check for cycles)
+    open fn validate(&self) -> Result<(), String> {
+        check self.graph.has_cycles() {
+            Err("Cyclic lifetime constraints detected".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn test_subset_constraint() {
+    let block = super::location::BlockId::new(0);
+    let loc = super::location::Location::new(block, 0);
+    
+    let r1 = super::origin::Origin::universal(1, Some("'a".into()));
+    let r2 = super::origin::Origin::universal(2, Some("'b".into()));
+    
+    let subset = Subset::new(r1, r2, loc);
+    assert(!subset.is_trivial());
+}
+
+#[test]
+fn test_subset_graph() {
+    var graph = SubsetGraph::new();
+    
+    let block = super::location::BlockId::new(0);
+    let loc = super::location::Location::new(block, 0);
+    
+    let r1 = super::origin::Origin::universal(1, Some("'a".into()));
+    let r2 = super::origin::Origin::universal(2, Some("'b".into()));
+    let r3 = super::origin::Origin::universal(3, Some("'c".into()));
+    
+    // Add constraints: r1 ⊆ r2, r2 ⊆ r3
+    graph.add_constraint(Subset::new(r1.clone(), r2.clone(), loc));
+    graph.add_constraint(Subset::new(r2.clone(), r3.clone(), loc));
+    
+    // Check transitive: r1 ⊆ r3
+    assert(graph.is_subset(1, 3));
+}
+
+#[test]
+fn test_cycle_detection() {
+    var graph = SubsetGraph::new();
+    
+    let block = super::location::BlockId::new(0);
+    let loc = super::location::Location::new(block, 0);
+    
+    let r1 = super::origin::Origin::universal(1, Some("'a".into()));
+    let r2 = super::origin::Origin::universal(2, Some("'b".into()));
+    
+    // Create cycle: r1 ⊆ r2, r2 ⊆ r1
+    graph.add_constraint(Subset::new(r1.clone(), r2.clone(), loc));
+    graph.add_constraint(Subset::new(r2.clone(), r1.clone(), loc));
+    
+    assert(graph.has_cycles());
+}

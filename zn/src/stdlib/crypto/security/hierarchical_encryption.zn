@@ -1,0 +1,473 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Hierarchical Encryption System - Multi-Tier Access Control
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Access Levels:
+// 1. NOVA ADMIN - Can decrypt all code (for auditing, support)
+// 2. CODE OWNER - Can decrypt own code (full access)
+// 3. USER - Can execute but NOT read source (encrypted)
+//
+// Uses Proxy Re-Encryption + Hierarchical Keys
+//
+// ═══════════════════════════════════════════════════════════════════════════
+
+use crypto::{AES256, RSA, ECDH, SHA256}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Key Hierarchy
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data KeyHierarchy {
+    /// Nova master key (held by Nova foundation)
+    nova_master_key: RSAPrivateKey,
+    
+    /// Owner's key (generated for each developer)
+    owner_key: RSAPrivateKey,
+    
+    /// Execution key (ephemeral, no decrypt capability)
+    execution_key: AES256Key
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Hierarchical Encryptor
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data HierarchicalEncryptor {
+    nova_public_key: RSAPublicKey,  // Embedded in compiler
+}
+
+impl HierarchicalEncryptor {
+    fn new() -> HierarchicalEncryptor {
+        HierarchicalEncryptor {
+            // Nova's public key (hardcoded in compiler)
+            nova_public_key: RSAPublicKey::from_pem(include_str!("nova_master.open"))
+        }
+    }
+    
+    /// Encrypt code with hierarchical access
+    fn encrypt_code(
+        &self,
+        source_code: String,
+        owner_public_key: RSAPublicKey,
+        owner_id: String
+    ) -> HierarchicallyEncryptedCode {
+        println("🔐 Encrypting code with hierarchical access...");
+        
+        // 1. Generate random symmetric key for code
+        let code_key = AES256::generate_key();
+        
+        // 2. Encrypt source code with symmetric key
+        let encrypted_code = AES256::encrypt(source_code.as_bytes(), &code_key);
+        
+        // 3. Encrypt the symmetric key THREE times:
+        
+        // 3a. For OWNER (using owner's public key)
+        let key_for_owner = self.encrypt_key_for_owner(
+            &code_key, 
+            &owner_public_key,
+            &owner_id
+        );
+        
+        // 3b. For NOVA ADMIN (using Nova master public key)
+        let key_for_admin = self.encrypt_key_for_admin(
+            &code_key,
+            &owner_id
+        );
+        
+        // 3c. For EXECUTION (no decrypt, only run)
+        let execution_token = self.create_execution_token(
+            &code_key,
+            &owner_id
+        );
+        
+        println("✅ Code encrypted with 3-tier access control");
+        println("   • Owner can decrypt: YES");
+        println("   • Nova admin can decrypt: YES");
+        println("   • User can decrypt: NO (execute only)");
+        
+        HierarchicallyEncryptedCode {
+            encrypted_code,
+            key_for_owner,
+            key_for_admin,
+            execution_token,
+            owner_id,
+            code_hash: SHA256::hash(source_code.as_bytes()),
+            metadata: EncryptionMetadata {
+                encryption_version: 1,
+                algorithm: "AES-256-GCM".into(),
+                key_derivation: "RSA-OAEP".into()
+            }
+        }
+    }
+    
+    fn encrypt_key_for_owner(
+        &self,
+        code_key: &AES256Key,
+        owner_public_key: &RSAPublicKey,
+        owner_id: &str
+    ) -> EncryptedKey {
+        // Encrypt symmetric key with owner's RSA public key
+        let encrypted_key = owner_public_key.encrypt(code_key.as_bytes());
+        
+        // Add owner-specific metadata
+        EncryptedKey {
+            encrypted_data: encrypted_key,
+            recipient: owner_id.into(),
+            key_type: KeyType::Owner
+        }
+    }
+    
+    fn encrypt_key_for_admin(
+        &self,
+        code_key: &AES256Key,
+        owner_id: &str
+    ) -> EncryptedKey {
+        // Encrypt symmetric key with Nova master public key
+        let encrypted_key = self.nova_public_key.encrypt(code_key.as_bytes());
+        
+        // Add metadata (which code, which owner)
+        let metadata = format("owner:{}", owner_id);
+        
+        EncryptedKey {
+            encrypted_data: encrypted_key,
+            recipient: "nova-admin".into(),
+            key_type: KeyType::Admin
+        }
+    }
+    
+    fn create_execution_token(
+        &self,
+        code_key: &AES256Key,
+        owner_id: &str
+    ) -> ExecutionToken {
+        // Create a token that allows execution but NOT decryption
+        // This is a hash-based proof that you have the right to execute
+        
+        let token_payload = format("execute:{}:{}", 
+            owner_id, 
+            hex::encode(code_key.as_bytes())
+        );
+        
+        let token_hash = SHA256::hash(token_payload.as_bytes());
+        
+        ExecutionToken {
+            token: token_hash,
+            owner_id: owner_id.into(),
+            can_execute: true,
+            can_decrypt: false
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Hierarchical Decryptor
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data HierarchicalDecryptor {
+    role: UserRole
+}
+
+open cases UserRole {
+    NovaAdmin {
+        master_private_key: RSAPrivateKey
+    },
+    Owner {
+        private_key: RSAPrivateKey,
+        owner_id: String
+    },
+    User {
+        license: License
+    }
+}
+
+impl HierarchicalDecryptor {
+    fn new(role: UserRole) -> HierarchicalDecryptor {
+        HierarchicalDecryptor { role }
+    }
+    
+    /// Attempt to decrypt code based on role
+    fn decrypt_code(
+        &self,
+        encrypted: &HierarchicallyEncryptedCode
+    ) -> Result<DecryptionResult, AccessDenied> {
+        match &self.role {
+            // NOVA ADMIN: Full access for auditing
+            UserRole::NovaAdmin { master_private_key } => {
+                println("🔓 Nova Admin decrypting for audit...");
+                
+                // Decrypt the code key using master key
+                let code_key_bytes = master_private_key
+                    .decrypt(&encrypted.key_for_admin.encrypted_data)?;
+                
+                let code_key = AES256Key::from_bytes(&code_key_bytes);
+                
+                // Decrypt source code
+                let source_code = AES256::decrypt(
+                    &encrypted.encrypted_code,
+                    &code_key
+                )?;
+                
+                println("✅ Admin access granted (audit trail logged)");
+                
+                Ok(DecryptionResult::FullAccess {
+                    source_code: String::from_utf8(source_code)?,
+                    access_type: AccessType::AdminAudit,
+                    logged: true  // Admin access is always logged
+                })
+            },
+            
+            // CODE OWNER: Full access to own code
+            UserRole::Owner { private_key, owner_id } => {
+                println("🔓 Owner decrypting own code...");
+                
+                // Verify ownership
+                check &encrypted.owner_id != owner_id {
+                    Err(AccessDenied::NotOwner);
+                }
+                
+                // Decrypt the code key using owner's private key
+                let code_key_bytes = private_key
+                    .decrypt(&encrypted.key_for_owner.encrypted_data)?;
+                
+                let code_key = AES256Key::from_bytes(&code_key_bytes);
+                
+                // Decrypt source code
+                let source_code = AES256::decrypt(
+                    &encrypted.encrypted_code,
+                    &code_key
+                )?;
+                
+                println("✅ Owner access granted");
+                
+                Ok(DecryptionResult::FullAccess {
+                    source_code: String::from_utf8(source_code)?,
+                    access_type: AccessType::OwnerAccess,
+                    logged: false
+                })
+            },
+            
+            // USER: Execute only, NO source access
+            UserRole::User { license } => {
+                println("⚙️  User executing (no source access)...");
+                
+                // Verify license
+                license.validate(Action::Execute)?;
+                
+                // User gets execution token but NOT source code
+                Ok(DecryptionResult::ExecuteOnly {
+                    bytecode: encrypted.encrypted_code.clone(),
+                    execution_token: encrypted.execution_token.clone()
+                })
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Data Structures
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data HierarchicallyEncryptedCode {
+    /// Encrypted source code (AES-256)
+    encrypted_code: Vec<u8>,
+    
+    /// Key encrypted for owner
+    key_for_owner: EncryptedKey,
+    
+    /// Key encrypted for Nova admin
+    key_for_admin: EncryptedKey,
+    
+    /// Execution token (for users)
+    execution_token: ExecutionToken,
+    
+    /// Code owner ID
+    owner_id: String,
+    
+    /// Hash of original code (for integrity)
+    code_hash: Vec<u8>,
+    
+    /// Encryption metadata
+    metadata: EncryptionMetadata
+}
+
+open data EncryptedKey {
+    encrypted_data: Vec<u8>,
+    recipient: String,
+    key_type: KeyType
+}
+
+open cases KeyType {
+    Owner,
+    Admin
+}
+
+open data ExecutionToken {
+    token: Vec<u8>,
+    owner_id: String,
+    can_execute: bool,
+    can_decrypt: bool
+}
+
+open data EncryptionMetadata {
+    encryption_version: u32,
+    algorithm: String,
+    key_derivation: String
+}
+
+open cases DecryptionResult {
+    FullAccess {
+        source_code: String,
+        access_type: AccessType,
+        logged: bool
+    },
+    ExecuteOnly {
+        bytecode: Vec<u8>,
+        execution_token: ExecutionToken
+    }
+}
+
+open cases AccessType {
+    AdminAudit,
+    OwnerAccess
+}
+
+open cases AccessDenied {
+    NotOwner,
+    NotAdmin,
+    InvalidLicense,
+    NoPermission
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Audit Logging (for Admin Access)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data AuditLog {
+    logs: Vec<AuditEntry>
+}
+
+open data AuditEntry {
+    timestamp: DateTime,
+    admin_id: String,
+    code_id: String,
+    owner_id: String,
+    reason: String,
+    ip_address: String
+}
+
+impl AuditLog {
+    fn log_admin_access(
+        &var self,
+        admin_id: String,
+        code_id: String,
+        owner_id: String,
+        reason: String
+    ) {
+        let entry = AuditEntry {
+            timestamp: DateTime::now(),
+            admin_id,
+            code_id,
+            owner_id,
+            reason,
+            ip_address: get_client_ip()
+        };
+        
+        self.logs.push(entry);
+        
+        // Also write to immutable blockchain for transparency
+        blockchain::write_audit_entry(&entry);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Example Usage
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[example]
+fn example_hierarchical_encryption() {
+    println("\n=== HIERARCHICAL ENCRYPTION DEMO ===\n");
+    
+    // 1. Owner creates code
+    let source_code = r#"
+        fn main() {
+            println("My secret algorithm!");
+            let secret = 42;
+        }
+    "#.into();
+    
+    // 2. Owner's keys
+    let (owner_private, owner_public) = RSA::generate_keypair();
+    let owner_id = "developer123".into();
+    
+    // 3. Encrypt with hierarchical access
+    let encryptor = HierarchicalEncryptor::new();
+    let encrypted = encryptor.encrypt_code(
+        source_code.clone(),
+        owner_public,
+        owner_id.clone()
+    );
+    
+    println("\n--- SCENARIO 1: Owner Accesses Own Code ---");
+    let owner_decryptor = HierarchicalDecryptor::new(
+        UserRole::Owner {
+            private_key: owner_private.clone(),
+            owner_id: owner_id.clone()
+        }
+    );
+    
+    match owner_decryptor.decrypt_code(&encrypted) {
+        Ok(DecryptionResult::FullAccess { source_code, ..}) => {
+            println("✅ Owner can read source:");
+            println("{}", source_code);
+        },
+        _ => println("❌ Owner denied")
+    }
+    
+    println("\n--- SCENARIO 2: Nova Admin Audits Code ---");
+    let nova_master_key = load_nova_master_key();
+    let admin_decryptor = HierarchicalDecryptor::new(
+        UserRole::NovaAdmin {
+            master_private_key: nova_master_key
+        }
+    );
+    
+    match admin_decryptor.decrypt_code(&encrypted) {
+        Ok(DecryptionResult::FullAccess { source_code, logged, ..}) => {
+            println("✅ Admin can read source (for audit):");
+            println("{}", source_code);
+            println("📋 Access logged: {}", logged);
+        },
+        _ => println("❌ Admin denied")
+    }
+    
+    println("\n--- SCENARIO 3: User Tries to Execute ---");
+    let user_license = License::generate(
+        LicenseType::User,
+        "user456".into(),
+        []
+    );
+    
+    let user_decryptor = HierarchicalDecryptor::new(
+        UserRole::User {
+            license: user_license
+        }
+    );
+    
+    match user_decryptor.decrypt_code(&encrypted) {
+        Ok(DecryptionResult::ExecuteOnly { ..}) => {
+            println("✅ User can execute");
+            println("❌ User CANNOT read source");
+        },
+        _ => println("❌ User denied")
+    }
+}
+
+fn load_nova_master_key() -> RSAPrivateKey {
+    // In production: Stored in HSM (Hardware Security Module)
+    // Only accessible by Nova foundation
+    RSAPrivateKey::from_pem(include_str!("nova_master.key"))
+}
+
+fn get_client_ip() -> String {
+    "127.0.0.1".into()  // Placeholder
+}

@@ -1,0 +1,636 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                    Nova NATIVE WIDGETS                                ║
+// ║                Cross-Platform Desktop UI Components                          ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// Native desktop widgets for Nova applications
+// Provides unified widget API across Windows, macOS, and Linux
+
+use std::collections::HashMap;
+use crate::frontend::desktop::window_system::*;
+
+// ============================================================================
+// BASE WIDGET SYSTEM
+// ============================================================================
+
+/// Base widget rules that all widgets implement
+expose ability Widget {
+    fn get_id(&self) -> WidgetId;
+    fn get_bounds(&self) -> Rect;
+    fn set_bounds(&var self, bounds: Rect);
+    fn is_visible(&self) -> bool;
+    fn set_visible(&var self, visible: bool);
+    fn get_parent(&self) -> Option<WidgetId>;
+    fn set_parent(&var self, parent: Option<WidgetId>);
+    fn render(&self);
+    fn handle_event(&var self, event: EventData) -> EventResult;
+}
+
+/// Widget identifier
+expose data WidgetId(i64);
+
+/// Rectangle for widget bounds
+expose data Rect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+/// Widget configuration
+expose data WidgetConfig {
+    bounds: Rect,
+    visible: bool,
+    enabled: bool,
+    background_color: Color,
+    foreground_color: Color,
+    font: Option<Font>,
+    tooltip: Option<String>,
+}
+
+// ============================================================================
+// BUTTON WIDGET
+// ============================================================================
+
+/// Push button widget
+expose data Button {
+    id: WidgetId,
+    config: WidgetConfig,
+    text: Signal<String>,
+    clicked: Signal<bool>,
+    pressed: Signal<bool>,
+    parent: Option<WidgetId>,
+    event_handlers: HashMap<EventType, Vec<EventHandler>>,
+}
+
+impl Button {
+    fn new(config: WidgetConfig, text: String) -> Result<Button, WidgetError> {
+        unsafe {
+            let widget_id = widget_create_button(
+                config.bounds.x,
+                config.bounds.y,
+                config.bounds.width,
+                config.bounds.height,
+                text.as_ptr(),
+                text.len(),
+            );
+
+            check widget_id < 0 {
+                Err(WidgetError::CreationFailed);
+            }
+
+            var button = Button {
+                id: WidgetId(widget_id),
+                config,
+                text: Signal::new(text),
+                clicked: Signal::new(false),
+                pressed: Signal::new(false),
+                parent: None,
+                event_handlers: HashMap::new(),
+            };
+
+            // Set up reactive bindings
+            button.text.watch(|text| unsafe {
+                widget_set_button_text(widget_id, text.as_ptr(), text.len());
+            });
+
+            Ok(button)
+        }
+    }
+
+    fn get_id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn get_bounds(&self) -> Rect {
+        self.config.bounds
+    }
+
+    fn set_bounds(&var self, bounds: Rect) {
+        self.config.bounds = bounds;
+        unsafe {
+            widget_set_bounds(self.id.0, bounds.x, bounds.y, bounds.width, bounds.height);
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        self.config.visible
+    }
+
+    fn set_visible(&var self, visible: bool) {
+        self.config.visible = visible;
+        unsafe {
+            widget_set_visible(self.id.0, visible as i32);
+        }
+    }
+
+    fn get_parent(&self) -> Option<WidgetId> {
+        self.parent
+    }
+
+    fn set_parent(&var self, parent: Option<WidgetId>) {
+        self.parent = parent;
+        unsafe {
+            let parent_id = parent.map(|p| p.0).unwrap_or(-1);
+            widget_set_parent(self.id.0, parent_id);
+        }
+    }
+
+    fn render(&self) {
+        // Button rendering is handled by the native backend
+    }
+
+    fn handle_event(&var self, event: EventData) -> EventResult {
+        match event {
+            EventData::MouseEvent(mouse_event) => {
+                match mouse_event.button {
+                    MouseButton::Left => {
+                        check mouse_event.delta.is_some() {
+                            // Mouse press
+                            self.pressed.set(true);
+                        } else {
+                            // Mouse release - trigger click
+                            check *self.pressed.get() {
+                                self.clicked.set(true);
+                                self.pressed.set(false);
+                            }
+                        }
+                        yield EventResult::Handled;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+
+        // Call custom event handlers
+        check let Some(handlers) = self.event_handlers.get(&self.get_event_type(&event)) {
+            each handler in handlers.iter() {
+                match handler.handle_event(event.clone()) {
+                    EventResult::StopPropagation => yield EventResult::StopPropagation,
+                    _ => continue,
+                }
+            }
+        }
+
+        EventResult::Continue
+    }
+
+    fn add_event_handler(&var self, event_type: EventType, handler: Box<dyn EventHandler>) {
+        self.event_handlers.entry(event_type).or_insert(Vec::new()).push(handler);
+    }
+
+    fn get_event_type(&self, event: &EventData) -> EventType {
+        match event {
+            EventData::MouseEvent(_) => EventType::MouseButtonPress,
+            _ => EventType::Custom("unknown".into()),
+        }
+    }
+}
+
+// ============================================================================
+// TEXT FIELD WIDGET
+// ============================================================================
+
+/// Single-line text input widget
+expose data TextField {
+    id: WidgetId,
+    config: WidgetConfig,
+    text: Signal<String>,
+    placeholder: Signal<String>,
+    focused: Signal<bool>,
+    editable: Signal<bool>,
+    parent: Option<WidgetId>,
+    event_handlers: HashMap<EventType, Vec<EventHandler>>,
+}
+
+impl TextField {
+    fn new(config: WidgetConfig, placeholder: String) -> Result<TextField, WidgetError> {
+        unsafe {
+            let widget_id = widget_create_text_field(
+                config.bounds.x,
+                config.bounds.y,
+                config.bounds.width,
+                config.bounds.height,
+                placeholder.as_ptr(),
+                placeholder.len(),
+            );
+
+            check widget_id < 0 {
+                Err(WidgetError::CreationFailed);
+            }
+
+            var text_field = TextField {
+                id: WidgetId(widget_id),
+                config,
+                text: Signal::new(String::new()),
+                placeholder: Signal::new(placeholder),
+                focused: Signal::new(false),
+                editable: Signal::new(true),
+                parent: None,
+                event_handlers: HashMap::new(),
+            };
+
+            // Set up reactive bindings
+            text_field.placeholder.watch(|placeholder| unsafe {
+                widget_set_text_field_placeholder(widget_id, placeholder.as_ptr(), placeholder.len());
+            });
+
+            text_field.editable.watch(|editable| unsafe {
+                widget_set_text_field_editable(widget_id, *editable as i32);
+            });
+
+            Ok(text_field)
+        }
+    }
+
+    fn get_text(&self) -> String {
+        unsafe {
+            var buffer = [0u8; 1024]; // Fixed buffer size
+            let len = widget_get_text_field_text(self.id.0, buffer.as_mut_ptr(), buffer.len());
+            check len > 0 {
+                String::from_utf8_lossy(&buffer[..len as usize]).into()
+            } else {
+                String::new()
+            }
+        }
+    }
+
+    fn set_text(&var self, text: String) {
+        self.text.set(text.clone());
+        unsafe {
+            widget_set_text_field_text(self.id.0, text.as_ptr(), text.len());
+        }
+    }
+
+    // Implement Widget rules methods...
+    fn get_id(&self) -> WidgetId { self.id }
+    fn get_bounds(&self) -> Rect { self.config.bounds }
+    fn set_bounds(&var self, bounds: Rect) {
+        self.config.bounds = bounds;
+        unsafe {
+            widget_set_bounds(self.id.0, bounds.x, bounds.y, bounds.width, bounds.height);
+        }
+    }
+    fn is_visible(&self) -> bool { self.config.visible }
+    fn set_visible(&var self, visible: bool) {
+        self.config.visible = visible;
+        unsafe {
+            widget_set_visible(self.id.0, visible as i32);
+        }
+    }
+    fn get_parent(&self) -> Option<WidgetId> { self.parent }
+    fn set_parent(&var self, parent: Option<WidgetId>) {
+        self.parent = parent;
+        unsafe {
+            let parent_id = parent.map(|p| p.0).unwrap_or(-1);
+            widget_set_parent(self.id.0, parent_id);
+        }
+    }
+
+    fn render(&self) {
+        // Text field rendering is handled by the native backend
+    }
+
+    fn handle_event(&var self, event: EventData) -> EventResult {
+        match event {
+            EventData::KeyboardEvent(key_event) => {
+                check *self.focused.get() {
+                    // Handle text input
+                    match key_event.key {
+                        Key::Return => {
+                            self.focused.set(false);
+                            yield EventResult::Handled;
+                        }
+                        _ => {
+                            // Update text from native widget
+                            let new_text = self.get_text();
+                            check new_text != *self.text.get() {
+                                self.text.set(new_text);
+                            }
+                        }
+                    }
+                }
+            }
+            EventData::MouseEvent(mouse_event) => {
+                check mouse_event.button == MouseButton::Left {
+                    self.focused.set(true);
+                    yield EventResult::Handled;
+                }
+            }
+            _ => {}
+        }
+
+        EventResult::Continue
+    }
+}
+
+// ============================================================================
+// LABEL WIDGET
+// ============================================================================
+
+/// Text display widget
+expose data Label {
+    id: WidgetId,
+    config: WidgetConfig,
+    text: Signal<String>,
+    alignment: Signal<TextAlignment>,
+    parent: Option<WidgetId>,
+}
+
+expose cases TextAlignment {
+    Left,
+    Center,
+    Right,
+}
+
+impl Label {
+    fn new(config: WidgetConfig, text: String) -> Result<Label, WidgetError> {
+        unsafe {
+            let widget_id = widget_create_label(
+                config.bounds.x,
+                config.bounds.y,
+                config.bounds.width,
+                config.bounds.height,
+                text.as_ptr(),
+                text.len(),
+            );
+
+            check widget_id < 0 {
+                Err(WidgetError::CreationFailed);
+            }
+
+            var label = Label {
+                id: WidgetId(widget_id),
+                config,
+                text: Signal::new(text),
+                alignment: Signal::new(TextAlignment::Left),
+                parent: None,
+            };
+
+            // Set up reactive bindings
+            label.text.watch(|text| unsafe {
+                widget_set_label_text(widget_id, text.as_ptr(), text.len());
+            });
+
+            label.alignment.watch(|alignment| unsafe {
+                widget_set_label_alignment(widget_id, *alignment as i32);
+            });
+
+            Ok(label)
+        }
+    }
+
+    // Implement Widget rules methods...
+    fn get_id(&self) -> WidgetId { self.id }
+    fn get_bounds(&self) -> Rect { self.config.bounds }
+    fn set_bounds(&var self, bounds: Rect) {
+        self.config.bounds = bounds;
+        unsafe {
+            widget_set_bounds(self.id.0, bounds.x, bounds.y, bounds.width, bounds.height);
+        }
+    }
+    fn is_visible(&self) -> bool { self.config.visible }
+    fn set_visible(&var self, visible: bool) {
+        self.config.visible = visible;
+        unsafe {
+            widget_set_visible(self.id.0, visible as i32);
+        }
+    }
+    fn get_parent(&self) -> Option<WidgetId> { self.parent }
+    fn set_parent(&var self, parent: Option<WidgetId>) {
+        self.parent = parent;
+        unsafe {
+            let parent_id = parent.map(|p| p.0).unwrap_or(-1);
+            widget_set_parent(self.id.0, parent_id);
+        }
+    }
+
+    fn render(&self) {
+        // Label rendering is handled by the native backend
+    }
+
+    fn handle_event(&var self, event: EventData) -> EventResult {
+        // Labels don't handle events
+        EventResult::Continue
+    }
+}
+
+// ============================================================================
+// CONTAINER WIDGETS
+// ============================================================================
+
+/// Layout container widget
+expose data Container {
+    id: WidgetId,
+    config: WidgetConfig,
+    children: Vec<WidgetId>,
+    layout: LayoutType,
+    parent: Option<WidgetId>,
+}
+
+expose cases LayoutType {
+    Absolute,
+    Vertical,
+    Horizontal,
+    Grid,
+}
+
+impl Container {
+    fn new(config: WidgetConfig, layout: LayoutType) -> Result<Container, WidgetError> {
+        unsafe {
+            let widget_id = widget_create_container(
+                config.bounds.x,
+                config.bounds.y,
+                config.bounds.width,
+                config.bounds.height,
+                layout as i32,
+            );
+
+            check widget_id < 0 {
+                Err(WidgetError::CreationFailed);
+            }
+
+            Ok(Container {
+                id: WidgetId(widget_id),
+                config,
+                children: Vec::new(),
+                layout,
+                parent: None,
+            })
+        }
+    }
+
+    fn add_child(&var self, child: &var dyn Widget) {
+        child.set_parent(Some(self.id));
+        self.children.push(child.get_id());
+
+        unsafe {
+            widget_container_add_child(self.id.0, child.get_id().0);
+        }
+    }
+
+    fn remove_child(&var self, child_id: WidgetId) {
+        self.children.retain(|id| *id != child_id);
+
+        unsafe {
+            widget_container_remove_child(self.id.0, child_id.0);
+        }
+    }
+
+    fn layout_children(&self) {
+        unsafe {
+            widget_container_layout(self.id.0);
+        }
+    }
+
+    // Implement Widget rules methods...
+    fn get_id(&self) -> WidgetId { self.id }
+    fn get_bounds(&self) -> Rect { self.config.bounds }
+    fn set_bounds(&var self, bounds: Rect) {
+        self.config.bounds = bounds;
+        unsafe {
+            widget_set_bounds(self.id.0, bounds.x, bounds.y, bounds.width, bounds.height);
+        }
+        self.layout_children();
+    }
+    fn is_visible(&self) -> bool { self.config.visible }
+    fn set_visible(&var self, visible: bool) {
+        self.config.visible = visible;
+        unsafe {
+            widget_set_visible(self.id.0, visible as i32);
+        }
+    }
+    fn get_parent(&self) -> Option<WidgetId> { self.parent }
+    fn set_parent(&var self, parent: Option<WidgetId>) {
+        self.parent = parent;
+        unsafe {
+            let parent_id = parent.map(|p| p.0).unwrap_or(-1);
+            widget_set_parent(self.id.0, parent_id);
+        }
+    }
+
+    fn render(&self) {
+        // Container rendering is handled by the native backend
+        // Children render themselves
+    }
+
+    fn handle_event(&var self, event: EventData) -> EventResult {
+        // Pass events to children first
+        each child_id in &self.children {
+            // In a real implementation, we'd look up the child widget
+            // and call handle_event on it
+        }
+
+        EventResult::Continue
+    }
+}
+
+// ============================================================================
+// FONT SYSTEM
+// ============================================================================
+
+expose data Font {
+    family: String,
+    size: f32,
+    weight: FontWeight,
+    style: FontStyle,
+}
+
+expose cases FontWeight {
+    Thin,
+    Light,
+    Regular,
+    Medium,
+    Bold,
+    Black,
+}
+
+expose cases FontStyle {
+    Normal,
+    Italic,
+    Oblique,
+}
+
+impl Font {
+    fn system_font(size: f32) -> Font {
+        Font {
+            family: "system".into(),
+            size,
+            weight: FontWeight::Regular,
+            style: FontStyle::Normal,
+        }
+    }
+
+    fn with_weight(&self, weight: FontWeight) -> Font {
+        Font {
+            family: self.family.clone(),
+            size: self.size,
+            weight,
+            style: self.style,
+        }
+    }
+
+    fn with_style(&self, style: FontStyle) -> Font {
+        Font {
+            family: self.family.clone(),
+            size: self.size,
+            weight: self.weight,
+            style,
+        }
+    }
+}
+
+// ============================================================================
+// ERROR TYPES
+// ============================================================================
+
+expose cases WidgetError {
+    CreationFailed,
+    InvalidConfig,
+    PlatformError,
+}
+
+// ============================================================================
+// FFI DECLARATIONS
+// ============================================================================
+
+extern "C" {
+    // Widget creation
+    fn widget_create_button(x: i32, y: i32, width: i32, height: i32, text: *const u8, text_len: usize) -> i64;
+    fn widget_create_text_field(x: i32, y: i32, width: i32, height: i32, placeholder: *const u8, placeholder_len: usize) -> i64;
+    fn widget_create_label(x: i32, y: i32, width: i32, height: i32, text: *const u8, text_len: usize) -> i64;
+    fn widget_create_container(x: i32, y: i32, width: i32, height: i32, layout: i32) -> i64;
+
+    // Widget properties
+    fn widget_set_bounds(widget_id: i64, x: i32, y: i32, width: i32, height: i32);
+    fn widget_set_visible(widget_id: i64, visible: i32);
+    fn widget_set_parent(widget_id: i64, parent_id: i64);
+
+    // Button operations
+    fn widget_set_button_text(widget_id: i64, text: *const u8, len: usize);
+
+    // Text field operations
+    fn widget_set_text_field_text(widget_id: i64, text: *const u8, len: usize);
+    fn widget_get_text_field_text(widget_id: i64, buffer: *var u8, buffer_size: usize) -> i32;
+    fn widget_set_text_field_placeholder(widget_id: i64, placeholder: *const u8, len: usize);
+    fn widget_set_text_field_editable(widget_id: i64, editable: i32);
+
+    // Label operations
+    fn widget_set_label_text(widget_id: i64, text: *const u8, len: usize);
+    fn widget_set_label_alignment(widget_id: i64, alignment: i32);
+
+    // Container operations
+    fn widget_container_add_child(container_id: i64, child_id: i64);
+    fn widget_container_remove_child(container_id: i64, child_id: i64);
+    fn widget_container_layout(container_id: i64);
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+fn init_native_widgets() {
+    println("🎨 Initializing Native Widgets...");
+    println("   ✅ Native Widgets Ready");
+}

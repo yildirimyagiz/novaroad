@@ -1,0 +1,611 @@
+// 🧬 Nova Advanced// 🔧 Nova Type System — v10.0
+// Advanced type system with Hindley-Milner type inference
+// + Nova Magic: Generic constraints, type classes, dependent types
+
+@module("type::system")
+@reproducible
+@export
+@inline
+
+use std::collections::{HashMap, Vec};
+use std::sync::Arc;
+use std::result::Result;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §1  TYPE SYSTEM CORE TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Type error
+open cases TypeError {
+    Inference(String),
+}
+
+/// Type variable for inference
+open data TypeVar {
+    id: u32,
+    name: String,
+    constraints: Vec<TypeConstraint>,
+}
+
+/// Type constraint
+open data TypeConstraint {
+    kind: ConstraintKind,
+    type_: Type,
+}
+
+/// Constraint kind
+open cases ConstraintKind {
+    HasTrait(String),
+    Implements(String),
+    SubtypeOf(Type),
+    SupertypeOf(Type),
+}
+
+/// Type representation
+open cases Type {
+    /// Concrete type
+    Concrete(ConcreteType),
+    /// Type variable
+    Var(TypeVar),
+    /// Function type
+    Function(Box<Type>, Box<Type>),
+    /// Generic type
+    Generic(String, Vec<Type>),
+    /// Tuple type
+    Tuple(Vec<Type>),
+    /// Array type
+    Array(Box<Type>, u64),
+    /// Reference type
+    Reference(Box<Type>),
+    /// Mutable reference
+    MutableReference(Box<Type>),
+}
+
+/// Concrete type
+open data ConcreteType {
+    name: String,
+    module: String,
+    generics: Vec<Type>,
+}
+
+/// Type substitution
+open data Substitution {
+    mapping: HashMap<u32, Type>,
+}
+
+impl Substitution {
+    open fn new() -> Substitution {
+        return Substitution {
+            mapping: HashMap::new(),
+        };
+    }
+    
+    open fn insert(&mut self, var_id: u32, type_: Type) {
+        self.mapping.insert(var_id, type_);
+    }
+    
+    open fn apply(&self, type_: &Type) -> Type {
+        match type_ {
+            Type::Var(var) => {
+                if let Some(substituted) = self.mapping.get(&var.id) {
+                    return substituted.clone();
+                } else {
+                    return Type::Var(var.clone());
+                }
+            }
+            Type::Function(param, ret) => {
+                return Type::Function(
+                    Box::new(self.apply(param)),
+                    Box::new(self.apply(ret))
+                );
+            }
+            Type::Generic(name, params) => {
+                let mut new_params = Vec::new();
+                for param in params {
+                    new_params.push(self.apply(param));
+                }
+                return Type::Generic(name, new_params);
+            }
+            Type::Tuple(types) => {
+                let mut new_types = Vec::new();
+                for type_ in types {
+                    new_types.push(self.apply(type_));
+                }
+                return Type::Tuple(new_types);
+            }
+            Type::Array(elem, size) => {
+                return Type::Array(Box::new(self.apply(elem)), *size);
+            }
+            Type::Reference(inner) => {
+                return Type::Reference(Box::new(self.apply(inner)));
+            }
+            Type::MutableReference(inner) => {
+                return Type::MutableReference(Box::new(self.apply(inner)));
+            }
+            Type::Concrete(concrete) => {
+                let mut new_generics = Vec::new();
+                for generic in &concrete.generics {
+                    new_generics.push(self.apply(generic));
+                }
+                return Type::Concrete(ConcreteType {
+                    name: concrete.name.clone(),
+                    module: concrete.module.clone(),
+                    generics: new_generics,
+                });
+            }
+        }
+    }
+}
+
+/// Type inference engine
+open data TypeInference {
+    type_vars: HashMap<String, TypeVar>,
+    substitutions: Substitution,
+    next_var_id: u32,
+}
+
+impl TypeInference {
+    open fn new() -> TypeInference {
+        return TypeInference {
+            type_vars: HashMap::new(),
+            substitutions: Substitution::new(),
+            next_var_id: 0,
+        };
+    }
+    
+    open fn fresh_type_var(&mut self, name: String) -> TypeVar {
+        let var = TypeVar {
+            id: self.next_var_id,
+            name: name,
+            constraints: Vec::new(),
+        };
+        self.type_vars.insert(name.clone(), var.clone());
+        self.next_var_id = self.next_var_id + 1;
+        return var;
+    }
+    
+    open fn infer_expression(&mut self, expr: &Expression) -> Result<Type, String> {
+        match expr {
+            Expression::Literal(lit) => self.infer_literal(lit),
+            Expression::Variable(var) => self.infer_variable(var),
+            Expression::Function(func) => self.infer_function(func),
+            Expression::Call(call) => self.infer_call(call),
+            Expression::Binary(bin) => self.infer_binary(bin),
+            Expression::Lambda(lambda) => self.infer_lambda(lambda),
+            Expression::Let(let_expr) => self.infer_let(let_expr),
+            Expression::If(if_expr) => self.infer_if(if_expr),
+        }
+    }
+    
+    fn infer_literal(&mut self, lit: &Literal) -> Result<Type, String> {
+        match lit {
+            Literal::Int(_) => Ok(Type::Concrete(ConcreteType::new("i64".into(), "core".into()))),
+            Literal::Float(_) => Ok(Type::Concrete(ConcreteType::new("f64".into(), "core".into()))),
+            Literal::String(_) => Ok(Type::Concrete(ConcreteType::new("String".into(), "core".into()))),
+            Literal::Bool(_) => Ok(Type::Concrete(ConcreteType::new("bool".into(), "core".into()))),
+            Literal::Char(_) => Ok(Type::Concrete(ConcreteType::new("char".into(), "core".into()))),
+        }
+    }
+    
+    fn infer_variable(&mut self, var: &Variable) -> Result<Type, String> {
+        // In real implementation, would look up in environment
+        let fresh_var = self.fresh_type_var(var.name.clone());
+        return Ok(Type::Var(fresh_var));
+    }
+    
+    fn infer_function(&mut self, func: &Function) -> Result<Type, String> {
+        let param_types: Result<Vec<Type>, String> = func.params.iter()
+            .map(|param| {
+                let fresh_var = self.fresh_type_var(param.name.clone());
+                Ok(Type::Var(fresh_var))
+            })
+            .collect();
+        
+        let param_types = param_types?;
+        let return_type = self.fresh_type_var("return".into());
+        
+        return Ok(Type::Function(
+            Box::new(Type::Tuple(param_types)),
+            Box::new(Type::Var(return_type))
+        ));
+    }
+    
+    fn infer_call(&mut self, call: &Call) -> Result<Type, String> {
+        let func_type = self.infer_expression(&call.function)?;
+        let arg_types: Result<Vec<Type>, String> = call.arguments.iter()
+            .map(|arg| self.infer_expression(arg))
+            .collect();
+        
+        let arg_types = arg_types?;
+        
+        match func_type {
+            Type::Function(param_type, return_type) => {
+                // Unify parameter types
+                self.unify(&param_type, &Type::Tuple(arg_types))?;
+                return Ok(*return_type);
+            }
+            _ => return Err("Cannot call non-function type".into()),
+        }
+    }
+    
+    fn infer_binary(&mut self, bin: &Binary) -> Result<Type, String> {
+        let left_type = self.infer_expression(&bin.left)?;
+        let right_type = self.infer_expression(&bin.right)?;
+        
+        // In real implementation, would handle operator overloading
+        self.unify(&left_type, &right_type)?;
+        return Ok(left_type);
+    }
+    
+    fn infer_lambda(&mut self, lambda: &Lambda) -> Result<Type, String> {
+        let param_types: Result<Vec<Type>, String> = lambda.params.iter()
+            .map(|param| {
+                let fresh_var = self.fresh_type_var(param.clone());
+                Ok(Type::Var(fresh_var))
+            })
+            .collect();
+        
+        let param_types = param_types?;
+        let body_type = self.infer_expression(&lambda.body)?;
+        
+        return Ok(Type::Function(
+            Box::new(Type::Tuple(param_types)),
+            Box::new(body_type)
+        ));
+    }
+    
+    fn infer_let(&mut self, let_expr: &Let) -> Result<Type, String> {
+        let value_type = self.infer_expression(&let_expr.value)?;
+        let body_type = self.infer_expression(&let_expr.body)?;
+        
+        // In real implementation, would add binding to environment
+        return Ok(body_type);
+    }
+    
+    fn infer_if(&mut self, if_expr: &If) -> Result<Type, String> {
+        let cond_type = self.infer_expression(&if_expr.condition)?;
+        let then_type = self.infer_expression(&if_expr.then_branch)?;
+        let else_type = self.infer_expression(&if_expr.else_branch)?;
+        
+        // Condition must be bool
+        self.unify(&cond_type, &Type::Concrete(ConcreteType::new("bool".into(), "core".into())))?;
+        
+        // Then and else branches must have same type
+        self.unify(&then_type, &else_type)?;
+        
+        return Ok(then_type);
+    }
+    
+    fn unify(&mut self, type1: &Type, type2: &Type) -> Result<(), String> {
+        match (type1, type2) {
+            (Type::Concrete(c1), Type::Concrete(c2)) if c1.name == c2.name => Ok(()),
+            (Type::Var(var1), Type::Var(var2)) if var1.id == var2.id => Ok(()),
+            (Type::Var(var), type_) | (type_, Type::Var(var)) => {
+                self.substitutions.insert(var.id, type_.clone());
+                Ok(())
+            }
+            (Type::Function(param1, ret1), Type::Function(param2, ret2)) => {
+                self.unify(param1, param2)?;
+                self.unify(ret1, ret2)
+            }
+            (Type::Tuple(types1), Type::Tuple(types2)) if types1.len() == types2.len() => {
+                for (t1, t2) in types1.iter().zip(types2.iter()) {
+                    self.unify(t1, t2)?;
+                }
+                Ok(())
+            }
+            _ => Err(format!("Cannot unify types: {:?} and {:?}", type1, type2)),
+        }
+    }
+    
+    open fn solve(&mut self) -> Result<Substitution, String> {
+        return Ok(self.substitutions.clone());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  GENERIC CONSTRAINTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Generic constraint checker
+open data GenericConstraintChecker {
+    constraints: HashMap<String, Vec<TypeConstraint>>,
+}
+
+impl GenericConstraintChecker {
+    open fn new() -> GenericConstraintChecker {
+        return GenericConstraintChecker {
+            constraints: HashMap::new(),
+        };
+    }
+    
+    open fn add_constraint(&mut self, type_param: String, constraint: TypeConstraint) {
+        self.constraints.entry(type_param).or_insert(Vec::new()).push(constraint);
+    }
+    
+    open fn check_constraints(&self, type_: &Type) -> Result<(), String> {
+        match type_ {
+            Type::Generic(name, params) => {
+                if let Some(constraints) = self.constraints.get(name) {
+                    for constraint in constraints {
+                        self.check_constraint(constraint, params)?;
+                    }
+                }
+                return Ok(());
+            }
+            Type::Function(param, ret) => {
+                self.check_constraints(param)?;
+                self.check_constraints(ret)
+            }
+            Type::Tuple(types) => {
+                for type_ in types {
+                    self.check_constraints(type_)?;
+                }
+                return Ok(());
+            }
+            Type::Array(elem, _) => self.check_constraints(elem),
+            Type::Reference(inner) => self.check_constraints(inner),
+            Type::MutableReference(inner) => self.check_constraints(inner),
+            Type::Concrete(concrete) => {
+                for generic in &concrete.generics {
+                    self.check_constraints(generic)?;
+                }
+                return Ok(());
+            }
+            Type::Var(_) => Ok(()),
+        }
+    }
+    
+    fn check_constraint(&self, constraint: &TypeConstraint, type_params: &[Type]) -> Result<(), String> {
+        match &constraint.kind {
+            ConstraintKind::HasTrait(trait_name) => {
+                // Check if type implements trait
+                return self.check_trait_implementation(type_params, trait_name);
+            }
+            ConstraintKind::Implements(interface_name) => {
+                // Check if type implements interface
+                return self.check_interface_implementation(type_params, interface_name);
+            }
+            ConstraintKind::SubtypeOf(supertype) => {
+                // Check if type is subtype
+                return self.check_subtype_relation(type_params, supertype);
+            }
+            ConstraintKind::SupertypeOf(subtype) => {
+                // Check if type is supertype
+                return self.check_supertype_relation(type_params, subtype);
+            }
+        }
+    }
+    
+    fn check_trait_implementation(&self, type_params: &[Type], trait_name: &str) -> Result<(), String> {
+        // In real implementation, would check trait registry
+        return Ok(());
+    }
+    
+    fn check_interface_implementation(&self, type_params: &[Type], interface_name: &str) -> Result<(), String> {
+        // In real implementation, would check interface registry
+        return Ok(());
+    }
+    
+    fn check_subtype_relation(&self, type_params: &[Type], supertype: &Type) -> Result<(), String> {
+        // In real implementation, would check subtype relation
+        return Ok(());
+    }
+    
+    fn check_supertype_relation(&self, type_params: &[Type], subtype: &Type) -> Result<(), String> {
+        // In real implementation, would check supertype relation
+        return Ok(());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  TYPE CLASSES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type class definition
+open data TypeClass {
+    name: String,
+    methods: HashMap<String, Type>,
+    superclasses: Vec<String>,
+    constraints: Vec<TypeConstraint>,
+}
+
+impl TypeClass {
+    open fn new(name: String) -> TypeClass {
+        return TypeClass {
+            name: name,
+            methods: HashMap::new(),
+            superclasses: Vec::new(),
+            constraints: Vec::new(),
+        };
+    }
+    
+    open fn add_method(&mut self, name: String, type_: Type) {
+        self.methods.insert(name, type_);
+    }
+    
+    open fn add_superclass(&mut self, superclass: String) {
+        self.superclasses.push(superclass);
+    }
+    
+    open fn add_constraint(&mut self, constraint: TypeConstraint) {
+        self.constraints.push(constraint);
+    }
+}
+
+/// Type class registry
+open data TypeClassRegistry {
+    classes: HashMap<String, TypeClass>,
+    instances: HashMap<String, Vec<TypeClassInstance>>,
+}
+
+/// Type class instance
+open data TypeClassInstance {
+    class_name: String,
+    type_: Type,
+    method_implementations: HashMap<String, Function>,
+}
+
+impl TypeClassRegistry {
+    open fn new() -> TypeClassRegistry {
+        return TypeClassRegistry {
+            classes: HashMap::new(),
+            instances: HashMap::new(),
+        };
+    }
+    
+    open fn register_class(&mut self, class: TypeClass) {
+        self.classes.insert(class.name.clone(), class);
+    }
+    
+    open fn register_instance(&mut self, instance: TypeClassInstance) {
+        self.instances.entry(instance.class_name.clone())
+            .or_insert(Vec::new())
+            .push(instance);
+    }
+    
+    open fn lookup_instance(&self, class_name: &str, type_: &Type) -> Option<TypeClassInstance> {
+        if let Some(instances) = self.instances.get(class_name) {
+            for instance in instances {
+                if self.type_matches(&instance.type_, type_) {
+                    return Some(instance.clone());
+                }
+            }
+        }
+        return None;
+    }
+    
+    fn type_matches(&self, instance_type: &Type, target_type: &Type) -> bool {
+        // In real implementation, would do proper type matching with generics
+        match (instance_type, target_type) {
+            (Type::Concrete(c1), Type::Concrete(c2)) => c1.name == c2.name,
+            (Type::Generic(name1, _), Type::Generic(name2, _)) => name1 == name2,
+            (Type::Function(p1, r1), Type::Function(p2, r2)) => {
+                self.type_matches(p1, p2) && self.type_matches(r1, r2)
+            }
+            _ => false,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  EXPRESSION AST
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Expression AST
+open cases Expression {
+    Literal(Literal),
+    Variable(Variable),
+    Function(Function),
+    Call(Call),
+    Binary(Binary),
+    Lambda(Lambda),
+    Let(Let),
+    If(If),
+}
+
+/// Literal value
+open cases Literal {
+    Int(i64),
+    Float(f64),
+    String(String),
+    Bool(bool),
+    Char(char),
+}
+
+/// Variable reference
+open data Variable {
+    name: String,
+}
+
+/// Function definition
+open data Function {
+    name: String,
+    params: Vec<Variable>,
+    body: Box<Expression>,
+}
+
+/// Function call
+open data Call {
+    function: Box<Expression>,
+    arguments: Vec<Expression>,
+}
+
+/// Binary operation
+open data Binary {
+    operator: BinaryOperator,
+    left: Box<Expression>,
+    right: Box<Expression>,
+}
+
+/// Binary operator
+open cases BinaryOperator {
+    Add, Sub, Mul, Div,
+    Eq, Ne, Lt, Le, Gt, Ge,
+    And, Or,
+}
+
+/// Lambda expression
+open data Lambda {
+    params: Vec<String>,
+    body: Box<Expression>,
+}
+
+/// Let binding
+open data Let {
+    name: String,
+    value: Box<Expression>,
+    body: Box<Expression>,
+}
+
+/// If expression
+open data If {
+    condition: Box<Expression>,
+    then_branch: Box<Expression>,
+    else_branch: Box<Expression>,
+}
+
+/// Function implementation
+open data Function {
+    name: String,
+    params: Vec<String>,
+    body: Expression,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §5  GLOBAL INSTANCES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Global type class registry
+var TYPE_CLASS_REGISTRY: TypeClassRegistry = TypeClassRegistry::new();
+
+/// Get global type class registry
+open fn get_type_class_registry() -> &TypeClassRegistry {
+    return &TYPE_CLASS_REGISTRY;
+}
+
+/// Initialize built-in type classes
+open fn init_type_classes() {
+    // Register common type classes
+    let mut eq_class = TypeClass::new("Eq".into());
+    eq_class.add_method("eq".into(), Type::Function(
+        Box::new(Type::Var(TypeVar::new(0, "self".into(), Vec::new()))),
+        Box::new(Type::Concrete(ConcreteType::new("bool".into(), "core".into())))
+    ));
+    TYPE_CLASS_REGISTRY.register_class(eq_class);
+    
+    let mut ord_class = TypeClass::new("Ord".into());
+    ord_class.add_superclass("Eq".into());
+    ord_class.add_method("cmp".into(), Type::Function(
+        Box::new(Type::Var(TypeVar::new(1, "self".into(), Vec::new()))),
+        Box::new(Type::Concrete(ConcreteType::new("Ordering".into(), "core".into())))
+    ));
+    TYPE_CLASS_REGISTRY.register_class(ord_class);
+    
+    let mut show_class = TypeClass::new("Show".into());
+    show_class.add_method("show".into(), Type::Function(
+        Box::new(Type::Var(TypeVar::new(2, "self".into(), Vec::new()))),
+        Box::new(Type::Concrete(ConcreteType::new("String".into(), "core".into())))
+    ));
+    TYPE_CLASS_REGISTRY.register_class(show_class);
+}

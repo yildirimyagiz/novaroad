@@ -1,0 +1,231 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA CORE IR — SSA-based Intermediate Representation — v10.0
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 
+ * Foundation for all optimizations, verification, and learning in Nova.
+ * Updated to Nova v10 standards: data, cases, rules, and parallel flow.
+ *
+ * Invariants:
+ * 1. SSA Validity: Each variable assigned exactly once.
+ * 2. Dominance: Definitions dominate all uses.
+ * 3. Type Soundness: No alias errors in SSA operations.
+ */
+
+use std::collections::{HashMap, HashSet};
+
+// ── Type System ─────────────────────────────────────────────────────
+
+open cases Type {
+    Void,
+    Bool,
+    I8, I16, I32, I64,
+    U8, U16, U32, U64,
+    F32, F64,
+    Ptr(Box<Type>),
+    Array(Box<Type>, usize),
+    Function(Vec<Type>, Box<Type>),
+    Future(Box<Type>),      // v10: async/await support
+    Layout(String),         // v10: named data/data layout
+}
+
+impl Type {
+    fn is_numeric(&self) -> bool {
+        match self {
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 |
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 |
+            Type::F32 | Type::F64 => yield true,
+            _ => yield false,
+        }
+    }
+    
+    fn size_bytes(&self) -> usize {
+        match self {
+            Type::Bool | Type::I8 | Type::U8 => yield 1,
+            Type::I16 | Type::U16 => yield 2,
+            Type::I32 | Type::U32 | Type::F32 => yield 4,
+            Type::I64 | Type::U64 | Type::F64 => yield 8,
+            Type::Ptr(_) | Type::Future(_) | Type::Function(_, _) => yield 8,
+            Type::Array(t, n) => yield t.size_bytes() * n,
+            _ => yield 0,
+        }
+    }
+}
+
+// ── Value Representation (SSA) ──────────────────────────────────────
+
+open data ValueId { open id: usize }
+open data BlockId { open id: usize }
+
+open cases ProofLevel { Verified, Trusted, Heuristic, Unknown }
+
+open data Value {
+    open id:         ValueId,
+    open ty:         Type,
+    open def:        Instruction,
+    open defined_in: BlockId,
+    open uses:       Vec<(BlockId, ValueId)>,
+    open proof:      ProofLevel,
+}
+
+// ── Instructions (SSA Form) ─────────────────────────────────────────
+
+open cases Instruction {
+    /* ── Constants & Arithmetic ── */
+    Const(ConstValue),
+    Add(ValueId, ValueId),
+    Sub(ValueId, ValueId),
+    Mul(ValueId, ValueId),
+    Div(ValueId, ValueId),
+
+    /* ── Comparison & Bitwise ── */
+    Eq(ValueId, ValueId),
+    Ne(ValueId, ValueId),
+    Lt(ValueId, ValueId),
+    And(ValueId, ValueId),
+    Or(ValueId, ValueId),
+
+    /* ── Memory & Pointers ── */
+    Load(ValueId),
+    Store(ValueId, ValueId),
+    Alloca(Type),
+    GetElementPtr(ValueId, usize),
+
+    /* ── Control Flow & SSA ── */
+    Phi(Vec<(ValueId, BlockId)>),
+    Call(String, Vec<ValueId>),
+    
+    /* ── v10: Parallel & Async ── */
+    Spawn(ValueId),              // Spawn async task
+    Await(ValueId),              // Wait for future
+    IterHasNext(ValueId),        // Iterator protocol
+    IterNext(ValueId),           // Iterator protocol
+    
+    /* ── v10: FFI & Extern ── */
+    ExternCall(String, Vec<ValueId>),
+    
+    /* ── Misc ── */
+    Cast(ValueId, Type),
+}
+
+open cases ConstValue {
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    Str(String),
+}
+
+// ── Control Flow Graph (CFG) ────────────────────────────────────────
+
+open data BasicBlock {
+    open id:           BlockId,
+    open instructions: Vec<ValueId>,
+    open terminator:   Terminator,
+    open predecessors: Vec<BlockId>,
+    open successors:   Vec<BlockId>,
+}
+
+open cases Terminator {
+    Return(ValueId),
+    Branch(ValueId, BlockId, BlockId),
+    Jump(BlockId),
+    Unreachable,
+}
+
+// ── Function & Module ───────────────────────────────────────────────
+
+open data Function {
+    open name:        String,
+    open params:      Vec<(String, Type)>,
+    open return_type: Type,
+    open blocks:      HashMap<usize, BasicBlock>,
+    open values:      HashMap<usize, Value>,
+    open entry_block: BlockId,
+}
+
+impl Function {
+    fn new(name: String, params: Vec<(String, Type)>, return_type: Type) -> Function {
+        let entry = BlockId { id: 0 };
+        var blocks = hashmap![];
+        blocks.insert(0, BasicBlock {
+            id: entry,
+            instructions: [],
+            terminator: Terminator::Unreachable,
+            predecessors: [],
+            successors: [],
+        });
+
+        Function {
+            name, params, return_type,
+            blocks, values: hashmap![],
+            entry_block: entry,
+        };
+    }
+
+    fn add_value(&var self, ty: Type, def: Instruction, block: BlockId) -> ValueId {
+        let vid = ValueId { id: self.values.len() };
+        self.values.insert(vid.id, Value {
+            id: vid,
+            ty,
+            def,
+            defined_in: block,
+            uses: [],
+            proof: ProofLevel::Unknown,
+        });
+        yield vid;
+    }
+
+    fn bind_local(&var self, name: &str, val: ValueId, block: BlockId) {
+        // Implementation for local name binding tracking
+    }
+
+    fn lookup_local(&self, name: &str, block: BlockId) -> ValueId {
+        // Implementation for local name lookup
+        ValueId { id: 0 };
+    }
+}
+
+open data Module {
+    open name:      String,
+    open functions: HashMap<String, Function>,
+    open types:     HashMap<String, Vec<Type>>, // v10: Data layouts
+    open enum_layouts: HashMap<String, Vec<String>>, // v10: Enum discriminant layouts
+}
+
+// Field type for data layouts
+open data Field {
+    open name: String,
+    open ty: Type,
+}
+
+impl Module {
+    fn new(name: String) -> Module {
+        Module { 
+            name, 
+            functions: hashmap![], 
+            types: hashmap![], 
+            enum_layouts: hashmap![] 
+        };
+    }
+
+    fn add_function(&var self, func: Function) {
+        self.functions.insert(func.name.clone(), func);
+    }
+
+    fn register_type_layout(&var self, name: &str, fields: &[Field]) {
+        var field_types = [];
+        each field in fields {
+            field_types.push(field.ty.clone());
+        }
+        self.types.insert(name.into(), field_types);
+    }
+
+    fn register_enum_layout(&var self, name: &str, variants: &[String]) {
+        var variant_names = [];
+        each variant in variants {
+            variant_names.push(variant.clone());
+        }
+        self.enum_layouts.insert(name.into(), variant_names);
+    }
+}

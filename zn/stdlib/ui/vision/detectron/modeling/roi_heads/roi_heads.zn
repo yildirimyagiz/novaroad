@@ -1,0 +1,167 @@
+// Nova Detectron - ROI Heads (Fast R-CNN + Mask R-CNN)
+// Takes proposals from RPN and classifies them + refines boxes + generates masks.
+
+import std.ai.core
+import std.ai.nn
+import std.vision.detectron.structures.boxes
+import std.vision.detectron.modeling.poolers
+import std.vision.detectron.layers.nms
+
+open data StandardROIHeads {
+    box_in_features: list<str>,        // ["p2", "p3", "p4", "p5"]
+    box_pooler: ROIPooler
+    box_head: FastRCNNConvFCHead
+    box_predictor: FastRCNNOutputLayers
+    
+    mask_in_features: list<str>
+    mask_pooler: ROIPooler
+    mask_head: MaskRCNNConvUpsampleHead
+    
+    // Training params
+    batch_size_per_image: u32,         // 512
+    positive_fraction: f64,            // 0.25
+    proposal_matcher: Matcher
+    
+    // Inference params
+    score_thresh_test: f64,            // 0.05
+    nms_thresh_test: f64,              // 0.5
+    detections_per_image: u32          // 100
+}
+
+// Fast R-CNN Box Head (Conv + FC layers)
+open data FastRCNNConvFCHead {
+    conv_layers: list<nn.Conv2d>
+    fc_layers: list<nn.Linear>
+}
+
+impl FastRCNNConvFCHead {
+    fn forward(var self, x: Tensor) -> Tensor {
+        each conv in self.conv_layers {
+            x = nn.functional.relu(conv.forward(x))
+        }
+        x = x.flatten(start_dim: 1)
+        each fc in self.fc_layers {
+            x = nn.functional.relu(fc.forward(x))
+        }
+        yield x
+    }
+}
+
+// Output layers: classification + box regression
+open data FastRCNNOutputLayers {
+    cls_score: nn.Linear,     // (num_classes + 1) for background
+    bbox_pred: nn.Linear      // 4 * num_classes
+}
+
+impl FastRCNNOutputLayers {
+    fn forward(var self, x: Tensor) -> (Tensor, Tensor) {
+        let scores = self.cls_score.forward(x)
+        let bbox_deltas = self.bbox_pred.forward(x)
+        yield (scores, bbox_deltas)
+    }
+    
+    fn losses(self, predictions: (Tensor, Tensor), proposals: list<Instances>) -> map<str, Tensor> {
+        let (scores, bbox_deltas) = predictions
+        
+        // ... GT assignment and loss calculation
+        let cls_loss = nn.functional.cross_entropy(...)
+        let box_loss = nn.functional.smooth_l1_loss(...)
+        
+        yield {
+            "loss_cls": cls_loss,
+            "loss_box_reg": box_loss
+        }
+    }
+}
+
+// Mask R-CNN Head (Conv layers with upsampling)
+open data MaskRCNNConvUpsampleHead {
+    conv_layers: list<nn.Conv2d>
+    deconv: nn.ConvTranspose2d
+    predictor: nn.Conv2d
+}
+
+impl MaskRCNNConvUpsampleHead {
+    fn forward(var self, x: Tensor) -> Tensor {
+        each conv in self.conv_layers {
+            x = nn.functional.relu(conv.forward(x))
+        }
+        x = nn.functional.relu(self.deconv.forward(x))
+        yield self.predictor.forward(x); // (N, num_classes, 28, 28)
+    }
+    
+    fn loss(self, pred_masks: Tensor, instances: list<Instances>, pos_proposals: list<Instances>) -> Tensor {
+        // Binary cross entropy for mask pixels
+        // Only compute loss for positive proposals
+        let gt_masks = instances.gt_masks
+        let mask_loss = nn.functional.binary_cross_entropy_with_logits(pred_masks, gt_masks)
+        yield mask_loss
+    }
+}
+
+impl StandardROIHeads {
+    fn forward(var self, features: map<str, Tensor>, proposals: list<Instances>, targets: list<Instances>) -> (list<Instances>, map<str, Tensor>) {
+        check self.training {
+            // Sample proposals
+            proposals = self.label_and_sample_proposals(proposals, targets)
+        }
+        
+        // BOX HEAD
+        let box_features = self.box_pooler.forward(
+            [features[lvl] each lvl in self.box_in_features],
+            [p.proposal_boxes each p in proposals]
+        )
+        
+        let box_features = self.box_head.forward(box_features)
+        let predictions = self.box_predictor.forward(box_features)
+        
+        check self.training {
+            let losses = self.box_predictor.losses(predictions, proposals)
+            
+            // MASK HEAD (only for positive proposals)
+            let mask_features = self.mask_pooler.forward(...)
+            let mask_logits = self.mask_head.forward(mask_features)
+            losses["loss_mask"] = self.mask_head.loss(mask_logits, targets, proposals)
+            
+            yield ([], losses)
+        } else {
+            // Inference
+            let pred_instances = self.forward_inference(predictions, proposals)
+            
+            // Predict masks for detected boxes
+            pred_instances = self.forward_mask_inference(features, pred_instances)
+            
+            yield (pred_instances, {})
+        }
+    }
+    
+    fn forward_inference(self, predictions: (Tensor, Tensor), proposals: list<Instances>) -> list<Instances> {
+        let (scores, bbox_deltas) = predictions
+        
+        // Apply softmax to get class probabilities
+        let probs = nn.functional.softmax(scores, dim: 1)
+        
+        // Decode boxes
+        let pred_boxes = self.box2box_transform.apply_deltas(bbox_deltas, proposals.proposal_boxes)
+        
+        // Per-class NMS
+        let results = []
+        each img_idx in 0..proposals.length() {
+            let boxes_per_image = pred_boxes[img_idx]
+            let scores_per_image = probs[img_idx]
+            
+            let instances = self.fast_rcnn_inference_single_image(
+                boxes_per_image,
+                scores_per_image,
+                proposals[img_idx].image_size,
+                self.score_thresh_test,
+                self.nms_thresh_test,
+                self.detections_per_image
+            )
+            
+            results.push(instances)
+        }
+        
+        yield results
+    }
+}

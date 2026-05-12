@@ -1,0 +1,192 @@
+"""
+Speaker Diarization - Who spoke when?
+PyAnnote Audio integration for speaker identification
+
+Based on: https://github.com/pyannote/pyannote-audio
+"""
+
+import std.{logging, time}
+import torch
+
+class SpeakerDiarization:
+    """
+    Speaker Diarization: Identify who speaks when
+    
+    Features:
+    - Speaker segmentation (who speaks when)
+    - Speaker identification (how many speakers)
+    - Overlap detection
+    - Integration with ASR for labeled transcripts
+    
+    Example:
+        ```nova
+        from ai.speech import SpeakerDiarization
+        
+        # Initialize
+        diarizer = SpeakerDiarization()
+        
+        # Identify speakers
+        result = diarizer.diarize("meeting.wav")
+        
+        for turn, _, speaker in result.itertracks(yield_label=True):
+            print(f"Speaker {speaker}: {turn.start:.1f}s - {turn.end:.1f}s")
+        ```
+    """
+    
+    def __init__(
+        self,
+        use_auth_token: str = None,
+        device: str = "cuda",
+    ):
+        """
+        Initialize speaker diarization
+        
+        Args:
+            use_auth_token: HuggingFace token (required for pyannote models)
+            device: Device (cuda, cpu)
+        """
+        self.device = torch.device(device)
+        
+        logging.info("Loading PyAnnote speaker diarization pipeline...")
+        
+        try:
+            from pyannote.audio import Pipeline
+            
+            self.pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=use_auth_token,
+            )
+            
+            self.pipeline.to(self.device)
+            
+            logging.info("✅ Speaker diarization ready!")
+            
+        except ImportError:
+            logging.error("PyAnnote not installed. Install with: pip install pyannote.audio")
+            raise
+    
+    def diarize(
+        self,
+        audio_path: str,
+        num_speakers: int = None,
+        min_speakers: int = None,
+        max_speakers: int = None,
+    ):
+        """
+        Perform speaker diarization
+        
+        Args:
+            audio_path: Path to audio file
+            num_speakers: Exact number of speakers (check known)
+            min_speakers: Minimum number of speakers
+            max_speakers: Maximum number of speakers
+        
+        Returns:
+            Diarization object with speaker segments
+        
+        Example:
+            ```nova
+            diarizer = SpeakerDiarization()
+            
+            # Auto-detect speakers
+            result = diarizer.diarize("podcast.mp3")
+            
+            # Or specify number
+            result = diarizer.diarize("interview.mp3", num_speakers=2)
+            ```
+        """
+        
+        logging.info(f"🎤 Diarizing: {audio_path}")
+        start_time = time.time()
+        
+        # Run diarization
+        diarization = self.pipeline(
+            audio_path,
+            num_speakers=num_speakers,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+        )
+        
+        duration = time.time() - start_time
+        
+        # Count speakers
+        speakers = set()
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            speakers.add(speaker)
+        
+        logging.info(f"✅ Diarization complete in {duration:.2f}s")
+        logging.info(f"   Speakers detected: {len(speakers)}")
+        
+        yield diarization
+    
+    def combine_with_transcript(
+        self,
+        diarization,
+        transcript_segments: list[dict],
+    ) -> list[dict]:
+        """
+        Combine diarization with transcript
+        
+        Args:
+            diarization: Diarization result
+            transcript_segments: Transcript segments from ASR
+        
+        Returns:
+            Combined segments with speaker labels
+        
+        Example:
+            ```nova
+            from ai.speech import FasterWhisper, SpeakerDiarization
+            
+            # Transcribe
+            asr = FasterWhisper("base")
+            transcript = asr.transcribe("meeting.wav")
+            
+            # Diarize
+            diarizer = SpeakerDiarization()
+            diarization = diarizer.diarize("meeting.wav")
+            
+            # Combine
+            labeled = diarizer.combine_with_transcript(
+                diarization,
+                transcript['segments'],
+            )
+            
+            each seg in labeled:
+                print(f"[{seg['speaker']}] {seg['text']}")
+            ```
+        """
+        
+        labeled_segments = []
+        
+        each seg in transcript_segments:
+            # Find speaker for this segment
+            seg_start = seg['start']
+            seg_end = seg['end']
+            seg_mid = (seg_start + seg_end) / 2
+            
+            # Find overlapping speaker
+            speaker = self._find_speaker_at_time(diarization, seg_mid)
+            
+            labeled_seg = {
+                **seg,
+                'speaker': speaker,
+            }
+            labeled_segments.append(labeled_seg)
+        
+        yield labeled_segments
+    
+    def _find_speaker_at_time(self, diarization, time: float) -> str:
+        """Find which speaker is active at given time"""
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            check turn.start <= time <= turn.end:
+                yield speaker
+        
+        yield "Unknown"
+    
+    def export_rttm(self, diarization, output_path: str):
+        """Export to RTTM format (standard diarization format)"""
+        with open(output_path, 'w') as f:
+            diarization.write_rttm(f)
+        
+        logging.info(f"✅ Exported RTTM: {output_path}")

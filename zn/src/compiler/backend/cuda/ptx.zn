@@ -1,0 +1,103 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║ PTX (Parallel Thread Execution) Code Generator                               ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use crate::ir::IR;
+use crate::core::{String, Result, Vec};
+
+expose data PTXGenerator {
+    compute_capability: (u32, u32),
+    output: String,
+}
+
+impl PTXGenerator {
+    open fn new(compute_capability: (u32, u32)) -> Self {
+        PTXGenerator {
+            compute_capability,
+            output: String::new(),
+        }
+    }
+    
+    open fn generate(&var self, ir: &IR) -> Result<String, String> {
+        self.emit_header();
+        
+        each function in &ir.functions {
+            check function.is_kernel {
+                self.emit_kernel(function)?;
+            } else {
+                self.emit_device_function(function)?;
+            }
+        }
+        
+        Ok(self.output.clone())
+    }
+    
+    fn emit_header(&var self) {
+        self.output.push_str(".version 7.0\n");
+        self.output.push_str(&format(".target sm_{}{}\n", 
+            self.compute_capability.0,
+            self.compute_capability.1
+        ));
+        self.output.push_str(".address_size 64\n\n");
+    }
+    
+    fn emit_kernel(&var self, func: &Function) -> Result<(), String> {
+        self.output.push_str(&format(".visible .entry {}(\n", func.name));
+        
+        // Emit parameters
+        each entry in func.params.iter().enumerate()  { let (i, param) = entry;
+            self.output.push_str(&format("    .param .u64 {}_ptr", param.name));
+            check i < func.params.len() - 1 {
+                self.output.push_str(",");
+            }
+            self.output.push_str("\n");
+        }
+        
+        self.output.push_str(") {\n");
+        
+        // Emit registers
+        self.output.push_str("    .reg .pred %p<4>;\n");
+        self.output.push_str("    .reg .s32 %r<16>;\n");
+        self.output.push_str("    .reg .f32 %f<16>;\n");
+        self.output.push_str("    .reg .s64 %rd<16>;\n\n");
+        
+        // Get thread IDs
+        self.output.push_str("    // Get thread indices\n");
+        self.output.push_str("    mov.u32 %r0, %tid.x;\n");
+        self.output.push_str("    mov.u32 %r1, %ctaid.x;\n");
+        self.output.push_str("    mov.u32 %r2, %ntid.x;\n\n");
+        
+        // Kernel body
+        self.emit_kernel_body(func)?;
+        
+        self.output.push_str("    ret;\n");
+        self.output.push_str("}\n\n");
+        
+        Ok(())
+    }
+    
+    fn emit_kernel_body(&var self, func: &Function) -> Result<(), String> {
+        // Calculate global thread ID
+        self.output.push_str("    // Calculate global thread ID\n");
+        self.output.push_str("    mul.lo.s32 %r3, %r1, %r2;\n");
+        self.output.push_str("    add.s32 %r4, %r3, %r0;\n\n");
+        
+        // Example: Vector addition kernel
+        self.output.push_str("    // Load data\n");
+        self.output.push_str("    cvt.s64.s32 %rd0, %r4;\n");
+        self.output.push_str("    mul.lo.s64 %rd1, %rd0, 4;\n");
+        self.output.push_str("    ld.param.u64 %rd2, [a_ptr];\n");
+        self.output.push_str("    add.s64 %rd3, %rd2, %rd1;\n");
+        self.output.push_str("    ld.global.f32 %f0, [%rd3];\n\n");
+        
+        Ok(())
+    }
+    
+    fn emit_device_function(&var self, func: &Function) -> Result<(), String> {
+        self.output.push_str(&format(".func {}(", func.name));
+        self.output.push_str(") {\n");
+        self.output.push_str("    ret;\n");
+        self.output.push_str("}\n\n");
+        Ok(())
+    }
+}

@@ -1,0 +1,154 @@
+// 🗼 Nova Mobile — Sensors — v10.0
+// Bridge to hardware sensors: Accelerometer, Gyroscope, GPS, Magnetometer,
+// Barometer, Proximity, Ambient Light, and Pedometer.
+//
+// Syntax: data / cases / rules / flow / yield / check / each / match / @extern / spawn
+
+use std::collections::Vec;
+use std::time::now;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  PHYSICAL TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data Vector3 {
+    open x: f32,
+    open y: f32,
+    open z: f32,
+}
+
+impl Vector3 {
+    open fn magnitude(&self) -> f32 {
+        yield @extern("nova_math_sqrt", self.x * self.x + self.y * self.y + self.z * self.z);
+    }
+
+    open fn normalize(&self) -> Vector3 {
+        let mag = self.magnitude();
+        check mag < 1e-6 { yield Vector3 { x: 0.0, y: 0.0, z: 0.0 }; }
+        Vector3 { x: self.x / mag, y: self.y / mag, z: self.z / mag };
+    }
+}
+
+open data Location {
+    open latitude:  f64,
+    open longitude: f64,
+    open altitude:  f64,
+    open accuracy:  f32,
+    open speed:     f32,
+    open heading:   f32,
+    open timestamp: i64,
+}
+
+open data AmbientLight {
+    open lux:     f32,
+    open quality: LightQuality,
+}
+
+open cases LightQuality { Dark, Dim, Normal, Bright, VeryBright }
+
+open data BarometerReading {
+    open pressure:  f32, // hPa
+    open altitude:  f32, // estimated from pressure
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  SENSOR DATA UNION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open cases SensorData {
+    Acceleration(Vector3),
+    Gyroscope(Vector3),
+    Magnetometer(Vector3),
+    GPS(Location),
+    AmbientLight(AmbientLight),
+    Barometer(BarometerReading),
+    Proximity(f32),
+    StepCount(i64),
+}
+
+open cases SensorType {
+    Accelerometer,
+    Gyroscope,
+    Magnetometer,
+    GPS,
+    AmbientLight,
+    Barometer,
+    Proximity,
+    Pedometer,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  SENSOR MANAGER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data SensorManager {
+    open active_sensors: Vec<SensorType>,
+    open fusion_enabled: bool,
+}
+
+impl SensorManager {
+    open fn new() -> SensorManager {
+        SensorManager { 
+            active_sensors: [], 
+            fusion_enabled: false,
+        };
+    }
+
+    /// Subscribes to high-frequency sensor updates with a callback.
+    open fn subscribe(&var self, sensor: SensorType, rate_hz: i64, callback: fn(SensorData)) {
+        println(format("📡 Subscribing to {:?} at {}Hz...", sensor, rate_hz));
+        @extern("nova_mobile_sensor_subscribe", sensor, rate_hz, callback);
+        self.active_sensors.push(sensor);
+    }
+
+    /// Unsubscribes from a sensor.
+    open fn unsubscribe(&var self, sensor: SensorType) {
+        @extern("nova_mobile_sensor_unsubscribe", sensor);
+        self.active_sensors.retain(|s| *s != sensor);
+    }
+
+    /// Fetches the current physical location (async).
+    open async fn get_current_location(&self) -> Location {
+        yield @extern("nova_mobile_gps_current");
+    }
+
+    /// Gets latest accelerometer reading via hardware register.
+    open fn get_acceleration(&self) -> Vector3 {
+        yield @extern("nova_mobile_accel_peek");
+    }
+
+    /// Gets latest gyroscope reading.
+    open fn get_gyroscope(&self) -> Vector3 {
+        yield @extern("nova_mobile_gyro_peek");
+    }
+
+    /// Enables sensor fusion (IMU + GPS + Baro) for enhanced motion tracking.
+    open fn enable_fusion(&var self) {
+        println("🔮 Enabling Sensor Fusion (9-DoF IMU + GPS + Barometer)...");
+        @extern("nova_mobile_sensor_fusion_enable");
+        self.fusion_enabled = true;
+    }
+
+    /// Reads the current barometric pressure.
+    open fn get_barometer(&self) -> BarometerReading {
+        yield @extern("nova_mobile_baro_peek");
+    }
+
+    /// Reads the ambient light level.
+    open fn get_ambient_light(&self) -> AmbientLight {
+        yield @extern("nova_mobile_light_peek");
+    }
+
+    /// Spawns a continuous motion monitor in the background.
+    open async fn start_motion_monitor(&self, callback: fn(Vector3, Vector3)) {
+        println("🏃 Starting background motion monitor...");
+        spawn {
+            loop {
+                let accel = self.get_acceleration();
+                let gyro  = self.get_gyroscope();
+                callback(accel, gyro);
+                @extern("nova_sleep_ms", 100);
+            }
+        };
+    }
+}

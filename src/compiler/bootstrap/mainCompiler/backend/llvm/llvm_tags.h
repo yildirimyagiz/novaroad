@@ -1,0 +1,13 @@
+#ifndef NOVA_LLVM_TAGS_H
+#define NOVA_LLVM_TAGS_H
+
+/* OptLevel definition */
+#define NOVA_LLVM_OPTLEVEL_O0 0
+#define NOVA_LLVM_OPTLEVEL_O1 1
+#define NOVA_LLVM_OPTLEVEL_O2 2
+#define NOVA_LLVM_OPTLEVEL_O3 3
+#define NOVA_LLVM_OPTLEVEL_OS 4
+#define NOVA_LLVM_OPTLEVEL_OZ 5
+
+#endif
+

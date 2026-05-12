@@ -1,0 +1,319 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova Cross-Language Interop                                                   ║
+// ║ Universal alias conversions and cross-language helpers                         ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// Module: ffi::interop;
+
+use ffi::c_bridge;
+use ffi::py_bridge;
+use ffi::rust_bridge;
+use ffi::js_bridge;
+use ffi::swift_bridge;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Universal Value Type
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Universal value that can cross language boundaries
+expose cases UniversalValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    Array(Vec<UniversalValue>),
+    Object(HashMap<String, UniversalValue>),
+    Binary(Vec<u8>),
+}
+
+impl UniversalValue {
+    /// Convert to Python
+    open fn to_python(&self) -> Result<py_bridge::PyObject, String> {
+        match self {
+            UniversalValue::Null => Ok(py_bridge::PyObject::null()),
+            UniversalValue::Bool(b) => Ok(py_bridge::PyObject::from_bool(*b)),
+            UniversalValue::Int(i) => Ok(py_bridge::PyObject::from_i64(*i)),
+            UniversalValue::Float(f) => Ok(py_bridge::PyObject::from_f64(*f)),
+            UniversalValue::String(s) => py_bridge::PyObject::from_string(s),
+            UniversalValue::Array(arr) => {
+                let list = py_bridge::PyObject::new_list(arr.len())?;
+                each (i, item) in arr.enumerate() {
+                    list.set_item(i, &item.to_python()?)?;
+                }
+                Ok(list)
+            },
+            UniversalValue::Object(obj) => {
+                let dict = py_bridge::PyObject::new_dict()?;
+                each (k, v) in obj {
+                    let key = py_bridge::PyObject::from_string(k)?;
+                    dict.set_property(k, &v.to_python()?)?;
+                }
+                Ok(dict)
+            },
+            UniversalValue::Binary(data) => {
+                // Convert to Python bytes
+                py_bridge::PyObject::from_bytes(data)
+            },
+        }
+    }
+    
+    /// Convert to JavaScript
+    open fn to_javascript(&self) -> Result<js_bridge::JsObject, String> {
+        match self {
+            UniversalValue::Null => Ok(js_bridge::JsObject::null()),
+            UniversalValue::Bool(b) => Ok(js_bridge::JsObject::from_bool(*b)),
+            UniversalValue::Int(i) => Ok(js_bridge::JsObject::from_i32(*i as i32)),
+            UniversalValue::Float(f) => Ok(js_bridge::JsObject::from_f64(*f)),
+            UniversalValue::String(s) => js_bridge::JsObject::from_string(s),
+            UniversalValue::Array(arr) => {
+                let array = js_bridge::JsObject::new_array(arr.len());
+                each (i, item) in arr.enumerate() {
+                    array.set_index(i, &item.to_javascript()?)?;
+                }
+                Ok(array)
+            },
+            UniversalValue::Object(obj) => {
+                let object = js_bridge::JsObject::new_object();
+                each (k, v) in obj {
+                    object.set_property(k, &v.to_javascript()?)?;
+                }
+                Ok(object)
+            },
+            UniversalValue::Binary(data) => {
+                js_bridge::JsObject::from_arraybuffer(data)
+            },
+        }
+    }
+    
+    /// Convert to JSON string
+    open fn to_json(&self) -> Result<String, String> {
+        match self {
+            UniversalValue::Null => Ok("null".into()),
+            UniversalValue::Bool(b) => Ok(b.into()),
+            UniversalValue::Int(i) => Ok(i.into()),
+            UniversalValue::Float(f) => Ok(f.into()),
+            UniversalValue::String(s) => Ok(format("\"{}\"", escape_json(s))),
+            UniversalValue::Array(arr) => {
+                let items: Result<Vec<String>, _> = arr.iter().map(|v| v.to_json()).collect();
+                Ok(format("[{}]", items?.join(",")))
+            },
+            UniversalValue::Object(obj) => {
+                let pairs: Result<Vec<String>, _> = obj.iter()
+                    .map(|(k, v)| Ok(format("\"{}\":{}", escape_json(k), v.to_json()?)))
+                    .collect();
+                Ok(format("{{{}}}", pairs?.join(",")))
+            },
+            UniversalValue::Binary(data) => {
+                Ok(format("\"{}\"", base64_encode(data)))
+            },
+        }
+    }
+}
+
+fn escape_json(s: &str) -> String {
+    s.replace("\\", "\\\\")
+     .replace("\"", "\\\"")
+     .replace("\n", "\\n")
+     .replace("\r", "\\r")
+     .replace("\t", "\\t")
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    // Simple base64 encoding
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    var result = String::new();
+    
+    each chunk in data.chunks(3) {
+        let b1 = chunk[0];
+        let b2 = chunk.get(1).copied().unwrap_or(0);
+        let b3 = chunk.get(2).copied().unwrap_or(0);
+        
+        result.push(TABLE[((b1 >> 2) & 0x3F) as usize] as char);
+        result.push(TABLE[(((b1 << 4) | (b2 >> 4)) & 0x3F) as usize] as char);
+        result.push(check chunk.len() > 1 { TABLE[(((b2 << 2) | (b3 >> 6)) & 0x3F) as usize] as char } else { '=' });
+        result.push(check chunk.len() > 2 { TABLE[(b3 & 0x3F) as usize] as char } else { '=' });
+    }
+    
+    result
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Cross-Language Function Wrapper
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Function that can be called from any language
+expose data UniversalFunction {
+    name: String,
+    func: Box<dyn Fn(Vec<UniversalValue>) -> Result<UniversalValue, String>>,
+}
+
+impl UniversalFunction {
+    open fn new<F>(name: impl Into<String>, func: F) -> Self
+    where
+        F: Fn(Vec<UniversalValue>) -> Result<UniversalValue, String> + 'static,
+    {
+        UniversalFunction {
+            name: name.into(),
+            func: Box::new(func),
+        }
+    }
+    
+    open fn call(&self, args: Vec<UniversalValue>) -> Result<UniversalValue, String> {
+        yield (self.func)(args)
+    }
+    
+    open fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Type Registry
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Registry for cross-language alias mappings
+expose data TypeRegistry {
+    mappings: HashMap<String, TypeMapping>,
+}
+
+expose data TypeMapping {
+    nova_type: String,
+    c_type: Option<String>,
+    python_type: Option<String>,
+    rust_type: Option<String>,
+    js_type: Option<String>,
+    swift_type: Option<String>,
+}
+
+impl TypeRegistry {
+    open fn new() -> Self {
+        var registry = TypeRegistry {
+            mappings: HashMap::new(),
+        };
+        registry.register_builtin_types();
+        registry
+    }
+    
+    fn register_builtin_types(&var self) {
+        self.register("bool", TypeMapping {
+            nova_type: "bool".into(),
+            c_type: Some("int".into()),
+            python_type: Some("bool".into()),
+            rust_type: Some("bool".into()),
+            js_type: Some("boolean".into()),
+            swift_type: Some("Bool".into()),
+        });
+        
+        self.register("i32", TypeMapping {
+            nova_type: "i32".into(),
+            c_type: Some("int32_t".into()),
+            python_type: Some("int".into()),
+            rust_type: Some("i32".into()),
+            js_type: Some("number".into()),
+            swift_type: Some("Int32".into()),
+        });
+        
+        self.register("f64", TypeMapping {
+            nova_type: "f64".into(),
+            c_type: Some("double".into()),
+            python_type: Some("float".into()),
+            rust_type: Some("f64".into()),
+            js_type: Some("number".into()),
+            swift_type: Some("Double".into()),
+        });
+        
+        self.register("String", TypeMapping {
+            nova_type: "String".into(),
+            c_type: Some("char*".into()),
+            python_type: Some("str".into()),
+            rust_type: Some("String".into()),
+            js_type: Some("string".into()),
+            swift_type: Some("String".into()),
+        });
+    }
+    
+    open fn register(&var self, name: impl Into<String>, mapping: TypeMapping) {
+        self.mappings.insert(name.into(), mapping);
+    }
+    
+    open fn get(&self, name: &str) -> Option<&TypeMapping> {
+        self.mappings.get(name)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Automatic Code Generation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Generate FFI bindings for all languages
+expose data BindingGenerator {
+    functions: Vec<FunctionSignature>,
+    types: TypeRegistry,
+}
+
+expose data FunctionSignature {
+    name: String,
+    params: Vec<(String, String)>, // (name, alias)
+    return_type: String,
+}
+
+impl BindingGenerator {
+    open fn new() -> Self {
+        BindingGenerator {
+            functions: Vec::new(),
+            types: TypeRegistry::new(),
+        }
+    }
+    
+    open fn add_function(&var self, sig: FunctionSignature) {
+        self.functions.push(sig);
+    }
+    
+    open fn generate_c_header(&self) -> String {
+        var output = String::from("#ifndef NOVA_FFI_H\n#define NOVA_FFI_H\n\n");
+        
+        each func in &self.functions {
+            let params: Vec<String> = func.params.iter()
+                .map(|(name, ty)| {
+                    let c_type = self.types.get(ty)
+                        .and_then(|m| m.c_type.as_ref())
+                        .unwrap_or(&ty);
+                    format("{} {}", c_type, name)
+                })
+                .collect();
+            
+            let ret_type = self.types.get(&func.return_type)
+                .and_then(|m| m.c_type.as_ref())
+                .unwrap_or(&func.return_type);
+            
+            output.push_str(&format("{} {}({});\n", ret_type, func.name, params.join(", ")));
+        }
+        
+        output.push_str("\n#endif\n");
+        output
+    }
+    
+    open fn generate_typescript(&self) -> String {
+        var output = String::from("// Nova FFI Bindings\n\n");
+        
+        each func in &self.functions {
+            let params: Vec<String> = func.params.iter()
+                .map(|(name, ty)| {
+                    let ts_type = self.types.get(ty)
+                        .and_then(|m| m.js_type.as_ref())
+                        .unwrap_or(&ty);
+                    format("{}: {}", name, ts_type)
+                })
+                .collect();
+            
+            let ret_type = self.types.get(&func.return_type)
+                .and_then(|m| m.js_type.as_ref())
+                .unwrap_or(&func.return_type);
+            
+            output.push_str(&format("export function {}({}): {};\n", func.name, params.join(", "), ret_type));
+        }
+        
+        output
+    }
+}

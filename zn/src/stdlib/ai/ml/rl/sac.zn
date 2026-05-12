@@ -1,0 +1,362 @@
+"""
+SAC - Soft Actor-Critic
+State-of-the-art RL for continuous control (robotics, drones)
+
+From stable-baselines3 / DLR-RM
+Reference: "Soft Actor-Critic Algorithms and Applications" (Haarnoja et al., 2019)
+
+Features:
+    - Off-policy
+    - Continuous actions
+    - Entropy regularization
+    - Twin Q-networks (stable)
+    - Automatic temperature tuning
+"""
+
+import ml.tensor as zt
+from ml.nn import Linear, Sequential, ReLU, Tanh
+from ml.optim import Adam
+import std.collections.{Vec, HashMap}
+
+// ═══════════════════════════════════════════════════════════════════════
+// REPLAY BUFFER
+// ═══════════════════════════════════════════════════════════════════════
+
+class ReplayBuffer:
+    """
+    Experience replay buffer for off-policy RL
+    
+    Stores transitions and samples random batches for training.
+    """
+    
+    capacity: int
+    buffer: Vec[(Tensor, Tensor, f32, Tensor, bool)]  // (s, a, r, s', done)
+    position: int
+    
+    def __init__(self, capacity: int = 100000):
+        self.capacity = capacity
+        self.buffer = Vec::new()
+        self.position = 0
+    
+    def add(
+        self,
+        state: Tensor,
+        action: Tensor,
+        reward: f32,
+        next_state: Tensor,
+        done: bool
+    ):
+        """Add transition to buffer"""
+        check self.buffer.len() < self.capacity:
+            self.buffer.push((state, action, reward, next_state, done))
+        } else {
+            // Overwrite oldest
+            self.buffer[self.position] = (state, action, reward, next_state, done)
+        }
+        
+        self.position = (self.position + 1) % self.capacity
+    
+    def sample(self, batch_size: int) -> (Tensor, Tensor, Tensor, Tensor, Tensor):
+        """
+        Sample random batch
+        
+        Returns:
+            (states, actions, rewards, next_states, dones)
+        """
+        assert self.buffer.len() >= batch_size, "Not enough samples"
+        
+        // Random indices
+        let indices = std.random.choice(0, self.buffer.len(), batch_size, replace=false)
+        
+        // Extract batch
+        var states = Vec::new()
+        var actions = Vec::new()
+        var rewards = Vec::new()
+        var next_states = Vec::new()
+        var dones = Vec::new()
+        
+        each idx in indices:
+            let (s, a, r, ns, d) = self.buffer[idx]
+            states.push(s)
+            actions.push(a)
+            rewards.push(r)
+            next_states.push(ns)
+            dones.push(check d { 1.0 } else { 0.0 })
+        }
+        
+        yield (
+            zt.stack(states),
+            zt.stack(actions),
+            zt.tensor(rewards),
+            zt.stack(next_states),
+            zt.tensor(dones),
+        )
+    
+    def size(&self) -> int:
+        yield self.buffer.len()
+
+// ═══════════════════════════════════════════════════════════════════════
+// SAC ALGORITHM
+// ═══════════════════════════════════════════════════════════════════════
+
+class SAC:
+    """
+    Soft Actor-Critic (SAC)
+    
+    State-of-the-art algorithm for continuous control tasks.
+    
+    Architecture:
+        - Actor network (policy)
+        - Twin Q-networks (critics)
+        - Automatic entropy tuning
+    
+    Example:
+        ```nova
+        sac = SAC(state_dim=4, action_dim=2)
+        
+        each episode in 0..1000 {
+            state = env.reset()
+            while !done {
+                action = sac.select_action(state)
+                next_state, reward, done = env.step(action)
+                sac.replay_buffer.add(state, action, reward, next_state, done)
+                
+                check sac.replay_buffer.size() > batch_size {
+                    sac.train_step()
+                }
+                
+                state = next_state
+            }
+        }
+        ```
+    """
+    
+    // Networks
+    actor: Sequential
+    critic_1: Sequential
+    critic_2: Sequential
+    target_critic_1: Sequential
+    target_critic_2: Sequential
+    
+    // Optimizers
+    actor_optimizer: Adam
+    critic_optimizer: Adam
+    alpha_optimizer: Adam
+    
+    // Hyperparameters
+    state_dim: int
+    action_dim: int
+    gamma: f32  // Discount factor
+    tau: f32    // Target network soft update
+    alpha: Tensor  // Entropy coefficient (learnable)
+    target_entropy: f32
+    
+    // Replay buffer
+    replay_buffer: ReplayBuffer
+    
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int = 256,
+        lr: f32 = 0.0003,
+        gamma: f32 = 0.99,
+        tau: f32 = 0.005,
+        alpha: f32 = 0.2,
+        auto_entropy_tuning: bool = true,
+        buffer_size: int = 1000000,
+    ):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.gamma = gamma
+        self.tau = tau
+        
+        // Build actor (policy network)
+        // Output: mean and log_std for Gaussian policy
+        self.actor = Sequential([
+            Linear(state_dim, hidden_dim),
+            ReLU(),
+            Linear(hidden_dim, hidden_dim),
+            ReLU(),
+            Linear(hidden_dim, action_dim * 2),  // mean + log_std
+        ])
+        
+        // Build twin critics (Q-networks)
+        self.critic_1 = Sequential([
+            Linear(state_dim + action_dim, hidden_dim),
+            ReLU(),
+            Linear(hidden_dim, hidden_dim),
+            ReLU(),
+            Linear(hidden_dim, 1),
+        ])
+        
+        self.critic_2 = self.critic_1.clone()
+        
+        // Target networks (for stability)
+        self.target_critic_1 = self.critic_1.clone()
+        self.target_critic_2 = self.critic_2.clone()
+        
+        // Optimizers
+        self.actor_optimizer = Adam(self.actor.parameters(), lr=lr)
+        
+        let critic_params = self.critic_1.parameters() + self.critic_2.parameters()
+        self.critic_optimizer = Adam(critic_params, lr=lr)
+        
+        // Entropy tuning
+        check auto_entropy_tuning:
+            self.target_entropy = -action_dim as f32  // Heuristic
+            self.alpha = zt.tensor([alpha], requires_grad=true)
+            self.alpha_optimizer = Adam([self.alpha], lr=lr)
+        } else {
+            self.alpha = zt.tensor([alpha])
+        }
+        
+        // Replay buffer
+        self.replay_buffer = ReplayBuffer(buffer_size)
+    
+    def select_action(self, state: Tensor, deterministic: bool = false) -> Tensor:
+        """
+        Select action from policy
+        
+        Args:
+            state: Current state
+            deterministic: If true, use mean action (no noise)
+        
+        Returns:
+            Action tensor
+        """
+        // Forward through actor
+        output = self.actor.forward(state)
+        
+        // Split into mean and log_std
+        mean = output[:self.action_dim]
+        log_std = output[self.action_dim:]
+        
+        // Clamp log_std for stability
+        log_std = log_std.clamp(-20.0, 2.0)
+        std = log_std.exp()
+        
+        check deterministic:
+            yield mean.tanh()  // Squash to [-1, 1]
+        } else {
+            // Sample from Gaussian
+            noise = zt.randn_like(mean)
+            action = mean + std * noise
+            yield action.tanh()
+        }
+    }
+    
+    def train_step(self, batch_size: int = 256) -> HashMap[str, f32]:
+        """
+        Perform one training step
+        
+        Returns:
+            Dictionary of training metrics
+        """
+        // Sample batch
+        let (states, actions, rewards, next_states, dones) = self.replay_buffer.sample(batch_size)
+        
+        // ═══════════════════════════════════════════════════════════════
+        // UPDATE CRITICS
+        // ═══════════════════════════════════════════════════════════════
+        
+        // Compute target Q-value
+        let next_actions = self.select_action(next_states)
+        let next_log_probs = self._compute_log_prob(next_states, next_actions)
+        
+        // Twin Q targets
+        let next_q1 = self.target_critic_1.forward(zt.cat([next_states, next_actions], dim=1))
+        let next_q2 = self.target_critic_2.forward(zt.cat([next_states, next_actions], dim=1))
+        
+        // Take minimum (reduces overestimation bias)
+        let next_q = zt.minimum(next_q1, next_q2)
+        
+        // Target with entropy bonus
+        let target_q = rewards + (1 - dones) * self.gamma * (next_q - self.alpha * next_log_probs)
+        
+        // Current Q estimates
+        let current_q1 = self.critic_1.forward(zt.cat([states, actions], dim=1))
+        let current_q2 = self.critic_2.forward(zt.cat([states, actions], dim=1))
+        
+        // Critic loss (MSE)
+        let critic_loss = (current_q1 - target_q).pow(2).mean() + 
+                          (current_q2 - target_q).pow(2).mean()
+        
+        // Update critics
+        critic_loss.backward()
+        self.critic_optimizer.step()
+        self.critic_optimizer.zero_grad()
+        
+        // ═══════════════════════════════════════════════════════════════
+        // UPDATE ACTOR
+        // ═══════════════════════════════════════════════════════════════
+        
+        // Sample new actions from current policy
+        let new_actions = self.select_action(states)
+        let log_probs = self._compute_log_prob(states, new_actions)
+        
+        // Q-values for new actions
+        let q1_new = self.critic_1.forward(zt.cat([states, new_actions], dim=1))
+        let q2_new = self.critic_2.forward(zt.cat([states, new_actions], dim=1))
+        let q_new = zt.minimum(q1_new, q2_new)
+        
+        // Actor loss (maximize Q - α * entropy)
+        let actor_loss = (self.alpha * log_probs - q_new).mean()
+        
+        // Update actor
+        actor_loss.backward()
+        self.actor_optimizer.step()
+        self.actor_optimizer.zero_grad()
+        
+        // ═══════════════════════════════════════════════════════════════
+        // UPDATE TEMPERATURE (ENTROPY)
+        // ═══════════════════════════════════════════════════════════════
+        
+        check self.alpha.requires_grad:
+            let alpha_loss = -(self.alpha * (log_probs + self.target_entropy).detach()).mean()
+            
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+            self.alpha_optimizer.zero_grad()
+        }
+        
+        // ═══════════════════════════════════════════════════════════════
+        // UPDATE TARGET NETWORKS (soft update)
+        // ═══════════════════════════════════════════════════════════════
+        
+        self._soft_update(self.critic_1, self.target_critic_1)
+        self._soft_update(self.critic_2, self.target_critic_2)
+        
+        // Return metrics
+        var metrics = HashMap::new()
+        metrics["critic_loss"] = critic_loss.item()
+        metrics["actor_loss"] = actor_loss.item()
+        metrics["alpha"] = self.alpha.item()
+        metrics["q_mean"] = current_q1.mean().item()
+        
+        yield metrics
+    }
+    
+    def _compute_log_prob(&self, states: Tensor, actions: Tensor) -> Tensor:
+        """Compute log probability of actions under current policy"""
+        // Forward through actor
+        let output = self.actor.forward(states)
+        let mean = output[:, :self.action_dim]
+        let log_std = output[:, self.action_dim:].clamp(-20.0, 2.0)
+        let std = log_std.exp()
+        
+        // Gaussian log prob
+        let log_prob = -0.5 * ((actions - mean) / std).pow(2) - log_std - 0.5 * log(2.0 * PI)
+        
+        // Correction for tanh squashing
+        log_prob = log_prob - (1 - actions.pow(2) + 1e-6).log()
+        
+        yield log_prob.sum(dim=1)
+    }
+    
+    def _soft_update(&self, source: Sequential, target: Sequential):
+        """Soft update of target network: target = τ * source + (1-τ) * target"""
+        for (param, target_param) in zip(source.parameters(), target.parameters()):
+            target_param.data = self.tau * param.data + (1 - self.tau) * target_param.data
+        }
+    }

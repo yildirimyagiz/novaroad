@@ -1,0 +1,180 @@
+// XGBoost Unit Tests
+// Comprehensive test suite for XGBClassifier
+
+use nova.ml.ensemble.XGBClassifier;
+use nova.array.{Array, Matrix};
+use nova.test.{assert_eq, assert_approx, assert_true};
+
+@test
+fn test_xgboost_basic_fit_predict() {
+    // Simple 2-class classification
+    let X = Matrix::from([
+        [1.0, 2.0],
+        [2.0, 3.0],
+        [3.0, 4.0],
+        [4.0, 5.0],
+    ]);
+    let y = Array::from([0, 0, 1, 1]);
+    
+    var xgb = XGBClassifier::new()
+        .n_estimators(10)
+        .max_depth(3)
+        .build();
+    
+    xgb.fit(&X, &y).expect("Training failed");
+    let y_pred = xgb.predict(&X).expect("Prediction failed");
+    
+    assert_eq!(y_pred.len(), 4);
+    assert_true(xgb.n_classes_ == 2);
+}
+
+@test
+fn test_xgboost_multi_class() {
+    // 3-class classification
+    let X = Matrix::randn((100, 10));
+    let y = Array::randint(0, 3, 100);
+    
+    var xgb = XGBClassifier::new()
+        .n_estimators(50)
+        .build();
+    
+    xgb.fit(&X, &y).expect("Training failed");
+    
+    let probas = xgb.predict_proba(&X).expect("Prediction failed");
+    assert_eq!(probas.data(), (100, 3));
+    
+    // Check probabilities sum to 1
+    each i in 0..100 {
+        let sum: f64 = probas.row(i).sum();
+        assert_approx!(sum, 1.0, 1e-6);
+    }
+}
+
+@test
+fn test_xgboost_feature_importance() {
+    let X = Matrix::randn((50, 5));
+    let y = Array::randint(0, 2, 50);
+    
+    var xgb = XGBClassifier::new()
+        .n_estimators(20)
+        .build();
+    
+    xgb.fit(&X, &y).expect("Training failed");
+    
+    let importance = xgb.feature_importances();
+    assert_eq!(importance.len(), 5);
+    
+    // Importances should sum to approximately 1
+    let total: f64 = importance.sum();
+    assert_approx!(total, 1.0, 0.1);
+}
+
+@test
+@gpu_required
+fn test_xgboost_gpu() {
+    let X = Matrix::randn((1000, 20));
+    let y = Array::randint(0, 3, 1000);
+    
+    // CPU version
+    var xgb_cpu = XGBClassifier::new()
+        .n_estimators(50)
+        .use_gpu(false)
+        .build();
+    
+    let start_cpu = nova.time.now();
+    xgb_cpu.fit(&X, &y).expect("CPU training failed");
+    let time_cpu = nova.time.now() - start_cpu;
+    
+    let y_pred_cpu = xgb_cpu.predict(&X).expect("CPU prediction failed");
+    
+    // GPU version
+    var xgb_gpu = XGBClassifier::new()
+        .n_estimators(50)
+        .use_gpu(true)
+        .build();
+    
+    let start_gpu = nova.time.now();
+    xgb_gpu.fit(&X, &y).expect("GPU training failed");
+    let time_gpu = nova.time.now() - start_gpu;
+    
+    let y_pred_gpu = xgb_gpu.predict(&X).expect("GPU prediction failed");
+    
+    // Results should be similar
+    let agreement = y_pred_cpu.iter().zip(y_pred_gpu.iter())
+        .filter(|(a, b)| a == b)
+        .count() as f64 / y_pred_cpu.len() as f64;
+    
+    assert_true(agreement > 0.95, "CPU and GPU results should mostly agree");
+    
+    // GPU should be faster
+    println(f"CPU time: {time_cpu:.3f}s");
+    println(f"GPU time: {time_gpu:.3f}s");
+    println(f"Speedup: {time_cpu / time_gpu:.1f}x");
+}
+
+@test
+fn test_xgboost_builder_pattern() {
+    let xgb = XGBClassifier::new()
+        .n_estimators(100)
+        .max_depth(8)
+        .learning_rate(0.05)
+        .use_gpu(false)
+        .random_state(42)
+        .build();
+    
+    assert_eq!(xgb.n_estimators, 100);
+    assert_eq!(xgb.max_depth, 8);
+    assert_approx!(xgb.learning_rate, 0.05, 1e-9);
+}
+
+@test
+fn test_xgboost_sklearn_compatibility() {
+    // Test that API matches sklearn exactly
+    let X = Matrix::randn((50, 10));
+    let y = Array::randint(0, 2, 50);
+    
+    // This should work exactly like sklearn
+    var xgb = XGBClassifier::new()
+        .n_estimators(100)
+        .max_depth(6)
+        .learning_rate(0.1)
+        .build();
+    
+    xgb.fit(&X, &y)?;
+    let y_pred = xgb.predict(&X)?;
+    let y_proba = xgb.predict_proba(&X)?;
+    let importance = xgb.feature_importances();
+    
+    assert_eq!(y_pred.len(), 50);
+    assert_eq!(y_proba.data(), (50, 2));
+    assert_eq!(importance.len(), 10);
+}
+
+@benchmark
+fn bench_xgboost_small() {
+    let X = Matrix::randn((1000, 10));
+    let y = Array::randint(0, 2, 1000);
+    
+    var xgb = XGBClassifier::new()
+        .n_estimators(50)
+        .build();
+    
+    bench_start!();
+    xgb.fit(&X, &y).unwrap();
+    bench_end!();
+}
+
+@benchmark
+fn bench_xgboost_large() {
+    let X = Matrix::randn((10000, 20));
+    let y = Array::randint(0, 3, 10000);
+    
+    var xgb = XGBClassifier::new()
+        .n_estimators(100)
+        .use_gpu(true)
+        .build();
+    
+    bench_start!();
+    xgb.fit(&X, &y).unwrap();
+    bench_end!();
+}

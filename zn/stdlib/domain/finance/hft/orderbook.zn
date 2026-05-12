@@ -1,0 +1,404 @@
+// HFT Order Book - Nova Implementation
+// High-performance limit order book with microsecond precision
+
+use finance::hft::core::*
+
+// Price level in order book
+data PriceLevel {
+    price: f64,
+    total_quantity: f64,
+    orders: [OrderEntry]
+}
+
+// Order entry in price level
+data OrderEntry {
+    order_id: i64,
+    quantity: f64,
+    timestamp: i64
+}
+
+// Limit Order Book
+open data OrderBook {
+    symbol: str,
+    bids: [PriceLevel],  // Sorted descending by price
+    asks: [PriceLevel],  // Sorted ascending by price
+    last_update: i64
+}
+
+impl OrderBook {
+    fn new(symbol: str) -> Self {
+        OrderBook {
+            symbol: symbol,
+            bids: [],
+            asks: [],
+            last_update: 0
+        }
+    }
+    
+    // Get best bid (highest buy price)
+    fn best_bid(self) -> f64? {
+        check len(self.bids) > 0 {
+            yield self.bids[0].price
+        }
+        None
+    }
+    
+    // Get best ask (lowest sell price)
+    fn best_ask(self) -> f64? {
+        check len(self.asks) > 0 {
+            yield self.asks[0].price
+        }
+        None
+    }
+    
+    // Get mid price
+    fn mid_price(self) -> f64? {
+        let bid = self.best_bid()
+        let ask = self.best_ask()
+        
+        check bid.is_some() && ask.is_some() {
+            yield (bid.unwrap() + ask.unwrap()) / 2.0
+        }
+        None
+    }
+    
+    // Get spread
+    fn spread(self) -> f64? {
+        let bid = self.best_bid()
+        let ask = self.best_ask()
+        
+        check bid.is_some() && ask.is_some() {
+            yield ask.unwrap() - bid.unwrap()
+        }
+        None
+    }
+    
+    // Get bid-ask spread in basis points
+    fn spread_bps(self) -> f64? {
+        let spread = self.spread()
+        let mid = self.mid_price()
+        
+        check spread.is_some() && mid.is_some() {
+            yield (spread.unwrap() / mid.unwrap()) * 10000.0
+        }
+        None
+    }
+    
+    // Add order to book
+    fn add_order(var self, side: Side, price: f64, quantity: f64, order_id: i64, timestamp: i64) {
+        self.last_update = timestamp
+        
+        let entry = OrderEntry {
+            order_id: order_id,
+            quantity: quantity,
+            timestamp: timestamp
+        }
+        
+        let levels = match side {
+            Side::Buy => &var self.bids,
+            Side::Sell => &var self.asks
+        }
+        
+        // Find or create price level
+        var found = false
+        each level in levels {
+            check level.price == price {
+                level.orders.push(entry)
+                level.total_quantity += quantity
+                found = true
+                break
+            }
+        }
+        
+        check !found {
+            let new_level = PriceLevel {
+                price: price,
+                total_quantity: quantity,
+                orders: [entry]
+            }
+            levels.push(new_level)
+            
+            // Sort levels
+            match side {
+                Side::Buy => self.sort_bids(),
+                Side::Sell => self.sort_asks()
+            }
+        }
+    }
+    
+    // Remove order from book
+    fn remove_order(var self, side: Side, price: f64, order_id: i64, timestamp: i64) -> bool {
+        self.last_update = timestamp
+        
+        let levels = match side {
+            Side::Buy => &var self.bids,
+            Side::Sell => &var self.asks
+        }
+        
+        each level in levels {
+            check level.price == price {
+                var removed_qty = 0.0
+                var new_orders = []
+                
+                each order in level.orders {
+                    check order.order_id != order_id {
+                        new_orders.push(order)
+                    } else {
+                        removed_qty = order.quantity
+                    }
+                }
+                
+                level.orders = new_orders
+                level.total_quantity -= removed_qty
+                
+                // Remove empty price level
+                check len(level.orders) == 0 {
+                    self.remove_price_level(side, price)
+                }
+                
+                yield true
+            }
+        }
+        
+        yield false
+    }
+    
+    // Modify order quantity
+    fn modify_order(
+        var self,
+        side: Side,
+        price: f64,
+        order_id: i64,
+        new_quantity: f64,
+        timestamp: i64
+    ) -> bool {
+        self.last_update = timestamp
+        
+        let levels = match side {
+            Side::Buy => &var self.bids,
+            Side::Sell => &var self.asks
+        }
+        
+        each level in levels {
+            check level.price == price {
+                each order in level.orders {
+                    check order.order_id == order_id {
+                        let old_qty = order.quantity
+                        order.quantity = new_quantity
+                        level.total_quantity += (new_quantity - old_qty)
+                        yield true
+                    }
+                }
+            }
+        }
+        
+        yield false
+    }
+    
+    // Get depth at N levels
+    fn get_depth(self, levels: i32) -> BookDepth {
+        var bid_depth = []
+        var ask_depth = []
+        
+        let bid_count = Math.min(levels, len(self.bids))
+        let ask_count = Math.min(levels, len(self.asks))
+        
+        each i in 0..bid_count {
+            bid_depth.push(DepthLevel {
+                price: self.bids[i].price,
+                quantity: self.bids[i].total_quantity,
+                timestamp: self.last_update
+            })
+        }
+        
+        each i in 0..ask_count {
+            ask_depth.push(DepthLevel {
+                price: self.asks[i].price,
+                quantity: self.asks[i].total_quantity,
+                timestamp: self.last_update
+            })
+        }
+        
+        BookDepth {
+            bids: bid_depth,
+            asks: ask_depth,
+            timestamp: self.last_update
+        }
+    }
+    
+    // Calculate volume-weighted average price at depth
+    fn vwap_at_depth(self, side: Side, quantity: f64) -> f64? {
+        let levels = match side {
+            Side::Buy => &self.asks,  // Buying from asks
+            Side::Sell => &self.bids   // Selling to bids
+        }
+        
+        var remaining = quantity
+        var total_cost = 0.0
+        
+        each level in levels {
+            let available = level.total_quantity
+            let to_fill = Math.min(remaining, available)
+            
+            total_cost += to_fill * level.price
+            remaining -= to_fill
+            
+            check remaining <= 0.0 {
+                break
+            }
+        }
+        
+        check remaining > 0.0 {
+            None  // Not enough liquidity
+        }
+        
+        yield total_cost / quantity
+    }
+    
+    // Calculate market impact
+    fn market_impact(self, side: Side, quantity: f64) -> f64? {
+        let vwap = self.vwap_at_depth(side, quantity)
+        let mid = self.mid_price()
+        
+        check vwap.is_some() && mid.is_some() {
+            let impact = (vwap.unwrap() - mid.unwrap()) / mid.unwrap()
+            yield Math.abs(impact)
+        }
+        
+        None
+    }
+    
+    // Get total liquidity at N bps from mid
+    fn liquidity_at_bps(self, bps: f64) -> LiquidityProfile {
+        let mid = self.mid_price().unwrap_or(0.0)
+        let threshold = mid * (bps / 10000.0)
+        
+        var bid_liquidity = 0.0
+        var ask_liquidity = 0.0
+        
+        each level in self.bids {
+            check mid - level.price <= threshold {
+                bid_liquidity += level.total_quantity
+            }
+        }
+        
+        each level in self.asks {
+            check level.price - mid <= threshold {
+                ask_liquidity += level.total_quantity
+            }
+        }
+        
+        LiquidityProfile {
+            bid_liquidity: bid_liquidity,
+            ask_liquidity: ask_liquidity,
+            total_liquidity: bid_liquidity + ask_liquidity,
+            imbalance: (bid_liquidity - ask_liquidity) / (bid_liquidity + ask_liquidity)
+        }
+    }
+    
+    // Calculate order book imbalance
+    fn imbalance(self, levels: i32 = 5) -> f64 {
+        let depth = self.get_depth(levels)
+        
+        var bid_volume = 0.0
+        var ask_volume = 0.0
+        
+        each level in depth.bids {
+            bid_volume += level.quantity
+        }
+        
+        each level in depth.asks {
+            ask_volume += level.quantity
+        }
+        
+        let total = bid_volume + ask_volume
+        check total == 0.0 {
+            yield 0.0
+        }
+        
+        yield (bid_volume - ask_volume) / total
+    }
+    
+    // Private helper methods
+    fn sort_bids(var self) {
+        // Sort bids descending by price
+        self.bids.sort_by(|a, b| b.price.compare(a.price))
+    }
+    
+    fn sort_asks(var self) {
+        // Sort asks ascending by price
+        self.asks.sort_by(|a, b| a.price.compare(b.price))
+    }
+    
+    fn remove_price_level(var self, side: Side, price: f64) {
+        let levels = match side {
+            Side::Buy => &var self.bids,
+            Side::Sell => &var self.asks
+        }
+        
+        var new_levels = []
+        each level in levels {
+            check level.price != price {
+                new_levels.push(level)
+            }
+        }
+        
+        match side {
+            Side::Buy => self.bids = new_levels,
+            Side::Sell => self.asks = new_levels
+        }
+    }
+}
+
+// Book depth snapshot
+data BookDepth {
+    bids: [DepthLevel],
+    asks: [DepthLevel],
+    timestamp: i64
+}
+
+// Liquidity profile
+data LiquidityProfile {
+    bid_liquidity: f64,
+    ask_liquidity: f64,
+    total_liquidity: f64,
+    imbalance: f64
+}
+
+// Order book analytics
+open fn calculate_microprice(book: OrderBook, alpha: f64 = 0.5) -> f64? {
+    let best_bid = book.best_bid()
+    let best_ask = book.best_ask()
+    
+    check best_bid.is_none() || best_ask.is_none() {
+        None
+    }
+    
+    let bid = best_bid.unwrap()
+    let ask = best_ask.unwrap()
+    
+    check len(book.bids) == 0 || len(book.asks) == 0 {
+        yield (bid + ask) / 2.0
+    }
+    
+    let bid_size = book.bids[0].total_quantity
+    let ask_size = book.asks[0].total_quantity
+    
+    // Weighted mid-price
+    let weight = bid_size / (bid_size + ask_size)
+    yield weight * ask + (1.0 - weight) * bid
+}
+
+// Calculate effective spread
+open fn effective_spread(book: OrderBook, trade_price: f64, side: Side) -> f64? {
+    let mid = book.mid_price()
+    
+    check mid.is_none() {
+        None
+    }
+    
+    let m = mid.unwrap()
+    let spread = 2.0 * Math.abs(trade_price - m)
+    
+    yield spread / m  // As percentage
+}

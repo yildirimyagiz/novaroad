@@ -1,0 +1,129 @@
+// 🧹 Nova ML — Preprocessing — v10.0
+// Feature scaling, encoding, and imputation tools.
+//
+// Syntax: data / cases / yield / check / each / match
+
+use ai::ml::tensor::{Tensor, zeros, ones};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  SCALERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data StandardScaler {
+    open mean: Tensor,
+    open std:  Tensor,
+}
+
+impl StandardScaler {
+    open fn new() -> StandardScaler {
+        StandardScaler {
+            mean: zeros([0]),
+            std:  zeros([0]),
+        };
+    }
+
+    open fn fit(&var self, X: &Tensor) {
+        println("🧹 Scaling: Computing mean and std...");
+        self.mean = X.mean(0);
+        // Dispatch to hardware-accelerated variance/std kernel
+        self.std = @extern("nova_ml_std", X, 0); 
+        yield;
+    }
+
+    open fn transform(&self, X: &Tensor) -> Tensor {
+        yield X.sub(&self.mean).div(&self.std);
+    }
+}
+
+open data MinMaxScaler {
+    open min:   Tensor,
+    open max:   Tensor,
+    open range: (f32, f32),
+}
+
+impl MinMaxScaler {
+    open fn new() -> MinMaxScaler {
+        MinMaxScaler {
+            min:   zeros([0]),
+            max:   zeros([0]),
+            range: (0.0, 1.0),
+        };
+    }
+
+    open fn fit(&var self, X: &Tensor) {
+        self.min = @extern("nova_ml_min", X, 0);
+        self.max = @extern("nova_ml_max", X, 0);
+        yield;
+    }
+
+    open fn transform(&self, X: &Tensor) -> Tensor {
+        let denom = self.max.sub(&self.min);
+        let x_std = X.sub(&self.min).div(&denom);
+        yield x_std.mul_scalar(self.range.1 - self.range.0).add_scalar(self.range.0);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  ENCODERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data LabelEncoder {
+    open mapping: HashMap<String, i64>,
+}
+
+impl LabelEncoder {
+    open fn new() -> LabelEncoder { yield LabelEncoder { mapping: HashMap::new() }; }
+
+    open fn fit(&var self, labels: Vec<String>) {
+        var count = 0;
+        each label in labels {
+            check !self.mapping.contains_key(&label) {
+                self.mapping.insert(label, count);
+                count += 1;
+            }
+        }
+        yield;
+    }
+
+    open fn transform(&self, labels: Vec<String>) -> Vec<i64> {
+        var result = [];
+        each label in labels {
+            result.push(self.mapping.get(&label).unwrap_or(-1));
+        }
+        yield result;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  IMPUTERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open cases ImputeStrategy {
+    Mean,
+    Median,
+    Constant(f32),
+}
+
+open data SimpleImputer {
+    open strategy: ImputeStrategy,
+    open stats:    Tensor,
+}
+
+impl SimpleImputer {
+    open fn new(s: ImputeStrategy) -> SimpleImputer {
+        SimpleImputer { strategy: s, stats: zeros([0]) };
+    }
+
+    open fn fit(&var self, X: &Tensor) {
+        self.stats = match self.strategy {
+            ImputeStrategy::Mean        => X.mean(0),
+            ImputeStrategy::Median      => @extern("nova_ml_median", X, 0),
+            ImputeStrategy::Constant(v) => ones([X.data[1]]).mul_scalar(v),
+        };
+        yield;
+    }
+
+    open fn transform(&self, X: &Tensor) -> Tensor {
+        yield @extern("nova_ml_fill_na", X, &self.stats);
+    }
+}

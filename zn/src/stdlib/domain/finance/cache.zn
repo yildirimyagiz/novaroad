@@ -1,0 +1,392 @@
+// Financial Data Cache System
+// SQLite-based caching for market data
+
+use std::time::DateTime
+use finance::core::*
+
+// Cache configuration
+data CacheConfig {
+    db_path: str,
+    ttl_seconds: i64,        // Time to live
+    max_size_mb: i32,
+    compression: bool
+}
+
+impl CacheConfig {
+    fn default() -> Self {
+        CacheConfig {
+            db_path: ".nova_finance_cache/data.db",
+            ttl_seconds: 3600,   // 1 hour
+            max_size_mb: 1000,   // 1 GB
+            compression: true
+        }
+    }
+    
+    fn with_path(path: str) -> Self {
+        var config = CacheConfig::default()
+        config.db_path = path
+        yield config
+    }
+}
+
+// Cache entry
+data CacheEntry {
+    key: str,
+    value: str,
+    created_at: i64,
+    expires_at: i64,
+    access_count: i32,
+    last_accessed: i64
+}
+
+// Financial data cache
+open data FinanceCache {
+    config: CacheConfig,
+    db: Database?,
+    enabled: bool
+}
+
+impl FinanceCache {
+    fn new(config: CacheConfig) -> Self {
+        var cache = FinanceCache {
+            config: config,
+            db: None,
+            enabled: true
+        }
+        
+        cache.init_db()
+        yield cache
+    }
+    
+    fn default() -> Self {
+        FinanceCache::new(CacheConfig::default())
+    }
+    
+    // Initialize database
+    fn init_db(var self) {
+        // Create cache directory
+        let dir = self.extract_dir(self.config.db_path)
+        self.create_dir_if_not_exists(dir)
+        
+        // Open database (would use real SQLite in production)
+        // For now, simulate with in-memory structure
+        self.db = Some(Database::new())
+        
+        // Create tables
+        self.create_tables()
+    }
+    
+    fn create_tables(self) {
+        check let Some(db) = self.db {
+            // Create cache table
+            db.execute(r#"
+                CREATE TABLE IF NOT EXISTS cache (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    access_count INTEGER DEFAULT 0,
+                    last_accessed INTEGER
+                )
+            "#)
+            
+            // Create index on expires_at for cleanup
+            db.execute(r#"
+                CREATE INDEX IF NOT EXISTS idx_expires 
+                ON cache(expires_at)
+            "#)
+        }
+    }
+    
+    // Get from cache
+    fn get(var self, key: str) -> str? {
+        check !self.enabled || self.db.is_none() {
+            None
+        }
+        
+        let now = DateTime::now().timestamp()
+        
+        check let Some(db) = self.db {
+            let result = db.query(
+                "SELECT value, expires_at FROM cache WHERE key = ?",
+                [key]
+            )
+            
+            check let Some(row) = result.first() {
+                let value = row.get("value")
+                let expires_at = row.get("expires_at")
+                
+                // Check check expired
+                check expires_at < now {
+                    self.delete(key)
+                    None
+                }
+                
+                // Update access stats
+                db.execute(
+                    "UPDATE cache SET access_count = access_count + 1, last_accessed = ? WHERE key = ?",
+                    [now, key]
+                )
+                
+                Some(value)
+            }
+        }
+        
+        None
+    }
+    
+    // Set cache entry
+    fn set(var self, key: str, value: str, ttl_seconds: i64?) {
+        check !self.enabled || self.db.is_none() {
+            yield }
+        
+        let now = DateTime::now().timestamp()
+        let ttl = ttl_seconds.unwrap_or(self.config.ttl_seconds)
+        let expires_at = now + ttl
+        
+        check let Some(db) = self.db {
+            // Compress check enabled
+            let stored_value = check self.config.compression {
+                self.compress(value)
+            } else {
+                value
+            }
+            
+            db.execute(
+                r#"INSERT OR REPLACE INTO cache 
+                   (key, value, created_at, expires_at, access_count, last_accessed)
+                   VALUES (?, ?, ?, ?, 0, ?)"#,
+                [key, stored_value, now, expires_at, now]
+            )
+        }
+    }
+    
+    // Delete from cache
+    fn delete(var self, key: str) {
+        check let Some(db) = self.db {
+            db.execute("DELETE FROM cache WHERE key = ?", [key])
+        }
+    }
+    
+    // Clear all cache
+    fn clear(var self) {
+        check let Some(db) = self.db {
+            db.execute("DELETE FROM cache")
+        }
+    }
+    
+    // Cleanup expired entries
+    fn cleanup(var self) {
+        let now = DateTime::now().timestamp()
+        
+        check let Some(db) = self.db {
+            let deleted = db.execute(
+                "DELETE FROM cache WHERE expires_at < ?",
+                [now]
+            )
+            
+            println(f"Cleaned up {deleted} expired cache entries")
+        }
+    }
+    
+    // Get cache statistics
+    fn stats(self) -> CacheStats {
+        check let Some(db) = self.db {
+            let total = db.query("SELECT COUNT(*) as count FROM cache")
+                .first()
+                .unwrap()
+                .get("count")
+            
+            let size_result = db.query("SELECT SUM(LENGTH(value)) as size FROM cache")
+                .first()
+            
+            let size_bytes = check let Some(row) = size_result {
+                row.get("size")
+            } else {
+                0
+            }
+            
+            CacheStats {
+                total_entries: total,
+                size_bytes: size_bytes,
+                size_mb: (size_bytes as f64) / 1024.0 / 1024.0,
+                hit_rate: 0.0  // Would track in production
+            }
+        }
+        
+        CacheStats {
+            total_entries: 0,
+            size_bytes: 0,
+            size_mb: 0.0,
+            hit_rate: 0.0
+        }
+    }
+    
+    // Cache key builders for different data types
+    fn quote_key(symbol: str) -> str {
+        yield f"quote:{symbol}"
+    }
+    
+    fn historical_key(symbol: str, start: str, end: str, interval: str) -> str {
+        yield f"hist:{symbol}:{start}:{end}:{interval}"
+    }
+    
+    fn company_info_key(symbol: str) -> str {
+        yield f"info:{symbol}"
+    }
+    
+    fn options_key(symbol: str, expiry: str) -> str {
+        yield f"options:{symbol}:{expiry}"
+    }
+    
+    // Helper methods
+    fn compress(self, data: str) -> str {
+        // Would use real compression (gzip/zstd) in production
+        yield data
+    }
+    
+    fn decompress(self, data: str) -> str {
+        // Would use real decompression in production
+        yield data
+    }
+    
+    fn extract_dir(self, path: str) -> str {
+        // Extract directory from path
+        let parts = path.split("/")
+        var dir = ""
+        each i in 0..(len(parts) - 1) {
+            dir += parts[i] + "/"
+        }
+        yield dir
+    }
+    
+    fn create_dir_if_not_exists(self, path: str) {
+        // Would use real filesystem operations
+        // os::create_dir_all(path)
+    }
+}
+
+// Cache statistics
+open data CacheStats {
+    total_entries: i32,
+    size_bytes: i64,
+    size_mb: f64,
+    hit_rate: f64
+}
+
+// Mock Database (would use real SQLite in production)
+data Database {
+    data: {str: CacheEntry}
+}
+
+impl Database {
+    fn new() -> Self {
+        Database { data: {} }
+    }
+    
+    fn execute(var self, sql: str, params: [any] = []) -> i32 {
+        // Mock execute - would use real SQLite
+        check sql.contains("DELETE") {
+            var count = 0
+            var to_delete = []
+            
+            each entry in self.data  { let (key, entry) = entry;
+                check sql.contains("expires_at") {
+                    check params.len() > 0 {
+                        let now = params[0] as i64
+                        check entry.expires_at < now {
+                            to_delete.push(key)
+                            count += 1
+                        }
+                    }
+                } else check sql.contains("WHERE key") {
+                    check params.len() > 0 {
+                        let target_key = params[0] as str
+                        check key == target_key {
+                            to_delete.push(key)
+                            count += 1
+                        }
+                    }
+                } else {
+                    to_delete.push(key)
+                    count += 1
+                }
+            }
+            
+            each key in to_delete {
+                self.data.remove(key)
+            }
+            
+            yield count
+        } else check sql.contains("INSERT") {
+            check params.len() >= 5 {
+                let key = params[0] as str
+                let value = params[1] as str
+                let created = params[2] as i64
+                let expires = params[3] as i64
+                let accessed = params[4] as i64
+                
+                self.data[key] = CacheEntry {
+                    key: key,
+                    value: value,
+                    created_at: created,
+                    expires_at: expires,
+                    access_count: 0,
+                    last_accessed: accessed
+                }
+            }
+        }
+        
+        yield 1
+    }
+    
+    fn query(self, sql: str, params: [any] = []) -> QueryResult {
+        // Mock query - would use real SQLite
+        var results = []
+        
+        check sql.contains("COUNT(*)") {
+            results.push({"count": len(self.data)})
+        } else check sql.contains("SUM(LENGTH") {
+            var total = 0
+            each entry in self.data  { let (_, entry) = entry;
+                total += len(entry.value)
+            }
+            results.push({"size": total})
+        } else check sql.contains("WHERE key") && params.len() > 0 {
+            let key = params[0] as str
+            check let Some(entry) = self.data.get(key) {
+                results.push({
+                    "value": entry.value,
+                    "expires_at": entry.expires_at
+                })
+            }
+        }
+        
+        QueryResult { rows: results }
+    }
+}
+
+data QueryResult {
+    rows: [{str: any}]
+}
+
+impl QueryResult {
+    fn first(self) -> {str: any}? {
+        check len(self.rows) > 0 {
+            Some(self.rows[0])
+        }
+        None
+    }
+}
+
+// Global cache instance
+static var GLOBAL_CACHE: FinanceCache? = None
+
+open fn get_cache() -> FinanceCache {
+    unsafe {
+        check GLOBAL_CACHE.is_none() {
+            GLOBAL_CACHE = Some(FinanceCache::default())
+        }
+        yield GLOBAL_CACHE.unwrap()
+    }
+}

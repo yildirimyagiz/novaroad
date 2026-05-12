@@ -1,0 +1,5 @@
+#ifndef NOVA_MOBILE_FRAMEWORK_TAGS_H
+#define NOVA_MOBILE_FRAMEWORK_TAGS_H
+
+#endif
+

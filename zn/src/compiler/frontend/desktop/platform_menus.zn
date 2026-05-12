@@ -1,0 +1,504 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                    Nova PLATFORM MENUS                                ║
+// ║                Cross-Platform Menu System & Shortcuts                         ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// Platform-specific menu system for Nova desktop applications
+// Provides unified menu API across Windows, macOS, and Linux
+
+use std::collections::HashMap;
+use crate::frontend::desktop::window_system::*;
+
+// ============================================================================
+// MENU SYSTEM
+// ============================================================================
+
+/// Menu item identifier
+expose data MenuItemId(i64);
+
+/// Menu identifier
+expose data MenuId(i64);
+
+/// Menu item types
+expose cases MenuItemType {
+    Normal,
+    Separator,
+    CheckBox,
+    Radio,
+    Submenu,
+}
+
+/// Menu item state
+expose data MenuItemState {
+    enabled: bool,
+    checked: bool,
+    visible: bool,
+}
+
+/// Menu item configuration
+expose data MenuItemConfig {
+    label: String,
+    shortcut: Option<MenuShortcut>,
+    item_type: MenuItemType,
+    initial_state: MenuItemState,
+}
+
+/// Menu shortcut
+expose data MenuShortcut {
+    key: Key,
+    modifiers: KeyModifiers,
+}
+
+/// Menu bar (main application menu)
+expose data MenuBar {
+    id: MenuId,
+    menus: Vec<Menu>,
+}
+
+/// Application menu
+expose data Menu {
+    id: MenuId,
+    title: String,
+    items: Vec<MenuItem>,
+    parent_menu: Option<MenuId>,
+}
+
+/// Individual menu item
+expose data MenuItem {
+    id: MenuItemId,
+    config: MenuItemConfig,
+    state: Signal<MenuItemState>,
+    action: Option<MenuAction>,
+    submenu: Option<Menu>,
+}
+
+/// Menu action callback
+expose ability MenuAction {
+    fn execute(&self);
+}
+
+// ============================================================================
+// MENU BAR OPERATIONS
+// ============================================================================
+
+impl MenuBar {
+    fn new() -> Result<MenuBar, MenuError> {
+        unsafe {
+            let menu_id = menu_bar_create();
+            check menu_id < 0 {
+                Err(MenuError::CreationFailed);
+            }
+
+            Ok(MenuBar {
+                id: MenuId(menu_id),
+                menus: Vec::new(),
+            })
+        }
+    }
+
+    fn add_menu(&var self, menu: Menu) {
+        self.menus.push(menu);
+        unsafe {
+            menu_bar_add_menu(self.id.0, menu.id.0);
+        }
+    }
+
+    fn remove_menu(&var self, menu_id: MenuId) {
+        self.menus.retain(|m| m.id != menu_id);
+        unsafe {
+            menu_bar_remove_menu(self.id.0, menu_id.0);
+        }
+    }
+
+    fn get_menu(&self, menu_id: MenuId) -> Option<&Menu> {
+        self.menus.iter().find(|m| m.id == menu_id)
+    }
+
+    fn get_menu_mut(&var self, menu_id: MenuId) -> Option<&var Menu> {
+        self.menus.iter_mut().find(|m| m.id == menu_id)
+    }
+}
+
+// ============================================================================
+// MENU OPERATIONS
+// ============================================================================
+
+impl Menu {
+    fn new(title: String) -> Result<Menu, MenuError> {
+        unsafe {
+            let menu_id = menu_create(title.as_ptr(), title.len());
+            check menu_id < 0 {
+                Err(MenuError::CreationFailed);
+            }
+
+            Ok(Menu {
+                id: MenuId(menu_id),
+                title,
+                items: Vec::new(),
+                parent_menu: None,
+            })
+        }
+    }
+
+    fn add_item(&var self, item: MenuItem) {
+        self.items.push(item);
+        unsafe {
+            menu_add_item(self.id.0, item.id.0);
+        }
+    }
+
+    fn remove_item(&var self, item_id: MenuItemId) {
+        self.items.retain(|i| i.id != item_id);
+        unsafe {
+            menu_remove_item(self.id.0, item_id.0);
+        }
+    }
+
+    fn insert_item(&var self, item: MenuItem, index: usize) {
+        check index <= self.items.len() {
+            self.items.insert(index, item);
+            unsafe {
+                menu_insert_item(self.id.0, item.id.0, index as i32);
+            }
+        }
+    }
+
+    fn get_item(&self, item_id: MenuItemId) -> Option<&MenuItem> {
+        self.items.iter().find(|i| i.id == item_id)
+    }
+
+    fn get_item_mut(&var self, item_id: MenuItemId) -> Option<&var MenuItem> {
+        self.items.iter_mut().find(|i| i.id == item_id)
+    }
+
+    fn set_title(&var self, title: String) {
+        self.title = title;
+        unsafe {
+            menu_set_title(self.id.0, title.as_ptr(), title.len());
+        }
+    }
+}
+
+// ============================================================================
+// MENU ITEM OPERATIONS
+// ============================================================================
+
+impl MenuItem {
+    fn new(config: MenuItemConfig, action: Option<MenuAction>) -> Result<MenuItem, MenuError> {
+        unsafe {
+            let item_id = menu_item_create(
+                config.label.as_ptr(),
+                config.label.len(),
+                config.item_type as i32,
+                config.initial_state.enabled as i32,
+                config.initial_state.checked as i32,
+                config.initial_state.visible as i32,
+            );
+
+            check item_id < 0 {
+                Err(MenuError::CreationFailed);
+            }
+
+            var item = MenuItem {
+                id: MenuItemId(item_id),
+                config,
+                state: Signal::new(config.initial_state),
+                action,
+                submenu: None,
+            };
+
+            // Set shortcut check provided
+            check let Some(shortcut) = &config.shortcut {
+                unsafe {
+                    menu_item_set_shortcut(
+                        item_id,
+                        shortcut.key as i32,
+                        shortcut.modifiers.shift as i32,
+                        shortcut.modifiers.ctrl as i32,
+                        shortcut.modifiers.alt as i32,
+                        shortcut.modifiers.super as i32,
+                    );
+                }
+            }
+
+            // Set up reactive state bindings
+            item.state.watch(|state| unsafe {
+                menu_item_set_state(item_id, state.enabled as i32, state.checked as i32, state.visible as i32);
+            });
+
+            Ok(item)
+        }
+    }
+
+    fn set_action(&var self, action: MenuAction) {
+        self.action = Some(action);
+    }
+
+    fn set_submenu(&var self, submenu: Menu) {
+        self.submenu = Some(submenu);
+        unsafe {
+            check let Some(sub) = &self.submenu {
+                menu_item_set_submenu(self.id.0, sub.id.0);
+            }
+        }
+    }
+
+    fn execute(&self) {
+        check let Some(action) = &self.action {
+            action.execute();
+        }
+    }
+
+    fn toggle_checked(&var self) {
+        var current_state = *self.state.get();
+        current_state.checked = !current_state.checked;
+        self.state.set(current_state);
+    }
+
+    fn set_enabled(&var self, enabled: bool) {
+        var current_state = *self.state.get();
+        current_state.enabled = enabled;
+        self.state.set(current_state);
+    }
+
+    fn set_visible(&var self, visible: bool) {
+        var current_state = *self.state.get();
+        current_state.visible = visible;
+        self.state.set(current_state);
+    }
+}
+
+// ============================================================================
+// STANDARD MENU CREATION
+// ============================================================================
+
+/// Create standard application menu
+impl MenuBar {
+    fn create_standard_menu_bar() -> Result<MenuBar, MenuError> {
+        var menu_bar = MenuBar::new()?;
+
+        // File menu
+        var file_menu = Menu::new("File".into())?;
+        file_menu.add_item(MenuItem::new(
+            MenuItemConfig {
+                label: "New".into(),
+                shortcut: Some(MenuShortcut {
+                    key: Key::N,
+                    modifiers: KeyModifiers { shift: false, ctrl: true, alt: false, super: false },
+                }),
+                item_type: MenuItemType::Normal,
+                initial_state: MenuItemState { enabled: true, checked: false, visible: true },
+            },
+            None,
+        )?);
+
+        file_menu.add_item(MenuItem::new(
+            MenuItemConfig {
+                label: "Open".into(),
+                shortcut: Some(MenuShortcut {
+                    key: Key::O,
+                    modifiers: KeyModifiers { shift: false, ctrl: true, alt: false, super: false },
+                }),
+                item_type: MenuItemType::Normal,
+                initial_state: MenuItemState { enabled: true, checked: false, visible: true },
+            },
+            None,
+        )?);
+
+        file_menu.add_item(MenuItem::new(
+            MenuItemConfig {
+                label: "".into(),
+                shortcut: None,
+                item_type: MenuItemType::Separator,
+                initial_state: MenuItemState { enabled: true, checked: false, visible: true },
+            },
+            None,
+        )?);
+
+        file_menu.add_item(MenuItem::new(
+            MenuItemConfig {
+                label: "Quit".into(),
+                shortcut: Some(MenuShortcut {
+                    key: Key::Q,
+                    modifiers: KeyModifiers { shift: false, ctrl: true, alt: false, super: false },
+                }),
+                item_type: MenuItemType::Normal,
+                initial_state: MenuItemState { enabled: true, checked: false, visible: true },
+            },
+            None,
+        )?);
+
+        menu_bar.add_menu(file_menu);
+
+        // Edit menu
+        var edit_menu = Menu::new("Edit".into())?;
+        edit_menu.add_item(MenuItem::new(
+            MenuItemConfig {
+                label: "Undo".into(),
+                shortcut: Some(MenuShortcut {
+                    key: Key::Z,
+                    modifiers: KeyModifiers { shift: false, ctrl: true, alt: false, super: false },
+                }),
+                item_type: MenuItemType::Normal,
+                initial_state: MenuItemState { enabled: true, checked: false, visible: true },
+            },
+            None,
+        )?);
+
+        edit_menu.add_item(MenuItem::new(
+            MenuItemConfig {
+                label: "Redo".into(),
+                shortcut: Some(MenuShortcut {
+                    key: Key::Z,
+                    modifiers: KeyModifiers { shift: true, ctrl: true, alt: false, super: false },
+                }),
+                item_type: MenuItemType::Normal,
+                initial_state: MenuItemState { enabled: true, checked: false, visible: true },
+            },
+            None,
+        )?);
+
+        edit_menu.add_item(MenuItem::new(
+            MenuItemConfig {
+                label: "".into(),
+                shortcut: None,
+                item_type: MenuItemType::Separator,
+                initial_state: MenuItemState { enabled: true, checked: false, visible: true },
+            },
+            None,
+        )?);
+
+        edit_menu.add_item(MenuItem::new(
+            MenuItemConfig {
+                label: "Cut".into(),
+                shortcut: Some(MenuShortcut {
+                    key: Key::X,
+                    modifiers: KeyModifiers { shift: false, ctrl: true, alt: false, super: false },
+                }),
+                item_type: MenuItemType::Normal,
+                initial_state: MenuItemState { enabled: true, checked: false, visible: true },
+            },
+            None,
+        )?);
+
+        edit_menu.add_item(MenuItem::new(
+            MenuItemConfig {
+                label: "Copy".into(),
+                shortcut: Some(MenuShortcut {
+                    key: Key::C,
+                    modifiers: KeyModifiers { shift: false, ctrl: true, alt: false, super: false },
+                }),
+                item_type: MenuItemType::Normal,
+                initial_state: MenuItemState { enabled: true, checked: false, visible: true },
+            },
+            None,
+        )?);
+
+        edit_menu.add_item(MenuItem::new(
+            MenuItemConfig {
+                label: "Paste".into(),
+                shortcut: Some(MenuShortcut {
+                    key: Key::V,
+                    modifiers: KeyModifiers { shift: false, ctrl: true, alt: false, super: false },
+                }),
+                item_type: MenuItemType::Normal,
+                initial_state: MenuItemState { enabled: true, checked: false, visible: true },
+            },
+            None,
+        )?);
+
+        menu_bar.add_menu(edit_menu);
+
+        Ok(menu_bar)
+    }
+}
+
+// ============================================================================
+// MENU EVENT HANDLING
+// ============================================================================
+
+/// Menu event dispatcher
+expose data MenuEventDispatcher {
+    menu_bar: MenuBar,
+    handlers: HashMap<MenuItemId, Box<dyn MenuAction>>,
+}
+
+impl MenuEventDispatcher {
+    fn new(menu_bar: MenuBar) -> MenuEventDispatcher {
+        MenuEventDispatcher {
+            menu_bar,
+            handlers: HashMap::new(),
+        }
+    }
+
+    fn register_handler(&var self, item_id: MenuItemId, handler: Box<dyn MenuAction>) {
+        self.handlers.insert(item_id, handler);
+    }
+
+    fn handle_menu_event(&self, item_id: MenuItemId) {
+        check let Some(handler) = self.handlers.get(&item_id) {
+            handler.execute();
+        }
+
+        // Also check menu items in menu bar
+        each menu in &self.menu_bar.menus {
+            each item in &menu.items {
+                check item.id == item_id {
+                    item.execute();
+                    yield;
+                }
+            }
+        }
+    }
+
+    fn get_menu_bar(&self) -> &MenuBar {
+        &self.menu_bar
+    }
+
+    fn get_menu_bar_mut(&var self) -> &var MenuBar {
+        &var self.menu_bar
+    }
+}
+
+// ============================================================================
+// ERROR TYPES
+// ============================================================================
+
+expose cases MenuError {
+    CreationFailed,
+    InvalidConfig,
+    PlatformError,
+}
+
+// ============================================================================
+// FFI DECLARATIONS
+// ============================================================================
+
+extern "C" {
+    // Menu bar operations
+    fn menu_bar_create() -> i64;
+    fn menu_bar_add_menu(menu_bar_id: i64, menu_id: i64);
+    fn menu_bar_remove_menu(menu_bar_id: i64, menu_id: i64);
+
+    // Menu operations
+    fn menu_create(title: *const u8, title_len: usize) -> i64;
+    fn menu_add_item(menu_id: i64, item_id: i64);
+    fn menu_remove_item(menu_id: i64, item_id: i64);
+    fn menu_insert_item(menu_id: i64, item_id: i64, index: i32);
+    fn menu_set_title(menu_id: i64, title: *const u8, title_len: usize);
+
+    // Menu item operations
+    fn menu_item_create(label: *const u8, label_len: usize, item_type: i32, enabled: i32, checked: i32, visible: i32) -> i64;
+    fn menu_item_set_shortcut(item_id: i64, key: i32, shift: i32, ctrl: i32, alt: i32, super: i32);
+    fn menu_item_set_state(item_id: i64, enabled: i32, checked: i32, visible: i32);
+    fn menu_item_set_submenu(item_id: i64, submenu_id: i64);
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+fn init_platform_menus() {
+    println("🍽️  Initializing Platform Menus...");
+    println("   ✅ Platform Menus Ready");
+}

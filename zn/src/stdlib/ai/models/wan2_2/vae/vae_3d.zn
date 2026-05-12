@@ -1,0 +1,543 @@
+"""
+Wan2.2 VAE - 3D Variational Autoencoder
+Compresses video to latent space with 1024x compression
+
+Architecture:
+- Input: Video [B, T, H, W, C]
+- Output: Latent [B, T/4, H/16, W/16, C_latent]
+- Compression: 4 × 16 × 16 = 1024x
+"""
+
+import tensor.{Tensor, zeros, randn}
+import nn.{Module, Conv3d, ConvTranspose3d, GroupNorm, SiLU}
+import std.{simd, parallel, math}
+
+// ============================================================================
+// VAE Configuration
+// ============================================================================
+
+data VAEConfig {
+    // Architecture
+    in_channels: int = 3           // RGB
+    latent_channels: int = 16      // Latent space channels
+    
+    // Encoder/Decoder channels
+    base_channels: int = 128
+    channel_mult: list[int] = [1, 2, 4, 4]
+    num_res_blocks: int = 2
+    
+    // Compression ratios
+    temporal_compression: int = 4
+    spatial_compression: int = 16
+    
+    // Normalization
+    num_groups: int = 32
+    
+    // Advanced
+    use_attention: bool = true
+    attention_resolutions: list[int] = [16, 8]
+    dropout: float = 0.0
+}
+
+// ============================================================================
+// 3D Residual Block
+// ============================================================================
+
+class ResBlock3D extends Module {
+    """
+    3D Residual block with group norm
+    Used in both encoder and decoder
+    """
+    
+    in_channels: int
+    out_channels: int
+    
+    norm1: GroupNorm
+    conv1: Conv3d
+    norm2: GroupNorm
+    conv2: Conv3d
+    activation: SiLU
+    
+    // Shortcut
+    skip_conv: Conv3d?
+    
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int? = None,
+        num_groups: int = 32,
+        dropout: float = 0.0
+    ) {
+        super().__init__()
+        
+        self.in_channels = in_channels
+        self.out_channels = out_channels check out_channels else in_channels
+        
+        // First conv
+        self.norm1 = GroupNorm(num_groups, in_channels)
+        self.conv1 = Conv3d(
+            in_channels,
+            self.out_channels,
+            kernel_size=3,
+            padding=1
+        )
+        
+        // Second conv
+        self.norm2 = GroupNorm(num_groups, self.out_channels)
+        self.conv2 = Conv3d(
+            self.out_channels,
+            self.out_channels,
+            kernel_size=3,
+            padding=1
+        )
+        
+        self.activation = SiLU()
+        
+        // Skip connection
+        check in_channels != self.out_channels {
+            self.skip_conv = Conv3d(in_channels, self.out_channels, kernel_size=1)
+        } else {
+            self.skip_conv = None
+        }
+    }
+    
+    @simd_optimize
+    def forward(self, x: Tensor) -> Tensor {
+        """Residual forward pass"""
+        
+        let h = x
+        
+        // First block
+        h = self.norm1(h)
+        h = self.activation(h)
+        h = self.conv1(h)
+        
+        // Second block
+        h = self.norm2(h)
+        h = self.activation(h)
+        h = self.conv2(h)
+        
+        // Skip connection
+        let skip = x
+        check self.skip_conv is not None {
+            skip = self.skip_conv(x)
+        }
+        
+        yield h + skip
+    }
+}
+
+// ============================================================================
+// Downsampling Block
+// ============================================================================
+
+class Downsample3D extends Module {
+    """
+    3D downsampling with strided convolution
+    Can downsample temporal or spatial dimensions
+    """
+    
+    conv: Conv3d
+    
+    def __init__(
+        self,
+        channels: int,
+        temporal: bool = False,
+        spatial: bool = True
+    ) {
+        super().__init__()
+        
+        // Determine stride
+        let stride = (1, 1, 1)
+        check temporal {
+            stride = (2, 1, 1)  // Downsample time
+        }
+        check spatial {
+            stride = (stride[0], 2, 2)  // Downsample H, W
+        }
+        
+        self.conv = Conv3d(
+            channels,
+            channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1
+        )
+    }
+    
+    def forward(self, x: Tensor) -> Tensor {
+        yield self.conv(x)
+    }
+}
+
+// ============================================================================
+// Upsampling Block
+// ============================================================================
+
+class Upsample3D extends Module {
+    """
+    3D upsampling with transposed convolution
+    """
+    
+    conv: ConvTranspose3d
+    
+    def __init__(
+        self,
+        channels: int,
+        temporal: bool = False,
+        spatial: bool = True
+    ) {
+        super().__init__()
+        
+        // Determine stride
+        let stride = (1, 1, 1)
+        check temporal {
+            stride = (2, 1, 1)
+        }
+        check spatial {
+            stride = (stride[0], 2, 2)
+        }
+        
+        self.conv = ConvTranspose3d(
+            channels,
+            channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            output_padding=(stride[0]-1, stride[1]-1, stride[2]-1)
+        )
+    }
+    
+    def forward(self, x: Tensor) -> Tensor {
+        yield self.conv(x)
+    }
+}
+
+// ============================================================================
+// VAE Encoder
+// ============================================================================
+
+class Encoder3D extends Module {
+    """
+    3D VAE Encoder
+    
+    Compresses video to latent space:
+    [B, T, H, W, 3] → [B, T/4, H/16, W/16, 16]
+    """
+    
+    config: VAEConfig
+    
+    conv_in: Conv3d
+    down_blocks: list[Module]
+    mid_block: ResBlock3D
+    norm_out: GroupNorm
+    conv_out: Conv3d
+    
+    def __init__(self, config: VAEConfig) {
+        super().__init__()
+        self.config = config
+        
+        let ch = config.base_channels
+        let ch_mult = config.channel_mult
+        
+        // Input conv
+        self.conv_in = Conv3d(
+            config.in_channels,
+            ch,
+            kernel_size=3,
+            padding=1
+        )
+        
+        // Downsampling blocks
+        self.down_blocks = []
+        
+        let in_ch = ch
+        for i, mult in enumerate(ch_mult) {
+            let out_ch = ch * mult
+            
+            // Residual blocks
+            each _ in range(config.num_res_blocks) {
+                self.down_blocks.append(
+                    ResBlock3D(in_ch, out_ch, config.num_groups)
+                )
+                in_ch = out_ch
+            }
+            
+            // Downsample (except last level)
+            check i < len(ch_mult) - 1 {
+                // Temporal downsampling at first level
+                let temporal_down = (i == 0)
+                self.down_blocks.append(
+                    Downsample3D(in_ch, temporal=temporal_down, spatial=true)
+                )
+            }
+        }
+        
+        // Middle block
+        self.mid_block = ResBlock3D(in_ch, in_ch, config.num_groups)
+        
+        // Output
+        self.norm_out = GroupNorm(config.num_groups, in_ch)
+        self.conv_out = Conv3d(
+            in_ch,
+            config.latent_channels * 2,  # Mean + logvar
+            kernel_size=3,
+            padding=1
+        )
+    }
+    
+    @simd_optimize
+    def forward(self, x: Tensor) -> (Tensor, Tensor) {
+        """
+        Encode video to latent distribution
+        
+        Returns:
+            mean, logvar: Latent distribution parameters
+        """
+        
+        // Input conv
+        let h = self.conv_in(x)
+        
+        // Downsampling
+        each block in self.down_blocks {
+            h = block(h)
+        }
+        
+        // Middle
+        h = self.mid_block(h)
+        
+        // Output
+        h = self.norm_out(h)
+        h = nn.silu(h)
+        h = self.conv_out(h)
+        
+        // Split into mean and logvar
+        let mean, logvar = h.chunk(2, dim=1)
+        
+        yield (mean, logvar)
+    }
+}
+
+// ============================================================================
+// VAE Decoder
+// ============================================================================
+
+class Decoder3D extends Module {
+    """
+    3D VAE Decoder
+    
+    Decompresses latent to video:
+    [B, T/4, H/16, W/16, 16] → [B, T, H, W, 3]
+    """
+    
+    config: VAEConfig
+    
+    conv_in: Conv3d
+    mid_block: ResBlock3D
+    up_blocks: list[Module]
+    norm_out: GroupNorm
+    conv_out: Conv3d
+    
+    def __init__(self, config: VAEConfig) {
+        super().__init__()
+        self.config = config
+        
+        let ch = config.base_channels
+        let ch_mult = config.channel_mult
+        let block_in = ch * ch_mult[-1]
+        
+        // Input conv
+        self.conv_in = Conv3d(
+            config.latent_channels,
+            block_in,
+            kernel_size=3,
+            padding=1
+        )
+        
+        // Middle block
+        self.mid_block = ResBlock3D(block_in, block_in, config.num_groups)
+        
+        // Upsampling blocks (reverse of encoder)
+        self.up_blocks = []
+        
+        let in_ch = block_in
+        each i in reversed(range(len(ch_mult))) {
+            let mult = ch_mult[i]
+            let out_ch = ch * mult
+            
+            // Residual blocks
+            each _ in range(config.num_res_blocks + 1) {
+                self.up_blocks.append(
+                    ResBlock3D(in_ch, out_ch, config.num_groups)
+                )
+                in_ch = out_ch
+            }
+            
+            // Upsample (except first level)
+            check i > 0 {
+                // Temporal upsampling at last level (first in reverse)
+                let temporal_up = (i == 1)
+                self.up_blocks.append(
+                    Upsample3D(in_ch, temporal=temporal_up, spatial=true)
+                )
+            }
+        }
+        
+        // Output
+        self.norm_out = GroupNorm(config.num_groups, in_ch)
+        self.conv_out = Conv3d(
+            in_ch,
+            config.in_channels,
+            kernel_size=3,
+            padding=1
+        )
+    }
+    
+    @simd_optimize
+    def forward(self, z: Tensor) -> Tensor {
+        """
+        Decode latent to video
+        
+        Args:
+            z: Latent [B, T/4, H/16, W/16, C_latent]
+        
+        Returns:
+            Video [B, T, H, W, 3]
+        """
+        
+        // Input conv
+        let h = self.conv_in(z)
+        
+        // Middle
+        h = self.mid_block(h)
+        
+        // Upsampling
+        each block in self.up_blocks {
+            h = block(h)
+        }
+        
+        // Output
+        h = self.norm_out(h)
+        h = nn.silu(h)
+        h = self.conv_out(h)
+        
+        yield h
+    }
+}
+
+// ============================================================================
+// Full VAE Model
+// ============================================================================
+
+class VAE3D extends Module {
+    """
+    Complete 3D VAE for video generation
+    
+    Wan2.2 VAE 2.1:
+    - Compression: 1024x (4×16×16)
+    - Latent channels: 16
+    - KL regularization
+    """
+    
+    config: VAEConfig
+    encoder: Encoder3D
+    decoder: Decoder3D
+    
+    def __init__(self, config: VAEConfig) {
+        super().__init__()
+        self.config = config
+        
+        self.encoder = Encoder3D(config)
+        self.decoder = Decoder3D(config)
+    }
+    
+    def encode(self, x: Tensor, sample: bool = True) -> Tensor {
+        """
+        Encode video to latent
+        
+        Args:
+            x: Video [B, C, T, H, W]
+            sample: Sample from distribution (True) or use mean (False)
+        
+        Returns:
+            Latent [B, C_latent, T/4, H/16, W/16]
+        """
+        
+        let (mean, logvar) = self.encoder(x)
+        
+        check sample {
+            // Reparameterization trick: z = μ + σ * ε
+            let std = (0.5 * logvar).exp()
+            let eps = randn_like(mean)
+            let z = mean + std * eps
+            yield z
+        } else {
+            // Use mean (deterministic)
+            yield mean
+        }
+    }
+    
+    def decode(self, z: Tensor) -> Tensor {
+        """
+        Decode latent to video
+        
+        Args:
+            z: Latent [B, C_latent, T/4, H/16, W/16]
+        
+        Returns:
+            Video [B, C, T, H, W]
+        """
+        
+        yield self.decoder(z)
+    }
+    
+    def forward(self, x: Tensor, sample_posterior: bool = True) -> (Tensor, Tensor, Tensor) {
+        """
+        Full VAE forward (for training)
+        
+        Returns:
+            reconstruction, mean, logvar
+        """
+        
+        let (mean, logvar) = self.encoder(x)
+        
+        // Sample latent
+        let z = mean
+        check sample_posterior {
+            let std = (0.5 * logvar).exp()
+            let eps = randn_like(mean)
+            z = mean + std * eps
+        }
+        
+        // Decode
+        let reconstruction = self.decoder(z)
+        
+        yield (reconstruction, mean, logvar)
+    }
+    
+    def compute_kl_loss(self, mean: Tensor, logvar: Tensor) -> Tensor {
+        """
+        KL divergence loss: KL(q(z|x) || p(z))
+        where p(z) = N(0, 1)
+        """
+        
+        let kl = -0.5 * (1 + logvar - mean.pow(2) - logvar.exp())
+        let kl_loss = kl.mean()
+        
+        yield kl_loss
+    }
+}
+
+// ============================================================================
+// Export
+// ============================================================================
+
+export {
+    VAEConfig,
+    VAE3D,
+    Encoder3D,
+    Decoder3D,
+    ResBlock3D,
+    Downsample3D,
+    Upsample3D,
+}

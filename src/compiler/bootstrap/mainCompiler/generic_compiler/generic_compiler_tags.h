@@ -1,0 +1,5 @@
+#ifndef NOVA_GENERIC_COMPILER_TAGS_H
+#define NOVA_GENERIC_COMPILER_TAGS_H
+
+#endif
+

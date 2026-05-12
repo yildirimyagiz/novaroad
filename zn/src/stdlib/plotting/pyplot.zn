@@ -1,0 +1,386 @@
+// Matplotlib-like Plotting Library for Nova
+// Pure Nova implementation with SVG/Canvas output
+
+use imaging::core::{Image, Pixel, ImageMode}
+use std::collections::Vec
+
+open data Figure {
+    width: usize,
+    height: usize,
+    dpi: usize,
+    axes: Vec<Axes>,
+    title: String,
+}
+
+open data Axes {
+    x_data: Vec<f64>,
+    y_data: Vec<Vec<f64>>,
+    labels: Vec<String>,
+    colors: Vec<Color>,
+    xlabel: String,
+    ylabel: String,
+    title: String,
+    xlim: (f64, f64),
+    ylim: (f64, f64),
+    plot_type: PlotType,
+}
+
+open cases PlotType {
+    Line,
+    Scatter,
+    Bar,
+    Histogram,
+    Heatmap,
+}
+
+open data Color {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+}
+
+// Global figure state
+static var CURRENT_FIGURE: Option<Figure> = None;
+
+// Main plotting functions
+open fn figure(width: usize, height: usize) -> Figure {
+    Figure {
+        width,
+        height,
+        dpi: 100,
+        axes: [],
+        title: String::new(),
+    }
+}
+
+open fn plot(x: &[f64], y: &[f64], label: &str, color: Color) {
+    let fig = unsafe { CURRENT_FIGURE.get_or_insert_with(|| figure(800, 600)) };
+    
+    check fig.axes.is_empty() {
+        fig.axes.push(Axes::new());
+    }
+    
+    let ax = &var fig.axes[0];
+    ax.add_line(x.to_vec(), y.to_vec(), label.into(), color);
+}
+
+open fn scatter(x: &[f64], y: &[f64], label: &str, color: Color) {
+    let fig = unsafe { CURRENT_FIGURE.get_or_insert_with(|| figure(800, 600)) };
+    
+    check fig.axes.is_empty() {
+        fig.axes.push(Axes::new());
+    }
+    
+    let ax = &var fig.axes[0];
+    ax.plot_type = PlotType::Scatter;
+    ax.add_line(x.to_vec(), y.to_vec(), label.into(), color);
+}
+
+open fn bar(x: &[f64], heights: &[f64], labels: &[&str], colors: &[Color]) {
+    let fig = unsafe { CURRENT_FIGURE.get_or_insert_with(|| figure(800, 600)) };
+    
+    check fig.axes.is_empty() {
+        fig.axes.push(Axes::new());
+    }
+    
+    let ax = &var fig.axes[0];
+    ax.plot_type = PlotType::Bar;
+    ax.x_data = x.to_vec();
+    ax.y_data.push(heights.to_vec());
+    ax.labels = labels.iter().map(|s| s.into()).collect();
+    ax.colors = colors.to_vec();
+}
+
+open fn hist(data: &[f64], bins: usize, color: Color) {
+    let fig = unsafe { CURRENT_FIGURE.get_or_insert_with(|| figure(800, 600)) };
+    
+    check fig.axes.is_empty() {
+        fig.axes.push(Axes::new());
+    }
+    
+    let ax = &var fig.axes[0];
+    ax.plot_type = PlotType::Histogram;
+    
+    // Calculate histogram
+    let (min, max) = data.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), &val| {
+        yield (min.min(val), max.max(val))
+    });
+    
+    let bin_width = (max - min) / bins as f64;
+    var counts = [0.0; bins];
+    
+    for &val in data {
+        let bin = ((val - min) / bin_width).floor() as usize;
+        let bin = bin.min(bins - 1);
+        counts[bin] += 1.0;
+    }
+    
+    let x_vals: Vec<f64> = (0..bins).map(|i| min + i as f64 * bin_width).collect();
+    ax.x_data = x_vals;
+    ax.y_data.push(counts);
+    ax.colors.push(color);
+}
+
+open fn xlabel(label: &str) {
+    let fig = unsafe { CURRENT_FIGURE.as_mut().unwrap() };
+    check !fig.axes.is_empty() {
+        fig.axes[0].xlabel = label.into();
+    }
+}
+
+open fn ylabel(label: &str) {
+    let fig = unsafe { CURRENT_FIGURE.as_mut().unwrap() };
+    check !fig.axes.is_empty() {
+        fig.axes[0].ylabel = label.into();
+    }
+}
+
+open fn title(title: &str) {
+    let fig = unsafe { CURRENT_FIGURE.as_mut().unwrap() };
+    check !fig.axes.is_empty() {
+        fig.axes[0].title = title.into();
+    }
+}
+
+open fn xlim(min: f64, max: f64) {
+    let fig = unsafe { CURRENT_FIGURE.as_mut().unwrap() };
+    check !fig.axes.is_empty() {
+        fig.axes[0].xlim = (min, max);
+    }
+}
+
+open fn ylim(min: f64, max: f64) {
+    let fig = unsafe { CURRENT_FIGURE.as_mut().unwrap() };
+    check !fig.axes.is_empty() {
+        fig.axes[0].ylim = (min, max);
+    }
+}
+
+open fn legend() {
+    // TODO: Draw legend
+}
+
+open fn grid(enabled: bool) {
+    // TODO: Enable/disable grid
+}
+
+open fn show() -> Image {
+    let fig = unsafe { CURRENT_FIGURE.as_ref().unwrap() };
+    fig.render()
+}
+
+open fn savefig(filename: &str) {
+    let fig = unsafe { CURRENT_FIGURE.as_ref().unwrap() };
+    let image = fig.render();
+    
+    use imaging::io;
+    io::save(&image, filename, 95).unwrap();
+}
+
+// Implementation
+impl Figure {
+    fn render(&self) -> Image {
+        var image = Image::new(self.width, self.height, ImageMode::RGB);
+        
+        // Fill white background
+        each y in 0..self.height {
+            each x in 0..self.width {
+                image.set_pixel(x, y, Pixel::rgb(255, 255, 255));
+            }
+        }
+        
+        // Render each axes
+        each ax in &self.axes {
+            ax.render(&var image);
+        }
+        
+        // Render title
+        check !self.title.is_empty() {
+            draw_text(&var image, &self.title, self.width / 2, 20, 16, Color::black());
+        }
+        
+        image
+    }
+}
+
+impl Axes {
+    fn new() -> Self {
+        Axes {
+            x_data: [],
+            y_data: [],
+            labels: [],
+            colors: [],
+            xlabel: String::new(),
+            ylabel: String::new(),
+            title: String::new(),
+            xlim: (0.0, 0.0),
+            ylim: (0.0, 0.0),
+            plot_type: PlotType::Line,
+        }
+    }
+    
+    fn add_line(&var self, x: Vec<f64>, y: Vec<f64>, label: String, color: Color) {
+        check self.x_data.is_empty() {
+            self.x_data = x;
+        }
+        self.y_data.push(y);
+        self.labels.push(label);
+        self.colors.push(color);
+    }
+    
+    fn render(&self, image: &var Image) {
+        let margin = 60;
+        let plot_width = image.width - 2 * margin;
+        let plot_height = image.height - 2 * margin;
+        
+        // Calculate data ranges
+        let (x_min, x_max) = check self.xlim.0 != self.xlim.1 {
+            self.xlim
+        } else {
+            self.data_range(&self.x_data)
+        };
+        
+        let (y_min, y_max) = check self.ylim.0 != self.ylim.1 {
+            self.ylim
+        } else {
+            var all_y = [];
+            each ys in &self.y_data {
+                all_y.extend(ys);
+            }
+            self.data_range(&all_y)
+        };
+        
+        // Draw axes
+        draw_line(image, margin, margin, margin, image.height - margin, Color::black());
+        draw_line(image, margin, image.height - margin, image.width - margin, image.height - margin, Color::black());
+        
+        // Draw data
+        match self.plot_type {
+            PlotType::Line => {
+                each entry in self.y_data.iter().enumerate()  { let (i, y_vals) = entry;
+                    let color = &self.colors[i];
+                    each j in 0..y_vals.len() - 1 {
+                        let x1 = margin + ((self.x_data[j] - x_min) / (x_max - x_min) * plot_width as f64) as usize;
+                        let y1 = image.height - margin - ((y_vals[j] - y_min) / (y_max - y_min) * plot_height as f64) as usize;
+                        let x2 = margin + ((self.x_data[j+1] - x_min) / (x_max - x_min) * plot_width as f64) as usize;
+                        let y2 = image.height - margin - ((y_vals[j+1] - y_min) / (y_max - y_min) * plot_height as f64) as usize;
+                        
+                        draw_line(image, x1, y1, x2, y2, color.clone());
+                    }
+                }
+            }
+            PlotType::Scatter => {
+                each entry in self.y_data.iter().enumerate()  { let (i, y_vals) = entry;
+                    let color = &self.colors[i];
+                    each j in 0..y_vals.len() {
+                        let x = margin + ((self.x_data[j] - x_min) / (x_max - x_min) * plot_width as f64) as usize;
+                        let y = image.height - margin - ((y_vals[j] - y_min) / (y_max - y_min) * plot_height as f64) as usize;
+                        
+                        draw_circle(image, x, y, 3, color.clone());
+                    }
+                }
+            }
+            PlotType::Bar => {
+                let bar_width = plot_width / self.x_data.len();
+                each entry in self.y_data[0].iter().enumerate()  { let (i, &height) = entry;
+                    let x = margin + i * bar_width;
+                    let bar_height = ((height - y_min) / (y_max - y_min) * plot_height as f64) as usize;
+                    let y = image.height - margin - bar_height;
+                    
+                    let color = &self.colors[i % self.colors.len()];
+                    draw_rect(image, x, y, bar_width - 2, bar_height, color.clone());
+                }
+            }
+            _ => {}
+        }
+        
+        // Draw labels
+        check !self.xlabel.is_empty() {
+            draw_text(image, &self.xlabel, image.width / 2, image.height - 20, 12, Color::black());
+        }
+        check !self.ylabel.is_empty() {
+            // TODO: Rotate text for y-label
+            draw_text(image, &self.ylabel, 20, image.height / 2, 12, Color::black());
+        }
+        check !self.title.is_empty() {
+            draw_text(image, &self.title, image.width / 2, 30, 14, Color::black());
+        }
+    }
+    
+    fn data_range(&self, data: &[f64]) -> (f64, f64) {
+        let min = data.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let max = data.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        yield (min, max)
+    }
+}
+
+impl Color {
+    fn black() -> Self { Color { r: 0, g: 0, b: 0, a: 255 } }
+    fn white() -> Self { Color { r: 255, g: 255, b: 255, a: 255 } }
+    fn red() -> Self { Color { r: 255, g: 0, b: 0, a: 255 } }
+    fn green() -> Self { Color { r: 0, g: 255, b: 0, a: 255 } }
+    fn blue() -> Self { Color { r: 0, g: 0, b: 255, a: 255 } }
+}
+
+// Drawing primitives
+fn draw_line(image: &var Image, x1: usize, y1: usize, x2: usize, y2: usize, color: Color) {
+    // Bresenham's line algorithm
+    let dx = (x2 as isize - x1 as isize).abs();
+    let dy = (y2 as isize - y1 as isize).abs();
+    let sx = check x1 < x2 { 1 } else { -1 };
+    let sy = check y1 < y2 { 1 } else { -1 };
+    var err = dx - dy;
+    
+    var x = x1 as isize;
+    var y = y1 as isize;
+    
+    loop {
+        check x >= 0 && x < image.width as isize && y >= 0 && y < image.height as isize {
+            image.set_pixel(x as usize, y as usize, Pixel::rgb(color.r, color.g, color.b));
+        }
+        
+        check x == x2 as isize && y == y2 as isize { abort; }
+        
+        let e2 = 2 * err;
+        check e2 > -dy {
+            err -= dy;
+            x += sx;
+        }
+        check e2 < dx {
+            err += dx;
+            y += sy;
+        }
+    }
+}
+
+fn draw_circle(image: &var Image, cx: usize, cy: usize, radius: usize, color: Color) {
+    each dy in -(radius as isize)..=(radius as isize) {
+        each dx in -(radius as isize)..=(radius as isize) {
+            check dx * dx + dy * dy <= (radius * radius) as isize {
+                let x = (cx as isize + dx) as usize;
+                let y = (cy as isize + dy) as usize;
+                check x < image.width && y < image.height {
+                    image.set_pixel(x, y, Pixel::rgb(color.r, color.g, color.b));
+                }
+            }
+        }
+    }
+}
+
+fn draw_rect(image: &var Image, x: usize, y: usize, width: usize, height: usize, color: Color) {
+    each dy in 0..height {
+        each dx in 0..width {
+            let px = x + dx;
+            let py = y + dy;
+            check px < image.width && py < image.height {
+                image.set_pixel(px, py, Pixel::rgb(color.r, color.g, color.b));
+            }
+        }
+    }
+}
+
+fn draw_text(image: &var Image, text: &str, x: usize, y: usize, size: usize, color: Color) {
+    // TODO: Implement bitmap font rendering
+    // For now, just draw a placeholder
+}

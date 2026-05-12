@@ -1,0 +1,1025 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova — Advanced Compile-Time Function Evaluation (CTFE)              ║
+// ║  Mobile-Aware · AST-aware (frontend/ast v10) · Touch/Gesture/Sensor Support  ║
+// ║  UI Components · Platform Calls · Animation Constants · Sensor Data          ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::HashMap;
+
+use compiler::frontend::ast::{
+    BinOp, Block, CallExpr, Expr, IdentExpr, Pattern, Span, Stmt,
+    UnaryOp, YieldStmt, ExprStmt, LetStmt, VarStmt, ContractStmt,
+    EachExpr, MatchExpr, MatchArm, CheckExpr, WhileExpr,
+};
+use compiler::frontend::mobile::mobile_ast_extensions::{
+    MobileExpr, MobileStmt, TouchEventExpr, GestureEventExpr,
+    DeviceSensorExpr, PlatformCallExpr, UIComponentExpr,
+    TouchEventType, GestureType, SensorType, SensorData,
+    UIComponentType, TouchHandlerStmt, GestureHandlerStmt,
+    SensorHandlerStmt, UIUpdateStmt, NavigationStmt,
+    NavigationAction, PointExpr,
+};
+use compiler::frontend::advanced::aurora_advanced_ui::{
+    AuroraView, ViewType, Modifiers, ViewModifier,
+};
+use compiler::frontend::advanced::animation_system::{
+    AnimatedValue, ViewAnimation, AnimationController, AnimationSpec,
+};
+
+/// Compile-time value representation.
+expose cases ConstValue derives [Clone] {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(String),
+    Array(Vec<ConstValue>),
+    Struct(HashMap<String, ConstValue>),
+    // Mobile-specific values
+    Point { x: f64, y: f64 },
+    TouchEvent { event_type: String, touches: Vec<ConstValue> },
+    GestureEvent { gesture_type: String, properties: HashMap<String, ConstValue> },
+    SensorData { sensor_type: String, values: Vec<f64> },
+    UIComponent { component_type: String, properties: HashMap<String, ConstValue> },
+    Color { r: f64, g: f64, b: f64, a: f64 },
+    Size { width: f64, height: f64 },
+    Null,
+}
+
+impl ConstValue {
+    open fn is_truthy(&self) -> bool {
+        match self {
+            ConstValue::Bool(b) => *b,
+            ConstValue::Int(n) => *n != 0,
+            ConstValue::Float(x) => *x != 0.0,
+            ConstValue::Str(s) => !s.is_empty(),
+            ConstValue::Array(v) => !v.is_empty(),
+            ConstValue::Struct(m) => !m.is_empty(),
+            ConstValue::Point { .. } => true, // Points are always truthy
+            ConstValue::TouchEvent { touches, .. } => !touches.is_empty(),
+            ConstValue::GestureEvent { .. } => true, // Gestures are truthy when present
+            ConstValue::SensorData { values, .. } => !values.is_empty(),
+            ConstValue::UIComponent { .. } => true, // UI components are truthy
+            ConstValue::Color { .. } => true, // Colors are truthy
+            ConstValue::Size { width, height } => *width > 0.0 && *height > 0.0,
+            ConstValue::Null => false,
+        }
+    }
+
+    open fn as_i64(&self) -> Option<i64> {
+        match self {
+            ConstValue::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    open fn as_f64(&self) -> Option<f64> {
+        match self {
+            ConstValue::Float(x) => Some(*x),
+            ConstValue::Int(n) => Some((*n) as f64),
+            _ => None,
+        }
+    }
+
+    open fn as_point(&self) -> Option<(f64, f64)> {
+        match self {
+            ConstValue::Point { x, y } => Some((*x, *y)),
+            _ => None,
+        }
+    }
+
+    open fn as_size(&self) -> Option<(f64, f64)> {
+        match self {
+            ConstValue::Size { width, height } => Some((*width, *height)),
+            _ => None,
+        }
+    }
+
+    open fn as_color(&self) -> Option<(f64, f64, f64, f64)> {
+        match self {
+            ConstValue::Color { r, g, b, a } => Some((*r, *g, *b, *a)),
+            _ => None,
+        }
+    }
+}
+
+/// Compile-time error.
+expose data ConstEvalError {
+    message: String,
+    span:    Span,
+}
+
+impl ConstEvalError {
+    open fn new(message: String, span: Span) -> ConstEvalError {
+        ConstEvalError { message, span }
+    }
+}
+
+/// Const-callable function (registered from compiler passes).
+expose data ConstFunction derives [Clone] {
+    params: Vec<String>,
+    body:   Block,
+}
+
+/// Internal execution control.
+kind ExecSignal {
+    None,
+    Return(Option<ConstValue>),
+    Break,
+    Continue,
+}
+
+expose data ConstEvaluator {
+    scopes: Vec<HashMap<String, ConstValue>>,
+    const_functions: HashMap<String, ConstFunction>,
+    max_iterations: i64,
+    iter_count: i64,
+}
+
+impl ConstEvaluator {
+    open fn new() -> ConstEvaluator {
+        ConstEvaluator {
+            scopes: [HashMap::new()],
+            const_functions: HashMap::new(),
+            max_iterations: 100_000,
+            iter_count: 0,
+        }
+    }
+
+    open fn with_max_iterations(var self, max: i64) -> ConstEvaluator {
+        self.max_iterations = max;
+        self
+    }
+
+    open fn register_const_fn(&var self, name: String, params: Vec<String>, body: Block) {
+        self.const_functions.insert(name, ConstFunction { params, body });
+    }
+
+    open fn set_global(&var self, name: String, value: ConstValue) {
+        self.scopes[0].insert(name, value);
+    }
+
+    open fn push_scope(&var self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    open fn pop_scope(&var self) {
+        check self.scopes.len() > 1 { self.scopes.pop(); }
+    }
+
+    open fn get(&self, name: &String) -> Option<ConstValue> {
+        each i in (0..self.scopes.len()).rev() {
+            check let Some(v) = self.scopes[i].get(name) {
+                Some(v.clone());
+            }
+        }
+        None
+    }
+
+    open fn set_local(&var self, name: String, value: ConstValue) {
+        let last = self.scopes.len() - 1;
+        self.scopes[last].insert(name, value);
+    }
+
+    open fn bump_iter(&var self, span: Span) -> Result<(), ConstEvalError> {
+        self.iter_count += 1;
+        check self.iter_count > self.max_iterations {
+            Err(ConstEvalError::new("CTFE iteration limit exceeded".into(), span));
+        }
+        Ok(())
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Public entrypoints
+    // ───────────────────────────────────────────────────────────────────────
+
+    open fn eval_expr(&var self, expr: &Expr) -> Result<ConstValue, ConstEvalError> {
+        match expr {
+            Expr::Int(i) => Ok(ConstValue::Int(i.value)),
+            Expr::Float(f) => Ok(ConstValue::Float(f.value)),
+            Expr::Str(s) => Ok(ConstValue::Str(s.value.clone())),
+            Expr::Bool(b) => Ok(ConstValue::Bool(b.value)),
+
+            Expr::Measured(_) => Err(ConstEvalError::new("Measured literals not supported in CTFE".into(), Span::zero())),
+
+            Expr::Ident(IdentExpr { name, span }) => {
+                check let Some(v) = self.get(name) { yield Ok(v)}
+                else { yield Err(ConstEvalError::new(format("Unknown const identifier '{}'", name), *span)) }
+            }
+
+            Expr::Path(_) => Err(ConstEvalError::new("Paths not supported in CTFE".into(), Span::zero())),
+
+            Expr::Unary(u) => self.eval_unary(u),
+            Expr::Binary(b) => self.eval_binary(b),
+
+            Expr::Range(r) => {
+                let s = self.eval_expr(r.start.as_ref())?.as_i64()
+                    .ok_or(ConstEvalError::new("Range start must be int".into(), r.span))?;
+                let e = self.eval_expr(r.end.as_ref())?.as_i64()
+                    .ok_or(ConstEvalError::new("Range end must be int".into(), r.span))?;
+                let st = 1;  // v10 RangeExpr doesn't have step
+
+                check st == 0 {
+                    Err(ConstEvalError::new("Range step cannot be 0".into(), r.span));
+                }
+
+                let len = ((e - s) / st).abs();
+                check len > 10_000 {
+                    Err(ConstEvalError::new("Range too large to materialize in CTFE".into(), r.span));
+                }
+
+                var out: Vec<ConstValue> = [];
+                var i = s;
+                check st > 0 {
+                    while i < e {
+                        out.push(ConstValue::Int(i));
+                        i += st;
+                    }
+                } else {
+                    while i > e {
+                        out.push(ConstValue::Int(i));
+                        i += st;
+                    }
+                }
+
+                Ok(ConstValue::Array(out))
+            }
+
+            Expr::Call(c) => self.eval_call(c),
+
+            Expr::Method(_) => Err(ConstEvalError::new("Method calls not supported in CTFE".into(), Span::zero())),
+
+            Expr::Index(ix) => {
+                let base = self.eval_expr(ix.base.as_ref())?;
+                check ix.indices.len() != 1 {
+                    Err(ConstEvalError::new("CTFE supports 1D indexing only".into(), ix.span));
+                }
+                let idx = self.eval_expr(&ix.indices[0])?
+                    .as_i64()
+                    .ok_or(ConstEvalError::new("Index must be int".into(), ix.span))? as usize;
+
+                match base {
+                    ConstValue::Array(v) => {
+                        check idx >= v.len() {
+                            Err(ConstEvalError::new("Index out of bounds".into(), ix.span));
+                        }
+                        Ok(v[idx].clone())
+                    }
+                    _ => Err(ConstEvalError::new("Indexing requires const array".into(), ix.span)),
+                }
+            }
+
+            Expr::Field(f) => {
+                let base = self.eval_expr(f.base.as_ref())?;
+                match base {
+                    ConstValue::Struct(m) => {
+                        check let Some(v) = m.get(&f.field) { yield Ok(v.clone())}
+                        else { yield Err(ConstEvalError::new(format("Unknown field '{}'", f.field), f.span)) }
+                    }
+                    _ => Err(ConstEvalError::new("Field access requires const data".into(), f.span)),
+                }
+            }
+
+            Expr::Array(elements, _) => {
+                var vals = [];
+                each elem in elements {
+                    vals.push(self.eval_expr(elem)?);
+                }
+                Ok(ConstValue::Array(vals))
+            }
+
+            Expr::Tuple(elements, _) => {
+                // Represent tuples as arrays for CTFE
+                var vals = [];
+                each elem in elements {
+                    vals.push(self.eval_expr(elem)?);
+                }
+                Ok(ConstValue::Array(vals))
+            }
+
+            Expr::Record(RecordExpr { name: _, fields, span }) => {
+                var map = HashMap::new();
+                each entry in fields  { let (fname, fexpr) = entry;
+                    let val = self.eval_expr(fexpr)?;
+                    map.insert(fname.clone(), val);
+                }
+                Ok(ConstValue::Struct(map))
+            }
+
+            Expr::Pipe(p) => {
+                let src = self.eval_expr(p.source.as_ref())?;
+                // Pipe into call: x |> f(a,b)  => f(x,a,b)
+                match p.target.as_ref() {
+                    Expr::Call(call) => {
+                        var args: Vec<Expr> = [];
+                        // Materialize `src` as a literal where possible.
+                        args.push(self.const_to_expr(&src, call.span)?);
+                        each arg in &call.args {
+                            args.push(arg.clone());
+                        }
+
+                        let stitched = CallExpr { callee: call.callee.clone(), args, span: call.span };
+                        self.eval_call(&stitched)
+                    }
+                    Expr::Ident(id) => {
+                        let stitched = CallExpr {
+                            callee: Box::new(Expr::Ident(id.clone())),
+                            args: [self.const_to_expr(&src, id.span)?],
+                            span: id.span,
+                        };
+                        self.eval_call(&stitched)
+                    }
+                    _ => Err(ConstEvalError::new("Pipe target must be identifier or call in CTFE".into(), p.span)),
+                }
+            }
+
+            Expr::Check(CheckExpr { cond, then, els, span }) => {
+                let cond_val = self.eval_expr(cond.as_ref())?;
+                check cond_val.is_truthy() {
+                    self.eval_expr(then.as_ref())
+                } else check let Some(e) = els {
+                    self.eval_expr(e.as_ref())
+                } else {
+                    Ok(ConstValue::Null)
+                }
+            }
+
+            Expr::Match(MatchExpr { value, arms, span }) => {
+                let val = self.eval_expr(value.as_ref())?;
+                each arm in arms {
+                    var bound = [];
+                    check self.pattern_matches(&arm.pattern, &val, &var bound, *span)? {
+                        // Bind variables
+                        each entry in bound  { let (name, bval) = entry;
+                            self.set_local(name, bval);
+                        }
+                        yield self.eval_expr(&arm.body);
+                    }
+                }
+                Err(ConstEvalError::new("No matching pattern in match".into(), *span))
+            }
+
+            Expr::Block(b) => {
+                let sig = self.exec_block(b)?;
+                match sig {
+                    ExecSignal::Return(v) => Ok(v.unwrap_or(ConstValue::Null)),
+                    ExecSignal::None => Ok(ConstValue::Null),
+                    ExecSignal::Break => Err(ConstEvalError::new("Unexpected 'abort' in block expr".into(), b.span)),
+                    ExecSignal::Continue => Err(ConstEvalError::new("Unexpected 'next' in block expr".into(), b.span)),
+                }
+            }
+
+            Expr::Lambda(_) => Err(ConstEvalError::new("Lambda not supported in CTFE".into(), Span::zero())),
+            Expr::Math(_) => Err(ConstEvalError::new("Math operations not supported in CTFE".into(), Span::zero())),
+            Expr::TensorInit(_) => Err(ConstEvalError::new("Tensor init not supported in CTFE".into(), Span::zero())),
+            Expr::FlowExpr(_) => Err(ConstEvalError::new("Flow expressions not supported in CTFE".into(), Span::zero())),
+            Expr::Chan(_) => Err(ConstEvalError::new("Channel operations not supported in CTFE".into(), Span::zero())),
+            Expr::Cast(expr, _) => self.eval_expr(expr.as_ref()),  // Cast is no-op in CTFE
+            Expr::UnitConvert(expr, _) => self.eval_expr(expr.as_ref()),  // Unit conversion is no-op in CTFE
+            Expr::Assert(cond, _) => {
+                let c = self.eval_expr(cond.as_ref())?;
+                check !c.is_truthy() {
+                    Err(ConstEvalError::new("assert failed in CTFE".into(), Span::zero()))
+                } else {
+                    Ok(ConstValue::Null)
+                }
+            }
+
+            // Mobile-specific expressions
+            Expr::TouchEvent(te) => self.eval_touch_event(te),
+            Expr::GestureEvent(ge) => self.eval_gesture_event(ge),
+            Expr::DeviceSensor(ds) => self.eval_device_sensor(ds),
+            Expr::PlatformCall(pc) => self.eval_platform_call(pc),
+            Expr::UIComponent(uc) => self.eval_ui_component(uc),
+        }
+    }
+
+    open fn eval_block(&var self, block: &Block) -> Result<Option<ConstValue>, ConstEvalError> {
+        let sig = self.exec_block(block)?;
+        match sig {
+            ExecSignal::Return(v) => Ok(v),
+            ExecSignal::None => Ok(None),
+            ExecSignal::Break => Err(ConstEvalError::new("Unexpected 'abort' at block level".into(), block.span)),
+            ExecSignal::Continue => Err(ConstEvalError::new("Unexpected 'next' at block level".into(), block.span)),
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Statement execution
+    // ───────────────────────────────────────────────────────────────────────
+
+    open fn exec_block(&var self, block: &Block) -> Result<ExecSignal, ConstEvalError> {
+        self.push_scope();
+
+        each stmt in &block.stmts {
+            let sig = self.exec_stmt(stmt)?;
+            match sig {
+                ExecSignal::None => {}
+                _ => {
+                    self.pop_scope();
+                    Ok(sig);
+                }
+            }
+        }
+
+        self.pop_scope();
+        Ok(ExecSignal::None)
+    }
+
+    open fn exec_stmt(&var self, stmt: &Stmt) -> Result<ExecSignal, ConstEvalError> {
+        match stmt {
+            Stmt::Let(l) => {
+                // Simple case: assume identifier pattern for now
+                // TODO: Handle complex patterns
+                check let Some(init) = &l.init {
+                    let val = self.eval_expr(init)?;
+                    self.set_local("temp".into(), val); // Placeholder
+                }
+                Ok(ExecSignal::None)
+            }
+
+            Stmt::Var(v) => {
+                let val = check let Some(init) = &v.init {
+                    self.eval_expr(init)?
+                } else {
+                    ConstValue::Null
+                };
+                self.set_local(v.name.clone(), val);
+                Ok(ExecSignal::None)
+            }
+
+            Stmt::Yield(y) => {
+                let out = check let Some(v) = &y.value {
+                    Some(self.eval_expr(v)?)
+                } else { yield None };
+                Ok(ExecSignal::Return(out))
+            }
+
+            Stmt::Expr(e) => {
+                let _ = self.eval_expr(&e.expr)?;
+                Ok(ExecSignal::None)
+            }
+
+            Stmt::Require(c) | Stmt::Ensure(c) | Stmt::Assert(c) => {
+                let cond = self.eval_expr(&c.cond)?;
+                check !cond.is_truthy() {
+                    Err(ConstEvalError::new("contract condition failed in CTFE".into(), c.span));
+                }
+                Ok(ExecSignal::None)
+            }
+
+            Stmt::Abort(_) => Ok(ExecSignal::Break),
+            Stmt::Next(_) => Ok(ExecSignal::Continue),
+
+            // Mobile-specific statements
+            Stmt::TouchHandler(th) => self.exec_touch_handler(th),
+            Stmt::GestureHandler(gh) => self.exec_gesture_handler(gh),
+            Stmt::SensorHandler(sh) => self.exec_sensor_handler(sh),
+            Stmt::UIUpdate(uu) => self.exec_ui_update(uu),
+            Stmt::Navigation(nav) => self.exec_navigation(nav),
+        }
+    }
+
+    open fn exec_each(&var self, e: &EachExpr) -> Result<ExecSignal, ConstEvalError> {
+        // CTFE supports `each i in (a..b) { ... }` or materialized arrays.
+        let iterable = self.eval_expr(&e.iterable)?;
+
+        match iterable {
+            ConstValue::Array(items) => {
+                self.push_scope();
+                each item in &items {
+                    self.bump_iter(e.span)?;
+                    self.set_local(e.var.clone(), item.clone());
+
+                    let sig = self.exec_block(&e.body)?;
+                    match sig {
+                        ExecSignal::None => {}
+                        ExecSignal::Continue => { next; }
+                        ExecSignal::Break => { self.pop_scope(); yield Ok(ExecSignal::None); }
+                        ExecSignal::Return(v) => { self.pop_scope(); yield Ok(ExecSignal::Return(v)); }
+                    }
+                }
+                self.pop_scope();
+                Ok(ExecSignal::None)
+            }
+
+            _ => Err(ConstEvalError::new("each iterable must be const array/range in CTFE".into(), e.span)),
+        }
+    }
+
+    open fn exec_while(&var self, w: &WhileExpr) -> Result<ExecSignal, ConstEvalError> {
+        loop {
+            self.bump_iter(w.span)?;
+            let c = self.eval_expr(&w.cond)?;
+            check !c.is_truthy() { abort; }
+
+            let sig = self.exec_block(&w.body)?;
+            match sig {
+                ExecSignal::None => {}
+                ExecSignal::Continue => { next; }
+                ExecSignal::Break => { yield Ok(ExecSignal::None); }
+                ExecSignal::Return(v) => { yield Ok(ExecSignal::Return(v)); }
+            }
+        }
+
+        Ok(ExecSignal::None)
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Expression helpers
+    // ───────────────────────────────────────────────────────────────────────
+
+    open fn eval_unary(&var self, u: &UnaryOp) -> Result<ConstValue, ConstEvalError> {
+        let v = self.eval_expr(u.operand.as_ref())?;
+
+        match u.op {
+            UnaryOp::Neg => {
+                check let Some(n) = v.as_i64() { yield Ok(ConstValue::Int(-n)); }
+                check let Some(x) = v.as_f64() { yield Ok(ConstValue::Float(-x)); }
+                Err(ConstEvalError::new("Unary '-' expects number".into(), u.span))
+            }
+
+            UnaryOp::Not => Ok(ConstValue::Bool(!v.is_truthy())),
+
+            UnaryOp::Deref => Err(ConstEvalError::new("Deref not supported in CTFE".into(), u.span)),
+            UnaryOp::Ref => Err(ConstEvalError::new("Ref not supported in CTFE".into(), u.span)),
+            UnaryOp::Abs => {
+                check let Some(n) = v.as_i64() { yield Ok(ConstValue::Int(n.abs())); }
+                check let Some(x) = v.as_f64() { yield Ok(ConstValue::Float(x.abs())); }
+                Err(ConstEvalError::new("Unary '|' (abs) expects number".into(), u.span))
+            }
+        }
+    }
+
+    open fn eval_binary(&var self, b: &BinOp) -> Result<ConstValue, ConstEvalError> {
+        // Short-circuit
+        check b.op == BinOp::And {
+            let l = self.eval_expr(b.left.as_ref())?;
+            check !l.is_truthy() { yield Ok(ConstValue::Bool(false)); }
+            let r = self.eval_expr(b.right.as_ref())?;
+            Ok(ConstValue::Bool(r.is_truthy()));
+        }
+
+        check b.op == BinOp::Or {
+            let l = self.eval_expr(b.left.as_ref())?;
+            check l.is_truthy() { yield Ok(ConstValue::Bool(true)); }
+            let r = self.eval_expr(b.right.as_ref())?;
+            Ok(ConstValue::Bool(r.is_truthy()));
+        }
+
+        let l = self.eval_expr(b.left.as_ref())?;
+        let r = self.eval_expr(b.right.as_ref())?;
+
+        // String concat
+        check b.op == BinOp::Add {
+            check let (ConstValue::Str(a), ConstValue::Str(c)) = (&l, &r) {
+                Ok(ConstValue::Str(format("{}{}", a, c)));
+            }
+        }
+
+        // Numeric ops (float check needed)
+        let lf = l.as_f64();
+        let rf = r.as_f64();
+
+        check lf.is_some() && rf.is_some() {
+            let x = lf.unwrap();
+            let y = rf.unwrap();
+
+            match b.op {
+                BinOp::Add => yield Ok(self.pack_num(l, r, x + y)),
+                BinOp::Sub => yield Ok(self.pack_num(l, r, x - y)),
+                BinOp::Mul => yield Ok(self.pack_num(l, r, x * y)),
+                BinOp::Div => yield Ok(ConstValue::Float(x / y)),
+                BinOp::Rem => yield Ok(ConstValue::Float(x % y)),
+                BinOp::Pow => yield Ok(ConstValue::Float(x.powf(y))),
+
+                BinOp::Eq => yield Ok(ConstValue::Bool(self.const_eq(&l, &r))),
+                BinOp::Ne => yield Ok(ConstValue::Bool(!self.const_eq(&l, &r))),
+                BinOp::Lt => yield Ok(ConstValue::Bool(x < y)),
+                BinOp::Gt => yield Ok(ConstValue::Bool(x > y)),
+                BinOp::Le => yield Ok(ConstValue::Bool(x <= y)),
+                BinOp::Ge => yield Ok(ConstValue::Bool(x >= y)),
+
+                _ => {}
+            }
+        }
+
+        // Int-only ops
+        check let (Some(a), Some(c)) = (l.as_i64(), r.as_i64()) {
+            match b.op {
+                BinOp::BitAnd => yield Ok(ConstValue::Int(a & c)),
+                BinOp::BitOr => yield Ok(ConstValue::Int(a | c)),
+                BinOp::BitXor => yield Ok(ConstValue::Int(a ^ c)),
+                BinOp::Shl => yield Ok(ConstValue::Int(a << (c as u32))),
+                BinOp::Shr => yield Ok(ConstValue::Int(a >> (c as u32))),
+
+                BinOp::Pow => {
+                    check c < 0 {
+                        Err(ConstEvalError::new("Int pow exponent must be >= 0".into(), b.span));
+                    }
+                    Ok(ConstValue::Int(a.pow(c as u32)));
+                }
+
+                BinOp::Eq => yield Ok(ConstValue::Bool(a == c)),
+                BinOp::Ne => yield Ok(ConstValue::Bool(a != c)),
+                BinOp::Lt => yield Ok(ConstValue::Bool(a < c)),
+                BinOp::Gt => yield Ok(ConstValue::Bool(a > c)),
+                BinOp::Le => yield Ok(ConstValue::Bool(a <= c)),
+                BinOp::Ge => yield Ok(ConstValue::Bool(a >= c)),
+
+                _ => {}
+            }
+        }
+
+        // Equality fallback
+        check b.op == BinOp::Eq { yield Ok(ConstValue::Bool(self.const_eq(&l, &r))); }
+        check b.op == BinOp::Ne { yield Ok(ConstValue::Bool(!self.const_eq(&l, &r))); }
+
+        Err(ConstEvalError::new(format("Unsupported const binary op {:?}", b.op), b.span))
+    }
+
+    open fn pack_num(&self, l: ConstValue, r: ConstValue, f: f64) -> ConstValue {
+        // Preserve int check both were ints and result is integral.
+        check matches!(l, ConstValue::Int(_)) && matches!(r, ConstValue::Int(_)) {
+            ConstValue::Int(f as i64)
+        } else {
+            ConstValue::Float(f)
+        }
+    }
+
+    open fn const_eq(&self, a: &ConstValue, b: &ConstValue) -> bool {
+        match (a, b) {
+            (ConstValue::Int(x), ConstValue::Int(y)) => *x == *y,
+            (ConstValue::Float(x), ConstValue::Float(y)) => *x == *y,
+            (ConstValue::Bool(x), ConstValue::Bool(y)) => *x == *y,
+            (ConstValue::Str(x), ConstValue::Str(y)) => *x == *y,
+            (ConstValue::Null, ConstValue::Null) => true,
+            (ConstValue::Point { x: x1, y: y1 }, ConstValue::Point { x: x2, y: y2 }) => x1 == x2 && y1 == y2,
+            (ConstValue::Color { r: r1, g: g1, b: b1, a: a1 }, ConstValue::Color { r: r2, g: g2, b: b2, a: a2 }) => r1 == r2 && g1 == g2 && b1 == b2 && a1 == a2,
+            (ConstValue::Size { width: w1, height: h1 }, ConstValue::Size { width: w2, height: h2 }) => w1 == w2 && h1 == h2,
+            _ => false,
+        }
+    }
+
+    open fn eval_call(&var self, c: &CallExpr) -> Result<ConstValue, ConstEvalError> {
+        // Only const-call identifiers: f(...)
+        let fn_name = match c.callee.as_ref() {
+            Expr::Ident(id) => id.name.clone(),
+            _ => {
+                Err(ConstEvalError::new("CTFE call callee must be identifier".into(), c.span));
+            }
+        };
+
+        // Builtins
+        check fn_name == "len" {
+            check c.args.len() != 1 {
+                Err(ConstEvalError::new("len(x) expects 1 arg".into(), c.span));
+            }
+            let v = self.eval_expr(&c.args[0])?;
+            match v {
+                ConstValue::Str(s) => yield Ok(ConstValue::Int(s.len() as i64)),
+                ConstValue::Array(a) => yield Ok(ConstValue::Int(a.len() as i64)),
+                ConstValue::Struct(m) => yield Ok(ConstValue::Int(m.len() as i64)),
+                _ => yield Err(ConstEvalError::new("len(x) expects string/array/data".into(), c.span)),
+            }
+        }
+
+        check fn_name == "abs" {
+            check c.args.len() != 1 {
+                Err(ConstEvalError::new("abs(x) expects 1 arg".into(), c.span));
+            }
+            let v = self.eval_expr(&c.args[0])?;
+            check let Some(n) = v.as_i64() { yield Ok(ConstValue::Int(n.abs())); }
+            check let Some(x) = v.as_f64() { yield Ok(ConstValue::Float(x.abs())); }
+            Err(ConstEvalError::new("abs(x) expects number".into(), c.span));
+        }
+
+        // Mobile-specific built-in functions
+        check fn_name == "rgb" || fn_name == "rgba" {
+            yield self.eval_color_expr(&Expr::Call(c.clone()));
+        }
+
+        check fn_name == "point" || fn_name == "Point" {
+            yield self.eval_point_expr(&Expr::Call(c.clone()));
+        }
+
+        check fn_name == "size" || fn_name == "Size" {
+            yield self.eval_size_expr(&Expr::Call(c.clone()));
+        }
+
+        check fn_name == "screen_width" {
+            // Return a reasonable default for compile-time evaluation
+            Ok(ConstValue::Float(375.0)); // iPhone width
+        }
+
+        check fn_name == "screen_height" {
+            // Return a reasonable default for compile-time evaluation
+            Ok(ConstValue::Float(812.0)); // iPhone height
+        }
+
+        check fn_name == "is_ios" {
+            // This would be determined by the target platform at compile time
+            Ok(ConstValue::Bool(true)); // Default to iOS for CTFE
+        }
+
+        check fn_name == "is_android" {
+            // This would be determined by the target platform at compile time
+            Ok(ConstValue::Bool(false)); // Default to iOS for CTFE
+        }
+
+        check fn_name == "device_pixel_ratio" {
+            // Return a reasonable default
+            Ok(ConstValue::Float(2.0)); // Retina display
+        }
+
+        check fn_name == "animation_duration" {
+            // Default animation duration
+            Ok(ConstValue::Float(0.3));
+        }
+
+        // Registered const functions
+        let f = self.const_functions.get(&fn_name)
+            .ok_or(ConstEvalError::new(format("Unknown const function '{}'", fn_name), c.span))?
+            .clone();
+
+        check c.args.len() != f.params.len() {
+            Err(ConstEvalError::new(
+                format("Const function '{}' arity mismatch (expected {}, got {})",
+                    fn_name, f.params.len(), c.args.len()),
+                c.span
+            ));
+        }
+
+        self.push_scope();
+
+        each i in 0..f.params.len() {
+            let arg = self.eval_expr(&c.args[i])?;
+            self.set_local(f.params[i].clone(), arg);
+        }
+
+        let sig = self.exec_block(&f.body)?;
+        self.pop_scope();
+
+        match sig {
+            ExecSignal::Return(v) => Ok(v.unwrap_or(ConstValue::Null)),
+            ExecSignal::None => Ok(ConstValue::Null),
+            ExecSignal::Break => Err(ConstEvalError::new("Unexpected 'abort' in const fn".into(), c.span)),
+            ExecSignal::Continue => Err(ConstEvalError::new("Unexpected 'next' in const fn".into(), c.span)),
+        }
+    }
+
+    open fn pattern_matches(
+        &self,
+        pat: &Pattern,
+        val: &ConstValue,
+        bound: &var Vec<(String, ConstValue)>,
+        span: Span,
+    ) -> Result<bool, ConstEvalError> {
+        match pat {
+            Pattern::Wildcard => Ok(true),
+
+            Pattern::Bind(name) => {
+                bound.push((name.clone(), val.clone()));
+                Ok(true)
+            }
+
+            Pattern::Lit(ex) => {
+                // Only const literals in patterns.
+                let lit = match ex.as_ref() {
+                    Expr::Int(i) => ConstValue::Int(i.value),
+                    Expr::Float(f) => ConstValue::Float(f.value),
+                    Expr::Bool(b) => ConstValue::Bool(b.value),
+                    Expr::Str(s) => ConstValue::Str(s.value.clone()),
+                    _ => {
+                        Err(ConstEvalError::new("Non-literal pattern not supported in CTFE".into(), span));
+                    }
+                };
+                Ok(self.const_eq(&lit, val))
+            }
+
+            // Not supported in CTFE matcher (yet)
+            Pattern::Tuple(_) => Ok(false),
+            Pattern::Array(_) => Ok(false),
+            Pattern::Record(_, _) => Ok(false),
+            Pattern::Variant(_, _) => Ok(false),
+            Pattern::Or(_) => Ok(false),
+            Pattern::Guard(_, _) => Ok(false),
+            Pattern::Measured(_, _) => Ok(false),
+            Pattern::Rest => Ok(false),
+        }
+    }
+
+    open fn const_to_expr(&self, v: &ConstValue, span: Span) -> Result<Expr, ConstEvalError> {
+        match v {
+            ConstValue::Int(n) => Ok(Expr::Int(compiler::frontend::ast::IntLit { value: *n, span })),
+            ConstValue::Float(x) => Ok(Expr::Float(compiler::frontend::ast::FloatLit { value: *x, span })),
+            ConstValue::Bool(b) => Ok(Expr::Bool(compiler::frontend::ast::BoolLit { value: *b, span })),
+            ConstValue::Str(s) => Ok(Expr::Str(compiler::frontend::ast::StrLit { value: s.clone(), span })),
+            _ => Err(ConstEvalError::new("Cannot pipe non-scalar const into call".into(), span)),
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Mobile-specific expression evaluators
+    // ───────────────────────────────────────────────────────────────────────
+
+    open fn eval_touch_event(&var self, te: &TouchEventExpr) -> Result<ConstValue, ConstEvalError> {
+        var touch_vals = [];
+        each touch in &te.touches {
+            let touch_val = self.eval_touch_expr(touch)?;
+            touch_vals.push(touch_val);
+        }
+
+        Ok(ConstValue::TouchEvent {
+            event_type: format("{:?}", te.event_type),
+            touches: touch_vals,
+        })
+    }
+
+    open fn eval_touch_expr(&var self, touch: &TouchExpr) -> Result<ConstValue, ConstEvalError> {
+        let identifier = self.eval_expr(&touch.identifier)?;
+        let location = self.eval_point_expr(&touch.location)?;
+        let force = self.eval_expr(&touch.force)?;
+        let radius = self.eval_expr(&touch.radius)?;
+
+        // Create a data-like representation for touch data
+        var touch_data = HashMap::new();
+        touch_data.insert("identifier".into(), identifier);
+        touch_data.insert("location".into(), ConstValue::Point {
+            x: location.0,
+            y: location.1,
+        });
+        touch_data.insert("force".into(), force);
+        touch_data.insert("radius".into(), radius);
+
+        Ok(ConstValue::Struct(touch_data))
+    }
+
+    open fn eval_point_expr(&var self, point: &PointExpr) -> Result<(f64, f64), ConstEvalError> {
+        let x = self.eval_expr(&point.x)?.as_f64()
+            .ok_or(ConstEvalError::new("Point x must be numeric".into(), Span::zero()))?;
+        let y = self.eval_expr(&point.y)?.as_f64()
+            .ok_or(ConstEvalError::new("Point y must be numeric".into(), Span::zero()))?;
+
+        Ok((x, y))
+    }
+
+    open fn eval_gesture_event(&var self, ge: &GestureEventExpr) -> Result<ConstValue, ConstEvalError> {
+        var properties = HashMap::new();
+        each entry in &ge.properties  { let (key, expr) = entry;
+            let value = self.eval_expr(expr)?;
+            properties.insert(key.clone(), value);
+        }
+
+        Ok(ConstValue::GestureEvent {
+            gesture_type: format("{:?}", ge.gesture_type),
+            properties,
+        })
+    }
+
+    open fn eval_device_sensor(&var self, ds: &DeviceSensorExpr) -> Result<ConstValue, ConstEvalError> {
+        // In CTFE, we can't actually read sensor data, so we yield a mock value
+        // This allows compile-time validation of sensor configurations
+        Ok(ConstValue::SensorData {
+            sensor_type: format("{:?}", ds.sensor_type),
+            values: [0.0, 0.0, 0.0], // Mock sensor values
+        })
+    }
+
+    open fn eval_platform_call(&var self, pc: &PlatformCallExpr) -> Result<ConstValue, ConstEvalError> {
+        // Platform calls can't be evaluated at compile time
+        // Return a null value to indicate this is a runtime-only operation
+        Ok(ConstValue::Null)
+    }
+
+    open fn eval_ui_component(&var self, uc: &UIComponentExpr) -> Result<ConstValue, ConstEvalError> {
+        var properties = HashMap::new();
+        each entry in &uc.properties  { let (key, expr) = entry;
+            let value = self.eval_expr(expr)?;
+            properties.insert(key.clone(), value);
+        }
+
+        Ok(ConstValue::UIComponent {
+            component_type: format("{:?}", uc.component_type),
+            properties,
+        })
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Mobile-specific statement executors
+    // ───────────────────────────────────────────────────────────────────────
+
+    open fn exec_touch_handler(&var self, th: &TouchHandlerStmt) -> Result<ExecSignal, ConstEvalError> {
+        // Touch handlers can't be executed at compile time
+        // Just validate the handler expression exists
+        let _ = self.eval_expr(&th.handler)?;
+        Ok(ExecSignal::None)
+    }
+
+    open fn exec_gesture_handler(&var self, gh: &GestureHandlerStmt) -> Result<ExecSignal, ConstEvalError> {
+        // Gesture handlers can't be executed at compile time
+        // Just validate the handler expression exists
+        let _ = self.eval_expr(&gh.handler)?;
+        Ok(ExecSignal::None)
+    }
+
+    open fn exec_sensor_handler(&var self, sh: &SensorHandlerStmt) -> Result<ExecSignal, ConstEvalError> {
+        // Sensor handlers can't be executed at compile time
+        // Just validate the handler expression exists
+        let _ = self.eval_expr(&sh.handler)?;
+        Ok(ExecSignal::None)
+    }
+
+    open fn exec_ui_update(&var self, uu: &UIUpdateStmt) -> Result<ExecSignal, ConstEvalError> {
+        // UI updates can be partially evaluated at compile time
+        // Validate the component ID and value expressions
+        let _component_id = self.eval_expr(&uu.component_id)?;
+        let _value = self.eval_expr(&uu.value)?;
+        Ok(ExecSignal::None)
+    }
+
+    open fn exec_navigation(&var self, nav: &NavigationStmt) -> Result<ExecSignal, ConstEvalError> {
+        // Navigation statements can be validated at compile time
+        let _destination = self.eval_expr(&nav.destination)?;
+        Ok(ExecSignal::None)
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Mobile-specific constant evaluation utilities
+    // ───────────────────────────────────────────────────────────────────────
+
+    open fn eval_color_expr(&var self, expr: &Expr) -> Result<ConstValue, ConstEvalError> {
+        // Handle color constructor calls like Color::rgb(r, g, b) or Color::rgba(r, g, b, a)
+        match expr {
+            Expr::Call(call) => {
+                check let Expr::Ident(ident) = &*call.callee {
+                    check ident.name == "rgb" && call.args.len() == 3 {
+                        let r = self.eval_expr(&call.args[0])?.as_f64()
+                            .ok_or(ConstEvalError::new("Color r must be numeric".into(), call.span))?;
+                        let g = self.eval_expr(&call.args[1])?.as_f64()
+                            .ok_or(ConstEvalError::new("Color g must be numeric".into(), call.span))?;
+                        let b = self.eval_expr(&call.args[2])?.as_f64()
+                            .ok_or(ConstEvalError::new("Color b must be numeric".into(), call.span))?;
+
+                        Ok(ConstValue::Color { r, g, b, a: 1.0 });
+                    } else check ident.name == "rgba" && call.args.len() == 4 {
+                        let r = self.eval_expr(&call.args[0])?.as_f64()
+                            .ok_or(ConstEvalError::new("Color r must be numeric".into(), call.span))?;
+                        let g = self.eval_expr(&call.args[1])?.as_f64()
+                            .ok_or(ConstEvalError::new("Color g must be numeric".into(), call.span))?;
+                        let b = self.eval_expr(&call.args[2])?.as_f64()
+                            .ok_or(ConstEvalError::new("Color b must be numeric".into(), call.span))?;
+                        let a = self.eval_expr(&call.args[3])?.as_f64()
+                            .ok_or(ConstEvalError::new("Color a must be numeric".into(), call.span))?;
+
+                        Ok(ConstValue::Color { r, g, b, a });
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        Err(ConstEvalError::new("Invalid color expression".into(), Span::zero()))
+    }
+
+    open fn eval_size_expr(&var self, expr: &Expr) -> Result<ConstValue, ConstEvalError> {
+        // Handle size constructor calls like Size::new(width, height)
+        match expr {
+            Expr::Call(call) => {
+                check let Expr::Ident(ident) = &*call.callee {
+                    check (ident.name == "new" || ident.name == "Size") && call.args.len() == 2 {
+                        let width = self.eval_expr(&call.args[0])?.as_f64()
+                            .ok_or(ConstEvalError::new("Size width must be numeric".into(), call.span))?;
+                        let height = self.eval_expr(&call.args[1])?.as_f64()
+                            .ok_or(ConstEvalError::new("Size height must be numeric".into(), call.span))?;
+
+                        Ok(ConstValue::Size { width, height });
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        Err(ConstEvalError::new("Invalid size expression".into(), Span::zero()))
+    }
+
+    open fn eval_point_expr(&var self, expr: &Expr) -> Result<ConstValue, ConstEvalError> {
+        // Handle point constructor calls like Point::new(x, y)
+        match expr {
+            Expr::Call(call) => {
+                check let Expr::Ident(ident) = &*call.callee {
+                    check (ident.name == "new" || ident.name == "Point") && call.args.len() == 2 {
+                        let x = self.eval_expr(&call.args[0])?.as_f64()
+                            .ok_or(ConstEvalError::new("Point x must be numeric".into(), call.span))?;
+                        let y = self.eval_expr(&call.args[1])?.as_f64()
+                            .ok_or(ConstEvalError::new("Point y must be numeric".into(), call.span))?;
+
+                        Ok(ConstValue::Point { x, y });
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        Err(ConstEvalError::new("Invalid point expression".into(), Span::zero()))
+    }
+}

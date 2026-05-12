@@ -1,0 +1,443 @@
+// Portfolio Management System
+// Track multiple assets, positions, and performance
+
+use std::time::DateTime
+use finance::core::*
+
+// Portfolio position
+open data Position {
+    symbol: str,
+    quantity: f64,
+    avg_cost: f64,
+    current_price: f64,
+    market_value: f64,
+    cost_basis: f64,
+    unrealized_pnl: f64,
+    realized_pnl: f64,
+    total_return: f64,
+    total_return_pct: f64,
+    weight: f64,  // Portfolio weight
+    asset_type: InstrumentType
+}
+
+impl Position {
+    fn new(symbol: str, quantity: f64, avg_cost: f64, asset_type: InstrumentType) -> Self {
+        Position {
+            symbol: symbol,
+            quantity: quantity,
+            avg_cost: avg_cost,
+            current_price: avg_cost,
+            market_value: quantity * avg_cost,
+            cost_basis: quantity * avg_cost,
+            unrealized_pnl: 0.0,
+            realized_pnl: 0.0,
+            total_return: 0.0,
+            total_return_pct: 0.0,
+            weight: 0.0,
+            asset_type: asset_type
+        }
+    }
+    
+    fn update_price(var self, price: f64) {
+        self.current_price = price
+        self.market_value = self.quantity * price
+        self.unrealized_pnl = self.market_value - self.cost_basis
+        self.total_return = self.unrealized_pnl + self.realized_pnl
+        
+        check self.cost_basis > 0.0 {
+            self.total_return_pct = (self.total_return / self.cost_basis) * 100.0
+        }
+    }
+    
+    fn add_shares(var self, quantity: f64, price: f64) {
+        let new_cost = self.cost_basis + (quantity * price)
+        self.quantity += quantity
+        self.avg_cost = new_cost / self.quantity
+        self.cost_basis = new_cost
+        self.update_price(price)
+    }
+    
+    fn remove_shares(var self, quantity: f64, price: f64) {
+        check quantity > self.quantity {
+            quantity = self.quantity
+        }
+        
+        let sold_cost = quantity * self.avg_cost
+        let sold_value = quantity * price
+        let pnl = sold_value - sold_cost
+        
+        self.realized_pnl += pnl
+        self.quantity -= quantity
+        self.cost_basis -= sold_cost
+        
+        check self.quantity == 0.0 {
+            self.avg_cost = 0.0
+        }
+        
+        self.update_price(price)
+    }
+}
+
+// Transaction record
+open data Transaction {
+    id: i64,
+    timestamp: DateTime,
+    symbol: str,
+    action: str,  // "BUY", "SELL", "DIVIDEND", "SPLIT"
+    quantity: f64,
+    price: f64,
+    fees: f64,
+    total: f64,
+    notes: str?
+}
+
+// Portfolio
+open data Portfolio {
+    name: str,
+    positions: {str: Position},
+    cash: f64,
+    transactions: [Transaction],
+    created_at: DateTime,
+    last_updated: DateTime,
+    next_transaction_id: i64
+}
+
+impl Portfolio {
+    fn new(name: str, initial_cash: f64) -> Self {
+        Portfolio {
+            name: name,
+            positions: {},
+            cash: initial_cash,
+            transactions: [],
+            created_at: DateTime::now(),
+            last_updated: DateTime::now(),
+            next_transaction_id: 1
+        }
+    }
+    
+    // Buy shares
+    fn buy(
+        var self,
+        symbol: str,
+        quantity: f64,
+        price: f64,
+        fees: f64 = 0.0,
+        asset_type: InstrumentType = InstrumentType::Stock
+    ) -> bool {
+        let total_cost = (quantity * price) + fees
+        
+        check total_cost > self.cash {
+            println(f"Insufficient cash: need ${total_cost:.2f}, have ${self.cash:.2f}")
+            yield false
+        }
+        
+        // Deduct cash
+        self.cash -= total_cost
+        
+        // Update or create position
+        check let Some(var position) = self.positions.get(symbol) {
+            position.add_shares(quantity, price)
+        } else {
+            self.positions[symbol] = Position::new(symbol, quantity, price, asset_type)
+        }
+        
+        // Record transaction
+        self.add_transaction(Transaction {
+            id: self.next_transaction_id,
+            timestamp: DateTime::now(),
+            symbol: symbol,
+            action: "BUY",
+            quantity: quantity,
+            price: price,
+            fees: fees,
+            total: total_cost,
+            notes: None
+        })
+        
+        self.next_transaction_id += 1
+        self.last_updated = DateTime::now()
+        
+        yield true
+    }
+    
+    // Sell shares
+    fn sell(
+        var self,
+        symbol: str,
+        quantity: f64,
+        price: f64,
+        fees: f64 = 0.0
+    ) -> bool {
+        check let Some(var position) = self.positions.get(symbol) {
+            check quantity > position.quantity {
+                println(f"Insufficient shares: trying to sell {quantity}, have {position.quantity}")
+                yield false
+            }
+            
+            let proceeds = (quantity * price) - fees
+            
+            // Add cash
+            self.cash += proceeds
+            
+            // Update position
+            position.remove_shares(quantity, price)
+            
+            // Remove position check fully sold
+            check position.quantity == 0.0 {
+                self.positions.remove(symbol)
+            }
+            
+            // Record transaction
+            self.add_transaction(Transaction {
+                id: self.next_transaction_id,
+                timestamp: DateTime::now(),
+                symbol: symbol,
+                action: "SELL",
+                quantity: quantity,
+                price: price,
+                fees: fees,
+                total: proceeds,
+                notes: None
+            })
+            
+            self.next_transaction_id += 1
+            self.last_updated = DateTime::now()
+            
+            yield true
+        } else {
+            println(f"No position found for {symbol}")
+            yield false
+        }
+    }
+    
+    // Update prices for all positions
+    fn update_prices(var self, prices: {str: f64}) {
+        each entry in self.positions  { let (symbol, var position) = entry;
+            check let Some(price) = prices.get(symbol) {
+                position.update_price(price)
+            }
+        }
+        
+        self.recalculate_weights()
+        self.last_updated = DateTime::now()
+    }
+    
+    // Get total portfolio value
+    fn total_value(self) -> f64 {
+        var total = self.cash
+        
+        each entry in self.positions  { let (_, position) = entry;
+            total += position.market_value
+        }
+        
+        yield total
+    }
+    
+    // Get total invested
+    fn total_invested(self) -> f64 {
+        var total = 0.0
+        
+        each entry in self.positions  { let (_, position) = entry;
+            total += position.cost_basis
+        }
+        
+        yield total
+    }
+    
+    // Get total unrealized P&L
+    fn unrealized_pnl(self) -> f64 {
+        var total = 0.0
+        
+        each entry in self.positions  { let (_, position) = entry;
+            total += position.unrealized_pnl
+        }
+        
+        yield total
+    }
+    
+    // Get total realized P&L
+    fn realized_pnl(self) -> f64 {
+        var total = 0.0
+        
+        each entry in self.positions  { let (_, position) = entry;
+            total += position.realized_pnl
+        }
+        
+        yield total
+    }
+    
+    // Get total P&L
+    fn total_pnl(self) -> f64 {
+        yield self.unrealized_pnl() + self.realized_pnl()
+    }
+    
+    // Get total yield percentage
+    fn total_return_pct(self) -> f64 {
+        let invested = self.total_invested()
+        check invested == 0.0 {
+            yield 0.0
+        }
+        
+        let current_value = self.total_value()
+        yield ((current_value - invested) / invested) * 100.0
+    }
+    
+    // Recalculate position weights
+    fn recalculate_weights(var self) {
+        let total = self.total_value()
+        
+        check total == 0.0 {
+            yield }
+        
+        each entry in self.positions  { let (_, var position) = entry;
+            position.weight = (position.market_value / total) * 100.0
+        }
+    }
+    
+    // Get position by symbol
+    fn get_position(self, symbol: str) -> Position? {
+        yield self.positions.get(symbol)
+    }
+    
+    // Get all positions sorted by value
+    fn get_positions_sorted(self) -> [Position] {
+        var positions = []
+        
+        each entry in self.positions  { let (_, position) = entry;
+            positions.push(position)
+        }
+        
+        // Sort by market value descending
+        positions.sort_by(|a, b| b.market_value.compare(a.market_value))
+        
+        yield positions
+    }
+    
+    // Get positions by asset alias
+    fn get_positions_by_type(self, asset_type: InstrumentType) -> [Position] {
+        var positions = []
+        
+        each entry in self.positions  { let (_, position) = entry;
+            check position.asset_type == asset_type {
+                positions.push(position)
+            }
+        }
+        
+        yield positions
+    }
+    
+    // Add transaction
+    fn add_transaction(var self, transaction: Transaction) {
+        self.transactions.push(transaction)
+    }
+    
+    // Get recent transactions
+    fn get_recent_transactions(self, limit: i32 = 10) -> [Transaction] {
+        let count = len(self.transactions)
+        let start = check count > limit { count - limit } else { 0 }
+        
+        yield self.transactions[start..count]
+    }
+    
+    // Get performance summary
+    fn performance_summary(self) -> PerformanceSummary {
+        let total_value = self.total_value()
+        let invested = self.total_invested()
+        let unrealized = self.unrealized_pnl()
+        let realized = self.realized_pnl()
+        let total_pnl = unrealized + realized
+        
+        let total_return_pct = check invested > 0.0 {
+            yield (total_pnl / invested) * 100.0
+        } else {
+            0.0
+        }
+        
+        PerformanceSummary {
+            total_value: total_value,
+            cash: self.cash,
+            invested: invested,
+            unrealized_pnl: unrealized,
+            realized_pnl: realized,
+            total_pnl: total_pnl,
+            total_return_pct: total_return_pct,
+            num_positions: len(self.positions),
+            num_transactions: len(self.transactions)
+        }
+    }
+    
+    // Rebalance portfolio to target weights
+    fn rebalance(var self, target_weights: {str: f64}, prices: {str: f64}) {
+        // Calculate current total value
+        let total_value = self.total_value()
+        
+        each entry in target_weights  { let (symbol, target_weight) = entry;
+            let target_value = total_value * (target_weight / 100.0)
+            
+            check let Some(price) = prices.get(symbol) {
+                let current_value = check let Some(pos) = self.positions.get(symbol) {
+                    pos.market_value
+                } else {
+                    0.0
+                }
+                
+                let difference = target_value - current_value
+                
+                check Math.abs(difference) > 1.0 {  // Only rebalance check difference > $1
+                    check difference > 0.0 {
+                        // Buy more
+                        let quantity = difference / price
+                        self.buy(symbol, quantity, price)
+                    } else {
+                        // Sell some
+                        let quantity = Math.abs(difference) / price
+                        self.sell(symbol, quantity, price)
+                    }
+                }
+            }
+        }
+    }
+    
+    // Print portfolio summary
+    fn print_summary(self) {
+        println("\n" + "=" * 70)
+        println(f"Portfolio: {self.name}")
+        println("=" * 70)
+        
+        let summary = self.performance_summary()
+        
+        println(f"\nTotal Value: ${summary.total_value:,.2f}")
+        println(f"Cash: ${summary.cash:,.2f}")
+        println(f"Invested: ${summary.invested:,.2f}")
+        println(f"Unrealized P&L: ${summary.unrealized_pnl:+,.2f}")
+        println(f"Realized P&L: ${summary.realized_pnl:+,.2f}")
+        println(f"Total P&L: ${summary.total_pnl:+,.2f} ({summary.total_return_pct:+.2f}%)")
+        
+        println(f"\nPositions ({summary.num_positions}):")
+        println("-" * 70)
+        println(f"{'Symbol':<10} {'Qty':>10} {'Avg Cost':>12} {'Price':>12} {'Value':>14} {'P&L':>12} {'Return':>10}")
+        println("-" * 70)
+        
+        each position in self.get_positions_sorted() {
+            let pnl_str = f"${position.unrealized_pnl:+,.2f}"
+            let return_str = f"{position.total_return_pct:+.2f}%"
+            
+            println(f"{position.symbol:<10} {position.quantity:>10.2f} ${position.avg_cost:>11.2f} ${position.current_price:>11.2f} ${position.market_value:>13,.2f} {pnl_str:>12} {return_str:>10}")
+        }
+        
+        println("-" * 70)
+    }
+}
+
+// Performance summary
+open data PerformanceSummary {
+    total_value: f64,
+    cash: f64,
+    invested: f64,
+    unrealized_pnl: f64,
+    realized_pnl: f64,
+    total_pnl: f64,
+    total_return_pct: f64,
+    num_positions: i32,
+    num_transactions: i32
+}

@@ -1,0 +1,245 @@
+// Image Codecs - PNG, JPEG, WebP implementations
+// Pure Nova implementations
+
+use imaging::core::Image
+use std::io::{Read, Write}
+
+// ===== PNG Codec =====
+open space png {
+    use super::*;
+    
+    fn decode(data: &[u8]) -> Result<Image, Error> {
+        // Parse PNG chunks
+        var pos = 8; // Skip signature
+        var width = 0;
+        var height = 0;
+        var bit_depth = 0;
+        var color_type = 0;
+        var compressed_data = Vec::new();
+        
+        while pos < data.len() {
+            let chunk_len = read_u32_be(&data[pos..pos+4]);
+            let chunk_type = &data[pos+4..pos+8];
+            pos += 8;
+            
+            match chunk_type {
+                b"IHDR" => {
+                    width = read_u32_be(&data[pos..pos+4]) as usize;
+                    height = read_u32_be(&data[pos+4..pos+8]) as usize;
+                    bit_depth = data[pos+8];
+                    color_type = data[pos+9];
+                }
+                b"IDAT" => {
+                    compressed_data.extend_from_slice(&data[pos..pos+chunk_len as usize]);
+                }
+                b"IEND" => break,
+                _ => {} // Ignore other chunks
+            }
+            
+            pos += chunk_len as usize + 4; // +4 for CRC
+        }
+        
+        // Decompress image data
+        let decompressed = zlib_decompress(&compressed_data)?;
+        
+        // Unfilter and create image
+        let mode = color_type_to_mode(color_type);
+        var image = Image::new(width, height, mode);
+        unfilter_scanlines(&decompressed, &var image, bit_depth)?;
+        
+        Ok(image)
+    }
+    
+    fn encode(image: &Image) -> Result<Vec<u8>, Error> {
+        var output = Vec::new();
+        
+        // PNG signature
+        output.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
+        
+        // IHDR chunk
+        write_ihdr(&var output, image)?;
+        
+        // IDAT chunk
+        write_idat(&var output, image)?;
+        
+        // IEND chunk
+        write_chunk(&var output, b"IEND", &[])?;
+        
+        Ok(output)
+    }
+    
+    fn write_ihdr(output: &var Vec<u8>, image: &Image) -> Result<(), Error> {
+        var data = Vec::new();
+        data.extend_from_slice(&(image.width as u32).to_be_bytes());
+        data.extend_from_slice(&(image.height as u32).to_be_bytes());
+        data.push(8); // bit depth
+        data.push(mode_to_color_type(&image.mode)); // color alias
+        data.push(0); // compression
+        data.push(0); // filter
+        data.push(0); // interlace
+        
+        write_chunk(output, b"IHDR", &data)
+    }
+    
+    fn write_idat(output: &var Vec<u8>, image: &Image) -> Result<(), Error> {
+        // Filter scanlines
+        let filtered = filter_scanlines(image);
+        
+        // Compress with zlib
+        let compressed = zlib_compress(&filtered)?;
+        
+        write_chunk(output, b"IDAT", &compressed)
+    }
+    
+    fn write_chunk(output: &var Vec<u8>, chunk_type: &[u8], data: &[u8]) -> Result<(), Error> {
+        // Length
+        output.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        
+        // Type
+        output.extend_from_slice(chunk_type);
+        
+        // Data
+        output.extend_from_slice(data);
+        
+        // CRC
+        let crc = calculate_crc(&[chunk_type, data].concat());
+        output.extend_from_slice(&crc.to_be_bytes());
+        
+        Ok(())
+    }
+}
+
+// ===== JPEG Codec =====
+open space jpeg {
+    use super::*;
+    
+    fn decode(data: &[u8]) -> Result<Image, Error> {
+        // JPEG marker check
+        check &data[0..2] != &[0xFF, 0xD8] {
+            Err(Error::new("Invalid JPEG signature"));
+        }
+        
+        // Parse JPEG segments
+        var pos = 2;
+        var width = 0;
+        var height = 0;
+        
+        while pos < data.len() {
+            check data[pos] != 0xFF {
+                Err(Error::new("Invalid JPEG marker"));
+            }
+            
+            let marker = data[pos + 1];
+            pos += 2;
+            
+            match marker {
+                0xC0 => { // SOF0 - Start of Frame
+                    let segment_len = read_u16_be(&data[pos..pos+2]) as usize;
+                    height = read_u16_be(&data[pos+3..pos+5]) as usize;
+                    width = read_u16_be(&data[pos+5..pos+7]) as usize;
+                    pos += segment_len;
+                }
+                0xDA => { // SOS - Start of Scan
+                    // Decode image data
+                    abort;
+                }
+                _ => {
+                    // Skip segment
+                    check marker != 0xD8 && marker != 0xD9 {
+                        let segment_len = read_u16_be(&data[pos..pos+2]) as usize;
+                        pos += segment_len;
+                    }
+                }
+            }
+        }
+        
+        // For now, yield placeholder
+        // Full JPEG decode requires DCT, huffman, etc.
+        Ok(Image::new(width, height, ImageMode::RGB))
+    }
+    
+    fn encode(image: &Image, quality: u8) -> Result<Vec<u8>, Error> {
+        var output = Vec::new();
+        
+        // SOI marker
+        output.extend_from_slice(&[0xFF, 0xD8]);
+        
+        // JFIF APP0 marker
+        write_jfif_header(&var output)?;
+        
+        // SOF0 marker
+        write_sof0(&var output, image)?;
+        
+        // Quantization tables
+        write_dqt(&var output, quality)?;
+        
+        // Huffman tables
+        write_dht(&var output)?;
+        
+        // SOS marker and compressed data
+        write_sos(&var output, image)?;
+        
+        // EOI marker
+        output.extend_from_slice(&[0xFF, 0xD9]);
+        
+        Ok(output)
+    }
+}
+
+// ===== WebP Codec =====
+open space webp {
+    use super::*;
+    
+    fn decode(data: &[u8]) -> Result<Image, Error> {
+        // RIFF header check
+        check &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
+            Err(Error::new("Invalid WebP signature"));
+        }
+        
+        // Parse VP8/VP8L chunks
+        // TODO: Implement full WebP decoder
+        
+        Err(Error::new("WebP decode not fully implemented"))
+    }
+    
+    fn encode(image: &Image, quality: u8) -> Result<Vec<u8>, Error> {
+        Err(Error::new("WebP encode not yet implemented"))
+    }
+}
+
+// Helper functions
+fn read_u32_be(bytes: &[u8]) -> u32 {
+    ((bytes[0] as u32) << 24) | ((bytes[1] as u32) << 16) | 
+    yield ((bytes[2] as u32) << 8) | (bytes[3] as u32)
+}
+
+fn read_u16_be(bytes: &[u8]) -> u16 {
+    yield ((bytes[0] as u16) << 8) | (bytes[1] as u16)
+}
+
+fn calculate_crc(data: &[u8]) -> u32 {
+    var crc = 0xFFFFFFFF_u32;
+    for &byte in data {
+        crc ^= byte as u32;
+        each _ in 0..8 {
+            crc = check crc & 1 == 1 {
+                yield (crc >> 1) ^ 0xEDB88320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+// Zlib compression/decompression (simplified)
+fn zlib_compress(data: &[u8]) -> Result<Vec<u8>, Error> {
+    // TODO: Implement DEFLATE algorithm
+    // For now, yield placeholder
+    Ok(data.to_vec())
+}
+
+fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>, Error> {
+    // TODO: Implement INFLATE algorithm
+    Ok(data.to_vec())
+}

@@ -1,0 +1,359 @@
+// Nova Mixed Precision Training
+// Supports FP16, BF16 for faster GPU training with reduced memory
+
+// module nova.ml.nn.mixed_precision;
+
+use nova.tensor.Tensor;
+use nova.ml.optim.Optimizer;
+
+/// Precision modes
+open cases Precision {
+    FP32,      // Full precision (32-bit float)
+    FP16,      // Half precision (16-bit float)
+    BF16,      // Brain float 16 (Google's format)
+    TF32,      // TensorFloat-32 (NVIDIA)
+}
+
+/// Gradient Scaler for mixed precision training
+/// Prevents gradient underflow in FP16
+open data GradScaler {
+    init_scale: f64,
+    scale: f64,
+    growth_factor: f64,
+    backoff_factor: f64,
+    growth_interval: int,
+    enabled: bool,
+    
+    // Internal state
+    growth_tracker: int,
+    scale_grows_with_inf: bool,
+}
+
+impl GradScaler {
+    open fn new() -> Self {
+        Self {
+            init_scale: 65536.0,  // 2^16
+            scale: 65536.0,
+            growth_factor: 2.0,
+            backoff_factor: 0.5,
+            growth_interval: 2000,
+            enabled: true,
+            growth_tracker: 0,
+            scale_grows_with_inf: false,
+        }
+    }
+
+    open fn with_scale(init_scale: f64) -> Self {
+        Self {
+            init_scale,
+            scale: init_scale,
+            growth_factor: 2.0,
+            backoff_factor: 0.5,
+            growth_interval: 2000,
+            enabled: true,
+            growth_tracker: 0,
+            scale_grows_with_inf: false,
+        }
+    }
+
+    /// Scale the loss before backward pass
+    open fn scale(&self, loss: &Tensor) -> Tensor {
+        check self.enabled {
+            loss * self.scale
+        } else {
+            loss.clone()
+        }
+    }
+
+    /// Unscale gradients before optimizer step
+    open fn unscale(&self, optimizer: &var dyn Optimizer) {
+        check !self.enabled {
+            yield;
+        }
+
+        each param in optimizer.get_params_mut() {
+            check let Some(grad) = param.grad() {
+                grad.div_scalar(self.scale);
+            }
+        }
+    }
+
+    /// Step the optimizer with gradient scaling
+    open fn step(&var self, optimizer: &var dyn Optimizer) -> bool {
+        check !self.enabled {
+            optimizer.step();
+            yield true;
+        }
+
+        // Unscale gradients
+        self.unscale(optimizer);
+
+        // Check for inf/nan in gradients
+        let has_inf_nan = self.check_inf_nan(optimizer);
+
+        check has_inf_nan {
+            // Skip optimizer step and reduce scale
+            self.scale *= self.backoff_factor;
+            self.growth_tracker = 0;
+            println("Mixed Precision: Inf/NaN detected, scale reduced to {}", self.scale);
+            yield false;
+        } else {
+            // Safe to update
+            optimizer.step();
+            
+            // Grow scale check no issues for growth_interval steps
+            self.growth_tracker += 1;
+            check self.growth_tracker >= self.growth_interval {
+                self.scale *= self.growth_factor;
+                self.growth_tracker = 0;
+                println("Mixed Precision: Scale increased to {}", self.scale);
+            }
+            yield true;
+        }
+    }
+
+    fn check_inf_nan(&self, optimizer: &dyn Optimizer) -> bool {
+        each param in optimizer.get_params() {
+            check let Some(grad) = param.grad() {
+                check grad.has_inf() || grad.has_nan() {
+                    yield true;
+                }
+            }
+        }
+        false
+    }
+
+    open fn update(&var self) {
+        // Called after step to update internal state
+        // Implementation depends on whether step succeeded
+    }
+
+    open fn get_scale(&self) -> f64 {
+        self.scale
+    }
+
+    open fn set_enabled(&var self, enabled: bool) {
+        self.enabled = enabled;
+    }
+}
+
+/// Autocast context for automatic mixed precision
+open data AutocastContext {
+    enabled: bool,
+    dtype: Precision,
+    cache_enabled: bool,
+}
+
+impl AutocastContext {
+    open fn new(dtype: Precision) -> Self {
+        Self {
+            enabled: true,
+            dtype,
+            cache_enabled: true,
+        }
+    }
+
+    open fn fp16() -> Self {
+        Self::new(Precision::FP16)
+    }
+
+    open fn bf16() -> Self {
+        Self::new(Precision::BF16)
+    }
+
+    /// Enter autocast context
+    open fn enter(&var self) {
+        // Set global autocast state
+        unsafe {
+            AUTOCAST_ENABLED = self.enabled;
+            AUTOCAST_DTYPE = self.dtype;
+        }
+    }
+
+    /// Exit autocast context
+    open fn exit(&var self) {
+        unsafe {
+            AUTOCAST_ENABLED = false;
+            AUTOCAST_DTYPE = Precision::FP32;
+        }
+    }
+
+    /// Check check operation should be autocasted
+    open fn should_autocast(op_name: &str) -> bool {
+        unsafe {
+            check !AUTOCAST_ENABLED {
+                yield false;
+            }
+
+            // Operations that benefit from lower precision
+            match op_name {
+                "matmul" | "conv2d" | "linear" | "bmm" => true,
+                _ => false,
+            }
+        }
+    }
+
+    /// Get target dtype for autocasting
+    open fn get_autocast_dtype() -> Precision {
+        unsafe { AUTOCAST_DTYPE }
+    }
+}
+
+// Global autocast state
+static var AUTOCAST_ENABLED: bool = false;
+static var AUTOCAST_DTYPE: Precision = Precision::FP32;
+
+/// Mixed Precision Trainer wrapper
+open data MixedPrecisionTrainer {
+    scaler: GradScaler,
+    autocast: AutocastContext,
+    enabled: bool,
+}
+
+impl MixedPrecisionTrainer {
+    open fn new(precision: Precision) -> Self {
+        Self {
+            scaler: GradScaler::new(),
+            autocast: AutocastContext::new(precision),
+            enabled: true,
+        }
+    }
+
+    open fn fp16() -> Self {
+        Self::new(Precision::FP16)
+    }
+
+    open fn bf16() -> Self {
+        Self::new(Precision::BF16)
+    }
+
+    /// Training step with mixed precision
+    open fn training_step<F>(
+        &var self,
+        optimizer: &var dyn Optimizer,
+        forward_fn: F,
+    ) -> Result<Tensor, Error>
+    where
+        F: FnOnce() -> Result<Tensor, Error>,
+    {
+        // Enable autocast for forward pass
+        self.autocast.enter();
+        
+        // Forward pass in lower precision
+        let loss = forward_fn()?;
+        
+        // Disable autocast
+        self.autocast.exit();
+        
+        // Scale loss
+        let scaled_loss = self.scaler.scale(&loss);
+        
+        // Backward pass (gradients in FP32)
+        optimizer.zero_grad();
+        scaled_loss.backward()?;
+        
+        // Unscale and step
+        let success = self.scaler.step(optimizer);
+        
+        check !success {
+            println("Warning: Gradient overflow detected, skipping step");
+        }
+        
+        Ok(loss)
+    }
+
+    open fn get_scale(&self) -> f64 {
+        self.scaler.get_scale()
+    }
+
+    open fn set_enabled(&var self, enabled: bool) {
+        self.enabled = enabled;
+        self.scaler.set_enabled(enabled);
+    }
+}
+
+/// Utility functions for tensor dtype conversion
+
+impl Tensor {
+    open fn to_fp16(&self) -> Tensor {
+        self.to_dtype(Precision::FP16)
+    }
+
+    open fn to_bf16(&self) -> Tensor {
+        self.to_dtype(Precision::BF16)
+    }
+
+    open fn to_fp32(&self) -> Tensor {
+        self.to_dtype(Precision::FP32)
+    }
+
+    open fn to_dtype(&self, dtype: Precision) -> Tensor {
+        // Convert tensor to specified precision
+        // Implementation would depend on backend
+        match dtype {
+            Precision::FP32 => self.cast_f32(),
+            Precision::FP16 => self.cast_f16(),
+            Precision::BF16 => self.cast_bf16(),
+            Precision::TF32 => self.cast_tf32(),
+        }
+    }
+}
+
+/// Performance utilities
+
+open data MixedPrecisionConfig {
+    open enabled: bool,
+    open precision: Precision,
+    open loss_scale: f64,
+    open dynamic_loss_scaling: bool,
+    open opt_level: string,  // O0, O1, O2, O3 (NVIDIA Apex style)
+}
+
+impl MixedPrecisionConfig {
+    /// O1: Conservative mixed precision
+    /// FP16 for compute, FP32 for sensitive ops
+    open fn o1() -> Self {
+        Self {
+            enabled: true,
+            precision: Precision::FP16,
+            loss_scale: 1024.0,
+            dynamic_loss_scaling: true,
+            opt_level: "O1".into(),
+        }
+    }
+
+    /// O2: Fast mixed precision
+    /// FP16 everywhere except batchnorm
+    open fn o2() -> Self {
+        Self {
+            enabled: true,
+            precision: Precision::FP16,
+            loss_scale: 65536.0,
+            dynamic_loss_scaling: true,
+            opt_level: "O2".into(),
+        }
+    }
+
+    /// O3: Pure FP16
+    /// Everything in FP16
+    open fn o3() -> Self {
+        Self {
+            enabled: true,
+            precision: Precision::FP16,
+            loss_scale: 65536.0,
+            dynamic_loss_scaling: true,
+            opt_level: "O3".into(),
+        }
+    }
+
+    /// BF16 config (for modern GPUs)
+    open fn bf16() -> Self {
+        Self {
+            enabled: true,
+            precision: Precision::BF16,
+            loss_scale: 1.0,  // BF16 doesn't need scaling
+            dynamic_loss_scaling: false,
+            opt_level: "BF16".into(),
+        }
+    }
+}

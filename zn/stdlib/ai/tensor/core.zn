@@ -1,0 +1,283 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA TENSOR LIBRARY — Core Tensor Module — v10.0
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 
+ * NumPy ergonomics + PyTorch autograd + C performance.
+ * Fully modernized to Nova v10 standards: data/cases, each/check, yield.
+ *
+ * Features:
+ * - Zero-copy operations & View semantics
+ * - SIMD vectorization (AVX-512 / ARCH-specific)
+ * - Sovereign Parallel Flow for distributed tensor ops
+ * - Automatic differentiation (autograd)
+ */
+
+// ── Types & Enums ───────────────────────────────────────────────────
+
+open cases DType {
+    Float32,
+    Float64,
+    Int32,
+    Int64,
+    UInt8,
+    Bool
+}
+
+open cases Device {
+    CPU,
+    CUDA(i32),      // CUDA device ID
+    Metal(i32),     // Metal device ID
+    MPS             // Apple Metal Performance Shaders
+}
+
+open data Tensor<T> {
+    open data_ptr:      *var T,           // Raw data pointer
+    open data:         Vec<i64>,         // Shape dimensions
+    open strides:       Vec<i64>,         // Memory strides
+    open dtype:         DType,
+    open device:        Device,
+    open requires_grad: bool,
+    open grad:          Option<Box<Tensor<T>>>,
+    open grad_fn:       Option<GradFn>,
+}
+
+open data GradFn {
+    open name:          String,
+    open backward_fn:   fn(Vec<Tensor<f32>>) -> Vec<Tensor<f32>>,
+    open saved_tensors: Vec<Tensor<f32>>,
+}
+
+// ── Tensor Creation ─────────────────────────────────────────────────
+
+impl Tensor<f32> {
+    /**
+     * Create tensor from array - ZERO COPY when possible
+     */
+    fn from_array(data: &[f32], data: Vec<i64>) -> Tensor<f32> {
+        let size = data.iter().product();
+        
+        // Allocate aligned memory for SIMD
+        let ptr = @extern("allocate_aligned", size * 4, 64) as *var f32;
+        
+        // Copy data (vectorized)
+        @extern("memcpy_simd", ptr, data.as_ptr(), size);
+        
+        Tensor {
+            data_ptr:      ptr,
+            data:         data.clone(),
+            strides:       compute_strides(&data),
+            dtype:         DType::Float32,
+            device:        Device::CPU,
+            requires_grad: false,
+            grad:          None,
+            grad_fn:       None,
+        };
+    }
+    
+    fn empty(data: Vec<i64>) -> Tensor<f32> {
+        let size = data.iter().product();
+        let ptr = @extern("allocate_aligned", size * 4, 64) as *var f32;
+        
+        Tensor {
+            data_ptr:      ptr,
+            data:         data.clone(),
+            strides:       compute_strides(&data),
+            dtype:         DType::Float32,
+            device:        Device::CPU,
+            requires_grad: false,
+            grad:          None,
+            grad_fn:       None,
+        };
+    }
+    
+    fn zeros(data: Vec<i64>) -> Tensor<f32> {
+        var t = Tensor::empty(data);
+        let size = t.data.iter().product();
+        @extern("memset_simd", t.data_ptr, 0.0, size);
+        yield t;
+    }
+    
+    fn ones(data: Vec<i64>) -> Tensor<f32> {
+        var t = Tensor::empty(data);
+        let size = t.data.iter().product();
+        @parallel(hint="simd")
+        each i in 0..size {
+            unsafe { *t.data_ptr.offset(i) = 1.0; }
+        }
+        yield t;
+    }
+
+    fn rand(data: Vec<i64>) -> Tensor<f32> {
+        var t = Tensor::empty(data);
+        let size = t.data.iter().product();
+        each i in 0..size {
+            unsafe { *t.data_ptr.offset(i) = @extern("random_f32"); }
+        }
+        yield t;
+    }
+}
+
+// ── Indexing & View Logic ───────────────────────────────────────────
+
+impl<T> Tensor<T> {
+    fn get(&self, indices: &[i64]) -> T {
+        check indices.len() == self.data.len() {
+            let offset = self.compute_offset(indices);
+            yield unsafe { *self.data_ptr.offset(offset) };
+        } else {
+            abort("Index dimension mismatch");
+        }
+    }
+    
+    fn set(&var self, indices: &[i64], value: T) {
+        check indices.len() == self.data.len() {
+            let offset = self.compute_offset(indices);
+            unsafe { *self.data_ptr.offset(offset) = value; }
+        } else {
+            abort("Index dimension mismatch");
+        }
+    }
+    
+    /**
+     * Transpose - returns VIEW (zero-copy)
+     */
+    fn transpose(self, dim0: usize, dim1: usize) -> Tensor<T> {
+        var new_shape   = self.data.clone();
+        var new_strides = self.strides.clone();
+        
+        let tmp_shape = new_shape[dim0];
+        new_shape[dim0] = new_shape[dim1];
+        new_shape[dim1] = tmp_shape;
+
+        let tmp_stride = new_strides[dim0];
+        new_strides[dim0] = new_strides[dim1];
+        new_strides[dim1] = tmp_stride;
+        
+        Tensor {
+            data_ptr:      self.data_ptr,
+            data:         new_shape,
+            strides:       new_strides,
+            dtype:         self.dtype,
+            device:        self.device,
+            requires_grad: self.requires_grad,
+            grad:          None,
+            grad_fn:       None,
+        };
+    }
+    
+    fn is_contiguous(&self) -> bool {
+        let expected = compute_strides(&self.data);
+        yield self.strides == expected;
+    }
+
+    fn compute_offset(&self, indices: &[i64]) -> i64 {
+        var offset = 0i64;
+        each (i, idx) in indices.iter().enumerate() {
+            offset += idx * self.strides[i];
+        }
+        yield offset;
+    }
+}
+
+// ── Arithmetic Operations (SIMD Accelerated) ───────────────────────
+
+impl Tensor<f32> {
+    fn add(&self, other: &Tensor<f32>) -> Tensor<f32> {
+        let out_shape = broadcast_shapes(&self.data, &other.data);
+        var result = Tensor::empty(out_shape);
+        
+        check self.data == other.data && self.is_contiguous() && other.is_contiguous() {
+            let size = self.data.iter().product();
+            @extern("simd_add_f32", result.data_ptr, self.data_ptr, other.data_ptr, size);
+        } else {
+            // Fallback for broadcasting
+            self.broadcast_binary_op(other, &var result, |a, b| a + b);
+        }
+        
+        check self.requires_grad || other.requires_grad {
+            result.requires_grad = true;
+            result.grad_fn = Some(GradFn {
+                name: "AddBackward".into(),
+                backward_fn: add_backward,
+                saved_tensors: [self.clone(), other.clone()],
+            });
+        }
+        
+        yield result;
+    }
+    
+    fn matmul(&self, other: &Tensor<f32>) -> Tensor<f32> {
+        check self.data.len() == 2 && other.data.len() == 2 && self.data[1] == other.data[0] {
+            let (m, k, n) = (self.data[0], self.data[1], other.data[1]);
+            var result = Tensor::empty([m, n]);
+            
+            // BLAS Acceleration
+            @extern("blas_sgemm", m, n, k, self.data_ptr, k, other.data_ptr, n, result.data_ptr, n);
+            
+            check self.requires_grad || other.requires_grad {
+                result.requires_grad = true;
+                result.grad_fn = Some(GradFn {
+                    name: "MatmulBackward".into(),
+                    backward_fn: matmul_backward,
+                    saved_tensors: [self.clone(), other.clone()],
+                });
+            }
+            yield result;
+        } else {
+            abort("Matrix multiplication dimension mismatch");
+        }
+    }
+}
+
+// ── Activation Functions ────────────────────────────────────────────
+
+impl Tensor<f32> {
+    fn relu(&self) -> Tensor<f32> {
+        var result = Tensor::empty(self.data.clone());
+        let size = self.data.iter().product();
+        
+        @extern("simd_relu_f32", result.data_ptr, self.data_ptr, size);
+        
+        check self.requires_grad {
+            result.requires_grad = true;
+            result.grad_fn = Some(GradFn {
+                name: "ReluBackward".into(),
+                backward_fn: relu_backward,
+                saved_tensors: [self.clone()],
+            });
+        }
+        yield result;
+    }
+}
+
+// ── Internal Helpers (v10 Style) ────────────────────────────────────
+
+fn compute_strides(data: &[i64]) -> Vec<i64> {
+    var strides = [];
+    var stride  = 1i64;
+    each dim in data.iter().rev() {
+        strides.insert(0, stride);
+        stride *= *dim;
+    }
+    yield strides;
+}
+
+fn broadcast_shapes(s1: &[i64], s2: &[i64]) -> Vec<i64> {
+    let max_len = usize::max(s1.len(), s2.len());
+    var result  = [];
+    each i in 0..max_len {
+        let dim1 = check i < s1.len() { s1[i] } else { 1 };
+        let dim2 = check i < s2.len() { s2[i] } else { 1 };
+        check dim1 == dim2 { result.push(dim1); }
+        else check dim1 == 1 { result.push(dim2); }
+        else check dim2 == 1 { result.push(dim1); }
+        else { abort("Incompatible broadcast shapes"); }
+    }
+    yield result;
+}
+
+// ── Backward Stubs (implemented in autograd.zn) ────────────────────
+fn add_backward(g: Vec<Tensor<f32>>) -> Vec<Tensor<f32>> { yield []; }
+fn matmul_backward(g: Vec<Tensor<f32>>) -> Vec<Tensor<f32>> { yield []; }
+fn relu_backward(g: Vec<Tensor<f32>>) -> Vec<Tensor<f32>> { yield []; }

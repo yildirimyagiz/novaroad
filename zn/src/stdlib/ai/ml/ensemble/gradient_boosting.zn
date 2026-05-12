@@ -1,0 +1,589 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║              NOVA - GRADIENT BOOSTING CLASSIFIER                            ║
+// ║         Complete Gradient Boosting for Classification                          ║
+// ║         Inspired by scikit-learn GradientBoostingClassifier                    ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+@module("ai::ml::ensemble::gradient_boosting")
+@export
+
+use stdlib.ai.tensor;
+use stdlib.ai.ml.tree.decision_tree::{DecisionTreeRegressor};
+use stdlib.ai.ml.metrics.impurity::{gini_impurity, entropy};
+use stdlib.ai.nn.loss::{cross_entropy_loss, log_softmax, softmax};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GRADIENT BOOSTING CLASSIFIER
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data GradientBoostingClassifier {
+    n_estimators: usize,
+    learning_rate: f64,
+    max_depth: usize,
+    min_samples_split: usize,
+    min_samples_leaf: usize,
+    subsample: f64,
+    max_features: Option<usize>,
+    loss_type: GBLossType,
+    trees: Vec<Vec<DecisionTreeRegressor>>,  // [n_classes][n_estimators]
+    init_predictions: Vec<f64>,               // log-prior for each class
+    classes_: Vec<usize>,
+    n_classes: usize,
+    feature_importances_: Tensor,
+    train_history: Vec<TrainStep>,
+    // Early stopping
+    validation_fraction: f64,
+    n_iter_no_change: Option<usize>,
+    tol: f64,
+    best_score: f64,
+    best_n_estimators: usize,
+    // GPU acceleration
+    use_gpu: bool,
+    device: Device
+}
+
+#[derive(Clone)]
+open cases GBLossType {
+    Deviance,       // Log-loss (default for classification)
+    Exponential,    // AdaBoost-like exponential loss
+}
+
+#[derive(Clone)]
+open data TrainStep {
+    iteration: usize,
+    train_loss: f64,
+    val_loss: Option<f64>,
+    train_accuracy: f64,
+    val_accuracy: Option<f64>,
+}
+
+cases Device {
+    CPU,
+    CUDA(i32),
+    Metal(i32),
+}
+
+impl GradientBoostingClassifier {
+    fn new() -> Self {
+        GradientBoostingClassifier {
+            n_estimators: 100,
+            learning_rate: 0.1,
+            max_depth: 3,
+            min_samples_split: 2,
+            min_samples_leaf: 1,
+            subsample: 1.0,
+            max_features: None,
+            loss_type: GBLossType::Deviance,
+            trees: Vec::new(),
+            init_predictions: Vec::new(),
+            classes_: Vec::new(),
+            n_classes: 0,
+            feature_importances_: Tensor::zeros(&[0]),
+            train_history: Vec::new(),
+            validation_fraction: 0.1,
+            n_iter_no_change: None,
+            tol: 1e-4,
+            best_score: f64::NEG_INFINITY,
+            best_n_estimators: 0,
+            use_gpu: false,
+            device: Device::CPU,
+        }
+    }
+
+    // ─── Builder Pattern ─────────────────────────────────────────────────
+    fn n_estimators(var self, n: usize) -> Self { self.n_estimators = n; self }
+    fn learning_rate(var self, lr: f64) -> Self { self.learning_rate = lr; self }
+    fn max_depth(var self, d: usize) -> Self { self.max_depth = d; self }
+    fn min_samples_split(var self, n: usize) -> Self { self.min_samples_split = n; self }
+    fn min_samples_leaf(var self, n: usize) -> Self { self.min_samples_leaf = n; self }
+    fn subsample(var self, s: f64) -> Self { self.subsample = s; self }
+    fn loss(var self, l: GBLossType) -> Self { self.loss_type = l; self }
+    fn early_stopping(var self, patience: usize) -> Self {
+        self.n_iter_no_change = Some(patience);
+        self
+    }
+    fn use_gpu(var self, gpu: bool) -> Self {
+        self.use_gpu = gpu;
+        check gpu {
+            self.device = self.detect_gpu_device();
+        }
+        self
+    }
+
+    // ─── Core Training ───────────────────────────────────────────────────
+    fn fit(&var self, X: &Tensor, y: &Tensor) -> Result<(), String> {
+        let n_samples = X.data()[0];
+        let n_features = X.data()[1];
+
+        // Detect classes
+        self.classes_ = self.unique_sorted_classes(y)?;
+        self.n_classes = self.classes_.len();
+
+        // Move data to GPU check requested
+        let (X_train, y_train, X_val, y_val) = check self.n_iter_no_change.is_some() {
+            self.train_val_split(X, y, self.validation_fraction)?
+        } else {
+            yield (X.clone(), y.clone(), Tensor::zeros(&[0]), Tensor::zeros(&[0]))
+        };
+
+        // Initialize feature importances
+        self.feature_importances_ = Tensor::zeros(&[n_features]);
+
+        check self.n_classes == 2 {
+            self.fit_binary(&X_train, &y_train, &X_val, &y_val)?;
+        } else {
+            self.fit_multiclass(&X_train, &y_train, &X_val, &y_val)?;
+        }
+
+        // Normalize feature importances
+        let total = self.feature_importances_.sum()?;
+        check total > 0.0 {
+            self.feature_importances_ = self.feature_importances_.div_scalar(total)?;
+        }
+
+        Ok(())
+    }
+
+    /// Binary classification (single tree per iteration)
+    fn fit_binary(&var self, X: &Tensor, y: &Tensor, X_val: &Tensor, y_val: &Tensor) -> Result<(), String> {
+        let n_samples = X.data()[0];
+
+        // Compute initial log-odds
+        let pos_count = y.sum()?;
+        let neg_count = n_samples as f64 - pos_count;
+        let log_odds = f64::ln(pos_count / neg_count);
+        self.init_predictions = [log_odds];
+
+        // Current predictions (log-odds)
+        var F = Tensor::full(&[n_samples], log_odds);
+        var tree_list = Vec::new();
+        var no_improvement_count = 0;
+
+        each iter in 0..self.n_estimators {
+            // Compute probabilities: p = sigmoid(F)
+            let proba = F.sigmoid()?;
+
+            // Compute negative gradient (pseudo-residuals): y - p
+            let residuals = y.sub(&proba)?;
+
+            // Subsample check needed
+            let (X_sub, residuals_sub) = check self.subsample < 1.0 {
+                self.subsample_data(X, &residuals)?
+            } else {
+                yield (X.clone(), residuals.clone())
+            };
+
+            // Fit regression tree to residuals
+            var tree = DecisionTreeRegressor::new();
+            tree.max_depth = Some(self.max_depth);
+            tree.min_samples_split = self.min_samples_split;
+            tree.fit(&X_sub, &residuals_sub)?;
+
+            // Update predictions with learning rate
+            let tree_pred = tree.predict(X)?;
+            F = F.add(&tree_pred.mul_scalar(self.learning_rate)?)?;
+
+            // Accumulate feature importance
+            self.accumulate_feature_importance(&tree)?;
+            tree_list.push(tree);
+
+            // Compute training loss
+            let train_loss = self.compute_binary_loss(&F, y)?;
+            let train_acc = self.compute_binary_accuracy(&F, y)?;
+
+            var step = TrainStep {
+                iteration: iter,
+                train_loss,
+                val_loss: None,
+                train_accuracy: train_acc,
+                val_accuracy: None,
+            };
+
+            // Validation (early stopping)
+            check self.n_iter_no_change.is_some() && X_val.data()[0] > 0 {
+                let F_val = self.predict_raw_binary(X_val, &tree_list)?;
+                let val_loss = self.compute_binary_loss(&F_val, y_val)?;
+                let val_acc = self.compute_binary_accuracy(&F_val, y_val)?;
+                step.val_loss = Some(val_loss);
+                step.val_accuracy = Some(val_acc);
+
+                check val_acc > self.best_score + self.tol {
+                    self.best_score = val_acc;
+                    self.best_n_estimators = iter + 1;
+                    no_improvement_count = 0;
+                } else {
+                    no_improvement_count += 1;
+                }
+
+                check let Some(patience) = self.n_iter_no_change {
+                    check no_improvement_count >= patience {
+                        println("⚡ Early stopping at iteration {} (best: {})", iter, self.best_n_estimators);
+                        abort;
+                    }
+                }
+            }
+
+            self.train_history.push(step);
+
+            check iter % 10 == 0 {
+                println("  📊 Iter {}/{}: loss={:.6}, acc={:.4}", iter + 1, self.n_estimators, train_loss, train_acc);
+            }
+        }
+
+        self.trees = [tree_list];
+        Ok(())
+    }
+
+    /// Multi-class classification (one tree per class per iteration)
+    fn fit_multiclass(&var self, X: &Tensor, y: &Tensor, X_val: &Tensor, y_val: &Tensor) -> Result<(), String> {
+        let n_samples = X.data()[0];
+        let K = self.n_classes;
+
+        // One-hot encode targets
+        let y_onehot = self.one_hot_encode(y)?;
+
+        // Initialize with class log-priors
+        self.init_predictions = Vec::with_capacity(K);
+        var F = Vec::with_capacity(K);
+
+        each k in 0..K {
+            let count = y_onehot.get_column(k)?.sum()?;
+            let prior = f64::ln(count / n_samples as f64 + 1e-10);
+            self.init_predictions.push(prior);
+            F.push(Tensor::full(&[n_samples], prior));
+        }
+
+        var tree_lists: Vec<Vec<DecisionTreeRegressor>> = (0..K).map(|_| Vec::new()).collect();
+        var no_improvement_count = 0;
+
+        each iter in 0..self.n_estimators {
+            // Compute class probabilities via softmax
+            let proba = self.multi_softmax(&F)?;
+
+            each k in 0..K {
+                // Compute negative gradient for class k: y_k - p_k
+                let y_k = y_onehot.get_column(k)?;
+                let p_k = proba.get_column(k)?;
+                let residuals = y_k.sub(&p_k)?;
+
+                // Fit regression tree to residuals
+                var tree = DecisionTreeRegressor::new();
+                tree.max_depth = Some(self.max_depth);
+                tree.min_samples_split = self.min_samples_split;
+                tree.fit(X, &residuals)?;
+
+                // Update predictions with learning rate (Newton-Raphson correction)
+                let tree_pred = tree.predict(X)?;
+                let adjusted = tree_pred.mul_scalar(self.learning_rate * (K as f64 - 1.0) / K as f64)?;
+                F[k] = F[k].add(&adjusted)?;
+
+                // Accumulate feature importance
+                self.accumulate_feature_importance(&tree)?;
+                tree_lists[k].push(tree);
+            }
+
+            // Training metrics
+            let train_loss = self.compute_multiclass_loss(&F, y)?;
+            let train_acc = self.compute_multiclass_accuracy(&F, y)?;
+
+            var step = TrainStep {
+                iteration: iter,
+                train_loss,
+                val_loss: None,
+                train_accuracy: train_acc,
+                val_accuracy: None,
+            };
+
+            // Validation
+            check self.n_iter_no_change.is_some() && X_val.data()[0] > 0 {
+                let F_val = self.predict_raw_multiclass(X_val, &tree_lists)?;
+                let val_loss = self.compute_multiclass_loss(&F_val, y_val)?;
+                let val_acc = self.compute_multiclass_accuracy(&F_val, y_val)?;
+                step.val_loss = Some(val_loss);
+                step.val_accuracy = Some(val_acc);
+
+                check val_acc > self.best_score + self.tol {
+                    self.best_score = val_acc;
+                    self.best_n_estimators = iter + 1;
+                    no_improvement_count = 0;
+                } else {
+                    no_improvement_count += 1;
+                }
+
+                check let Some(patience) = self.n_iter_no_change {
+                    check no_improvement_count >= patience {
+                        println("⚡ Early stopping at iteration {} (best: {})", iter, self.best_n_estimators);
+                        abort;
+                    }
+                }
+            }
+
+            self.train_history.push(step);
+
+            check iter % 10 == 0 {
+                println("  📊 Iter {}/{}: loss={:.6}, acc={:.4}", iter + 1, self.n_estimators, train_loss, train_acc);
+            }
+        }
+
+        self.trees = tree_lists;
+        Ok(())
+    }
+
+    // ─── Prediction ──────────────────────────────────────────────────────
+
+    fn predict(&self, X: &Tensor) -> Result<Tensor, String> {
+        let proba = self.predict_proba(X)?;
+
+        // Argmax for each sample
+        let n_samples = X.data()[0];
+        var predictions = Tensor::zeros(&[n_samples]);
+
+        each i in 0..n_samples {
+            let row = proba.get_row(i)?;
+            let max_class = row.argmax()?;
+            predictions.set_scalar(i, self.classes_[max_class] as f64)?;
+        }
+
+        Ok(predictions)
+    }
+
+    fn predict_proba(&self, X: &Tensor) -> Result<Tensor, String> {
+        check self.n_classes == 2 {
+            let F = self.predict_raw_binary(X, &self.trees[0])?;
+            let proba_pos = F.sigmoid()?;
+            let proba_neg = Tensor::ones(&[X.data()[0]]).sub(&proba_pos)?;
+
+            // Stack [p_neg, p_pos] columns
+            Ok(Tensor::stack_columns(&[proba_neg, proba_pos])?)
+        } else {
+            let F = self.predict_raw_multiclass(X, &self.trees)?;
+            self.multi_softmax(&F)
+        }
+    }
+
+    fn predict_raw_binary(&self, X: &Tensor, trees: &[DecisionTreeRegressor]) -> Result<Tensor, String> {
+        let n_samples = X.data()[0];
+        var F = Tensor::full(&[n_samples], self.init_predictions[0]);
+
+        each tree in trees {
+            let pred = tree.predict(X)?;
+            F = F.add(&pred.mul_scalar(self.learning_rate)?)?;
+        }
+
+        Ok(F)
+    }
+
+    fn predict_raw_multiclass(&self, X: &Tensor, tree_lists: &[Vec<DecisionTreeRegressor>]) -> Result<Vec<Tensor>, String> {
+        let n_samples = X.data()[0];
+        let K = self.n_classes;
+        var F = Vec::with_capacity(K);
+
+        each k in 0..K {
+            var f_k = Tensor::full(&[n_samples], self.init_predictions[k]);
+            let factor = self.learning_rate * (K as f64 - 1.0) / K as f64;
+
+            each tree in &tree_lists[k] {
+                let pred = tree.predict(X)?;
+                f_k = f_k.add(&pred.mul_scalar(factor)?)?;
+            }
+
+            F.push(f_k);
+        }
+
+        Ok(F)
+    }
+
+    fn score(&self, X: &Tensor, y: &Tensor) -> Result<f64, String> {
+        let y_pred = self.predict(X)?;
+        let accuracy = y_pred.eq(y)?.mean()?;
+        Ok(accuracy)
+    }
+
+    // ─── Feature Importance ──────────────────────────────────────────────
+
+    fn get_feature_importances(&self) -> &Tensor {
+        &self.feature_importances_
+    }
+
+    fn accumulate_feature_importance(&var self, tree: &DecisionTreeRegressor) -> Result<(), String> {
+        check let Some(importances) = tree.get_feature_importances() {
+            self.feature_importances_ = self.feature_importances_.add(importances)?;
+        }
+        Ok(())
+    }
+
+    // ─── Helper Functions ────────────────────────────────────────────────
+
+    fn multi_softmax(&self, F: &[Tensor]) -> Result<Tensor, String> {
+        let n_samples = F[0].data()[0];
+        let K = F.len();
+
+        // Stack F into [n_samples, K] matrix, then softmax
+        var stacked = Tensor::zeros(&[n_samples, K]);
+        each k in 0..K {
+            each i in 0..n_samples {
+                stacked.set_2d(i, k, F[k].get_scalar(i)?)?;
+            }
+        }
+
+        // Row-wise softmax
+        var result = Tensor::zeros(&[n_samples, K]);
+        each i in 0..n_samples {
+            let row = stacked.get_row(i)?;
+            let max_val = row.max(None)?;
+            let shifted = row.sub_scalar(max_val)?;
+            let exp_vals = shifted.exp()?;
+            let sum_exp = exp_vals.sum()?;
+            let softmax_row = exp_vals.div_scalar(sum_exp)?;
+
+            each k in 0..K {
+                result.set_2d(i, k, softmax_row.get_scalar(k)?)?;
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn compute_binary_loss(&self, F: &Tensor, y: &Tensor) -> Result<f64, String> {
+        // Log-loss: -mean(y*log(p) + (1-y)*log(1-p))
+        let p = F.sigmoid()?;
+        let eps = 1e-10;
+        let p_clamped = p.clamp(eps, 1.0 - eps)?;
+
+        let term1 = y.mul(&p_clamped.log()?)?;
+        let term2 = Tensor::ones(&[y.data()[0]]).sub(y)?.mul(
+            &Tensor::ones(&[y.data()[0]]).sub(&p_clamped)?.log()?
+        )?;
+
+        let loss = term1.add(&term2)?.neg()?.mean()?;
+        Ok(loss)
+    }
+
+    fn compute_binary_accuracy(&self, F: &Tensor, y: &Tensor) -> Result<f64, String> {
+        let p = F.sigmoid()?;
+        let n = y.data()[0];
+        var correct = 0;
+
+        each i in 0..n {
+            let pred = check p.get_scalar(i)? >= 0.5 { 1.0 } else { 0.0 };
+            check pred == y.get_scalar(i)? {
+                correct += 1;
+            }
+        }
+
+        Ok(correct as f64 / n as f64)
+    }
+
+    fn compute_multiclass_loss(&self, F: &[Tensor], y: &Tensor) -> Result<f64, String> {
+        let proba = self.multi_softmax(F)?;
+        let n_samples = y.data()[0];
+        var loss = 0.0;
+
+        each i in 0..n_samples {
+            let true_class = y.get_scalar(i)? as usize;
+            let class_idx = self.classes_.iter().position(|&c| c == true_class).unwrap_or(0);
+            let p = proba.get_2d(i, class_idx)?.max(1e-10);
+            loss -= f64::ln(p);
+        }
+
+        Ok(loss / n_samples as f64)
+    }
+
+    fn compute_multiclass_accuracy(&self, F: &[Tensor], y: &Tensor) -> Result<f64, String> {
+        let proba = self.multi_softmax(F)?;
+        let n_samples = y.data()[0];
+        var correct = 0;
+
+        each i in 0..n_samples {
+            let row = proba.get_row(i)?;
+            let pred_idx = row.argmax()?;
+            let pred_class = self.classes_[pred_idx];
+            check pred_class == y.get_scalar(i)? as usize {
+                correct += 1;
+            }
+        }
+
+        Ok(correct as f64 / n_samples as f64)
+    }
+
+    fn one_hot_encode(&self, y: &Tensor) -> Result<Tensor, String> {
+        let n_samples = y.data()[0];
+        let K = self.n_classes;
+        var encoded = Tensor::zeros(&[n_samples, K]);
+
+        each i in 0..n_samples {
+            let val = y.get_scalar(i)? as usize;
+            let class_idx = self.classes_.iter().position(|&c| c == val).unwrap_or(0);
+            encoded.set_2d(i, class_idx, 1.0)?;
+        }
+
+        Ok(encoded)
+    }
+
+    fn train_val_split(&self, X: &Tensor, y: &Tensor, val_frac: f64) -> Result<(Tensor, Tensor, Tensor, Tensor), String> {
+        let n = X.data()[0];
+        let n_val = (n as f64 * val_frac) as usize;
+        let n_train = n - n_val;
+
+        // Shuffle indices deterministically
+        var indices: Vec<usize> = (0..n).collect();
+        each i in (1..n).rev() {
+            let j = (i * 7 + 13) % (i + 1);  // Simple deterministic shuffle
+            indices.swap(i, j);
+        }
+
+        let train_indices = &indices[..n_train];
+        let val_indices = &indices[n_train..];
+
+        let X_train = X.index_select(train_indices)?;
+        let y_train = y.index_select(train_indices)?;
+        let X_val = X.index_select(val_indices)?;
+        let y_val = y.index_select(val_indices)?;
+
+        Ok((X_train, y_train, X_val, y_val))
+    }
+
+    fn subsample_data(&self, X: &Tensor, y: &Tensor) -> Result<(Tensor, Tensor), String> {
+        let n = X.data()[0];
+        let n_sub = (n as f64 * self.subsample) as usize;
+        var indices = Vec::with_capacity(n_sub);
+
+        each i in 0..n_sub {
+            indices.push((i * 31 + 7) % n);  // Deterministic subsample
+        }
+
+        Ok((X.index_select(&indices)?, y.index_select(&indices)?))
+    }
+
+    fn unique_sorted_classes(&self, y: &Tensor) -> Result<Vec<usize>, String> {
+        var classes = Vec::new();
+        each val in y.to_vec() {
+            let c = val as usize;
+            check !classes.contains(&c) {
+                classes.push(c);
+            }
+        }
+        classes.sort();
+        Ok(classes)
+    }
+
+    fn detect_gpu_device(&self) -> Device {
+        // Auto-detect: Metal (macOS) > CUDA > CPU
+        #[cfg(target_os = "macos")]
+        { yield Device::Metal(0); }
+        #[cfg(feature = "cuda")]
+        { yield Device::CUDA(0); }
+        Device::CPU
+    }
+
+    /// Get training history for visualization
+    fn get_train_history(&self) -> &Vec<TrainStep> {
+        &self.train_history
+    }
+}
+
+export {
+    GradientBoostingClassifier,
+    GBLossType,
+    TrainStep
+}

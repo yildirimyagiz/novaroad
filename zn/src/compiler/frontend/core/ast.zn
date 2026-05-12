@@ -1,0 +1,825 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova  —  AST  v10.0                                                ║
+// ║                                                                              ║
+// ║  YENİ: v10'da AST'nin 5 temel yeniliği var                                 ║
+// ║                                                                              ║
+// ║  1. TYPE EXPRESSION SISTEMI                                                  ║
+// ║     Tip ifadeleri artık `String` değil, yapısal `TypeExpr` node'ları.        ║
+// ║     Bu sayede unit algebra, flow alias, tensor data compile-time'da          ║
+// ║     gerçekten analiz edilebilir.                                             ║
+// ║                                                                              ║
+// ║  2. UNIT-TYPED LITERALS                                                      ║
+// ║     `5.kg`, `3.m/s²`, `100.°C` artık birer AST node'u.                      ║
+// ║     Type checker `5.kg + 3.m` → ERROR; `5.kg + 2.g` → `7.kg` der.          ║
+// ║                                                                              ║
+// ║  3. FLOW TYPES                                                               ║
+// ║     `flow<T>` = reaktif stream. Async + reactive birleşik alias.              ║
+// ║     `Signal<i32>`, `Stream<Event>`, `Task<Result<T>>` hepsi flow türevi.    ║
+// ║                                                                              ║
+// ║  4. SHAPE-TYPED TENSORS                                                      ║
+// ║     `tensor<f32>[batch=32, seq=512, d_model=768]` — isimli boyutlar.        ║
+// ║     Boyut hatası compile-time'da yakalanır.                                  ║
+// ║                                                                              ║
+// ║  5. CONTRACT NODES (Pre/Post condition)                                      ║
+// ║     `require`, `ensure`, `proof` blokları fonksiyon gövdesinden ayrı        ║
+// ║     AST node'ları — bu sayede doğrulama araçları bunları kullanabilir.      ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::HashMap;
+use crate::frontend::core::core_types::{VPUModel, FlowKind, DimExpr};
+use span::Span;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §0  SPAN — Kaynak Konumu (imported from core_types)
+// ══════════════════════════════════════════════════════════════════════════════
+// Span is now defined in core_types.zn to avoid duplication
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §1  TİP İFADELERİ  (TypeExpr)
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//  FARK: Eski versiyonda tipler `Option<String>` olarak temsil ediliyordu.
+//  Bu yaklaşım alias-checker'ın birimler, tensor data'ler ve flow
+//  alias'ları analiz etmesini imkansız kılıyordu.
+//
+//  Şimdi her tip, yapısal bir AST node'u.
+
+space cases DimSize derives [Clone] {
+    Known(i64),       // tensor boyutu biliniyor: [784]
+    Named(String),    // sembolik boyut: [batch]
+    Expr(Box<Expr>),  // hesaplanmış boyut: [n*2]
+    Any,              // dinamik: [_]
+}
+
+// DimExpr is now defined in core_types.zn to avoid duplication
+
+space cases TypeExpr derives [Clone] {
+
+    // Temel tipler: i32, f64, bool, str
+    Prim(String),
+
+    // Referans: &T, &var T
+    Ref(Box<TypeExpr>, bool),           // (inner, mutable)
+
+    // Generik: Vec<T>, Option<T>
+    Generic(String, Vec<TypeExpr>),
+
+    // Path: std::io::Error
+    Path(Vec<String>),
+
+    // Tuple: (i32, f64, bool)
+    Tuple(Vec<TypeExpr>),
+
+    // Dizi: [T; N]
+    Array(Box<TypeExpr>, Option<i64>),
+
+    // ── YENİ: Miktarlı Tip ───────────────────────────────────────────────────
+    // `qty<f64, kg>`  veya  `qty<f64, m/s²>`
+    // Type checker bu iki tipi toplama sokmaz.
+    Qty(Box<TypeExpr>, DimExpr),
+
+    // ── YENİ: Tensor Tip ─────────────────────────────────────────────────────
+    // `tensor<f32>[batch=32, seq=512, d=768]`
+    // İsimli boyutlar sayesinde `mat_a @ mat_b` → boyut uyumsuzluğu compile-time'da
+    Tensor(Box<TypeExpr>, Vec<(Option<String>, DimSize)>),
+
+    // ── YENİ: Flow Tip ───────────────────────────────────────────────────────
+    // `flow<T>` — reaktif/async değer akışı
+    // Signal<T>  = tek değer, değişebilir
+    // Stream<T>  = çoklu değer akışı
+    // Task<T>    = tek async değer
+    Flow(FlowKind, Box<TypeExpr>),
+
+    // Trait object: dyn Rules
+    DynRules(Vec<String>),
+
+    // Fonksiyon tipi: fn(A, B) -> C
+    FnPtr(Vec<TypeExpr>, Box<TypeExpr>),
+
+    // Placeholder: _
+    Infer,
+
+    // ── YENİ: VPU Model ──────────────────────────────────────────────────────
+    // Kodun hangi ordu katmanında çalışacağını belirler
+    VPU(VPUModel),
+}
+
+// VPUModel and FlowKind are now defined in core_types.zn to avoid duplication
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §2  OPERATÖRLER
+// ══════════════════════════════════════════════════════════════════════════════
+
+space cases BinOp derives [Display, Clone, Copy, Eq, Hash] {
+    // Aritmetik
+    Add, Sub, Mul, Div, Rem, Pow, MatMul,
+    // Karşılaştırma
+    Eq, Ne, Lt, Gt, Le, Ge,
+    // Atama
+    Assign,
+    // Mantıksal
+    And, Or,
+    // Bitsel
+    BitAnd, BitOr, BitXor, Shl, Shr,
+    // Pipeline
+    Pipe,
+    // Yaklaşık eşitlik (bilimsel)  `a ~ b`
+    Approx,
+}
+
+space cases UnaryOp derives [Display, Clone, Copy, Eq] {
+    Neg,    // -x
+    Not,    // !x
+    Deref,  // *x
+    Ref,    // &x
+    Abs,    // |x| — mutlak değer (matematik sözdizimi)
+}
+
+space cases MathOp derives [Display, Clone, Copy, Eq] {
+    Grad,     // gradyan (autodiff)
+    Diff,     // türev
+    Integral, // integral
+    Sum,      // toplam
+    Prod,     // çarpım
+    Limit,    // limit
+    Solve,    // denklem çözme
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §3  İFADELER  (Expr)
+// ══════════════════════════════════════════════════════════════════════════════
+
+space cases Expr derives [Clone] {
+
+    // ── Atomik Literaller ─────────────────────────────────────────────────────
+    Int(IntLit),
+    Float(FloatLit),
+    Str(StrLit),
+    Bool(BoolLit),
+    Unit,                         // () — birim değer
+
+    // ── YENİ: Miktarlı Literal ───────────────────────────────────────────────
+    // `5.kg`, `9.81.m/s²`, `37.°C`
+    // Hem değer hem birim bilgisi literal'ın kendisinde
+    Measured(MeasuredLit),
+
+    // ── İsimler ───────────────────────────────────────────────────────────────
+    Ident(IdentExpr),
+    Path(PathExpr),               // a::b::c
+
+    // ── Operatörler ───────────────────────────────────────────────────────────
+    Binary(BinaryExpr),
+    Unary(UnaryExpr),
+
+    // ── Erişim ────────────────────────────────────────────────────────────────
+    Field(FieldExpr),             // expr.field
+    Index(IndexExpr),             // expr[i]
+    Call(CallExpr),               // expr(args)
+    Method(MethodExpr),           // expr.method(args) — ayrı node, daha net
+
+    // ── Koleksiyonlar ─────────────────────────────────────────────────────────
+    Array(ArrayExpr),             // [a, b, c]
+    Tuple(TupleExpr),             // (a, b, c)
+    Record(RecordExpr),           // Point { x: 1.0, y: 2.0 }
+
+    // ── Blok & Kontrol ────────────────────────────────────────────────────────
+    Block(Block),
+    Check(CheckExpr),             // check condition { } else { }
+    Match(MatchExpr),             // match value { pattern => ... }
+    Loop(LoopExpr),
+    Each(EachExpr),
+    While(WhileExpr),
+
+    // ── Fonksiyon ─────────────────────────────────────────────────────────────
+    Lambda(LambdaExpr),           // |x, y| x + y
+    Pipe(PipeExpr),               // a |> f |> g
+
+    // ── Aralık ────────────────────────────────────────────────────────────────
+    Range(RangeExpr),
+
+    // ── Hata Yönetimi ─────────────────────────────────────────────────────────
+    Try(Box<Expr>),               // try expr — hata yay
+    Catch(CatchExpr),             // try { } catch err { }
+
+    // ── YENİ: Matematik Operatörleri ─────────────────────────────────────────
+    // `grad(energy, v)` → tip: Fn(Mass, Velocity) -> Force
+    // Tip sistemi boyut analizini burada yapar
+    Math(MathExpr),
+
+    // ── YENİ: Tensor İnşası ───────────────────────────────────────────────────
+    // `tensor<f32>[32, 512, 768] { zeros }`
+    TensorInit(TensorInitExpr),
+
+    // ── YENİ: Flow İfadesi ────────────────────────────────────────────────────
+    // `signal(0)`, `stream([1,2,3])`, `spawn { async_work() }`
+    FlowExpr(FlowConstruct),
+
+    // ── YENİ: Kanal İfaesi ───────────────────────────────────────────────────
+    // `send(ch, value)`, `recv(ch)`
+    Chan(ChanExpr),
+
+    // ── Tip Dönüşümü ──────────────────────────────────────────────────────────
+    Cast(Box<Expr>, TypeExpr),    // expr as Type
+    UnitConvert(Box<Expr>, DimExpr),  // `5.kg in lb` — compile-time checked dönüşüm
+
+    // ── Doğrulama ─────────────────────────────────────────────────────────────
+    Assert(Box<Expr>, Option<Box<Expr>>),  // assert condition, "mesaj"
+}
+
+// ── Literal node'ları ──────────────────────────────────────────────────────────
+
+space data IntLit    derives [Clone] { open value: i64,    open span: Span }
+space data FloatLit  derives [Clone] { open value: f64,    open span: Span }
+space data StrLit    derives [Clone] { open value: String, open span: Span }
+space data BoolLit   derives [Clone] { open value: bool,   open span: Span }
+space data IdentExpr derives [Clone] { open name:  String, open span: Span }
+
+space data PathExpr  derives [Clone] {
+    open segments: Vec<String>,
+    open span:     Span,
+}
+
+/// YENİ: `5.kg`, `3.14.m/s²`
+space data MeasuredLit derives [Clone] {
+    open value:   f64,
+    open unit:    DimExpr,  // boyut ifadesi
+    open unit_str: String,  // orijinal yazım: "kg", "m/s²"
+    open span:    Span,
+}
+
+// ── Operatör ifadeleri ────────────────────────────────────────────────────────
+
+space data BinaryExpr derives [Clone] {
+    open left:  Box<Expr>,
+    open op:    BinOp,
+    open right: Box<Expr>,
+    open span:  Span,
+}
+
+space data UnaryExpr derives [Clone] {
+    open op:      UnaryOp,
+    open operand: Box<Expr>,
+    open span:    Span,
+}
+
+// ── Erişim ifadeleri ──────────────────────────────────────────────────────────
+
+space data FieldExpr derives [Clone] {
+    open base:  Box<Expr>,
+    open field: String,
+    open span:  Span,
+}
+
+space data IndexExpr derives [Clone] {
+    open base:    Box<Expr>,
+    open indices: Vec<Expr>,
+    open span:    Span,
+}
+
+space data CallExpr derives [Clone] {
+    open callee:   Box<Expr>,
+    open args:     Vec<Expr>,
+    open type_args: Vec<TypeExpr>,  // YENİ: turbofish benzeri `f::<T>()`
+    open span:     Span,
+}
+
+space data MethodExpr derives [Clone] {
+    open receiver: Box<Expr>,
+    open method:   String,
+    open args:     Vec<Expr>,
+    open type_args: Vec<TypeExpr>,
+    open span:     Span,
+}
+
+// ── Koleksiyon ifadeleri ──────────────────────────────────────────────────────
+
+space data ArrayExpr derives [Clone] {
+    open elements: Vec<Expr>,
+    open span:     Span,
+}
+
+space data TupleExpr derives [Clone] {
+    open elements: Vec<Expr>,
+    open span:     Span,
+}
+
+space data RecordExpr derives [Clone] {
+    open name:   Option<String>,   // isimli: `Point { x: 1 }` veya anonim: `{ x: 1 }`
+    open fields: Vec<(String, Expr)>,
+    open span:   Span,
+}
+
+// ── Kontrol akış ifadeleri ────────────────────────────────────────────────────
+
+space data CheckExpr derives [Clone] {
+    open cond: Box<Expr>,
+    open then: Box<Expr>,
+    open els:  Option<Box<Expr>>,
+    open span: Span,
+}
+
+space data MatchExpr derives [Clone] {
+    open value: Box<Expr>,
+    open arms:  Vec<MatchArm>,
+    open span:  Span,
+}
+
+space data MatchArm derives [Clone] {
+    open pattern: Pattern,
+    open guard:   Option<Box<Expr>>,
+    open body:    Box<Expr>,
+    open span:    Span,
+}
+
+space data LoopExpr  derives [Clone] { open body: Block, open span: Span }
+space data WhileExpr derives [Clone] { open cond: Box<Expr>, open body: Block, open span: Span }
+space data EachExpr  derives [Clone] {
+    open var:      String,
+    open iterable: Box<Expr>,
+    open body:     Block,
+    open span:     Span,
+}
+
+// ── Lambda & Pipeline ─────────────────────────────────────────────────────────
+
+space data LambdaExpr derives [Clone] {
+    open params:    Vec<Param>,
+    open return_ty: Option<TypeExpr>,
+    open body:      Box<Expr>,
+    open span:      Span,
+}
+
+space data PipeExpr derives [Clone] {
+    open stages: Vec<Expr>,   // a |> f |> g — tüm aşamalar sıralı
+    open span:   Span,
+}
+
+space data RangeExpr derives [Clone] {
+    open start:     Box<Expr>,
+    open end:       Box<Expr>,
+    open inclusive: bool,
+    open span:      Span,
+}
+
+space data CatchExpr derives [Clone] {
+    open body:     Block,
+    open err_var:  String,
+    open handler:  Block,
+    open span:     Span,
+}
+
+// ── YENİ: Matematik ifadeleri ─────────────────────────────────────────────────
+//
+//  `grad(f, x)` → x'e göre f'nin gradyanı
+//  Type checker: f: Fn(A) -> B, x: A → yield: Fn(A) -> B/A (boyut bölünmesi)
+//
+space data MathExpr derives [Clone] {
+    open op:       MathOp,
+    open args:     Vec<Expr>,
+    open wrt:      Option<Box<Expr>>,   // "with respect to" — türev alınan değişken
+    open bounds:   Option<(Box<Expr>, Box<Expr>)>,  // integral sınırları
+    open span:     Span,
+}
+
+// ── YENİ: Tensor inşası ───────────────────────────────────────────────────────
+//
+//  `tensor<f32>[batch=32, seq=512] { zeros }`
+//  `tensor<f64>[3, 3] { yield [[1,0,0],[0,1,0],[0,0,1]]}`
+//
+space cases TensorInit {
+    Zeros,
+    Ones,
+    Fill(Box<Expr>),
+    FromList(Vec<Expr>),
+    FromFn(Box<Expr>),
+}
+
+space data TensorInitExpr derives [Clone] {
+    open dtype:  TypeExpr,
+    open dims:   Vec<(Option<String>, DimSize)>,   // (isim, boyut)
+    open init:   TensorInit,
+    open span:   Span,
+}
+
+// ── YENİ: Flow inşası ─────────────────────────────────────────────────────────
+//
+//  signal(0)       → Signal<i32>
+//  stream(list)    → Stream<T>
+//  spawn { ... }   → Task<T>
+//  channel()       → (Sender<T>, Receiver<T>)
+//
+space cases FlowConstruct derives [Clone] {
+    Signal(Box<Expr>),            // başlangıç değeriyle signal
+    Stream(Box<Expr>),            // iterable'dan stream
+    Spawn(Block),                 // async task
+    MakeChannel,                  // kanal çifti oluştur
+}
+
+// ── YENİ: Kanal ifadeleri ─────────────────────────────────────────────────────
+
+space cases ChanExpr derives [Clone] {
+    Send(Box<Expr>, Box<Expr>),   // send(channel, value)
+    Recv(Box<Expr>),              // recv(channel)
+    TrySend(Box<Expr>, Box<Expr>),
+    TryRecv(Box<Expr>),
+}
+
+// ── Birim dönüşümü ────────────────────────────────────────────────────────────
+// `5.kg in lb` — compile-time'da boyut uyumluluğu kontrol edilir
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §4  PATERNLER  (Pattern Matching)
+// ══════════════════════════════════════════════════════════════════════════════
+
+space cases Pattern derives [Clone] {
+    Wildcard,                               // _
+    Bind(String),                           // x
+    Lit(Box<Expr>),                         // 42, "hello", true
+    Tuple(Vec<Pattern>),                    // (a, b, c)
+    Array(Vec<Pattern>),                    // [head, ..tail]
+    Record(String, Vec<(String, Pattern)>), // Point { x: px, y: py }
+    Variant(String, Vec<Pattern>),          // Some(x), Ok(v)
+    Or(Vec<Pattern>),                       // a | b | c
+    Guard(Box<Pattern>, Box<Expr>),         // pat check condition
+    // YENİ: Birim örüntüsü
+    Measured(f64, String),                  // 5.kg — birimli değer eşleştir
+    Rest,                                   // .. — kalan elemanlar
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §5  İFADELER  (Stmt)
+// ══════════════════════════════════════════════════════════════════════════════
+
+space cases Stmt derives [Clone] {
+    Let(LetStmt),
+    Var(VarStmt),
+    Match(MatchStmt),
+    Yield(YieldStmt),
+    Expr(ExprStmt),
+    Abort(Span),               // abort
+    Next(Span),                // next
+
+    // YENİ: Sözleşme ifadeleri — doğrulama araçları bunları ayrı görür
+    Require(ContractStmt),     // require condition
+    Ensure(ContractStmt),      // ensure condition
+    
+    // ⚔️ L1/L2 ARMY - GPU Operasyonları
+    Parallel(ParallelStmt),    // parallel { threads(1024) { ... } }
+    Sync(Span),                // sync threads / memory
+}
+
+space data ParallelStmt derives [Clone] {
+    open grid:   Option<Box<Expr>>,    // Grid boyutu (3D)
+    open block:  Option<Box<Expr>>,    // Block/Thread boyutu (3D)
+    open body:   Block,
+    open span:   Span,
+}
+
+space data LetStmt derives [Clone] {
+    open pattern: Pattern,
+    open ty:      Option<TypeExpr>,
+    open init:    Option<Expr>,
+    open span:    Span,
+}
+
+space data VarStmt derives [Clone] {
+    open name:  String,
+    open ty:    Option<TypeExpr>,
+    open init:  Option<Expr>,
+    open span:  Span,
+}
+
+space data ExprStmt derives [Clone] {
+    open expr:  Expr,
+    open span:  Span,
+}
+
+space data YieldStmt derives [Clone] {
+    open value: Option<Expr>,
+    open span:  Span,
+}
+
+space data MatchStmt derives [Clone] {
+    open value: Box<Expr>,
+    open arms:  Vec<MatchArm>,
+    open span:  Span,
+}
+
+space data ContractStmt derives [Clone] {
+    open cond:    Expr,
+    open message: Option<Expr>,
+    open span:    Span,
+}
+
+space data Block derives [Clone] {
+    open stmts: Vec<Stmt>,
+    open span:  Span,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §6  ORTAK YARDIMCILAR
+// ══════════════════════════════════════════════════════════════════════════════
+
+space data Param derives [Clone] {
+    open name: String,
+    open ty:   Option<TypeExpr>,
+    open span: Span,
+}
+
+space data GenericParam derives [Clone] {
+    open name:        String,
+    open constraints: Vec<TypeExpr>,
+}
+
+space data Attr derives [Clone] {
+    open name: String,
+    open args: Vec<Expr>,
+    open span: Span,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §7  ÜST DÜZEYLEYELİ TANIMLAR  (Top-level Declarations)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Fonksiyon Tanımı ──────────────────────────────────────────────────────────
+//
+//  YENİ: Fonksiyonların ön/son koşulları ayrı alanlar.
+//  Bu sayede doğrulama araçları (SMT solver, fuzzer vs.) bunları kullanabilir.
+//
+space data FnDef derives [Clone] {
+    open name:      String,
+    open generics:  Vec<GenericParam>,
+    open params:    Vec<Param>,
+    open return_ty: Option<TypeExpr>,
+    open requires:  Vec<ContractStmt>,  // YENİ: ön-koşullar
+    open ensures:   Vec<ContractStmt>,  // YENİ: son-koşullar
+    open body:      Block,
+    open vpu_model: Option<VPUModel>,  // YENİ: Hangi katmanda çalışacak?
+    open is_open:   bool,
+    open is_async:  bool,
+    open attrs:     Vec<Attr>,
+    open span:      Span,
+}
+
+// ── Veri Yapısı (data) ────────────────────────────────────────────────────────
+space data DataDef derives [Clone] {
+    open name:     String,
+    open generics: Vec<GenericParam>,
+    open fields:   Vec<FieldDef>,
+    open is_open:  bool,
+    open attrs:    Vec<Attr>,
+    open span:     Span,
+}
+
+space data FieldDef derives [Clone] {
+    open name:    String,
+    open ty:      TypeExpr,
+    open is_open: bool,
+    open default: Option<Expr>,    // YENİ: varsayılan değer
+    open span:    Span,
+}
+
+// ── Varyant Tipi (cases) ──────────────────────────────────────────────────────
+space cases VariantPayload derives [Clone] {
+    Empty,
+    Tuple(Vec<TypeExpr>),
+    Record(Vec<FieldDef>),
+}
+
+space data VariantDef derives [Clone] {
+    open name:    String,
+    open payload: VariantPayload,
+    open attrs:   Vec<Attr>,
+    open span:    Span,
+}
+
+space data CasesDef derives [Clone] {
+    open name:     String,
+    open generics: Vec<GenericParam>,
+    open variants: Vec<VariantDef>,
+    open is_open:  bool,
+    open attrs:    Vec<Attr>,
+    open span:     Span,
+}
+
+// ── Davranış Arayüzü (rules) ──────────────────────────────────────────────────
+space data RulesDef derives [Clone] {
+    open name:     String,
+    open generics: Vec<GenericParam>,
+    open requires: Vec<TypeExpr>,      // YENİ: `rules Display requires Debug`
+    open methods:  Vec<FnSig>,
+    open defaults: Vec<FnDef>,
+    open is_open:  bool,
+    open attrs:    Vec<Attr>,
+    open span:     Span,
+}
+
+/// Fonksiyon imzası (gövdesiz)
+space data FnSig derives [Clone] {
+    open name:      String,
+    open generics:  Vec<GenericParam>,
+    open params:    Vec<Param>,
+    open return_ty: Option<TypeExpr>,
+    open requires:  Vec<ContractStmt>,
+    open ensures:   Vec<ContractStmt>,
+    open span:      Span,
+}
+
+// ── Implementasyon Bloğu (impl) ──────────────────────────────────────────────
+space data SkillBlock derives [Clone] {
+    open target:   TypeExpr,
+    open generics: Vec<GenericParam>,
+    open for_rules: Option<TypeExpr>,  // `impl X for Y`
+    open methods:  Vec<FnDef>,
+    open span:     Span,
+}
+
+// ── YENİ: Flow Type Tanımı ────────────────────────────────────────────────────
+//
+//  `flow Counter = Signal<i32>`
+//  `flow EventBus<T> = Stream<T> where T: Clone`
+//
+space data FlowDef derives [Clone] {
+    open name:     String,
+    open generics: Vec<GenericParam>,
+    open kind:     FlowKind,
+    open inner:    TypeExpr,
+    open is_open:  bool,
+    open attrs:    Vec<Attr>,
+    open span:     Span,
+}
+
+// ── YENİ: Unit Tanımı ─────────────────────────────────────────────────────────
+//
+//  unit Mass {
+//      base: kg
+//      g  = kg * 0.001
+//      lb = kg * 0.453592
+//      t  = kg * 1000.0
+//  }
+//
+space data UnitFamilyDef derives [Clone] {
+    open name:         String,
+    open base_unit:    String,
+    open conversions:  Vec<UnitConversion>,
+    open dim_exponent: i64,   // kütle: 1, hız: 1, ivme: 1... (boyut analizi için)
+    open attrs:        Vec<Attr>,
+    open span:         Span,
+}
+
+space data UnitConversion derives [Clone] {
+    open from_unit: String,
+    open to_base:   Expr,    // dönüşüm faktörü
+    open span:      Span,
+}
+
+// ── YENİ: Quantity Type Alias ─────────────────────────────────────────────────
+//
+//  `qty Speed = f64 in m/s`
+//
+space data QtyDef derives [Clone] {
+    open name:   String,
+    open scalar: TypeExpr,
+    open dim:    DimExpr,
+    open is_open: bool,
+    open attrs:  Vec<Attr>,
+    open span:   Span,
+}
+
+// ── Tensor Tanımı ─────────────────────────────────────────────────────────────
+space data TensorDef derives [Clone] {
+    open name:  String,
+    open dtype: TypeExpr,
+    open dims:  Vec<(Option<String>, DimSize)>,
+    open init:  Option<TensorInitExpr>,
+    open attrs: Vec<Attr>,
+    open span:  Span,
+}
+
+// ── YENİ: Kernel Tanımı (GPU) ─────────────────────────────────────────────────
+//
+//  kernel matmul<f32>(a: tensor<f32>[M, K], b: tensor<f32>[K, N])
+//      -> tensor<f32>[M, N]
+//  {
+//      parallel { ... }
+//  }
+//
+space data KernelDef derives [Clone] {
+    open name:    String,
+    open generics: Vec<GenericParam>,
+    open params:  Vec<Param>,
+    open result:  TypeExpr,
+    open vpu_model: VPUModel,          // YENİ: Kernel hangi VPU'yu hedefliyor?
+    open body:    Block,
+    open attrs:   Vec<Attr>,
+    open span:    Span,
+}
+
+// ── Bilimsel Domain Tanımları ─────────────────────────────────────────────────
+
+space data MoleculeDef derives [Clone] {
+    open name:        String,
+    open composition: HashMap<String, i64>,   // H:2, O:1
+    open charge:      i64,
+    open span:        Span,
+}
+
+space data ReactionDef derives [Clone] {
+    open name:        String,
+    open reactants:   Vec<(i64, String)>,    // [(2, "H2"), (1, "O2")]
+    open products:    Vec<(i64, String)>,    // [(2, "H2O")]
+    open conditions:  Vec<String>,           // ["Δ", "catalyst: Pt"]
+    open span:        Span,
+}
+
+space data SeqDef derives [Clone] {
+    open kind:  String,   // "dna" | "rna" | "protein"
+    open name:  String,
+    open data:  String,   // "ATCG..."
+    open span:  Span,
+}
+
+// ── Proof Bloğu ──────────────────────────────────────────────────────────────
+//
+//  proof lemma_name {
+//      assume ...
+//      assert ...
+//      ...
+//  }
+//
+space data ProofBlock derives [Clone] {
+    open name:    Option<String>,
+    open assumes: Vec<ContractStmt>,
+    open steps:   Vec<Stmt>,
+    open span:    Span,
+}
+
+// ── UI Tanımları ──────────────────────────────────────────────────────────────
+
+space data ComponentDef derives [Clone] {
+    open name:     String,
+    open generics: Vec<GenericParam>,
+    open props:    Vec<FieldDef>,
+    open state:    Vec<Stmt>,           // `var count = 0`
+    open view:     Option<ViewDef>,
+    open methods:  Vec<FnDef>,
+    open is_open:  bool,
+    open attrs:    Vec<Attr>,
+    open span:     Span,
+}
+
+space data ViewDef derives [Clone] {
+    open root:   Box<Expr>,            // UI ağacının kökü (örn: column { ... })
+    open span:   Span,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §8  PROGRAM KÖK
+// ══════════════════════════════════════════════════════════════════════════════
+
+space cases TopLevel derives [Clone] {
+    Use(UseDecl),
+    Fn(FnDef),
+    Data(DataDef),
+    Cases(CasesDef),
+    Rules(RulesDef),
+    Skill(SkillBlock),
+    Flow(FlowDef),
+    Unit(UnitFamilyDef),
+    Qty(QtyDef),
+    Tensor(TensorDef),
+    Kernel(KernelDef),
+    Molecule(MoleculeDef),
+    Reaction(ReactionDef),
+    Seq(SeqDef),
+    Proof(ProofBlock),
+    Alias(String, TypeExpr, Span),    // alias Foo = Bar<i32>
+    Given(String, TypeExpr, Expr, Span), // given MAX: i32 = 100
+    Component(ComponentDef),          // YENİ: UI bileşeni
+    View(ViewDef),                   // YENİ: Görünüm tanımı
+    Space(SpaceDef),
+}
+
+space data UseDecl derives [Clone] {
+    open path:  Vec<String>,
+    open items: Vec<String>,       // `use std::io::{Read, Write}`
+    open alias: Option<String>,    // `use std::io as io`
+    open span:  Span,
+}
+
+space data SpaceDef derives [Clone] {
+    open name:  String,
+    open items: Vec<TopLevel>,
+    open span:  Span,
+}
+
+space data Program {
+    open file:  String,
+    open items: Vec<TopLevel>,
+}
+
+impl Program {
+    open fn new(file: String) -> Program {
+        Program { file, items: [] }
+    }
+}

@@ -1,0 +1,297 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Polonius - AST Visitor for Location Numbering                         ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use super::location::{Location, LocationContext, BlockId};
+use super::cfg::{CFG, CFGBuilder, EdgeKind};
+use super::origin::{Origin, OriginContext};
+use super::loan::{Path, LocalId, FieldId};
+
+/// AST Visitor that assigns locations and builds CFG
+expose data ASTVisitor {
+    location_ctx: LocationContext,
+    cfg_builder: CFGBuilder,
+    origin_ctx: OriginContext,
+    
+    /// Map from variable names to local IDs
+    var_map: HashMap<String, LocalId>,
+    next_local_id: u32,
+}
+
+impl ASTVisitor {
+    open fn new() -> ASTVisitor {
+        ASTVisitor {
+            location_ctx: LocationContext::new(),
+            cfg_builder: CFGBuilder::new(),
+            origin_ctx: OriginContext::new(),
+            var_map: HashMap::new(),
+            next_local_id: 0,
+        }
+    }
+    
+    /// Visit a function definition
+    open fn visit_function(&var self, name: String, params: Vec<FunctionParam>, body: Expr) {
+        // Create origins for parameters
+        each param in params {
+            let origin = self.origin_ctx.new_universal(Some(param.name.clone()));
+            let local_id = self.register_var(param.name);
+        }
+        
+        // Visit function body
+        self.visit_expr(body);
+    }
+    
+    /// Visit an expression
+    open fn visit_expr(&var self, expr: Expr) -> Location {
+        let loc = self.new_location();
+        
+        match expr {
+            Expr::Block(stmts) => self.visit_block(stmts, loc),
+            Expr::If(cond, then_branch, else_branch) => self.visit_if(*cond, *then_branch, else_branch, loc),
+            Expr::Match(scrutinee, arms) => self.visit_match(*scrutinee, arms, loc),
+            Expr::While(cond, body) => self.visit_while(*cond, *body, loc),
+            Expr::For(var, iter, body) => self.visit_for(var, *iter, *body, loc),
+            Expr::Let(name, value) => self.visit_let(name, *value, loc),
+            Expr::Assign(target, value) => self.visit_assign(*target, *value, loc),
+            Expr::Borrow(is_mut, expr) => self.visit_borrow(is_mut, *expr, loc),
+            Expr::Call(func, args) => self.visit_call(*func, args, loc),
+            Expr::Field(base, field) => self.visit_field(*base, field, loc),
+            Expr::Index(base, index) => self.visit_index(*base, *index, loc),
+            Expr::Var(name) => self.visit_var(name, loc),
+            Expr::Literal(_) => loc,
+            _ => loc,
+        }
+    }
+    
+    open fn visit_block(&var self, stmts: Vec<Stmt>, loc: Location) -> Location {
+        var last_loc = loc;
+        each stmt in stmts {
+            last_loc = self.visit_stmt(stmt);
+        }
+        last_loc
+    }
+    
+    open fn visit_if(&var self, cond: Expr, then_branch: Expr, else_branch: Option<Box<Expr>>, loc: Location) -> Location {
+        // Visit condition
+        self.visit_expr(cond);
+        
+        // Create blocks for branches
+        let then_block = self.cfg_builder.new_block();
+        let else_block = self.cfg_builder.new_block();
+        let merge_block = self.cfg_builder.new_block();
+        
+        // Add conditional edges
+        self.cfg_builder.add_edge(then_block, EdgeKind::Conditional);
+        self.cfg_builder.add_edge(else_block, EdgeKind::Conditional);
+        
+        // Visit then branch
+        self.cfg_builder.set_current(then_block);
+        self.visit_expr(then_branch);
+        self.cfg_builder.add_edge(merge_block, EdgeKind::Normal);
+        
+        // Visit else branch
+        self.cfg_builder.set_current(else_block);
+        check let Some(else_expr) = else_branch {
+            self.visit_expr(*else_expr);
+        }
+        self.cfg_builder.add_edge(merge_block, EdgeKind::Normal);
+        
+        // Continue at merge block
+        self.cfg_builder.set_current(merge_block);
+        
+        loc
+    }
+    
+    open fn visit_match(&var self, scrutinee: Expr, arms: Vec<MatchArm>, loc: Location) -> Location {
+        self.visit_expr(scrutinee);
+        
+        let merge_block = self.cfg_builder.new_block();
+        
+        each arm in arms {
+            let arm_block = self.cfg_builder.new_block();
+            self.cfg_builder.add_edge(arm_block, EdgeKind::Conditional);
+            self.cfg_builder.set_current(arm_block);
+            self.visit_expr(arm.body);
+            self.cfg_builder.add_edge(merge_block, EdgeKind::Normal);
+        }
+        
+        self.cfg_builder.set_current(merge_block);
+        loc
+    }
+    
+    open fn visit_while(&var self, cond: Expr, body: Expr, loc: Location) -> Location {
+        let loop_header = self.cfg_builder.new_block();
+        let loop_body = self.cfg_builder.new_block();
+        let exit_block = self.cfg_builder.new_block();
+        
+        // Jump to loop header
+        self.cfg_builder.add_edge(loop_header, EdgeKind::Normal);
+        
+        // Visit condition at header
+        self.cfg_builder.set_current(loop_header);
+        self.visit_expr(cond);
+        self.cfg_builder.add_edge(loop_body, EdgeKind::Conditional);
+        self.cfg_builder.add_edge(exit_block, EdgeKind::Conditional);
+        
+        // Visit loop body
+        self.cfg_builder.set_current(loop_body);
+        self.visit_expr(body);
+        self.cfg_builder.add_edge(loop_header, EdgeKind::Normal); // Back edge
+        
+        self.cfg_builder.set_current(exit_block);
+        loc
+    }
+    
+    open fn visit_for(&var self, var: String, iter: Expr, body: Expr, loc: Location) -> Location {
+        // Register loop variable
+        var_id = self.register_var(var);
+        var_origin = self.origin_ctx.new_existential(loc);
+        
+        self.visit_expr(iter);
+        
+        // Similar to while loop
+        let loop_header = self.cfg_builder.new_block();
+        let loop_body = self.cfg_builder.new_block();
+        let exit_block = self.cfg_builder.new_block();
+        
+        self.cfg_builder.add_edge(loop_header, EdgeKind::Normal);
+        self.cfg_builder.set_current(loop_header);
+        self.cfg_builder.add_edge(loop_body, EdgeKind::Conditional);
+        self.cfg_builder.add_edge(exit_block, EdgeKind::Conditional);
+        
+        self.cfg_builder.set_current(loop_body);
+        self.visit_expr(body);
+        self.cfg_builder.add_edge(loop_header, EdgeKind::Normal);
+        
+        self.cfg_builder.set_current(exit_block);
+        loc
+    }
+    
+    open fn visit_let(&var self, name: String, value: Expr, loc: Location) -> Location {
+        var_id = self.register_var(name);
+        let origin = self.origin_ctx.new_existential(loc);
+        self.visit_expr(value);
+        loc
+    }
+    
+    open fn visit_assign(&var self, target: Expr, value: Expr, loc: Location) -> Location {
+        self.visit_expr(target);
+        self.visit_expr(value);
+        loc
+    }
+    
+    open fn visit_borrow(&var self, is_mut: bool, expr: Expr, loc: Location) -> Location {
+        // This creates a loan - will be tracked by loan system
+        self.visit_expr(expr);
+        loc
+    }
+    
+    open fn visit_call(&var self, func: Expr, args: Vec<Expr>, loc: Location) -> Location {
+        self.visit_expr(func);
+        each arg in args {
+            self.visit_expr(arg);
+        }
+        loc
+    }
+    
+    open fn visit_field(&var self, base: Expr, field: String, loc: Location) -> Location {
+        self.visit_expr(base);
+        loc
+    }
+    
+    open fn visit_index(&var self, base: Expr, index: Expr, loc: Location) -> Location {
+        self.visit_expr(base);
+        self.visit_expr(index);
+        loc
+    }
+    
+    open fn visit_var(&var self, name: String, loc: Location) -> Location {
+        // Reference to variable
+        loc
+    }
+    
+    open fn visit_stmt(&var self, stmt: Stmt) -> Location {
+        match stmt {
+            Stmt::Expr(expr) => self.visit_expr(expr),
+            Stmt::Let(name, value) => self.visit_let(name, value),
+            Stmt::Return(expr) => {
+                let loc = self.visit_expr(expr);
+                self.cfg_builder.add_edge(self.cfg_builder.cfg.exit, EdgeKind::Return);
+                loc
+            }
+        }
+    }
+    
+    open fn new_location(&var self) -> Location {
+        let loc = self.location_ctx.new_location(self.cfg_builder.current_block);
+        self.cfg_builder.add_location(loc);
+        loc
+    }
+    
+    open fn register_var(&var self, name: String) -> LocalId {
+        check let Some(&local_id) = self.var_map.get(&name) {
+            local_id
+        } else {
+            let local_id = LocalId { id: self.next_local_id };
+            self.next_local_id += 1;
+            self.var_map.insert(name, local_id);
+            local_id
+        }
+    }
+    
+    open fn finish(self) -> (LocationContext, CFG, OriginContext) {
+        yield (self.location_ctx, self.cfg_builder.finish(), self.origin_ctx)
+    }
+}
+
+// Simplified AST types for visitor
+expose cases Expr {
+    Block(Vec<Stmt>),
+    If(Box<Expr>, Box<Expr>, Option<Box<Expr>>),
+    Match(Box<Expr>, Vec<MatchArm>),
+    While(Box<Expr>, Box<Expr>),
+    For(String, Box<Expr>, Box<Expr>),
+    Let(String, Box<Expr>),
+    Assign(Box<Expr>, Box<Expr>),
+    Borrow(bool, Box<Expr>),
+    Call(Box<Expr>, Vec<Expr>),
+    Field(Box<Expr>, String),
+    Index(Box<Expr>, Box<Expr>),
+    Var(String),
+    Literal(Literal),
+}
+
+expose cases Stmt {
+    Expr(Expr),
+    Let(String, Expr),
+    Return(Expr),
+}
+
+expose data MatchArm {
+    pattern: Pattern,
+    body: Expr,
+}
+
+expose cases Pattern {
+    Wildcard,
+    Var(String),
+    Literal(Literal),
+}
+
+expose cases Literal {
+    Int(i64),
+    Bool(bool),
+    String(String),
+}
+
+expose data FunctionParam {
+    name: String,
+    ty: Type,
+}
+
+expose cases Type {
+    Int,
+    Bool,
+    String,
+    Unit,
+}

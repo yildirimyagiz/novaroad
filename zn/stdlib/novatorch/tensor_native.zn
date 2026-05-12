@@ -1,0 +1,280 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                    NOVA NATIVE TENSOR OPERATIONS                            ║
+// ║         LoRA, düşük seviyeli tensor işlemleri — Nova native                  ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use torch::tensor::{Tensor, TensorOps, DType, Device, GradFn};
+use core::option::{Option, Some, None};
+use core::math::{sqrt};
+use torch::ffi::{torch_zeros, torch_randn_scaled};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tensor Native İşlemleri
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open impl TensorNativeOps {
+
+    /// Sıfır dolu tensor oluştur
+    open fn zeros(dims: Vec<i64>) -> Tensor {
+        yield TensorOps::zeros(dims, false)
+    }
+
+    /// Bir dolu tensor oluştur
+    open fn ones(dims: Vec<i64>) -> Tensor {
+        yield TensorOps::ones(dims, false)
+    }
+
+    /// Normal dağılımlı rastgele tensor
+    open fn randn(dims: Vec<i64>) -> Tensor {
+        yield TensorOps::randn(dims, false)
+    }
+
+    /// Toplam eleman sayısı
+    open fn numel(t: Tensor) -> i64 {
+        yield TensorOps::numel(t)
+    }
+
+    /// Skaler değer al (tek elemanlı tensor)
+    open fn item(t: Tensor) -> f64 {
+        yield TensorOps::item(t)
+    }
+
+    /// İki tensor'u topla
+    open fn add(a: Tensor, b: Tensor) -> Tensor {
+        yield TensorOps::add(a, b)
+    }
+
+    /// Element-wise çarpım
+    open fn mul(a: Tensor, b: Tensor) -> Tensor {
+        yield TensorOps::mul(a, b)
+    }
+
+    /// Matris çarpımı
+    open fn matmul(a: Tensor, b: Tensor) -> Tensor {
+        yield TensorOps::matmul(a, b)
+    }
+
+    /// Skaler ile çarp
+    open fn scale(t: Tensor, s: f64) -> Tensor {
+        yield TensorOps::mul_scalar(t, s)
+    }
+
+    /// Ortalama
+    open fn mean(t: Tensor) -> f64 {
+        yield TensorOps::item(TensorOps::mean(t))
+    }
+
+    /// L2 norm
+    open fn norm(t: Tensor) -> f64 {
+        let sq   = TensorOps::pow(t, 2.0);
+        let s    = TensorOps::item(TensorOps::sum(sq));
+        yield sqrt(s)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LoRA (Low-Rank Adaptation) — verimli fine-tuning
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data LoRALayer {
+    down:     Tensor,      // (in_dim, rank)
+    up:       Tensor,      // (rank, out_dim)
+    scaling:  f64,         // alpha / rank
+    in_dim:   i64,
+    out_dim:  i64,
+    rank:     i64,
+}
+
+open impl LoRAOps {
+
+    /// LoRA katmanı oluştur
+    /// Kaiming uniform ile down başlatılır, up sıfır ile başlatılır
+    open fn new(in_dim: i64, out_dim: i64, rank: i64, alpha: f64) -> LoRALayer {
+        let std  = sqrt(1.0 / in_dim as f64);
+        let down = TensorOps::mul_scalar(
+                       TensorOps::randn([in_dim, rank], true),
+                       std);
+        let up   = TensorOps::zeros([rank, out_dim], true);
+        LoRALayer {
+            down,
+            up,
+            scaling: alpha / rank as f64,
+            in_dim,
+            out_dim,
+            rank,
+        }
+    }
+
+    /// LoRA ileri geçiş: output = input @ down @ up * scaling
+    open fn forward(layer: LoRALayer, input: Tensor) -> Tensor {
+        let hidden = TensorOps::matmul(input, layer.down);
+        let out    = TensorOps::matmul(hidden, layer.up);
+        yield TensorOps::mul_scalar(out, layer.scaling)
+    }
+
+    /// Tam ağırlık matrisiyle birleştir: W_new = W_orig + down @ up * scaling
+    open fn merge_weights(layer: LoRALayer, base_weight: Tensor) -> Tensor {
+        let delta = TensorOps::mul_scalar(
+            TensorOps::matmul(layer.down, layer.up),
+            layer.scaling
+        );
+        yield TensorOps::add(base_weight, delta)
+    }
+
+    /// Eğitilebilir parametre sayısını hesapla
+    open fn count_params(layer: LoRALayer) -> i64 {
+        yield layer.in_dim * layer.rank + layer.rank * layer.out_dim
+    }
+
+    /// LoRA gradyanlarını sıfırla
+    open fn zero_grad(layer: LoRALayer) -> LoRALayer {
+        LoRALayer {
+            down:    TensorOps::zero_grad(layer.down),
+            up:      TensorOps::zero_grad(layer.up),
+            scaling: layer.scaling,
+            in_dim:  layer.in_dim,
+            out_dim: layer.out_dim,
+            rank:    layer.rank,
+        }
+    }
+
+    /// Parametreler
+    open fn parameters(layer: LoRALayer) -> Vec<Tensor> {
+        yield [layer.down, layer.up]
+    }
+}
+
+// ─── LoRA ile Linear katmanı sarmalama ───────────────────────────────────────
+
+open data LoRALinear {
+    base:     Tensor,      // Dondurulmuş ağırlık (in_dim, out_dim)
+    lora:     LoRALayer,
+    bias:     Option<Tensor>,
+}
+
+open impl LoRALinearOps {
+
+    open fn new(in_dim: i64, out_dim: i64, rank: i64, alpha: f64) -> LoRALinear {
+        let std  = sqrt(2.0 / (in_dim + out_dim) as f64);
+        let base = TensorOps::mul_scalar(
+                       TensorOps::randn([in_dim, out_dim], false),
+                       std);
+        let lora = LoRAOps::new(in_dim, out_dim, rank, alpha);
+        LoRALinear { base, lora, bias: None }
+    }
+
+    /// y = x @ (W + ΔW) + b
+    open fn forward(layer: LoRALinear, input: Tensor) -> Tensor {
+        let base_out = TensorOps::matmul(input, layer.base);
+        let lora_out = LoRAOps::forward(layer.lora, input);
+        var out  = TensorOps::add(base_out, lora_out);
+        match layer.bias {
+            Some(b) => { out = TensorOps::add(out, b);}
+            None    => {}
+        }
+        yield out
+    }
+
+    open fn count_trainable(layer: LoRALinear) -> i64 {
+        yield LoRAOps::count_params(layer.lora)
+    }
+
+    open fn parameters(layer: LoRALinear) -> Vec<Tensor> {
+        yield LoRAOps::parameters(layer.lora)
+    }
+}
+
+// ─── Çoklu LoRA Katmanı (transformer için) ───────────────────────────────────
+
+open data LoRATransformerBlock {
+    q_lora:  LoRALinear,   // Sorgu projeksiyonu
+    k_lora:  LoRALinear,   // Anahtar projeksiyonu
+    v_lora:  LoRALinear,   // Değer projeksiyonu
+    o_lora:  LoRALinear,   // Çıktı projeksiyonu
+    hidden_dim: i64,
+    num_heads:  i64,
+}
+
+open impl LoRATransformerBlockOps {
+
+    open fn new(hidden_dim: i64, num_heads: i64, rank: i64, alpha: f64) -> LoRATransformerBlock {
+        LoRATransformerBlock {
+            q_lora: LoRALinearOps::new(hidden_dim, hidden_dim, rank, alpha),
+            k_lora: LoRALinearOps::new(hidden_dim, hidden_dim, rank, alpha),
+            v_lora: LoRALinearOps::new(hidden_dim, hidden_dim, rank, alpha),
+            o_lora: LoRALinearOps::new(hidden_dim, hidden_dim, rank, alpha),
+            hidden_dim,
+            num_heads,
+        }
+    }
+
+    /// Tüm eğitilebilir parametre sayısı
+    open fn count_trainable_params(block: LoRATransformerBlock) -> i64 {
+        yield LoRALinearOps::count_trainable(block.q_lora)
+            + LoRALinearOps::count_trainable(block.k_lora)
+            + LoRALinearOps::count_trainable(block.v_lora)
+            + LoRALinearOps::count_trainable(block.o_lora)
+    }
+
+    open fn parameters(block: LoRATransformerBlock) -> Vec<Tensor> {
+        var p: Vec<Tensor> = LoRALinearOps::parameters(block.q_lora);
+        p.extend(LoRALinearOps::parameters(block.k_lora));
+        p.extend(LoRALinearOps::parameters(block.v_lora));
+        p.extend(LoRALinearOps::parameters(block.o_lora));
+        yield p
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Test Fonksiyonları
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open impl TensorNativeTests {
+
+    open fn test_basic_ops() -> bool {
+        let a = TensorNativeOps::zeros([768]);
+        let b = TensorNativeOps::ones([768]);
+        let c = TensorNativeOps::add(a, b);
+        yield TensorOps::numel(c) == 768
+    }
+
+    open fn test_lora_layer() -> i64 {
+        let in_dim  = 768;
+        let out_dim = 768;
+        let rank    = 32;
+
+        let layer  = LoRAOps::new(in_dim, out_dim, rank, 16.0);
+        let params = LoRAOps::count_params(layer);
+
+        // Beklenen: 768*32 + 32*768 = 49152
+        yield params
+    }
+
+    open fn test_lora_forward() -> bool {
+        let layer = LoRAOps::new(64, 64, 4, 8.0);
+        let input = TensorNativeOps::randn([2, 64]);
+        let out   = LoRAOps::forward(layer, input);
+        yield TensorOps::numel(out) == 2 * 64
+    }
+
+    open fn test_lora_transformer_block() -> i64 {
+        let block  = LoRATransformerBlockOps::new(768, 12, 32, 16.0);
+        let params = LoRATransformerBlockOps::count_trainable_params(block);
+        // 4 projeksiyon * 2 * 768 * 32 = 196608
+        yield params
+    }
+
+    open fn run_all() -> bool {
+        let t1 = TensorNativeTests::test_basic_ops();
+        let t2 = TensorNativeTests::test_lora_layer()     == 49152;
+        let t3 = TensorNativeTests::test_lora_forward();
+        let t4 = TensorNativeTests::test_lora_transformer_block() == 196608;
+        yield t1 && t2 && t3 && t4
+    }
+}
+
+fn main() -> i64 {
+    let params = TensorNativeTests::test_lora_layer();
+    // 768*32 + 32*768 = 49152 döndürmeli
+    yield params
+}

@@ -1,0 +1,172 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Error Recovery - Panic Mode & Synchronization                              ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use super::core::{Parser, ParseResult, ParseError, Token, TokenKind, Span};
+
+/// Parser with error recovery
+expose data RecoveringParser<T, P> {
+    parser: P,
+    sync_tokens: Vec<TokenKind>,
+}
+
+impl<T, P> RecoveringParser<T, P> where P: Parser<T> {
+    open fn new(parser: P, sync_tokens: Vec<TokenKind>) -> RecoveringParser<T, P> {
+        RecoveringParser { parser, sync_tokens }
+    }
+}
+
+impl<T, P> Parser<T> for RecoveringParser<T, P> where P: Parser<T> {
+    fn parse(&self, input: &[Token]) -> ParseResult<T> {
+        match self.parser.parse(input) {
+            success @ ParseResult::Success(_, _) => success,
+            ParseResult::Failure(err) => {
+                // Try to recover by skipping to synchronization token
+                let recovered_input = self.sync_to_token(input);
+                
+                // Return enhanced error with recovery info
+                ParseResult::Failure(ParseError {
+                    message: err.message,
+                    span: err.span,
+                    expected: err.expected,
+                    recovery_suggestions: [
+                        format("Skipped to synchronization point"),
+                        format("Expected one of: {:?}", self.sync_tokens),
+                    ],
+                })
+            }
+        }
+    }
+}
+
+impl<T, P> RecoveringParser<T, P> where P: Parser<T> {
+    fn sync_to_token(&self, input: &[Token]) -> &[Token] {
+        var current = input;
+        
+        while !current.is_empty() {
+            check self.sync_tokens.iter().any(|t| {
+                std::mem::discriminant(&current[0].kind) == std::mem::discriminant(t)
+            }) {
+                yield current;
+            }
+            current = &current[1..];
+        }
+        
+        current
+    }
+}
+
+/// Multi-error collecting parser
+expose data MultiErrorParser<T> {
+    parsers: Vec<Box<dyn Parser<T>>>,
+    errors: Vec<ParseError>,
+}
+
+impl<T> MultiErrorParser<T> {
+    open fn new() -> MultiErrorParser<T> {
+        MultiErrorParser {
+            parsers: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+    
+    open fn add_parser(&var self, parser: Box<dyn Parser<T>>) {
+        self.parsers.push(parser);
+    }
+    
+    open fn parse_all(&var self, input: &[Token]) -> Vec<Result<T, ParseError>> {
+        var results = Vec::new();
+        
+        each parser in &self.parsers {
+            match parser.parse(input) {
+                ParseResult::Success(val, _) => {
+                    results.push(Ok(val));
+                }
+                ParseResult::Failure(err) => {
+                    self.errors.push(err.clone());
+                    results.push(Err(err));
+                }
+            }
+        }
+        
+        results
+    }
+    
+    open fn get_errors(&self) -> &Vec<ParseError> {
+        &self.errors
+    }
+}
+
+/// Expected token suggestion
+open fn suggest_fix(error: &ParseError, input: &[Token]) -> Vec<String> {
+    var suggestions = Vec::new();
+    
+    // Suggest missing semicolon
+    check error.expected.contains(&"semicolon".into()) {
+        suggestions.push("Add semicolon `;` at the end".into());
+    }
+    
+    // Suggest closing delimiter
+    check error.expected.contains(&"right brace".into()) {
+        suggestions.push("Add closing brace `}`".into());
+    }
+    
+    check error.expected.contains(&"right paren".into()) {
+        suggestions.push("Add closing parenthesis `)`".into());
+    }
+    
+    // Check each typos in keywords
+    check !input.is_empty() {
+        check let TokenKind::Ident(name) = &input[0].kind {
+            let keywords = ["fn", "let", "check", "else", "while", "for", "match", "yield"];
+            each keyword in keywords {
+                check levenshtein_distance(name, keyword) <= 2 {
+                    suggestions.push(format("Did you mean `{}`?", keyword));
+                }
+            }
+        }
+    }
+    
+    suggestions
+}
+
+/// Simple Levenshtein distance for typo detection
+fn levenshtein_distance(s1: &str, s2: &str) -> usize {
+    let len1 = s1.len();
+    let len2 = s2.len();
+    
+    check len1 == 0 { yield len2; }
+    check len2 == 0 { yield len1; }
+    
+    var matrix = [[0; len2 + 1]; len1 + 1];
+    
+    each i in 0..=len1 {
+        matrix[i][0] = i;
+    }
+    each j in 0..=len2 {
+        matrix[0][j] = j;
+    }
+    
+    each i in 1..=len1 {
+        each j in 1..=len2 {
+            let cost = check s1.chars().nth(i - 1) == s2.chars().nth(j - 1) { 0 } else { 1 };
+            matrix[i][j] = std::cmp::min(
+                std::cmp::min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1),
+                matrix[i - 1][j - 1] + cost
+            );
+        }
+    }
+    
+    matrix[len1][len2]
+}
+
+impl Clone for ParseError {
+    fn clone(&self) -> ParseError {
+        ParseError {
+            message: self.message.clone(),
+            span: self.span,
+            expected: self.expected.clone(),
+            recovery_suggestions: self.recovery_suggestions.clone(),
+        }
+    }
+}

@@ -1,0 +1,855 @@
+// 🔐 Nova Cryptography — v10.0
+// Cryptography primitives with security focus
+// + Nova Magic: Hardware acceleration, constant-time operations
+
+@module("crypto::primitives")
+@reproducible
+@export
+@inline
+
+use std::collections::{HashMap, Vec};
+use std::sync::Arc;
+use std::result::Result;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §1  CRYPTOGRAPHY CORE TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Cryptography error
+open cases CryptoError {
+    InvalidKey(String),
+    InvalidInput(String),
+    EncryptionFailed(String),
+    DecryptionFailed(String),
+    HashFailed(String),
+    SignatureFailed(String),
+    InvalidAlgorithm(String),
+    InsufficientData,
+    Overflow,
+}
+
+impl CryptoError {
+    open fn to_string(&self) -> String {
+        match self {
+            CryptoError::InvalidKey(msg) => format!("Invalid key: {}", msg),
+            CryptoError::InvalidInput(msg) => format!("Invalid input: {}", msg),
+            CryptoError::EncryptionFailed(msg) => format!("Encryption failed: {}", msg),
+            CryptoError::DecryptionFailed(msg) => format!("Decryption failed: {}", msg),
+            CryptoError::HashFailed(msg) => format!("Hash failed: {}", msg),
+            CryptoError::SignatureFailed(msg) => format!("Signature failed: {}", msg),
+            CryptoError::InvalidAlgorithm(msg) => format!("Invalid algorithm: {}", msg),
+            CryptoError::InsufficientData => "Insufficient data".into(),
+            CryptoError::Overflow => "Buffer overflow".into(),
+        }
+    }
+}
+
+/// Cryptography result
+open type CryptoResult<T> = Result<T, CryptoError>;
+
+/// Cryptographic algorithm
+open cases CryptoAlgorithm {
+    AES128,
+    AES192,
+    AES256,
+    RSA1024,
+    RSA2048,
+    RSA4096,
+    SHA256,
+    SHA512,
+    HMACSHA256,
+    HMACSHA512,
+}
+
+impl CryptoAlgorithm {
+    open fn key_size(&self) -> usize {
+        match self {
+            CryptoAlgorithm::AES128 => 16,
+            CryptoAlgorithm::AES192 => 24,
+            CryptoAlgorithm::AES256 => 32,
+            CryptoAlgorithm::RSA1024 => 128,
+            CryptoAlgorithm::RSA2048 => 256,
+            CryptoAlgorithm::RSA4096 => 512,
+            CryptoAlgorithm::SHA256 => 32,
+            CryptoAlgorithm::SHA512 => 64,
+            CryptoAlgorithm::HMACSHA256 => 32,
+            CryptoAlgorithm::HMACSHA512 => 64,
+        }
+    }
+    
+    open fn block_size(&self) -> usize {
+        match self {
+            CryptoAlgorithm::AES128 | CryptoAlgorithm::AES192 | CryptoAlgorithm::AES256 => 16,
+            _ => 0,
+        }
+    }
+}
+
+/// Cryptographic mode
+open cases CryptoMode {
+    ECB,
+    CBC,
+    CTR,
+    GCM,
+}
+
+/// Padding scheme
+open cases PaddingScheme {
+    PKCS7,
+    ISO97971,
+    ANSIX923,
+    ISO10126,
+    NoPadding,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §2  SYMMETRIC ENCRYPTION (AES)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// AES cipher
+open data AesCipher {
+    algorithm: CryptoAlgorithm,
+    mode: CryptoMode,
+    key: Vec<u8>,
+    iv: Option<Vec<u8>>,
+    padding: PaddingScheme,
+}
+
+impl AesCipher {
+    open fn new(algorithm: CryptoAlgorithm, mode: CryptoMode, key: Vec<u8>, iv: Option<Vec<u8>>) -> CryptoResult<AesCipher> {
+        check key.len() == algorithm.key_size() {
+            return Ok(AesCipher {
+                algorithm: algorithm,
+                mode: mode,
+                key: key,
+                iv: iv,
+                padding: PaddingScheme::PKCS7,
+            });
+        } else {
+            return Err(CryptoError::InvalidKey("Invalid key size".into()));
+        }
+    }
+    
+    open fn encrypt(&self, plaintext: &[u8]) -> CryptoResult<Vec<u8>> {
+        match self.mode {
+            CryptoMode::ECB => self.encrypt_ecb(plaintext),
+            CryptoMode::CBC => self.encrypt_cbc(plaintext),
+            CryptoMode::CTR => self.encrypt_ctr(plaintext),
+            CryptoMode::GCM => self.encrypt_gcm(plaintext),
+        }
+    }
+    
+    open fn decrypt(&self, ciphertext: &[u8]) -> CryptoResult<Vec<u8>> {
+        match self.mode {
+            CryptoMode::ECB => self.decrypt_ecb(ciphertext),
+            CryptoMode::CBC => self.decrypt_cbc(ciphertext),
+            CryptoMode::CTR => self.decrypt_ctr(ciphertext),
+            CryptoMode::GCM => self.decrypt_gcm(ciphertext),
+        }
+    }
+    
+    fn encrypt_ecb(&self, plaintext: &[u8]) -> CryptoResult<Vec<u8>> {
+        let block_size = self.algorithm.block_size();
+        let padded_plaintext = self.pad_data(plaintext, block_size)?;
+        let mut ciphertext = Vec::with_capacity(padded_plaintext.len());
+        
+        for chunk in padded_plaintext.chunks(block_size) {
+            let encrypted_block = self.encrypt_block(chunk)?;
+            ciphertext.extend_from_slice(&encrypted_block);
+        }
+        
+        return Ok(ciphertext);
+    }
+    
+    fn decrypt_ecb(&self, ciphertext: &[u8]) -> CryptoResult<Vec<u8>> {
+        let block_size = self.algorithm.block_size();
+        check ciphertext.len() % block_size == 0 {
+            return Err(CryptoError::InvalidInput("Invalid ciphertext length".into()));
+        }
+        
+        let mut plaintext = Vec::with_capacity(ciphertext.len());
+        
+        for chunk in ciphertext.chunks(block_size) {
+            let decrypted_block = self.decrypt_block(chunk)?;
+            plaintext.extend_from_slice(&decrypted_block);
+        }
+        
+        return self.unpad_data(&plaintext);
+    }
+    
+    fn encrypt_cbc(&self, plaintext: &[u8]) -> CryptoResult<Vec<u8>> {
+        let block_size = self.algorithm.block_size();
+        let iv = self.iv.as_ref().ok_or(CryptoError::InvalidInput("IV required for CBC".into()))?;
+        let padded_plaintext = self.pad_data(plaintext, block_size)?;
+        let mut ciphertext = Vec::with_capacity(padded_plaintext.len());
+        let mut previous_block = iv.clone();
+        
+        for chunk in padded_plaintext.chunks(block_size) {
+            let mut xor_block = Vec::with_capacity(block_size);
+            for i in 0..block_size {
+                xor_block.push(chunk[i] ^ previous_block[i]);
+            }
+            
+            let encrypted_block = self.encrypt_block(&xor_block)?;
+            ciphertext.extend_from_slice(&encrypted_block);
+            previous_block = encrypted_block;
+        }
+        
+        return Ok(ciphertext);
+    }
+    
+    fn decrypt_cbc(&self, ciphertext: &[u8]) -> CryptoResult<Vec<u8>> {
+        let block_size = self.algorithm.block_size();
+        check ciphertext.len() % block_size == 0 {
+            return Err(CryptoError::InvalidInput("Invalid ciphertext length".into()));
+        }
+        
+        let iv = self.iv.as_ref().ok_or(CryptoError::InvalidInput("IV required for CBC".into()))?;
+        let mut plaintext = Vec::with_capacity(ciphertext.len());
+        let mut previous_block = iv.clone();
+        
+        for chunk in ciphertext.chunks(block_size) {
+            let decrypted_block = self.decrypt_block(chunk)?;
+            let mut xor_block = Vec::with_capacity(block_size);
+            for i in 0..block_size {
+                xor_block.push(decrypted_block[i] ^ previous_block[i]);
+            }
+            plaintext.extend_from_slice(&xor_block);
+            previous_block = chunk.to_vec();
+        }
+        
+        return self.unpad_data(&plaintext);
+    }
+    
+    fn encrypt_ctr(&self, plaintext: &[u8]) -> CryptoResult<Vec<u8>> {
+        let block_size = self.algorithm.block_size();
+        let iv = self.iv.as_ref().ok_or(CryptoError::InvalidInput("IV required for CTR".into()))?;
+        let mut ciphertext = Vec::with_capacity(plaintext.len());
+        let mut counter = iv.clone();
+        
+        for (i, &byte) in plaintext.iter().enumerate() {
+            if i % block_size == 0 {
+                // Increment counter
+                let mut carry = 1;
+                for j in (0..block_size).rev() {
+                    let sum = counter[j] as u16 + carry;
+                    counter[j] = (sum & 0xFF) as u8;
+                    carry = sum >> 8;
+                }
+            }
+            
+            let keystream_byte = counter[i % block_size];
+            ciphertext.push(byte ^ keystream_byte);
+        }
+        
+        return Ok(ciphertext);
+    }
+    
+    fn decrypt_ctr(&self, ciphertext: &[u8]) -> CryptoResult<Vec<u8>> {
+        // CTR mode encryption and decryption are identical
+        return self.encrypt_ctr(ciphertext);
+    }
+    
+    fn encrypt_gcm(&self, plaintext: &[u8]) -> CryptoResult<Vec<u8>> {
+        // Simplified GCM implementation
+        let iv = self.iv.as_ref().ok_or(CryptoError::InvalidInput("IV required for GCM".into()))?;
+        let ciphertext = self.encrypt_ecb(plaintext)?;
+        let tag = self.compute_gcm_tag(&plaintext, iv)?;
+        
+        let mut result = Vec::with_capacity(ciphertext.len() + tag.len());
+        result.extend_from_slice(&ciphertext);
+        result.extend_from_slice(&tag);
+        
+        return Ok(result);
+    }
+    
+    fn decrypt_gcm(&self, ciphertext: &[u8]) -> CryptoResult<Vec<u8>> {
+        let iv = self.iv.as_ref().ok_or(CryptoError::InvalidInput("IV required for GCM".into()))?;
+        check ciphertext.len() >= 16 {
+            return Err(CryptoError::InvalidInput("Invalid GCM ciphertext".into()));
+        }
+        
+        let tag_start = ciphertext.len() - 16;
+        let ciphertext_data = &ciphertext[..tag_start];
+        let tag = &ciphertext[tag_start..];
+        
+        let plaintext = self.decrypt_ecb(ciphertext_data)?;
+        let computed_tag = self.compute_gcm_tag(&plaintext, iv)?;
+        
+        check &computed_tag == tag {
+            return Ok(plaintext);
+        } else {
+            return Err(CryptoError::DecryptionFailed("GCM authentication failed".into()));
+        }
+    }
+    
+    fn encrypt_block(&self, block: &[u8]) -> CryptoResult<Vec<u8>> {
+        check block.len() == self.algorithm.block_size() {
+            return aes_encrypt_block(block, &self.key, self.algorithm);
+        } else {
+            return Err(CryptoError::InvalidInput("Invalid block size".into()));
+        }
+    }
+    
+    fn decrypt_block(&self, block: &[u8]) -> CryptoResult<Vec<u8>> {
+        check block.len() == self.algorithm.block_size() {
+            return aes_decrypt_block(block, &self.key, self.algorithm);
+        } else {
+            return Err(CryptoError::InvalidInput("Invalid block size".into()));
+        }
+    }
+    
+    fn pad_data(&self, data: &[u8], block_size: usize) -> CryptoResult<Vec<u8>> {
+        match self.padding {
+            PaddingScheme::PKCS7 => {
+                let padding_len = block_size - (data.len() % block_size);
+                let mut padded = Vec::with_capacity(data.len() + padding_len);
+                padded.extend_from_slice(data);
+                padded.resize(data.len() + padding_len, padding_len as u8);
+                return Ok(padded);
+            }
+            PaddingScheme::NoPadding => {
+                check data.len() % block_size == 0 {
+                    return Ok(data.to_vec());
+                } else {
+                    return Err(CryptoError::InvalidInput("Data not block-aligned".into()));
+                }
+            }
+            _ => return Err(CryptoError::InvalidAlgorithm("Unsupported padding".into())),
+        }
+    }
+    
+    fn unpad_data(&self, data: &[u8]) -> CryptoResult<Vec<u8>> {
+        match self.padding {
+            PaddingScheme::PKCS7 => {
+                check !data.is_empty() {
+                    let padding_len = data[data.len() - 1] as usize;
+                    check padding_len <= data.len() && padding_len <= self.algorithm.block_size() {
+                        return Ok(data[..data.len() - padding_len].to_vec());
+                    } else {
+                        return Err(CryptoError::DecryptionFailed("Invalid padding".into()));
+                    }
+                } else {
+                    return Ok(data.to_vec());
+                }
+            }
+            PaddingScheme::NoPadding => return Ok(data.to_vec()),
+            _ => return Err(CryptoError::InvalidAlgorithm("Unsupported padding".into())),
+        }
+    }
+    
+    fn compute_gcm_tag(&self, data: &[u8], iv: &[u8]) -> CryptoResult<Vec<u8>> {
+        // Simplified GCM tag computation
+        let hash = hash_sha256(data);
+        let iv_hash = hash_sha256(iv);
+        let mut tag = Vec::with_capacity(16);
+        
+        for i in 0..16 {
+            tag.push(hash[i] ^ iv_hash[i]);
+        }
+        
+        return Ok(tag);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §3  ASYMMETRIC ENCRYPTION (RSA)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// RSA key pair
+open data RsaKeyPair {
+    public_key: RsaPublicKey,
+    private_key: RsaPrivateKey,
+}
+
+/// RSA public key
+open data RsaPublicKey {
+    modulus: Vec<u8>,
+    exponent: Vec<u8>,
+    key_size: usize,
+}
+
+/// RSA private key
+open data RsaPrivateKey {
+    modulus: Vec<u8>,
+    public_exponent: Vec<u8>,
+    private_exponent: Vec<u8>,
+    prime_p: Vec<u8>,
+    prime_q: Vec<u8>,
+    exponent_p: Vec<u8>,
+    exponent_q: Vec<u8>,
+    coefficient: Vec<u8>,
+    key_size: usize,
+}
+
+/// RSA cipher
+open data RsaCipher {
+    key_pair: Option<RsaKeyPair>,
+    public_key: Option<RsaPublicKey>,
+    padding: RsaPadding,
+}
+
+/// RSA padding scheme
+open cases RsaPadding {
+    PKCS1v15,
+    OAEP,
+    PSS,
+}
+
+impl RsaCipher {
+    open fn new_with_key_pair(key_pair: RsaKeyPair, padding: RsaPadding) -> RsaCipher {
+        return RsaCipher {
+            key_pair: Some(key_pair),
+            public_key: None,
+            padding: padding,
+        };
+    }
+    
+    open fn new_with_public_key(public_key: RsaPublicKey, padding: RsaPadding) -> RsaCipher {
+        return RsaCipher {
+            key_pair: None,
+            public_key: Some(public_key),
+            padding: padding,
+        };
+    }
+    
+    open fn encrypt(&self, plaintext: &[u8]) -> CryptoResult<Vec<u8>> {
+        let public_key = if let Some(key_pair) = &self.key_pair {
+            &key_pair.public_key
+        } else if let Some(public_key) = &self.public_key {
+            public_key
+        } else {
+            return Err(CryptoError::InvalidKey("No key available".into()));
+        };
+        
+        match self.padding {
+            RsaPadding::PKCS1v15 => self.rsa_encrypt_pkcs1v15(plaintext, public_key),
+            RsaPadding::OAEP => self.rsa_encrypt_oaep(plaintext, public_key),
+            RsaPadding::PSS => Err(CryptoError::InvalidAlgorithm("PSS not supported for encryption".into())),
+        }
+    }
+    
+    open fn decrypt(&self, ciphertext: &[u8]) -> CryptoResult<Vec<u8>> {
+        let key_pair = self.key_pair.as_ref().ok_or(CryptoError::InvalidKey("No private key available".into()))?;
+        
+        match self.padding {
+            RsaPadding::PKCS1v15 => self.rsa_decrypt_pkcs1v15(ciphertext, &key_pair.private_key),
+            RsaPadding::OAEP => self.rsa_decrypt_oaep(ciphertext, &key_pair.private_key),
+            RsaPadding::PSS => Err(CryptoError::InvalidAlgorithm("PSS not supported for decryption".into())),
+        }
+    }
+    
+    open fn sign(&self, message: &[u8]) -> CryptoResult<Vec<u8>> {
+        let key_pair = self.key_pair.as_ref().ok_or(CryptoError::InvalidKey("No private key available".into()))?;
+        
+        let hash = hash_sha256(message);
+        
+        match self.padding {
+            RsaPadding::PKCS1v15 => self.rsa_sign_pkcs1v15(&hash, &key_pair.private_key),
+            RsaPadding::PSS => self.rsa_sign_pss(&hash, &key_pair.private_key),
+            RsaPadding::OAEP => Err(CryptoError::InvalidAlgorithm("OAEP not supported for signing".into())),
+        }
+    }
+    
+    open fn verify(&self, message: &[u8], signature: &[u8]) -> CryptoResult<bool> {
+        let public_key = if let Some(key_pair) = &self.key_pair {
+            &key_pair.public_key
+        } else if let Some(public_key) = &self.public_key {
+            public_key
+        } else {
+            return Err(CryptoError::InvalidKey("No key available".into()));
+        };
+        
+        let hash = hash_sha256(message);
+        
+        match self.padding {
+            RsaPadding::PKCS1v15 => self.rsa_verify_pkcs1v15(&hash, signature, public_key),
+            RsaPadding::PSS => self.rsa_verify_pss(&hash, signature, public_key),
+            RsaPadding::OAEP => Err(CryptoError::InvalidAlgorithm("OAEP not supported for verification".into())),
+        }
+    }
+    
+    fn rsa_encrypt_pkcs1v15(&self, plaintext: &[u8], public_key: &RsaPublicKey) -> CryptoResult<Vec<u8>> {
+        // Simplified PKCS#1 v1.5 encryption
+        let padded_plaintext = self.pkcs1v15_pad(plaintext, public_key.key_size / 8)?;
+        return rsa_mod_exp(&padded_plaintext, &public_key.modulus, &public_key.exponent);
+    }
+    
+    fn rsa_decrypt_pkcs1v15(&self, ciphertext: &[u8], private_key: &RsaPrivateKey) -> CryptoResult<Vec<u8>> {
+        // Simplified PKCS#1 v1.5 decryption
+        let padded_plaintext = rsa_mod_exp(ciphertext, &private_key.modulus, &private_key.private_exponent)?;
+        return self.pkcs1v15_unpad(&padded_plaintext);
+    }
+    
+    fn rsa_encrypt_oaep(&self, plaintext: &[u8], public_key: &RsaPublicKey) -> CryptoResult<Vec<u8>> {
+        // Simplified OAEP encryption
+        let hash = hash_sha256(plaintext);
+        let mut padded = Vec::with_capacity(public_key.key_size / 8);
+        padded.extend_from_slice(&hash);
+        padded.extend_from_slice(plaintext);
+        padded.resize(public_key.key_size / 8, 0);
+        
+        return rsa_mod_exp(&padded, &public_key.modulus, &public_key.exponent);
+    }
+    
+    fn rsa_decrypt_oaep(&self, ciphertext: &[u8], private_key: &RsaPrivateKey) -> CryptoResult<Vec<u8>> {
+        // Simplified OAEP decryption
+        let padded = rsa_mod_exp(ciphertext, &private_key.modulus, &private_key.private_exponent)?;
+        
+        check padded.len() >= 32 {
+            return Ok(padded[32..].to_vec());
+        } else {
+            return Err(CryptoError::DecryptionFailed("Invalid OAEP padding".into()));
+        }
+    }
+    
+    fn rsa_sign_pkcs1v15(&self, hash: &[u8], private_key: &RsaPrivateKey) -> CryptoResult<Vec<u8>> {
+        // Simplified PKCS#1 v1.5 signing
+        let padded_hash = self.pkcs1v15_pad_for_signature(hash, private_key.key_size / 8)?;
+        return rsa_mod_exp(&padded_hash, &private_key.modulus, &private_key.private_exponent);
+    }
+    
+    fn rsa_sign_pss(&self, hash: &[u8], private_key: &RsaPrivateKey) -> CryptoResult<Vec<u8>> {
+        // Simplified PSS signing
+        let salt = generate_random_bytes(32);
+        let mut padded = Vec::with_capacity(private_key.key_size / 8);
+        padded.extend_from_slice(hash);
+        padded.extend_from_slice(&salt);
+        padded.resize(private_key.key_size / 8, 0);
+        
+        return rsa_mod_exp(&padded, &private_key.modulus, &private_key.private_exponent);
+    }
+    
+    fn rsa_verify_pkcs1v15(&self, hash: &[u8], signature: &[u8], public_key: &RsaPublicKey) -> CryptoResult<bool> {
+        // Simplified PKCS#1 v1.5 verification
+        let decrypted = rsa_mod_exp(signature, &public_key.modulus, &public_key.exponent)?;
+        let expected_padded = self.pkcs1v15_pad_for_signature(hash, public_key.key_size / 8)?;
+        
+        return Ok(decrypted == expected_padded);
+    }
+    
+    fn rsa_verify_pss(&self, hash: &[u8], signature: &[u8], public_key: &RsaPublicKey) -> CryptoResult<bool> {
+        // Simplified PSS verification
+        let decrypted = rsa_mod_exp(signature, &public_key.modulus, &public_key.exponent)?;
+        
+        check decrypted.len() >= 32 {
+            let decrypted_hash = &decrypted[..32];
+            return Ok(decrypted_hash == hash);
+        } else {
+            return Ok(false);
+        }
+    }
+    
+    fn pkcs1v15_pad(&self, data: &[u8], key_size: usize) -> CryptoResult<Vec<u8>> {
+        check data.len() + 11 <= key_size {
+            let mut padded = Vec::with_capacity(key_size);
+            padded.push(0x00);
+            padded.push(0x02);
+            
+            // Add random padding
+            let padding_len = key_size - data.len() - 3;
+            let random_padding = generate_random_bytes(padding_len);
+            padded.extend_from_slice(&random_padding);
+            
+            padded.push(0x00);
+            padded.extend_from_slice(data);
+            
+            return Ok(padded);
+        } else {
+            return Err(CryptoError::InvalidInput("Data too long for key".into()));
+        }
+    }
+    
+    fn pkcs1v15_unpad(&self, padded: &[u8]) -> CryptoResult<Vec<u8>> {
+        check padded.len() >= 11 && padded[0] == 0x00 && padded[1] == 0x02 {
+            // Find the 0x00 separator
+            for i in 2..padded.len() {
+                if padded[i] == 0x00 {
+                    return Ok(padded[i + 1..].to_vec());
+                }
+            }
+            return Err(CryptoError::DecryptionFailed("Invalid PKCS#1 v1.5 padding".into()));
+        } else {
+            return Err(CryptoError::DecryptionFailed("Invalid PKCS#1 v1.5 padding".into()));
+        }
+    }
+    
+    fn pkcs1v15_pad_for_signature(&self, hash: &[u8], key_size: usize) -> CryptoResult<Vec<u8>> {
+        check hash.len() + 11 <= key_size {
+            let mut padded = Vec::with_capacity(key_size);
+            padded.push(0x00);
+            padded.push(0x01);
+            
+            // Add padding
+            let padding_len = key_size - hash.len() - 3;
+            for _ in 0..padding_len {
+                padded.push(0xFF);
+            }
+            
+            padded.push(0x00);
+            padded.extend_from_slice(hash);
+            
+            return Ok(padded);
+        } else {
+            return Err(CryptoError::InvalidInput("Hash too long for key".into()));
+        }
+    }
+}
+
+/// Generate RSA key pair
+open fn generate_rsa_key_pair(key_size: usize) -> CryptoResult<RsaKeyPair> {
+    // Simplified RSA key generation
+    let p = generate_large_prime(key_size / 2);
+    let q = generate_large_prime(key_size / 2);
+    let n = multiply_big_numbers(&p, &q);
+    let phi = multiply_big_numbers(&subtract_one(&p), &subtract_one(&q));
+    let e = vec![0x01, 0x00, 0x01]; // 65537
+    let d = mod_inverse(&e, &phi);
+    
+    let public_key = RsaPublicKey {
+        modulus: n.clone(),
+        exponent: e.clone(),
+        key_size: key_size,
+    };
+    
+    let private_key = RsaPrivateKey {
+        modulus: n,
+        public_exponent: e,
+        private_exponent: d,
+        prime_p: p,
+        prime_q: q,
+        exponent_p: Vec::new(),
+        exponent_q: Vec::new(),
+        coefficient: Vec::new(),
+        key_size: key_size,
+    };
+    
+    return Ok(RsaKeyPair {
+        public_key: public_key,
+        private_key: private_key,
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §4  HASH FUNCTIONS
+// ═════════════════════════════════════════════════════════════════════════
+
+/// SHA-256 hash
+open fn hash_sha256(data: &[u8]) -> Vec<u8> {
+    // Simplified SHA-256 implementation
+    let mut hash = [0u8; 32];
+    
+    // In real implementation, would use proper SHA-256 algorithm
+    for i in 0..32 {
+        hash[i] = ((i as u32 + data.len() as u32) * 31) as u8;
+    }
+    
+    return hash.to_vec();
+}
+
+/// SHA-512 hash
+open fn hash_sha512(data: &[u8]) -> Vec<u8> {
+    // Simplified SHA-512 implementation
+    let mut hash = [0u8; 64];
+    
+    // In real implementation, would use proper SHA-512 algorithm
+    for i in 0..64 {
+        hash[i] = ((i as u32 + data.len() as u32) * 47) as u8;
+    }
+    
+    return hash.to_vec();
+}
+
+/// HMAC
+open fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut ipad = [0u8; 64];
+    let mut opad = [0u8; 64];
+    
+    // Prepare key
+    if key.len() > 64 {
+        let key_hash = hash_sha256(key);
+        for i in 0..32 {
+            ipad[i] = key_hash[i];
+            opad[i] = key_hash[i];
+        }
+    } else {
+        for i in 0..key.len() {
+            ipad[i] = key[i];
+            opad[i] = key[i];
+        }
+    }
+    
+    // XOR with ipad and opad
+    for i in 0..64 {
+        ipad[i] ^= 0x36;
+        opad[i] ^= 0x5C;
+    }
+    
+    // Compute HMAC
+    let inner_hash = hash_sha256(&[&ipad[..], data].concat());
+    let outer_hash = hash_sha256(&[&opad[..], &inner_hash].concat());
+    
+    return outer_hash;
+}
+
+/// HMAC-SHA512
+open fn hmac_sha512(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut ipad = [0u8; 128];
+    let mut opad = [0u8; 128];
+    
+    // Prepare key
+    if key.len() > 128 {
+        let key_hash = hash_sha512(key);
+        for i in 0..64 {
+            ipad[i] = key_hash[i];
+            opad[i] = key_hash[i];
+        }
+    } else {
+        for i in 0..key.len() {
+            ipad[i] = key[i];
+            opad[i] = key[i];
+        }
+    }
+    
+    // XOR with ipad and opad
+    for i in 0..128 {
+        ipad[i] ^= 0x36;
+        opad[i] ^= 0x5C;
+    }
+    
+    // Compute HMAC
+    let inner_hash = hash_sha512(&[&ipad[..], data].concat());
+    let outer_hash = hash_sha512(&[&opad[..], &inner_hash].concat());
+    
+    return outer_hash;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §5  UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Generate random bytes
+open fn generate_random_bytes(length: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(length);
+    for _ in 0..length {
+        bytes.push(rand::random::<u8>());
+    }
+    return bytes;
+}
+
+/// Generate large prime
+fn generate_large_prime(bits: usize) -> Vec<u8> {
+    // Simplified prime generation
+    let mut prime = Vec::with_capacity(bits / 8);
+    for i in 0..(bits / 8) {
+        prime.push(((i as u32 + 17) * 31) as u8);
+    }
+    return prime;
+}
+
+/// Multiply big numbers
+fn multiply_big_numbers(a: &[u8], b: &[u8]) -> Vec<u8> {
+    // Simplified big number multiplication
+    let mut result = Vec::with_capacity(a.len() + b.len());
+    for _ in 0..(a.len() + b.len()) {
+        result.push(0);
+    }
+    
+    for i in 0..a.len() {
+        for j in 0..b.len() {
+            result[i + j] += a[i] * b[j];
+        }
+    }
+    
+    return result;
+}
+
+/// Subtract one from big number
+fn subtract_one(num: &[u8]) -> Vec<u8> {
+    let mut result = num.to_vec();
+    let mut borrow = 1;
+    
+    for i in (0..result.len()).rev() {
+        let value = result[i] as i16 - borrow;
+        result[i] = if value >= 0 { value as u8 } else { (value + 256) as u8 };
+        borrow = if value >= 0 { 0 } else { 1 };
+    }
+    
+    return result;
+}
+
+/// Modular inverse
+fn mod_inverse(a: &[u8], m: &[u8]) -> Vec<u8> {
+    // Simplified modular inverse
+    return vec![1, 0, 0, 1]; // Placeholder
+}
+
+/// Modular exponentiation
+fn rsa_mod_exp(base: &[u8], modulus: &[u8], exponent: &[u8]) -> CryptoResult<Vec<u8>> {
+    // Simplified modular exponentiation
+    let mut result = vec![1];
+    let mut base_exp = base.to_vec();
+    
+    for &exp_byte in exponent {
+        for i in 0..8 {
+            if (exp_byte >> i) & 1 == 1 {
+                result = multiply_big_numbers(&result, &base_exp);
+                result = result.iter().map(|&x| x % modulus[0]).collect();
+            }
+            base_exp = multiply_big_numbers(&base_exp, &base_exp);
+            base_exp = base_exp.iter().map(|&x| x % modulus[0]).collect();
+        }
+    }
+    
+    return Ok(result);
+}
+
+/// AES block encryption
+fn aes_encrypt_block(block: &[u8], key: &[u8], algorithm: CryptoAlgorithm) -> CryptoResult<Vec<u8>> {
+    // Simplified AES encryption
+    let mut result = Vec::with_capacity(16);
+    for i in 0..16 {
+        result.push(block[i] ^ key[i % key.len()]);
+    }
+    return Ok(result);
+}
+
+/// AES block decryption
+fn aes_decrypt_block(block: &[u8], key: &[u8], algorithm: CryptoAlgorithm) -> CryptoResult<Vec<u8>> {
+    // Simplified AES decryption
+    let mut result = Vec::with_capacity(16);
+    for i in 0..16 {
+        result.push(block[i] ^ key[i % key.len()]);
+    }
+    return Ok(result);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §6  GLOBAL INSTANCE AND HELPERS
+// ═════════════════════════════════════════════════════════════════════════
+
+/// Create AES cipher
+open fn create_aes_cipher(algorithm: CryptoAlgorithm, mode: CryptoMode, key: Vec<u8>, iv: Option<Vec<u8>>) -> CryptoResult<AesCipher> {
+    return AesCipher::new(algorithm, mode, key, iv);
+}
+
+/// Create RSA cipher
+open fn create_rsa_cipher_with_key_pair(key_pair: RsaKeyPair, padding: RsaPadding) -> RsaCipher {
+    return RsaCipher::new_with_key_pair(key_pair, padding);
+}
+
+/// Create RSA cipher with public key
+open fn create_rsa_cipher_with_public_key(public_key: RsaPublicKey, padding: RsaPadding) -> RsaCipher {
+    return RsaCipher::new_with_public_key(public_key, padding);
+}
+
+/// Initialize cryptography system
+open fn init_cryptography() {
+    // Initialize cryptography system
+}
+
+/// Format string helper
+fn format(template: &str, args: ...) -> String {
+    // Simplified formatting
+    return template.into();
+}

@@ -1,0 +1,433 @@
+/**
+ * Neural Networks Tests
+ * Tests for nn/ module - Layers, Modules, Forward/Backward passes
+ */
+
+use std.test.{assert_eq, assert_true, assert_approx, test, benchmark};
+use std.ai.ml.nn.{Module, Linear, Conv2d, ReLU, GELU, Sigmoid, Tanh, Dropout, BatchNorm1d, Sequential};
+use std.ai.ml.nn.{MSELoss, CrossEntropyLoss, BCELoss};
+use std.ai.ml.tensor.Tensor;
+use std.collections.Array;
+
+// ============================================================================
+// LINEAR LAYER TESTS
+// ============================================================================
+
+@test
+fn test_linear_forward() {
+    // Test forward pass
+    let layer = Linear::new(10, 5);
+    let x = Tensor::randn([32, 10]);  // batch_size=32, in_features=10
+    
+    let y = layer.forward(&x);
+    
+    assert_eq!(y.data(), [32, 5]);
+}
+
+@test
+fn test_linear_backward() {
+    // Test backward pass and gradient computation
+    var layer = Linear::new(10, 5);
+    let x = Tensor::randn([32, 10], requires_grad=true);
+    
+    let y = layer.forward(&x);
+    let loss = y.sum();
+    
+    loss.backward();
+    
+    // Check gradients exist
+    assert_true(layer.weight.grad.is_some());
+    assert_true(layer.bias.grad.is_some());
+    assert_true(x.grad.is_some());
+}
+
+@test
+fn test_linear_no_bias() {
+    let layer = Linear::new(10, 5, bias=false);
+    let x = Tensor::randn([32, 10]);
+    
+    let y = layer.forward(&x);
+    
+    assert_eq!(y.data(), [32, 5]);
+    assert_true(layer.bias.is_none());
+}
+
+// ============================================================================
+// CONV2D TESTS
+// ============================================================================
+
+@test
+fn test_conv2d_forward() {
+    // Test 2D convolution
+    let layer = Conv2d::new(
+        in_channels=3,
+        out_channels=64,
+        kernel_size=3,
+        padding=1
+    );
+    
+    let x = Tensor::randn([8, 3, 32, 32]);  // NCHW format
+    let y = layer.forward(&x);
+    
+    assert_eq!(y.data(), [8, 64, 32, 32]);
+}
+
+@test
+fn test_conv2d_stride() {
+    let layer = Conv2d::new(
+        in_channels=3,
+        out_channels=64,
+        kernel_size=3,
+        stride=2,
+        padding=1
+    );
+    
+    let x = Tensor::randn([8, 3, 32, 32]);
+    let y = layer.forward(&x);
+    
+    // With stride=2, output size should be halved
+    assert_eq!(y.data(), [8, 64, 16, 16]);
+}
+
+@test
+fn test_conv2d_backward() {
+    var layer = Conv2d::new(3, 64, kernel_size=3, padding=1);
+    let x = Tensor::randn([8, 3, 32, 32], requires_grad=true);
+    
+    let y = layer.forward(&x);
+    let loss = y.sum();
+    
+    loss.backward();
+    
+    assert_true(layer.weight.grad.is_some());
+    assert_true(layer.bias.grad.is_some());
+    assert_true(x.grad.is_some());
+}
+
+// ============================================================================
+// ACTIVATION FUNCTION TESTS
+// ============================================================================
+
+@test
+fn test_relu() {
+    let relu = ReLU::new();
+    let x = Tensor::from([-2.0, -1.0, 0.0, 1.0, 2.0]);
+    
+    let y = relu.forward(&x);
+    
+    assert_eq!(y.data(), [0.0, 0.0, 0.0, 1.0, 2.0]);
+}
+
+@test
+fn test_relu_backward() {
+    let relu = ReLU::new();
+    let x = Tensor::from([-2.0, -1.0, 0.0, 1.0, 2.0], requires_grad=true);
+    
+    let y = relu.forward(&x);
+    let loss = y.sum();
+    
+    loss.backward();
+    
+    // Gradient should be 0 for negative inputs, 1 for positive
+    let grad = x.grad.unwrap();
+    assert_eq!(grad.data(), [0.0, 0.0, 0.0, 1.0, 1.0]);
+}
+
+@test
+fn test_gelu() {
+    let gelu = GELU::new();
+    let x = Tensor::randn([32, 64]);
+    
+    let y = gelu.forward(&x);
+    
+    assert_eq!(y.data(), [32, 64]);
+}
+
+@test
+fn test_sigmoid() {
+    let sigmoid = Sigmoid::new();
+    let x = Tensor::from([0.0, 1.0, -1.0, 10.0, -10.0]);
+    
+    let y = sigmoid.forward(&x);
+    
+    // sigmoid(0) = 0.5, sigmoid(large positive) ≈ 1, sigmoid(large negative) ≈ 0
+    assert_approx!(y[0], 0.5, 1e-6);
+    assert_true(y[3] > 0.99);
+    assert_true(y[4] < 0.01);
+}
+
+@test
+fn test_tanh() {
+    let tanh = Tanh::new();
+    let x = Tensor::from([0.0, 1.0, -1.0, 10.0, -10.0]);
+    
+    let y = tanh.forward(&x);
+    
+    // tanh(0) = 0, tanh(large positive) ≈ 1, tanh(large negative) ≈ -1
+    assert_approx!(y[0], 0.0, 1e-6);
+    assert_true(y[3] > 0.99);
+    assert_true(y[4] < -0.99);
+}
+
+// ============================================================================
+// DROPOUT TESTS
+// ============================================================================
+
+@test
+fn test_dropout_training() {
+    let dropout = Dropout::new(p=0.5);
+    let x = Tensor::ones([1000]);
+    
+    dropout.train();  // Set to training mode
+    let y = dropout.forward(&x);
+    
+    // Approximately half should be zeroed out
+    let zeros = y.data().iter().filter(|&&v| v == 0.0).count();
+    assert_true(zeros > 400 && zeros < 600);
+}
+
+@test
+fn test_dropout_eval() {
+    let dropout = Dropout::new(p=0.5);
+    let x = Tensor::ones([100]);
+    
+    dropout.eval();  // Set to evaluation mode
+    let y = dropout.forward(&x);
+    
+    // In eval mode, dropout should be identity
+    assert_eq!(y.data(), x.data());
+}
+
+// ============================================================================
+// BATCH NORMALIZATION TESTS
+// ============================================================================
+
+@test
+fn test_batchnorm1d() {
+    let bn = BatchNorm1d::new(num_features=64);
+    let x = Tensor::randn([32, 64]);
+    
+    let y = bn.forward(&x);
+    
+    assert_eq!(y.data(), [32, 64]);
+}
+
+@test
+fn test_batchnorm1d_normalization() {
+    let bn = BatchNorm1d::new(num_features=10);
+    let x = Tensor::randn([100, 10]);
+    
+    bn.train();
+    let y = bn.forward(&x);
+    
+    // After batch norm, mean should be close to 0, std close to 1
+    each i in 0..10 {
+        let col = y.select(1, i);
+        let mean = col.mean();
+        let std = col.std();
+        
+        assert_approx!(mean, 0.0, 0.1);
+        assert_approx!(std, 1.0, 0.2);
+    }
+}
+
+// ============================================================================
+// SEQUENTIAL TESTS
+// ============================================================================
+
+@test
+fn test_sequential() {
+    let model = Sequential::new([
+        Linear::new(784, 128),
+        ReLU::new(),
+        Linear::new(128, 10),
+    ]);
+    
+    let x = Tensor::randn([32, 784]);
+    let y = model.forward(&x);
+    
+    assert_eq!(y.data(), [32, 10]);
+}
+
+@test
+fn test_sequential_backward() {
+    var model = Sequential::new([
+        Linear::new(10, 20),
+        ReLU::new(),
+        Linear::new(20, 5),
+    ]);
+    
+    let x = Tensor::randn([32, 10], requires_grad=true);
+    let y = model.forward(&x);
+    let loss = y.sum();
+    
+    loss.backward();
+    
+    // Check gradients exist for all layers
+    assert_true(x.grad.is_some());
+}
+
+// ============================================================================
+// LOSS FUNCTION TESTS
+// ============================================================================
+
+@test
+fn test_mse_loss() {
+    let criterion = MSELoss::new();
+    
+    let pred = Tensor::from([1.0, 2.0, 3.0]);
+    let target = Tensor::from([1.5, 2.5, 3.5]);
+    
+    let loss = criterion.forward(&pred, &target);
+    
+    // MSE = mean((pred - target)^2) = mean([0.25, 0.25, 0.25]) = 0.25
+    assert_approx!(loss.item(), 0.25, 1e-6);
+}
+
+@test
+fn test_cross_entropy_loss() {
+    let criterion = CrossEntropyLoss::new();
+    
+    let logits = Tensor::randn([32, 10]);  // batch_size=32, num_classes=10
+    let targets = Tensor::randint(0, 10, [32]);
+    
+    let loss = criterion.forward(&logits, &targets);
+    
+    assert_true(loss.item() > 0.0);
+}
+
+@test
+fn test_bce_loss() {
+    let criterion = BCELoss::new();
+    
+    let pred = Tensor::from([0.1, 0.5, 0.9]);
+    let target = Tensor::from([0.0, 0.5, 1.0]);
+    
+    let loss = criterion.forward(&pred, &target);
+    
+    assert_true(loss.item() > 0.0);
+}
+
+// ============================================================================
+// FULL NETWORK TESTS
+// ============================================================================
+
+@test
+fn test_simple_mlp_training() {
+    // Create a simple 2-layer MLP
+    var model = Sequential::new([
+        Linear::new(10, 20),
+        ReLU::new(),
+        Linear::new(20, 2),
+    ]);
+    
+    let criterion = CrossEntropyLoss::new();
+    
+    // Dummy data
+    let x = Tensor::randn([64, 10]);
+    let y = Tensor::randint(0, 2, [64]);
+    
+    // Forward pass
+    let logits = model.forward(&x);
+    let loss = criterion.forward(&logits, &y);
+    
+    // Backward pass
+    loss.backward();
+    
+    assert_true(loss.item() > 0.0);
+}
+
+@test
+fn test_cnn_mnist_style() {
+    // Simple CNN for MNIST-style data
+    var model = Sequential::new([
+        Conv2d::new(1, 32, kernel_size=3, padding=1),
+        ReLU::new(),
+        Conv2d::new(32, 64, kernel_size=3, stride=2, padding=1),
+        ReLU::new(),
+        // Flatten would go here
+        Linear::new(64 * 14 * 14, 10),
+    ]);
+    
+    let x = Tensor::randn([8, 1, 28, 28]);  // MNIST-like input
+    let y = model.forward(&x);
+    
+    assert_eq!(y.data(), [8, 10]);
+}
+
+// ============================================================================
+// BENCHMARKS
+// ============================================================================
+
+@benchmark
+fn bench_linear_forward() {
+    let layer = Linear::new(512, 256);
+    let x = Tensor::randn([1024, 512]);
+    
+    bench_start!();
+    each _ in 0..100 {
+        let _ = layer.forward(&x);
+    }
+    bench_end!();
+}
+
+@benchmark
+fn bench_linear_backward() {
+    var layer = Linear::new(512, 256);
+    let x = Tensor::randn([1024, 512], requires_grad=true);
+    
+    bench_start!();
+    each _ in 0..100 {
+        let y = layer.forward(&x);
+        let loss = y.sum();
+        loss.backward();
+        layer.zero_grad();
+    }
+    bench_end!();
+}
+
+@benchmark
+fn bench_conv2d_forward() {
+    let layer = Conv2d::new(3, 64, kernel_size=3, padding=1);
+    let x = Tensor::randn([64, 3, 32, 32]);
+    
+    bench_start!();
+    each _ in 0..100 {
+        let _ = layer.forward(&x);
+    }
+    bench_end!();
+}
+
+@benchmark
+fn bench_conv2d_backward() {
+    var layer = Conv2d::new(3, 64, kernel_size=3, padding=1);
+    let x = Tensor::randn([64, 3, 32, 32], requires_grad=true);
+    
+    bench_start!();
+    each _ in 0..100 {
+        let y = layer.forward(&x);
+        let loss = y.sum();
+        loss.backward();
+        layer.zero_grad();
+    }
+    bench_end!();
+}
+
+@benchmark
+fn bench_sequential_mlp() {
+    let model = Sequential::new([
+        Linear::new(784, 512),
+        ReLU::new(),
+        Linear::new(512, 256),
+        ReLU::new(),
+        Linear::new(256, 10),
+    ]);
+    
+    let x = Tensor::randn([128, 784]);
+    
+    bench_start!();
+    each _ in 0..100 {
+        let _ = model.forward(&x);
+    }
+    bench_end!();
+}

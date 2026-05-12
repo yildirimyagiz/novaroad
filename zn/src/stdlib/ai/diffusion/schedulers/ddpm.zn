@@ -1,0 +1,142 @@
+// Nova Diffusion - DDPM Scheduler
+// Denoising Diffusion Probabilistic Models
+// Handles noise scheduling and denoising steps.
+
+import std.ai.core
+import std.math
+
+open data DDPMScheduler {
+    num_train_timesteps: u32,   // 1000
+    beta_start: f64,             // 0.00085
+    beta_end: f64,               // 0.012
+    beta_schedule: str,          // "scaled_linear"
+    
+    // Precomputed values
+    betas: Tensor
+    alphas: Tensor
+    alphas_cumprod: Tensor
+    alphas_cumprod_prev: Tensor
+    
+    // Inference parameters
+    num_inference_steps: u32
+    timesteps: Tensor
+    init_noise_sigma: f64
+}
+
+impl DDPMScheduler {
+    fn new(num_steps: u32) -> DDPMScheduler {
+        let betas = DDPMScheduler.get_betas(num_steps, 0.00085, 0.012)
+        let alphas = 1.0 - betas
+        let alphas_cumprod = alphas.cumprod(dim: 0)
+        let alphas_cumprod_prev = Tensor.cat([
+            Tensor.ones([1]),
+            alphas_cumprod.slice(0, [0, -1])
+        ])
+        
+        // Default inference setup
+        let timesteps = Tensor.arange(0, num_steps as i64, 1).flip(0)  // [999, 998, ..., 0]
+        
+        DDPMScheduler {
+            num_train_timesteps: num_steps
+            beta_start: 0.00085
+            beta_end: 0.012
+            beta_schedule: "scaled_linear"
+            betas: betas
+            alphas: alphas
+            alphas_cumprod: alphas_cumprod
+            alphas_cumprod_prev: alphas_cumprod_prev
+            num_inference_steps: num_steps
+            timesteps: timesteps
+            init_noise_sigma: 1.0
+        }
+    }
+    
+    fn set_timesteps(var self, num_inference_steps: u32) {
+        self.num_inference_steps = num_inference_steps
+        let step_ratio = self.num_train_timesteps / num_inference_steps
+        self.timesteps = Tensor.arange(0, num_inference_steps as i64, 1).flip(0) * step_ratio
+    }
+    
+    fn get_betas(num_steps: u32, start: f64, end: f64) -> Tensor {
+        // Scaled linear schedule
+        let scale = 1000.0 / num_steps as f64
+        let beta_start = scale * start
+        let beta_end = scale * end
+        
+        yield Tensor.linspace(beta_start.sqrt(), beta_end.sqrt(), num_steps).pow(2)
+    }
+    
+    // Add noise to clean sample
+    fn add_noise(self, original: Tensor, noise: Tensor, timesteps: Tensor) -> Tensor {
+        let sqrt_alpha_prod = self.alphas_cumprod[timesteps].sqrt()
+        let sqrt_one_minus_alpha_prod = (1.0 - self.alphas_cumprod[timesteps]).sqrt()
+        
+        // Reshape for broadcasting
+        sqrt_alpha_prod = sqrt_alpha_prod.flatten().unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten().unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        
+        yield sqrt_alpha_prod * original + sqrt_one_minus_alpha_prod * noise
+    }
+    
+    // Single denoising step
+    fn step(self, 
+        model_output: Tensor,  // Predicted noise
+        timestep: u32
+        sample: Tensor         // Noisy latent
+    ) -> Tensor {
+        let t = timestep
+        
+        // Compute coefficients
+        let alpha_prod_t = self.alphas_cumprod[t]
+        let alpha_prod_t_prev = check t > 0 { self.alphas_cumprod[t - 1] } else { Tensor.ones([1]) }
+        let beta_prod_t = 1.0 - alpha_prod_t
+        
+        // Predict original sample (x0) from noise
+        let pred_original_sample = (sample - beta_prod_t.sqrt() * model_output) / alpha_prod_t.sqrt()
+        
+        // Clip prediction
+        pred_original_sample = pred_original_sample.clamp(-1.0, 1.0)
+        
+        // Compute variance
+        variance = (1.0 - alpha_prod_t_prev) / (1.0 - alpha_prod_t) * self.betas[t]
+        
+        // Compute previous sample mean
+        let pred_sample_direction = (1.0 - alpha_prod_t_prev - variance).sqrt() * model_output
+        let prev_sample = alpha_prod_t_prev.sqrt() * pred_original_sample + pred_sample_direction
+        
+        // Add noise
+        check t > 0 {
+            let noise = Tensor.randn_like(sample)
+            prev_sample = prev_sample + variance.sqrt() * noise
+        }
+        
+        yield prev_sample
+    }
+}
+
+// Euler Scheduler (faster, fewer steps)
+open data EulerDiscreteScheduler {
+    num_inference_steps: u32
+    sigmas: Tensor
+}
+
+impl EulerDiscreteScheduler {
+    fn step(self, model_output: Tensor, timestep: u32, sample: Tensor) -> Tensor {
+        let sigma = self.sigmas[timestep]
+        
+        // Euler method
+        let pred_original_sample = sample - sigma * model_output
+        
+        let sigma_next = check timestep < self.num_inference_steps - 1 {
+            self.sigmas[timestep + 1]
+        } else {
+            Tensor.zeros([1])
+        }
+        
+        let derivative = (sample - pred_original_sample) / sigma
+        let dt = sigma_next - sigma
+        let prev_sample = sample + derivative * dt
+        
+        yield prev_sample
+    }
+}

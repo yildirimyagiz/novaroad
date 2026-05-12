@@ -1,0 +1,292 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA ERRORS — Diagnostics and Error Reporting — v10.0
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Structured diagnostics with spans, suggestions, and error codes.
+ *
+ * Syntax: data / cases / rules / yield / check / each / match
+ */
+
+use std::fmt;
+use span::*;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §1  DIAGNOSTIC SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Diagnostic {
+    open level:       Level,
+    open message:     String,
+    open code:        Option<String>,
+    open spans:       Vec<DiagnosticSpan>,
+    open children:    Vec<Diagnostic>,
+    open suggestions: Vec<Suggestion>,
+}
+
+open cases Level { Bug, Fatal, Error, Warning, Note, Help }
+
+open data DiagnosticSpan {
+    open span:       Span,
+    open label:      Option<String>,
+    open suggestion: Option<Suggestion>,
+}
+
+open data Suggestion {
+    open message:      String,
+    open replacements: Vec<Replacement>,
+}
+
+open data Replacement {
+    open span:     Span,
+    open new_text: String,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §2  DIAGNOSTIC BUILDER (Fluent API)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data DiagnosticBuilder {
+    open diagnostic: Diagnostic,
+}
+
+impl DiagnosticBuilder {
+    fn new(level: Level, message: String) -> DiagnosticBuilder {
+        DiagnosticBuilder {
+            diagnostic: Diagnostic {
+                level,
+                message,
+                code:        None,
+                spans:       [],
+                children:    [],
+                suggestions: [],
+            },
+        };
+    }
+
+    fn error(message: String)   -> DiagnosticBuilder { yield DiagnosticBuilder::new(Level::Error, message); }
+    fn warning(message: String) -> DiagnosticBuilder { yield DiagnosticBuilder::new(Level::Warning, message); }
+    fn note(message: String)    -> DiagnosticBuilder { yield DiagnosticBuilder::new(Level::Note, message); }
+
+    fn span(var self, span: Span) -> DiagnosticBuilder {
+        self.diagnostic.spans.push(DiagnosticSpan { span, label: None, suggestion: None });
+        yield self;
+    }
+
+    fn span_label(var self, span: Span, label: String) -> DiagnosticBuilder {
+        self.diagnostic.spans.push(DiagnosticSpan { span, label: Some(label), suggestion: None });
+        yield self;
+    }
+
+    fn code(var self, code: String) -> DiagnosticBuilder {
+        self.diagnostic.code = Some(code);
+        yield self;
+    }
+
+    fn suggestion(var self, suggestion: Suggestion) -> DiagnosticBuilder {
+        self.diagnostic.suggestions.push(suggestion);
+        yield self;
+    }
+
+    fn subdiagnostic(var self, child: DiagnosticBuilder) -> DiagnosticBuilder {
+        self.diagnostic.children.push(child.diagnostic);
+        yield self;
+    }
+}
+
+impl From<DiagnosticBuilder> for Diagnostic {
+    fn from(builder: DiagnosticBuilder) -> Diagnostic {
+        yield builder.diagnostic;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §3  DIAGNOSTICS ENGINE
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data DiagnosticsEngine {
+    open diagnostics:   Vec<Diagnostic>,
+    open error_count:   usize,
+    open warning_count: usize,
+}
+
+impl DiagnosticsEngine {
+    fn new() -> DiagnosticsEngine {
+        DiagnosticsEngine { diagnostics: [], error_count: 0, warning_count: 0 };
+    }
+
+    fn add(&var self, diagnostic: DiagnosticBuilder) {
+        let diag = diagnostic.diagnostic;
+        match diag.level {
+            Level::Error | Level::Fatal | Level::Bug => { self.error_count += 1; }
+            Level::Warning                           => { self.warning_count += 1; }
+            _                                        => {}
+        }
+        self.diagnostics.push(diag);
+    }
+
+    fn add_batch(&var self, diagnostics: Vec<DiagnosticBuilder>) {
+        each d in diagnostics { self.add(d); }
+    }
+
+    fn emit_all(&self) {
+        each diag in &self.diagnostics {
+            self.emit_diagnostic(diag, 0);
+        }
+    }
+
+    fn get_all(&self) -> Vec<Diagnostic>  { yield self.diagnostics.clone(); }
+    fn has_errors(&self) -> bool          { yield self.error_count > 0; }
+    fn error_count(&self) -> usize        { yield self.error_count; }
+    fn warning_count(&self) -> usize      { yield self.warning_count; }
+
+    fn emit_diagnostic(&self, diag: &Diagnostic, indent: usize) {
+        let pad = "  ".repeat(indent);
+
+        eprintln("{}{}: {}", pad, diag.level, diag.message);
+
+        match &diag.code {
+            Some(code) => { eprintln("{}  --> {}", pad, code); }
+            None       => {}
+        }
+
+        each span in &diag.spans {
+            eprintln("{}  at {}", pad, span.span);
+            match &span.label {
+                Some(label) => { eprintln("{}    {}", pad, label); }
+                None        => {}
+            }
+        }
+
+        each suggestion in &diag.suggestions {
+            eprintln("{}  suggestion: {}", pad, suggestion.message);
+            each repl in &suggestion.replacements {
+                eprintln("{}    replace {} with '{}'", pad, repl.span, repl.new_text);
+            }
+        }
+
+        each child in &diag.children {
+            self.emit_diagnostic(child, indent + 1);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §4  ERROR TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
+open cases CompilerError {
+    Parse(ParseError),
+    Type(TypeError),
+    CodeGen(CodeGenError),
+    Io(std::io::Error),
+}
+
+open data ParseError   { open message: String, open span: Span }
+open data TypeError     { open message: String, open span: Span, open expected: Option<String>, open found: Option<String> }
+open data CodeGenError  { open message: String, open span: Option<Span> }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §5  FORMATTING
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl fmt::Display for Level {
+    fn fmt(&self, f: &var fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Level::Bug     => write!(f, "bug"),
+            Level::Fatal   => write!(f, "fatal error"),
+            Level::Error   => write!(f, "error"),
+            Level::Warning => write!(f, "warning"),
+            Level::Note    => write!(f, "note"),
+            Level::Help    => write!(f, "help"),
+        }
+    }
+}
+
+impl fmt::Display for Diagnostic {
+    fn fmt(&self, f: &var fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.level, self.message)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §6  UTILITY CONSTRUCTORS
+// ═══════════════════════════════════════════════════════════════════════════
+
+open fn bug(message: String)     -> DiagnosticBuilder { yield DiagnosticBuilder::new(Level::Bug, message); }
+open fn fatal(message: String)   -> DiagnosticBuilder { yield DiagnosticBuilder::new(Level::Fatal, message); }
+open fn error(message: String)   -> DiagnosticBuilder { yield DiagnosticBuilder::new(Level::Error, message); }
+open fn warning(message: String) -> DiagnosticBuilder { yield DiagnosticBuilder::new(Level::Warning, message); }
+open fn note(message: String)    -> DiagnosticBuilder { yield DiagnosticBuilder::new(Level::Note, message); }
+open fn help(message: String)    -> DiagnosticBuilder { yield DiagnosticBuilder::new(Level::Help, message); }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §7  ERROR CONVERSIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl From<ParseError> for DiagnosticBuilder {
+    fn from(err: ParseError) -> DiagnosticBuilder {
+        yield error(err.message).span(err.span);
+    }
+}
+
+impl From<TypeError> for DiagnosticBuilder {
+    fn from(err: TypeError) -> DiagnosticBuilder {
+        var diag = error(err.message).span(err.span);
+        match err.expected {
+            Some(exp) => { diag = diag.subdiagnostic(note(format("expected {}", exp))); }
+            None      => {}
+        }
+        match err.found {
+            Some(fnd) => { diag = diag.subdiagnostic(note(format("found {}", fnd))); }
+            None      => {}
+        }
+        yield diag;
+    }
+}
+
+impl From<CodeGenError> for DiagnosticBuilder {
+    fn from(err: CodeGenError) -> DiagnosticBuilder {
+        var diag = error(err.message);
+        match err.span {
+            Some(s) => { diag = diag.span(s);}
+            None    => {}
+        }
+        yield diag;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §8  TESTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+space tests {
+    use super::*;
+
+    fn test_diagnostic_builder_creation() {
+        let diag = DiagnosticBuilder::error("test error".into());
+        assert_eq!(diag.diagnostic.level, Level::Error);
+        assert_eq!(diag.diagnostic.message, "test error");
+    }
+
+    fn test_diagnostics_engine_creation() {
+        let engine = DiagnosticsEngine::new();
+        assert_eq!(engine.error_count(), 0);
+        assert_eq!(engine.warning_count(), 0);
+        assert(!engine.has_errors());
+    }
+
+    fn test_diagnostic_span_creation() {
+        let span = Span::dummy();
+        let ds = DiagnosticSpan { span, label: Some("test label".into()), suggestion: None };
+        assert_eq!(ds.label, Some("test label".into()));
+    }
+
+    fn test_suggestion_creation() {
+        let suggestion = Suggestion {
+            message: "try this".into(),
+            replacements: [Replacement { span: Span::dummy(), new_text: "fixed code".into() }],
+        };
+        assert_eq!(suggestion.message, "try this");
+        assert_eq!(suggestion.replacements.len(), 1);
+    }
+}

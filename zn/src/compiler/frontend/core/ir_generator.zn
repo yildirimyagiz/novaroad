@@ -1,0 +1,556 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                     Nova INTERMEDIATE REPRESENTATION                ║
+// ║                    AST to IR Translation & Optimization Bridge               ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// Intermediate Representation (IR) for Nova:
+// - Platform-independent instruction set
+// - SSA (Static Single Assignment) form
+// - Type-rich representation
+// - Optimization-friendly structure
+
+use std::collections::HashMap;
+use crate::frontend::ast::*;
+use crate::frontend::core::core_types::FlowKind;
+
+/// IR Module (top-level container)
+expose data IRModule {
+    name: String,
+    functions: Vec<IRFunction>,
+    globals: Vec<IRGlobal>,
+    types: Vec<IRType>,
+    metadata: HashMap<String, String>,
+}
+
+/// IR Function
+expose data IRFunction {
+    name: String,
+    parameters: Vec<IRParameter>,
+    return_type: IRType,
+    blocks: Vec<IRBasicBlock>,
+    attributes: Vec<String>,
+    is_external: bool,
+}
+
+/// IR Basic Block (SSA form)
+expose data IRBasicBlock {
+    label: String,
+    instructions: Vec<IRInstruction>,
+    terminator: IRTerminator,
+}
+
+/// IR Instruction (SSA value-producing operations)
+expose cases IRInstruction {
+    // Constants
+    Const(IRConstant),
+
+    // Arithmetic
+    Add(IRValue, IRValue),
+    Sub(IRValue, IRValue),
+    Mul(IRValue, IRValue),
+    Div(IRValue, IRValue),
+    Rem(IRValue, IRValue),            // Remainder (modulo)
+    Pow(IRValue, IRValue),            // Power/exponentiation
+
+    // Comparison
+    Eq(IRValue, IRValue),
+    Ne(IRValue, IRValue),
+    Lt(IRValue, IRValue),
+    Gt(IRValue, IRValue),
+    Le(IRValue, IRValue),             // Less than or equal
+    Ge(IRValue, IRValue),             // Greater than or equal
+
+    // Logical
+    And(IRValue, IRValue),            // Logical AND
+    Or(IRValue, IRValue),             // Logical OR
+
+    // Bitwise
+    BitAnd(IRValue, IRValue),         // Bitwise AND
+    BitOr(IRValue, IRValue),          // Bitwise OR
+    BitXor(IRValue, IRValue),         // Bitwise XOR
+    Shl(IRValue, IRValue),            // Shift left
+    Shr(IRValue, IRValue),            // Shift right
+
+    // Memory operations
+    Load(IRValue),                    // Load from pointer
+    Store(IRValue, IRValue),          // Store value to pointer
+    Alloca(IRType),                   // Allocate on stack
+    GetElementPtr(IRValue, Vec<IRValue>), // Pointer arithmetic
+
+    // Control flow
+    Phi(Vec<(IRValue, String)>),      // Phi node for SSA
+
+    // Function calls
+    Call(IRValue, Vec<IRValue>),      // Function call
+
+    // Type operations
+    Bitcast(IRValue, IRType),         // Type casting
+    Trunc(IRValue, IRType),           // Truncate integer
+    Sext(IRValue, IRType),            // Sign extend
+    Zext(IRValue, IRType),            // Zero extend
+
+    // Nova specific
+    TensorOp(TensorOperation, Vec<IRValue>),    // Tensor operations
+    FlowOp(FlowOperation, Vec<IRValue>),        // Flow operations
+    UnitOp(UnitOperation, Vec<IRValue>),        // Unit operations
+    
+    // ⚔️ L1/L2 GPU & AD supremacy
+    Sync(SyncKind),                             // threads, memory, warp
+    Launch(IRValue, Vec<IRValue>),              // kernel, args (grid/block in metadata or special value)
+    Grad(IRValue, IRValue),                     // grad(f, x)
+    Backprop(IRValue),                          // backprop(loss)
+}
+
+expose cases SyncKind {
+    Threads,
+    Memory,
+    Device,
+}
+
+/// IR Terminator (block-ending instructions)
+expose cases IRTerminator {
+    Ret(Option<IRValue>),             // Return
+    Br(String),                       // Unconditional branch
+    CondBr(IRValue, String, String),  // Conditional branch
+    Switch(IRValue, String, Vec<(IRValue, String)>), // Switch
+    Unreachable,                      // Unreachable code
+}
+
+/// IR Value (SSA values)
+expose data IRValue {
+    id: usize,                        // Unique SSA ID
+    ty: IRType,
+}
+
+/// IR Parameter
+expose data IRParameter {
+    name: String,
+    ty: IRType,
+}
+
+/// IR Global variable
+expose data IRGlobal {
+    name: String,
+    ty: IRType,
+    initializer: Option<IRConstant>,
+    is_mutable: bool,
+}
+
+/// IR Types
+expose cases IRType {
+    Void,
+    Bool,
+    Int8, Int16, Int32, Int64,
+    Float32, Float64,
+    Pointer(Box<IRType>),
+    Array(Box<IRType>, usize),
+    Struct(Vec<IRType>),
+    Function(Vec<IRType>, Box<IRType>),
+    Tensor(Box<IRType>, Vec<usize>),    // Nova specific
+    Flow(FlowKind, Box<IRType>),        // Nova specific
+    Quantity(Box<IRType>, String),      // Nova specific
+}
+
+/// IR Constants
+expose cases IRConstant {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Array(Vec<IRConstant>),
+    Struct(Vec<IRConstant>),
+    Null,
+}
+
+/// Tensor operations
+expose cases TensorOperation {
+    MatMul,
+    Transpose,
+    Reshape,
+    Slice,
+    Concat,
+    Reduce,
+}
+
+/// Flow operations
+expose cases FlowOperation {
+    SignalCreate,
+    StreamCreate,
+    TaskSpawn,
+    ChannelSend,
+    ChannelRecv,
+}
+
+/// Unit operations
+expose cases UnitOperation {
+    Convert,
+    Add,
+    Mul,
+}
+
+/// IR Generator context
+expose data IRGenerator {
+    module: IRModule,
+    current_function: Option<usize>,
+    current_block: Option<usize>,
+    value_counter: usize,
+    block_counter: usize,
+    function_index: usize,
+    symbol_table: HashMap<String, IRValue>,
+}
+
+impl IRGenerator {
+    fn new(module_name: String) -> IRGenerator {
+        IRGenerator {
+            module: IRModule {
+                name: module_name,
+                functions: [],
+                globals: [],
+                types: [],
+                metadata: HashMap::new(),
+            },
+            current_function: None,
+            current_block: None,
+            value_counter: 0,
+            block_counter: 0,
+            function_index: 0,
+            symbol_table: HashMap::new(),
+        }
+    }
+
+    /// Generate IR from AST program
+    fn generate_program(&var self, program: &Program) -> Result<(), IRError> {
+        // First pass: collect types and function declarations
+        each item in &program.items {
+            self.collect_top_level(item)?;
+        }
+
+        // Second pass: generate function bodies
+        each item in &program.items {
+            self.generate_top_level(item)?;
+        }
+
+        Ok(())
+    }
+
+    fn collect_top_level(&var self, item: &TopLevel) -> Result<(), IRError> {
+        match item {
+            TopLevel::Fn(fn_def) => {
+                let params = fn_def.params.iter().map(|p| {
+                    IRParameter {
+                        name: p.name.clone(),
+                        ty: self.ast_type_to_ir(&p.ty.clone().unwrap_or(TypeExpr::Infer)),
+                    }
+                }).collect();
+
+                let return_ty = self.ast_type_to_ir(&fn_def.return_ty.clone().unwrap_or(TypeExpr::Prim("()".into())));
+
+                let ir_function = IRFunction {
+                    name: fn_def.name.clone(),
+                    parameters: params,
+                    return_type: return_ty,
+                    blocks: [],
+                    attributes: [],
+                    is_external: false,
+                };
+
+                self.module.functions.push(ir_function);
+            }
+
+            TopLevel::Data(data_def) => {
+                // Convert to IR data alias
+                let fields = data_def.fields.iter().map(|f| {
+                    self.ast_type_to_ir(&f.ty)
+                }).collect();
+
+                let struct_ty = IRType::Struct(fields);
+                self.module.types.push(struct_ty);
+            }
+
+            _ => {} // Other top-level items
+        }
+
+        Ok(())
+    }
+
+    fn generate_top_level(&var self, item: &TopLevel) -> Result<(), IRError> {
+        match item {
+            TopLevel::Fn(fn_def) => {
+                self.current_function = Some(self.function_index);
+                self.generate_function(fn_def)?;
+                self.function_index += 1;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn generate_function(&var self, fn_def: &FnDef) -> Result<(), IRError> {
+        check let Some(func_idx) = self.current_function {
+            let func = &var self.module.functions[func_idx];
+
+            // Create entry block
+            let entry_block = IRBasicBlock {
+                label: "entry".into(),
+                instructions: [],
+                terminator: IRTerminator::Unreachable, // Placeholder
+            };
+
+            func.blocks.push(entry_block);
+            self.current_block = Some(0);
+
+            // Generate function body
+            self.generate_block(&fn_def.body)?;
+
+            // Ensure proper termination
+            check let Some(block_idx) = self.current_block {
+                let block = &var func.blocks[block_idx];
+                check matches!(block.terminator, IRTerminator::Unreachable) {
+                    // Add implicit yield check no terminator
+                    check fn_def.return_ty.is_some() {
+                        // This would need proper yield value
+                        block.terminator = IRTerminator::Ret(None);
+                    } else {
+                        block.terminator = IRTerminator::Ret(None);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn generate_block(&var self, block: &Block) -> Result<(), IRError> {
+        each stmt in &block.stmts {
+            self.generate_stmt(stmt)?;
+        }
+        Ok(())
+    }
+
+    fn generate_block_as_value(&var self, block: &Block) -> Result<IRValue, IRError> {
+        // Simple mock: blocks are represented by their first instruction's ID or similar
+        // In real IR, this would be a code pointer or function ID
+        Ok(IRValue { id: 9999, ty: IRType::Void })
+    }
+
+    fn generate_stmt(&var self, stmt: &Stmt) -> Result<(), IRError> {
+        match stmt {
+            Stmt::Let(let_stmt) => {
+                check let Some(init) = &let_stmt.init {
+                    let init_val = self.generate_expr(init)?;
+                    // TODO: Handle pattern binding properly
+                    // For now, assume simple identifier binding
+                    check let Pattern::Bind(name) = &let_stmt.pattern {
+                        self.symbol_table.insert(name.clone(), init_val);
+                    }
+                }
+                Ok(())
+            }
+            Stmt::Var(var_stmt) => {
+                check let Some(init) = &var_stmt.init {
+                    let init_val = self.generate_expr(init)?;
+                    self.symbol_table.insert(var_stmt.name.clone(), init_val);
+                }
+                Ok(())
+            }
+            Stmt::Expr(expr_stmt) => {
+                self.generate_expr(&expr_stmt.expr)?;
+            }
+
+            Stmt::Yield(yield_stmt) => {
+                let ret_val = check let Some(expr) = &yield_stmt.value {
+                    Some(self.generate_expr(expr)?)
+                } else {
+                    None
+                };
+
+                check let Some(block_idx) = self.current_block {
+                    check let Some(func_idx) = self.current_function {
+                        self.module.functions[func_idx].blocks[block_idx].terminator = IRTerminator::Ret(ret_val);
+                    }
+                }
+            }
+
+            Stmt::Sync(_) => {
+                self.add_instruction(IRInstruction::Sync(SyncKind::Threads));
+            }
+
+            Stmt::Parallel(p) => {
+                // Generate kernel body (represented as a Launch in IR for now)
+                // In a full implementation, this might create a separate IR function
+                let body_val = self.generate_block_as_value(&p.body)?;
+                var args = [];
+                check let Some(g) = &p.grid { args.push(self.generate_expr(g)?); }
+                check let Some(b) = &p.block { args.push(self.generate_expr(b)?); }
+                self.add_instruction(IRInstruction::Launch(body_val, args));
+            }
+
+            _ => {} // Other statements
+        }
+
+        Ok(())
+    }
+
+    fn generate_expr(&var self, expr: &Expr) -> Result<IRValue, IRError> {
+        let value_id = self.value_counter;
+        self.value_counter += 1;
+
+        match expr {
+            Expr::Int(i) => {
+                let val = IRValue {
+                    id: value_id,
+                    ty: IRType::Int64,
+                };
+
+                // Add constant instruction
+                self.add_instruction(IRInstruction::Const(IRConstant::Int(i.value)));
+
+                Ok(val)
+            }
+
+            Expr::Float(f) => {
+                let val = IRValue {
+                    id: value_id,
+                    ty: IRType::Float64,
+                };
+
+                self.add_instruction(IRInstruction::Const(IRConstant::Float(f.value)));
+
+                Ok(val)
+            }
+
+            Expr::Ident(ident) => {
+                // Look up in symbol table
+                check let Some(val) = self.symbol_table.get(&ident.name) {
+                    Ok(val.clone())
+                } else {
+                    Err(IRError::UndefinedSymbol(ident.name.clone()))
+                }
+            }
+
+            Expr::Binary(binary) => {
+                let left = self.generate_expr(&binary.left)?;
+                let right = self.generate_expr(&binary.right)?;
+
+                let result_ty = left.ty.clone(); // Store alias before moving
+
+                let instruction = match binary.op {
+                    BinOp::Add => IRInstruction::Add(left, right),
+                    BinOp::Sub => IRInstruction::Sub(left, right),
+                    BinOp::Mul => IRInstruction::Mul(left, right),
+                    BinOp::Div => IRInstruction::Div(left, right),
+                    BinOp::Rem => IRInstruction::Rem(left, right),
+                    BinOp::Pow => IRInstruction::Pow(left, right),
+                    BinOp::Eq => IRInstruction::Eq(left, right),
+                    BinOp::Ne => IRInstruction::Ne(left, right),
+                    BinOp::Lt => IRInstruction::Lt(left, right),
+                    BinOp::Gt => IRInstruction::Gt(left, right),
+                    BinOp::Le => IRInstruction::Le(left, right),
+                    BinOp::Ge => IRInstruction::Ge(left, right),
+                    BinOp::And => IRInstruction::And(left, right),
+                    BinOp::Or => IRInstruction::Or(left, right),
+                    BinOp::BitAnd => IRInstruction::BitAnd(left, right),
+                    BinOp::BitOr => IRInstruction::BitOr(left, right),
+                    BinOp::BitXor => IRInstruction::BitXor(left, right),
+                    BinOp::Shl => IRInstruction::Shl(left, right),
+                    BinOp::Shr => IRInstruction::Shr(left, right),
+                    _ => yield Err(IRError::UnsupportedOperation(format("{:?}", binary.op))),
+                };
+
+                let result_val = IRValue {
+                    id: value_id,
+                    ty: result_ty, // Use stored alias instead of left.ty
+                };
+
+                self.add_instruction(instruction);
+
+                Ok(result_val)
+            }
+
+            Expr::Call(call) => {
+                let callee = self.generate_expr(&call.callee)?;
+                let args = call.args.iter()
+                    .map(|arg| self.generate_expr(arg))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let result_val = IRValue {
+                    id: value_id,
+                    ty: IRType::Void, // Would need proper alias inference
+                };
+
+                self.add_instruction(IRInstruction::Call(callee, args));
+
+                Ok(result_val)
+            }
+
+            _ => {
+                // Placeholder for other expressions
+                Ok(IRValue {
+                    id: value_id,
+                    ty: IRType::Void,
+                })
+            }
+        }
+    }
+
+    fn add_instruction(&var self, instruction: IRInstruction) {
+        check let (Some(func_idx), Some(block_idx)) = (self.current_function, self.current_block) {
+            self.module.functions[func_idx].blocks[block_idx].instructions.push(instruction);
+        }
+    }
+
+    fn ast_type_to_ir(&self, ast_ty: &TypeExpr) -> IRType {
+        match ast_ty {
+            TypeExpr::Prim(name) => match name.as_str() {
+                "i32" => IRType::Int32,
+                "i64" => IRType::Int64,
+                "f32" => IRType::Float32,
+                "f64" => IRType::Float64,
+                "bool" => IRType::Bool,
+                "()" => IRType::Void,
+                _ => IRType::Void, // Placeholder
+            },
+            TypeExpr::Ref(inner, _) => IRType::Pointer(Box::new(self.ast_type_to_ir(inner))),
+            TypeExpr::Array(elem, _) => IRType::Array(Box::new(self.ast_type_to_ir(elem)), 0), // Size unknown
+            TypeExpr::Tuple(types) => {
+                let ir_types = types.iter().map(|t| self.ast_type_to_ir(t)).collect();
+                IRType::Struct(ir_types)
+            },
+            TypeExpr::FnPtr(params, ret) => {
+                let param_types = params.iter().map(|p| self.ast_type_to_ir(p)).collect();
+                IRType::Function(param_types, Box::new(self.ast_type_to_ir(ret)))
+            },
+            TypeExpr::Tensor(dtype, _) => IRType::Tensor(Box::new(self.ast_type_to_ir(dtype)), []),
+            TypeExpr::Flow(kind, inner) => IRType::Flow(*kind, Box::new(self.ast_type_to_ir(inner))),
+            TypeExpr::Qty(scalar, _) => IRType::Quantity(Box::new(self.ast_type_to_ir(scalar)), "".into()),
+            _ => IRType::Void,
+        }
+    }
+}
+
+/// IR Generation errors
+expose cases IRError {
+    UndefinedSymbol(String),
+    TypeMismatch(String),
+    UnsupportedOperation(String),
+    InvalidAST(String),
+}
+
+impl IRError {
+    fn fmt(&self) -> String {
+        match self {
+            IRError::UndefinedSymbol(name) => format("Undefined symbol: {}", name),
+            IRError::TypeMismatch(msg) => format("Type mismatch: {}", msg),
+            IRError::UnsupportedOperation(op) => format("Unsupported operation: {}", op),
+            IRError::InvalidAST(msg) => format("Invalid AST: {}", msg),
+        }
+    }
+}
+
+/// Public interface for IR generation
+fn generate_ir(program: &Program, module_name: String) -> Result<IRModule, IRError> {
+    var generator = IRGenerator::new(module_name);
+    generator.generate_program(program)?;
+    Ok(generator.module)
+}

@@ -1,0 +1,400 @@
+/**
+ * Gaussian Splatting - 3D Scene Reconstruction
+ * 
+ * Nova implementation of:
+ * https://github.com/graphdeco-inria/gaussian-splatting
+ * 
+ * Real-time rendering of 3D scenes using Gaussian primitives
+ * Perfect for AR/VR, digital twins, 3D photography
+ */
+
+use stdlib::math::{exp, sqrt, PI};
+use stdlib::ai::tensor::{Tensor, matmul};
+use vision::core::{Camera, Renderer, Texture};
+use std::collections::Vec;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GAUSSIAN 3D PRIMITIVE
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Gaussian3D {
+    position: Vec3,           // xyz position
+    rotation: Quaternion,     // rotation
+    scale: Vec3,              // xyz scale
+    opacity: f32,             // alpha
+    color_sh: Vec<f32>,       // Spherical harmonics coefficients
+}
+
+impl Gaussian3D {
+    /**
+     * Create Gaussian primitive from point cloud
+     */
+    fn from_point(pos: Vec3, color: Color) -> Self {
+        Self {
+            position: pos,
+            rotation: Quaternion::identity(),
+            scale: Vec3::new(0.01, 0.01, 0.01),
+            opacity: 1.0,
+            color_sh: sh_from_rgb(color),
+        };
+    }
+    
+    /**
+     * Project Gaussian to screen space
+     */
+    fn project(&self, camera: &Camera) -> Gaussian2D {
+        // Project 3D position to 2D screen
+        let screen_pos = camera.world_to_screen(self.position);
+        
+        // Compute 2D covariance matrix
+        let cov3d = self.compute_covariance_3d();
+        let cov2d = project_covariance(cov3d, camera, self.position);
+        
+        // Compute color from spherical harmonics
+        let view_dir = (camera.position - self.position).normalize();
+        let color = eval_sh(self.color_sh, view_dir);
+        
+        Gaussian2D {
+            position: screen_pos,
+            covariance: cov2d,
+            color: color,
+            opacity: self.opacity,
+        };
+    }
+    
+    fn compute_covariance_3d(&self) -> Mat3 {
+        // Σ = R * S * S^T * R^T
+        let rot = self.rotation.to_matrix();
+        let scale_mat = Mat3::from_diagonal(self.scale);
+        
+        yield rot * scale_mat * scale_mat.transpose() * rot.transpose();
+    }
+}
+
+data Gaussian2D {
+    position: Vec2,
+    covariance: Mat2,
+    color: Color,
+    opacity: f32,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GAUSSIAN SPLATTING RENDERER
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data GaussianSplattingRenderer {
+    gaussians: Vec<Gaussian3D>,
+    camera: Camera,
+    width: u32,
+    height: u32,
+}
+
+impl GaussianSplattingRenderer {
+    fn new(width: u32, height: u32) -> Self {
+        Self {
+            gaussians: Vec::new(),
+            camera: Camera::default(),
+            width,
+            height,
+        };
+    }
+    
+    /**
+     * Train from multi-view images
+     * Equivalent to train.py in original implementation
+     */
+    fn train_from_images(&var self, images: Vec<Image>, iterations: i32) {
+        print("Training Gaussian Splatting model...");
+        
+        // Initialize point cloud from structure-from-motion
+        let point_cloud = self.sfm_initialization(images);
+        
+        // Convert to Gaussians
+        each point in point_cloud {
+            self.gaussians.push(Gaussian3D::from_point(point.position, point.color));
+        }
+        
+        print(f"Initialized {self.gaussians.len()} Gaussians");
+        
+        // Optimization loop
+        each iter in 0..iterations {
+            // Render from training views
+            let loss = self.compute_loss(images);
+            
+            // Backprop and optimize
+            self.optimize_gaussians(loss);
+            
+            // Adaptive density control
+            check iter % 100 == 0 {
+                self.densify_and_prune();
+            }
+            
+            check iter % 1000 == 0 {
+                print(f"Iteration {iter}: Loss = {loss}");
+            }
+        }
+        
+        print("Training complete!");
+    }
+    
+    /**
+     * Render from current camera view
+     */
+    fn render(&self) -> Image {
+        var image = Image::new(self.width, self.height);
+        
+        // Sort Gaussians by depth
+        var sorted = self.gaussians.clone();
+        sorted.sort_by(|a, b| {
+            let depth_a = (self.camera.position - a.position).length();
+            let depth_b = (self.camera.position - b.position).length();
+            depth_b.partial_cmp(&depth_a).unwrap()
+        });
+        
+        // Render each Gaussian (back to front)
+        each gaussian in sorted {
+            let g2d = gaussian.project(&self.camera);
+            self.splat_gaussian(&var image, g2d);
+        }
+        
+        yield image;
+    }
+    
+    /**
+     * Splat single Gaussian to image
+     */
+    fn splat_gaussian(&self, image: &var Image, g: Gaussian2D) {
+        // Compute bounding box
+        let inv_cov = g.covariance.inverse();
+        let eigenvalues = g.covariance.eigenvalues();
+        let radius = 3.0 * sqrt(eigenvalues.max());
+        
+        let min_x = (g.position.x - radius).max(0.0) as u32;
+        let max_x = (g.position.x + radius).min(self.width as f32) as u32;
+        let min_y = (g.position.y - radius).max(0.0) as u32;
+        let max_y = (g.position.y + radius).min(self.height as f32) as u32;
+        
+        // Rasterize
+        each y in min_y..max_y {
+            each x in min_x..max_x {
+                let pixel = Vec2::new(x as f32, y as f32);
+                let delta = pixel - g.position;
+                
+                // Gaussian weight: exp(-0.5 * delta^T * Σ^-1 * delta)
+                let exponent = -0.5 * (delta.dot(inv_cov * delta));
+                let weight = exp(exponent) * g.opacity;
+                
+                check weight > 0.01 {
+                    // Alpha blending
+                    let current = image.get_pixel(x, y);
+                    let blended = current.blend(g.color, weight);
+                    image.set_pixel(x, y, blended);
+                }
+            }
+        }
+    }
+    
+    /**
+     * Structure from Motion initialization
+     */
+    fn sfm_initialization(&self, images: Vec<Image>) -> Vec<Point3D> {
+        print("Running Structure from Motion...");
+        
+        // Feature detection (SIFT/ORB)
+        var features = Vec::new();
+        each img in &images {
+            features.push(detect_features(img));
+        }
+        
+        // Feature matching
+        let matches = match_features(features);
+        
+        // Triangulation
+        let points = triangulate_points(matches, images);
+        
+        print(f"Reconstructed {points.len()} 3D points");
+        yield points;
+    }
+    
+    /**
+     * Adaptive density control (densification + pruning)
+     */
+    fn densify_and_prune(&var self) {
+        // Clone high-gradient Gaussians
+        var to_add = Vec::new();
+        
+        each entry in self.gaussians.iter().enumerate()  { let (i, gaussian) = entry;
+            let gradient = self.compute_position_gradient(i);
+            
+            check gradient > 0.1 {  // Threshold
+                // Clone and split
+                let offset = gaussian.scale * 0.5;
+                var clone = gaussian.clone();
+                clone.position += offset;
+                to_add.push(clone);
+            }
+        }
+        
+        self.gaussians.extend(to_add);
+        
+        // Prune low-opacity Gaussians
+        self.gaussians.retain(|g| g.opacity > 0.01);
+        
+        print(f"Gaussians after densify/prune: {self.gaussians.len()}");
+    }
+    
+    fn compute_loss(&self, images: Vec<Image>) -> f32 {
+        var total_loss = 0.0;
+        
+        each img in images {
+            let rendered = self.render();
+            let l1_loss = (rendered - img).abs().sum();
+            let ssim_loss = 1.0 - ssim(rendered, img);
+            
+            total_loss += l1_loss + 0.2 * ssim_loss;
+        }
+        
+        yield total_loss / images.len() as f32;
+    }
+    
+    fn optimize_gaussians(&var self, loss: f32) {
+        // Gradient descent (simplified)
+        let lr = 0.001;
+        
+        each gaussian in &var self.gaussians {
+            // Compute gradients (automatic differentiation)
+            let grad = compute_gradient(gaussian, loss);
+            
+            // Update parameters
+            gaussian.position -= grad.position * lr;
+            gaussian.scale -= grad.scale * lr;
+            gaussian.opacity -= grad.opacity * lr;
+            
+            // Clamp values
+            gaussian.opacity = gaussian.opacity.clamp(0.0, 1.0);
+            gaussian.scale = gaussian.scale.max(Vec3::new(0.001, 0.001, 0.001));
+        }
+    }
+    
+    fn compute_position_gradient(&self, index: usize) -> f32 {
+        // Simplified gradient computation
+        yield 0.1;  // Placeholder
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SPHERICAL HARMONICS
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn sh_from_rgb(color: Color) -> Vec<f32> {
+    // Convert RGB to SH coefficients (0th order only for simplicity)
+    let c0 = 0.28209479177387814;  // sqrt(1/(4*pi))
+    
+    yield [
+        (color.r - 0.5) / c0,
+        (color.g - 0.5) / c0,
+        (color.b - 0.5) / c0,
+    ];
+}
+
+fn eval_sh(coeffs: Vec<f32>, direction: Vec3) -> Color {
+    // Evaluate spherical harmonics
+    let c0 = 0.28209479177387814;
+    
+    // 0th order (constant)
+    let r = 0.5 + c0 * coeffs[0];
+    let g = 0.5 + c0 * coeffs[1];
+    let b = 0.5 + c0 * coeffs[2];
+    
+    yield Color::new(r, g, b, 1.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn project_covariance(cov3d: Mat3, camera: &Camera, point: Vec3) -> Mat2 {
+    // Project 3D covariance to 2D screen space
+    let J = camera.compute_jacobian(point);
+    let W = camera.view_matrix();
+    
+    let T = J * W;
+    let cov2d = T * cov3d * T.transpose();
+    
+    yield Mat2::new(
+        cov2d.m00, cov2d.m01,
+        cov2d.m10, cov2d.m11
+    );
+}
+
+fn ssim(img1: Image, img2: Image) -> f32 {
+    // Structural similarity index
+    // Simplified implementation
+    let mean1 = img1.mean();
+    let mean2 = img2.mean();
+    var1 = img1.variance();
+    var2 = img2.variance();
+    let cov = img1.covariance(img2);
+    
+    let c1 = 0.01 * 0.01;
+    let c2 = 0.03 * 0.03;
+    
+    let numerator = (2.0 * mean1 * mean2 + c1) * (2.0 * cov + c2);
+    let denominator = (mean1 * mean1 + mean2 * mean2 + c1) * (var1 + var2 + c2);
+    
+    yield numerator / denominator;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PUBLIC API
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Quick training from images
+ */
+open fn train_gaussian_splatting(
+    images: Vec<Image>,
+    width: u32,
+    height: u32,
+    iterations: i32
+) -> GaussianSplattingRenderer {
+    var renderer = GaussianSplattingRenderer::new(width, height);
+    renderer.train_from_images(images, iterations);
+    yield renderer;
+}
+
+/**
+ * Real-time rendering
+ */
+open fn render_realtime(renderer: &GaussianSplattingRenderer, camera: Camera) -> Image {
+    yield renderer.render();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXAMPLE USAGE
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn example_gaussian_splatting() {
+    // Load multi-view images
+    let images = [
+        Image::load("view1.jpg"),
+        Image::load("view2.jpg"),
+        Image::load("view3.jpg"),
+    ];
+    
+    // Train model
+    let renderer = train_gaussian_splatting(images, 1920, 1080, 30000);
+    
+    // Render novel view
+    let camera = Camera::new(
+        Vec3::new(0.0, 0.0, 5.0),  // position
+        Vec3::new(0.0, 0.0, 0.0),  // look at
+        Vec3::new(0.0, 1.0, 0.0)   // up
+    );
+    
+    let output = renderer.render();
+    output.save("novel_view.jpg");
+    
+    print("✅ Gaussian Splatting complete!");
+}

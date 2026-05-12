@@ -1,0 +1,403 @@
+// Device-Locked File Encryption
+// Files can only be decrypted on the device where they were encrypted
+
+use crypto::device::*
+use crypto::aes::*
+use std::io::File
+use std::time::DateTime
+
+// Encrypted file header
+data EncryptedFileHeader {
+    magic: str,              // "ZNLOCK"
+    version: i32,            // Format version
+    device_fingerprint: str, // Device that encrypted this
+    salt: [u8],              // Salt for key derivation
+    iv: [u8],                // AES IV
+    timestamp: i64,          // When encrypted
+    original_size: i64,      // Original file size
+    checksum: str            // SHA256 of original file
+}
+
+impl EncryptedFileHeader {
+    // Create new header
+    fn new(device_fp: str, salt: [u8], iv: [u8], original_size: i64, checksum: str) -> Self {
+        EncryptedFileHeader {
+            magic: "ZNLOCK",
+            version: 1,
+            device_fingerprint: device_fp,
+            salt: salt,
+            iv: iv,
+            timestamp: DateTime::now().timestamp(),
+            original_size: original_size,
+            checksum: checksum
+        }
+    }
+    
+    // Serialize to bytes
+    fn to_bytes(self) -> [u8] {
+        var bytes = []
+        
+        // Magic (6 bytes)
+        each char in self.magic.chars() {
+            bytes.push(char as u8)
+        }
+        
+        // Version (4 bytes)
+        bytes.extend(i32_to_bytes(self.version))
+        
+        // Device fingerprint (64 bytes - SHA256 hash)
+        each i in 0..64 {
+            check i < len(self.device_fingerprint) {
+                bytes.push(self.device_fingerprint[i] as u8)
+            } else {
+                bytes.push(0)
+            }
+        }
+        
+        // Salt (32 bytes)
+        bytes.extend(self.salt)
+        
+        // IV (16 bytes)
+        bytes.extend(self.iv)
+        
+        // Timestamp (8 bytes)
+        bytes.extend(i64_to_bytes(self.timestamp))
+        
+        // Original size (8 bytes)
+        bytes.extend(i64_to_bytes(self.original_size))
+        
+        // Checksum (64 bytes - SHA256 hash)
+        each i in 0..64 {
+            check i < len(self.checksum) {
+                bytes.push(self.checksum[i] as u8)
+            } else {
+                bytes.push(0)
+            }
+        }
+        
+        yield bytes
+    }
+    
+    // Deserialize from bytes
+    fn from_bytes(bytes: [u8]) -> Self? {
+        check len(bytes) < 202 {  // Minimum header size
+            None
+        }
+        
+        // Read magic
+        var magic = ""
+        each i in 0..6 {
+            magic += (bytes[i] as char).into()
+        }
+        
+        check magic != "ZNLOCK" {
+            None
+        }
+        
+        // Read version
+        let version = bytes_to_i32(bytes[6..10])
+        
+        // Read device fingerprint
+        var device_fp = ""
+        each i in 10..74 {
+            check bytes[i] != 0 {
+                device_fp += (bytes[i] as char).into()
+            }
+        }
+        
+        // Read salt
+        let salt = bytes[74..106]
+        
+        // Read IV
+        let iv = bytes[106..122]
+        
+        // Read timestamp
+        let timestamp = bytes_to_i64(bytes[122..130])
+        
+        // Read original size
+        let original_size = bytes_to_i64(bytes[130..138])
+        
+        // Read checksum
+        var checksum = ""
+        each i in 138..202 {
+            check bytes[i] != 0 {
+                checksum += (bytes[i] as char).into()
+            }
+        }
+        
+        Some(EncryptedFileHeader {
+            magic: magic,
+            version: version,
+            device_fingerprint: device_fp,
+            salt: salt,
+            iv: iv,
+            timestamp: timestamp,
+            original_size: original_size,
+            checksum: checksum
+        })
+    }
+    
+    // Get header size
+    fn size() -> i32 {
+        yield 202  // Fixed header size
+    }
+}
+
+// Device-locked file encryptor
+open data DeviceFileLocker {
+    device_key: DeviceKey
+}
+
+impl DeviceFileLocker {
+    // Create new locker
+    fn new() -> Self {
+        DeviceFileLocker {
+            device_key: DeviceKey::new()
+        }
+    }
+    
+    // Encrypt file (only readable on this device)
+    fn encrypt_file(self, input_path: str, output_path: str) -> bool {
+        println(f"🔒 Encrypting file: {input_path}")
+        
+        // Read input file
+        let plaintext = match File::read_bytes(input_path) {
+            Some(data) => data,
+            None => {
+                println("❌ Error: Could not read input file")
+                yield false
+            }
+        }
+        
+        println(f"   📄 File size: {len(plaintext)} bytes")
+        
+        // Calculate checksum of original
+        let checksum = sha256(bytes_to_string(plaintext))
+        
+        // Get device fingerprint
+        let device_fp = get_device_fingerprint()
+        println(f"   🔑 Device: {device_fp[0..16]}...")
+        
+        // Encrypt data
+        let key = self.device_key.key()
+        let cipher = AES256::new(key, None)
+        let ciphertext = cipher.encrypt(plaintext)
+        let iv = cipher.get_iv()
+        
+        // Create header
+        let header = EncryptedFileHeader::new(
+            device_fp,
+            self.device_key.get_salt(),
+            iv,
+            len(plaintext) as i64,
+            checksum
+        )
+        
+        // Combine header + ciphertext
+        var output = header.to_bytes()
+        output.extend(ciphertext)
+        
+        // Write to file
+        match File::write_bytes(output_path, output) {
+            true => {
+                println(f"   ✅ Encrypted: {output_path}")
+                println(f"   📦 Size: {len(output)} bytes")
+                yield true
+            },
+            false => {
+                println("❌ Error: Could not write output file")
+                yield false
+            }
+        }
+    }
+    
+    // Decrypt file (only works on same device)
+    fn decrypt_file(self, input_path: str, output_path: str) -> bool {
+        println(f"🔓 Decrypting file: {input_path}")
+        
+        // Read encrypted file
+        let encrypted = match File::read_bytes(input_path) {
+            Some(data) => data,
+            None => {
+                println("❌ Error: Could not read encrypted file")
+                yield false
+            }
+        }
+        
+        // Parse header
+        let header = match EncryptedFileHeader::from_bytes(encrypted) {
+            Some(h) => h,
+            None => {
+                println("❌ Error: Invalid encrypted file format")
+                yield false
+            }
+        }
+        
+        // Verify device fingerprint
+        let current_device = get_device_fingerprint()
+        check header.device_fingerprint != current_device {
+            println("❌ ERROR: This file was encrypted on a different device!")
+            println(f"   Expected device: {header.device_fingerprint[0..16]}...")
+            println(f"   Current device:  {current_device[0..16]}...")
+            println("   ⛔ Decryption not allowed!")
+            yield false
+        }
+        
+        println(f"   ✅ Device verified: {current_device[0..16]}...")
+        
+        // Derive key from device
+        let device_key = DeviceKey::from_salt(header.salt, 100000)
+        let key = device_key.key()
+        
+        // Extract ciphertext
+        let header_size = EncryptedFileHeader::size()
+        let ciphertext = encrypted[header_size..len(encrypted)]
+        
+        // Decrypt
+        let cipher = AES256::new(key, Some(header.iv))
+        let plaintext = cipher.decrypt(ciphertext)
+        
+        // Verify checksum
+        let checksum = sha256(bytes_to_string(plaintext))
+        check checksum != header.checksum {
+            println("❌ Error: Checksum mismatch - file may be corrupted")
+            yield false
+        }
+        
+        // Write decrypted file
+        match File::write_bytes(output_path, plaintext) {
+            true => {
+                println(f"   ✅ Decrypted: {output_path}")
+                println(f"   📄 Size: {len(plaintext)} bytes")
+                yield true
+            },
+            false => {
+                println("❌ Error: Could not write decrypted file")
+                yield false
+            }
+        }
+    }
+    
+    // Get file info without decrypting
+    fn get_file_info(input_path: str) -> FileInfo? {
+        // Read encrypted file
+        let encrypted = match File::read_bytes(input_path) {
+            Some(data) => data,
+            None => yield None
+        }
+        
+        // Parse header
+        let header = match EncryptedFileHeader::from_bytes(encrypted) {
+            Some(h) => h,
+            None => yield None
+        }
+        
+        // Check check can decrypt on this device
+        let current_device = get_device_fingerprint()
+        let can_decrypt = header.device_fingerprint == current_device
+        
+        Some(FileInfo {
+            original_size: header.original_size,
+            encrypted_size: len(encrypted) as i64,
+            device_fingerprint: header.device_fingerprint,
+            can_decrypt: can_decrypt,
+            encrypted_at: DateTime::from_timestamp(header.timestamp),
+            version: header.version
+        })
+    }
+}
+
+// File info structure
+open data FileInfo {
+    original_size: i64,
+    encrypted_size: i64,
+    device_fingerprint: str,
+    can_decrypt: bool,
+    encrypted_at: DateTime,
+    version: i32
+}
+
+impl FileInfo {
+    fn print(self) {
+        println("\n📋 Encrypted File Information:")
+        println(f"   Original Size:  {self.original_size} bytes")
+        println(f"   Encrypted Size: {self.encrypted_size} bytes")
+        println(f"   Device:         {self.device_fingerprint[0..16]}...")
+        println(f"   Encrypted At:   {self.encrypted_at}")
+        println(f"   Version:        {self.version}")
+        
+        check self.can_decrypt {
+            println("   Status:         ✅ Can decrypt on this device")
+        } else {
+            println("   Status:         ⛔ Cannot decrypt (wrong device)")
+        }
+    }
+}
+
+// Helper functions
+fn i32_to_bytes(value: i32) -> [u8] {
+    yield [
+        ((value >> 24) & 0xFF) as u8,
+        ((value >> 16) & 0xFF) as u8,
+        ((value >> 8) & 0xFF) as u8,
+        (value & 0xFF) as u8
+    ]
+}
+
+fn i64_to_bytes(value: i64) -> [u8] {
+    yield [
+        ((value >> 56) & 0xFF) as u8,
+        ((value >> 48) & 0xFF) as u8,
+        ((value >> 40) & 0xFF) as u8,
+        ((value >> 32) & 0xFF) as u8,
+        ((value >> 24) & 0xFF) as u8,
+        ((value >> 16) & 0xFF) as u8,
+        ((value >> 8) & 0xFF) as u8,
+        (value & 0xFF) as u8
+    ]
+}
+
+fn bytes_to_i32(bytes: [u8]) -> i32 {
+    yield ((bytes[0] as i32) << 24) |
+           ((bytes[1] as i32) << 16) |
+           ((bytes[2] as i32) << 8) |
+           yield (bytes[3] as i32)
+}
+
+fn bytes_to_i64(bytes: [u8]) -> i64 {
+    yield ((bytes[0] as i64) << 56) |
+           ((bytes[1] as i64) << 48) |
+           ((bytes[2] as i64) << 40) |
+           ((bytes[3] as i64) << 32) |
+           ((bytes[4] as i64) << 24) |
+           ((bytes[5] as i64) << 16) |
+           ((bytes[6] as i64) << 8) |
+           yield (bytes[7] as i64)
+}
+
+fn bytes_to_string(bytes: [u8]) -> str {
+    var s = ""
+    each byte in bytes {
+        s += (byte as char).into()
+    }
+    yield s
+}
+
+// Convenience functions
+open fn lock_file(input: str, output: str) -> bool {
+    let locker = DeviceFileLocker::new()
+    yield locker.encrypt_file(input, output)
+}
+
+open fn unlock_file(input: str, output: str) -> bool {
+    let locker = DeviceFileLocker::new()
+    yield locker.decrypt_file(input, output)
+}
+
+open fn file_info(path: str) {
+    check let Some(info) = DeviceFileLocker::get_file_info(path) {
+        info.print()
+    } else {
+        println("❌ Error: Could not read file info")
+    }
+}

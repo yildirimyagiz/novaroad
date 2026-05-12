@@ -1,0 +1,203 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Polonius - Loan Tracking                                              ║
+// ║  Track borrows and their validity regions                                   ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+//
+// A Loan represents a borrow in the program. It tracks:
+// - Where the borrow was created
+// - What path was borrowed
+// - What region/lifetime the borrow is valid for
+
+use super::location::Location;
+use super::origin::Origin;
+
+/// Represents a borrow (loan) in the program
+expose data Loan {
+    /// Unique identifier for this loan
+    id: LoanId,
+    
+    /// Location where the borrow was created
+    issued_at: Location,
+    
+    /// The path that was borrowed (e.g., x.field)
+    borrowed_path: Path,
+    
+    /// The region this loan is associated with
+    region: Origin,
+    
+    /// Whether this is a mutable borrow
+    is_mut: bool,
+}
+
+/// Unique identifier for a loan
+expose data LoanId {
+    id: u32,
+}
+
+/// Represents a path in the program (e.g., variable, field access)
+expose cases Path {
+    /// Local variable
+    Local(LocalId),
+    
+    /// Field access (base.field)
+    Field(Box<Path>, FieldId),
+    
+    /// Array/vector index (base[index])
+    Index(Box<Path>),
+    
+    /// Dereference (*ptr)
+    Deref(Box<Path>),
+}
+
+/// Local variable identifier
+expose data LocalId {
+    id: u32,
+}
+
+/// Field identifier
+expose data FieldId {
+    id: u32,
+    name: String,
+}
+
+impl Loan {
+    /// Create a new loan
+    open fn new(
+        id: LoanId,
+        issued_at: Location,
+        borrowed_path: Path,
+        region: Origin,
+        is_mut: bool,
+    ) -> Loan {
+        Loan {
+            id,
+            issued_at,
+            borrowed_path,
+            region,
+            is_mut,
+        }
+    }
+    
+    /// Check check this loan conflicts with another
+    open fn conflicts_with(&self, other: &Loan) -> bool {
+        // Two loans conflict check:
+        // 1. They access overlapping paths, AND
+        // 2. At least one is mutable
+        
+        check !self.is_mut && !other.is_mut {
+            yield false; // Two immutable borrows never conflict
+        }
+        
+        self.borrowed_path.overlaps_with(&other.borrowed_path)
+    }
+}
+
+impl Path {
+    /// Create a local variable path
+    open fn local(id: u32) -> Path {
+        Path::Local(LocalId { id })
+    }
+    
+    /// Create a field access path
+    open fn field(base: Path, field_id: u32, field_name: String) -> Path {
+        Path::Field(Box::new(base), FieldId { id: field_id, name: field_name })
+    }
+    
+    /// Check check this path overlaps with another
+    open fn overlaps_with(&self, other: &Path) -> bool {
+        // Simplified overlap check
+        // TODO: Implement precise path overlap analysis
+        
+        match (self, other) {
+            (Path::Local(a), Path::Local(b)) => a.id == b.id,
+            (Path::Field(base_a, field_a), Path::Field(base_b, field_b)) => {
+                field_a.id == field_b.id && base_a.overlaps_with(base_b)
+            }
+            _ => false, // Simplified for now
+        }
+    }
+}
+
+/// Context for tracking loans
+expose data LoanContext {
+    next_loan_id: u32,
+    loans: Vec<Loan>,
+}
+
+impl LoanContext {
+    open fn new() -> LoanContext {
+        LoanContext {
+            next_loan_id: 0,
+            loans: Vec::new(),
+        }
+    }
+    
+    /// Issue a new loan
+    open fn issue_loan(
+        &var self,
+        issued_at: Location,
+        borrowed_path: Path,
+        region: Origin,
+        is_mut: bool,
+    ) -> LoanId {
+        let id = LoanId { id: self.next_loan_id };
+        self.next_loan_id += 1;
+        
+        let loan = Loan::new(id, issued_at, borrowed_path, region, is_mut);
+        self.loans.push(loan);
+        
+        id
+    }
+    
+    /// Get all loans
+    open fn all_loans(&self) -> &Vec<Loan> {
+        &self.loans
+    }
+    
+    /// Find conflicting loans at a location
+    open fn find_conflicts(&self, loan: &Loan) -> Vec<&Loan> {
+        self.loans.iter()
+            .filter(|l| l.id.id != loan.id.id && l.conflicts_with(loan))
+            .collect()
+    }
+}
+
+#[test]
+fn test_loan_conflicts() {
+    let block = super::location::BlockId::new(0);
+    let loc = super::location::Location::new(block, 0);
+    
+    let origin = super::origin::Origin::universal(0, Some("'a".into()));
+    
+    let path = Path::local(0);
+    
+    let loan1 = Loan::new(
+        LoanId { id: 0 },
+        loc,
+        path.clone(),
+        origin.clone(),
+        false, // immutable
+    );
+    
+    let loan2 = Loan::new(
+        LoanId { id: 1 },
+        loc,
+        path.clone(),
+        origin.clone(),
+        false, // immutable
+    );
+    
+    // Two immutable loans don't conflict
+    assert(!loan1.conflicts_with(&loan2));
+    
+    let loan3 = Loan::new(
+        LoanId { id: 2 },
+        loc,
+        path,
+        origin,
+        true, // mutable
+    );
+    
+    // Mutable and immutable conflict
+    assert(loan1.conflicts_with(&loan3));
+}

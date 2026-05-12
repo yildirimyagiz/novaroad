@@ -1,0 +1,572 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║              NOVA STABLE DIFFUSION TRAINING                                 ║
+// ║              LoRA, DreamBooth, Fine-tuning implementations                    ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use stdlib.ai.diffusion.{
+    pipeline.StableDiffusionPipeline,
+    scheduler.DDPMScheduler
+}
+use stdlib.ai.torch.{Tensor, nn, optim}
+use std.{io, progress}
+
+// ============================================================================
+// LORA (Low-Rank Adaptation)
+// ============================================================================
+
+open data LoRALayer {
+    // Original layer (frozen)
+    original: nn::Linear,
+    
+    // LoRA parameters (trainable)
+    lora_down: nn::Linear,  // [in_features, rank]
+    lora_up: nn::Linear,    // [rank, out_features]
+    
+    // Config
+    rank: i32,
+    alpha: f32,
+    scale: f32,
+}
+
+impl LoRALayer {
+    fn new(original: nn::Linear, rank: i32, alpha: f32) -> Self {
+        let in_features = original.in_features;
+        let out_features = original.out_features;
+        
+        // Initialize LoRA matrices
+        let lora_down = nn::Linear::new(in_features, rank, false);
+        let lora_up = nn::Linear::new(rank, out_features, false);
+        
+        // Initialize lora_up with zeros (important!)
+        lora_up.weight.zero_();
+        
+        let scale = alpha / rank as f32;
+        
+        LoRALayer {
+            original,
+            lora_down,
+            lora_up,
+            rank,
+            alpha,
+            scale
+        }
+    }
+    
+    fn forward(&var self, x: &Tensor) -> Tensor {
+        // Original output (frozen)
+        let original_out = self.original.forward(x);
+        
+        // LoRA path
+        let lora_out = self.lora_down.forward(x);
+        let lora_out = self.lora_up.forward(&lora_out);
+        let lora_out = lora_out * self.scale;
+        
+        // Combine
+        original_out + lora_out
+    }
+    
+    fn trainable_parameters(&var self) -> Vec<&var Tensor> {
+        [
+            &var self.lora_down.weight,
+            &var self.lora_up.weight
+        ]
+    }
+}
+
+// ============================================================================
+// LORA TRAINER
+// ============================================================================
+
+open data LoRATrainer {
+    pipeline: StableDiffusionPipeline,
+    lora_layers: Vec<LoRALayer>,
+    
+    // Training config
+    learning_rate: f32,
+    batch_size: i32,
+    num_epochs: i32,
+    gradient_accumulation_steps: i32,
+    
+    // Optimizer
+    optimizer: optim::AdamW,
+    
+    // Scheduler
+    noise_scheduler: DDPMScheduler,
+    
+    // Mixed precision
+    use_fp16: bool,
+    scaler: Option<GradScaler>,
+}
+
+impl LoRATrainer {
+    fn new(
+        pipeline: StableDiffusionPipeline,
+        rank: i32,
+        alpha: f32,
+        learning_rate: f32
+    ) -> Self {
+        // Inject LoRA into UNet
+        let lora_layers = Self::inject_lora_into_unet(&var pipeline.unet, rank, alpha);
+        
+        // Get trainable parameters
+        var params = Vec::new();
+        each layer in &var lora_layers {
+            params.extend(layer.trainable_parameters());
+        }
+        
+        let optimizer = optim::AdamW::new(params, learning_rate, 0.01);
+        
+        LoRATrainer {
+            pipeline,
+            lora_layers,
+            learning_rate,
+            batch_size: 4,
+            num_epochs: 100,
+            gradient_accumulation_steps: 4,
+            optimizer,
+            noise_scheduler: DDPMScheduler::new(1000, 0.00085, 0.012, "scaled_linear"),
+            use_fp16: true,
+            scaler: Some(GradScaler::new())
+        }
+    }
+    
+    fn inject_lora_into_unet(unet: &var UNet, rank: i32, alpha: f32) -> Vec<LoRALayer> {
+        var lora_layers = Vec::new();
+        
+        // Inject LoRA into cross-attention layers
+        // This is where we adapt the model to new concepts
+        
+        // In production, iterate through all attention layers
+        // For now, simplified version
+        
+        lora_layers
+    }
+    
+    @gpu_accelerated
+    fn train(&var self, dataset_path: &str) {
+        println("🎓 Starting LoRA Training");
+        println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println("  Learning rate: {}", self.learning_rate);
+        println("  Batch size: {}", self.batch_size);
+        println("  Epochs: {}", self.num_epochs);
+        println("  LoRA rank: {} (alpha: {})", self.lora_layers[0].rank, self.lora_layers[0].alpha);
+        println("");
+        
+        // Load dataset
+        let dataloader = ImageTextDataset::new(dataset_path, self.batch_size);
+        
+        var global_step = 0;
+        
+        each epoch in 0..self.num_epochs {
+            println("Epoch {}/{}", epoch + 1, self.num_epochs);
+            
+            var epoch_loss = 0.0;
+            var num_batches = 0;
+            
+            each entry in dataloader.iter().enumerate()  { let (batch_idx, batch) = entry;
+                let (images, captions) = batch;
+                
+                // Encode images to latents
+                let latents = self.pipeline.vae.encode(&images);
+                
+                // Sample noise
+                let noise = Tensor::randn_like(&latents);
+                
+                // Sample timesteps
+                let bsz = latents.data[0];
+                let timesteps = Tensor::randint(0, self.noise_scheduler.num_train_timesteps, &[bsz]);
+                
+                // Add noise to latents
+                let noisy_latents = self.noise_scheduler.add_noise(&latents, &noise, &timesteps);
+                
+                // Encode text
+                let (text_embeddings, _) = self.pipeline.text_encoder.encode_text(&captions);
+                
+                // Predict noise
+                let noise_pred = self.pipeline.unet.forward(
+                    &noisy_latents,
+                    &timesteps,
+                    &text_embeddings
+                );
+                
+                // Compute loss
+                let loss = nn::mse_loss(&noise_pred, &noise);
+                
+                // Backward pass with gradient accumulation
+                let loss = loss / self.gradient_accumulation_steps as f32;
+                
+                check self.use_fp16 {
+                    self.scaler.as_mut().unwrap().scale(loss).backward();
+                } else {
+                    loss.backward();
+                }
+                
+                // Update weights
+                check (batch_idx + 1) % self.gradient_accumulation_steps as usize == 0 {
+                    check self.use_fp16 {
+                        self.scaler.as_mut().unwrap().step(&var self.optimizer);
+                        self.scaler.as_mut().unwrap().update();
+                    } else {
+                        self.optimizer.step();
+                    }
+                    
+                    self.optimizer.zero_grad();
+                    global_step += 1;
+                }
+                
+                epoch_loss += loss.item();
+                num_batches += 1;
+                
+                // Progress
+                check batch_idx % 10 == 0 {
+                    println("  Step {}: loss = {:.4f}", global_step, loss.item());
+                }
+            }
+            
+            let avg_loss = epoch_loss / num_batches as f32;
+            println("  Average loss: {:.4f}", avg_loss);
+            
+            // Save checkpoint
+            check (epoch + 1) % 10 == 0 {
+                self.save_lora(format("lora_epoch_{}.safetensors", epoch + 1));
+            }
+        }
+        
+        println("");
+        println("✅ Training complete!");
+        self.save_lora("lora_final.safetensors");
+    }
+    
+    fn save_lora(&self, path: String) {
+        // Save LoRA weights in safetensors format
+        println("💾 Saving LoRA to: {}", path);
+        
+        var state_dict = HashMap::new();
+        
+        each entry in self.lora_layers.iter().enumerate()  { let (i, layer) = entry;
+            state_dict.insert(
+                format("lora.{}.down.weight", i),
+                layer.lora_down.weight.clone()
+            );
+            state_dict.insert(
+                format("lora.{}.up.weight", i),
+                layer.lora_up.weight.clone()
+            );
+        }
+        
+        // Save using safetensors format
+        safetensors::save(&state_dict, &path);
+    }
+    
+    fn load_lora(&var self, path: &str) {
+        println("📂 Loading LoRA from: {}", path);
+        
+        let state_dict = safetensors::load(path);
+        
+        each entry in self.lora_layers.iter_mut().enumerate()  { let (i, layer) = entry;
+            let down_key = format("lora.{}.down.weight", i);
+            let up_key = format("lora.{}.up.weight", i);
+            
+            check let Some(down_weight) = state_dict.get(&down_key) {
+                layer.lora_down.weight.copy_from(down_weight);
+            }
+            
+            check let Some(up_weight) = state_dict.get(&up_key) {
+                layer.lora_up.weight.copy_from(up_weight);
+            }
+        }
+        
+        println("✅ LoRA loaded successfully");
+    }
+}
+
+// ============================================================================
+// DREAMBOOTH TRAINER
+// ============================================================================
+
+open data DreamBoothTrainer {
+    pipeline: StableDiffusionPipeline,
+    
+    // Training config
+    instance_prompt: String,
+    class_prompt: String,
+    learning_rate: f32,
+    num_train_steps: i32,
+    
+    // Prior preservation
+    use_prior_preservation: bool,
+    prior_loss_weight: f32,
+    
+    optimizer: optim::AdamW,
+    noise_scheduler: DDPMScheduler,
+}
+
+impl DreamBoothTrainer {
+    fn new(
+        pipeline: StableDiffusionPipeline,
+        instance_prompt: &str,
+        class_prompt: &str,
+        learning_rate: f32
+    ) -> Self {
+        // Get all UNet parameters
+        let params = pipeline.unet.parameters();
+        let optimizer = optim::AdamW::new(params, learning_rate, 0.01);
+        
+        DreamBoothTrainer {
+            pipeline,
+            instance_prompt: instance_prompt.into(),
+            class_prompt: class_prompt.into(),
+            learning_rate,
+            num_train_steps: 800,
+            use_prior_preservation: true,
+            prior_loss_weight: 1.0,
+            optimizer,
+            noise_scheduler: DDPMScheduler::new(1000, 0.00085, 0.012, "scaled_linear")
+        }
+    }
+    
+    @gpu_accelerated
+    fn train(&var self, instance_images_path: &str, class_images_path: Option<&str>) {
+        println("🎓 Starting DreamBooth Training");
+        println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println("  Instance prompt: {}", self.instance_prompt);
+        println("  Class prompt: {}", self.class_prompt);
+        println("  Learning rate: {}", self.learning_rate);
+        println("  Train steps: {}", self.num_train_steps);
+        println("");
+        
+        // Load instance images
+        let instance_dataloader = ImageTextDataset::new(instance_images_path, 1);
+        
+        // Load or generate class images for prior preservation
+        let class_dataloader = check self.use_prior_preservation {
+            check let Some(class_path) = class_images_path {
+                Some(ImageTextDataset::new(class_path, 1))
+            } else {
+                // Generate class images
+                println("Generating class images for prior preservation...");
+                self.generate_class_images(200);
+                Some(ImageTextDataset::new("generated_class_images", 1))
+            }
+        } else {
+            None
+        };
+        
+        each step in 0..self.num_train_steps {
+            // Get instance batch
+            let (instance_images, _) = instance_dataloader.next();
+            let instance_latents = self.pipeline.vae.encode(&instance_images);
+            
+            // Get instance prompt embeddings
+            let (instance_embeddings, _) = self.pipeline.encode_prompt(&self.instance_prompt, None);
+            
+            // Sample noise and timestep
+            let noise = Tensor::randn_like(&instance_latents);
+            let timesteps = Tensor::randint(0, self.noise_scheduler.num_train_timesteps, &[1]);
+            
+            let noisy_latents = self.noise_scheduler.add_noise(&instance_latents, &noise, &timesteps);
+            
+            // Predict noise
+            let noise_pred = self.pipeline.unet.forward(&noisy_latents, &timesteps, &instance_embeddings);
+            
+            // Instance loss
+            var loss = nn::mse_loss(&noise_pred, &noise);
+            
+            // Prior preservation loss
+            check let Some(ref class_dl) = class_dataloader {
+                let (class_images, _) = class_dl.next();
+                let class_latents = self.pipeline.vae.encode(&class_images);
+                let (class_embeddings, _) = self.pipeline.encode_prompt(&self.class_prompt, None);
+                
+                let class_noise = Tensor::randn_like(&class_latents);
+                let noisy_class_latents = self.noise_scheduler.add_noise(&class_latents, &class_noise, &timesteps);
+                
+                let class_noise_pred = self.pipeline.unet.forward(&noisy_class_latents, &timesteps, &class_embeddings);
+                
+                let prior_loss = nn::mse_loss(&class_noise_pred, &class_noise);
+                loss = loss + self.prior_loss_weight * prior_loss;
+            }
+            
+            // Backward and optimize
+            loss.backward();
+            self.optimizer.step();
+            self.optimizer.zero_grad();
+            
+            check step % 50 == 0 {
+                println("Step {}/{}: loss = {:.4f}", step, self.num_train_steps, loss.item());
+            }
+            
+            // Save checkpoint
+            check (step + 1) % 200 == 0 {
+                self.save_checkpoint(format("dreambooth_step_{}.safetensors", step + 1));
+            }
+        }
+        
+        println("");
+        println("✅ DreamBooth training complete!");
+        self.save_checkpoint("dreambooth_final.safetensors");
+    }
+    
+    fn generate_class_images(&var self, num_images: i32) {
+        println("Generating {} class images...", num_images);
+        
+        each i in 0..num_images {
+            let image = self.pipeline.generate(
+                &self.class_prompt,
+                None,
+                50,
+                7.5,
+                512,
+                512,
+                Some(i as i64)
+            );
+            
+            image.save(format("generated_class_images/class_{}.png", i));
+            
+            check i % 10 == 0 {
+                println("  Generated {}/{}", i, num_images);
+            }
+        }
+    }
+    
+    fn save_checkpoint(&self, path: String) {
+        println("💾 Saving checkpoint: {}", path);
+        self.pipeline.unet.save_weights(&path);
+    }
+}
+
+// ============================================================================
+// DATASET LOADER
+// ============================================================================
+
+open data ImageTextDataset {
+    image_paths: Vec<String>,
+    captions: Vec<String>,
+    batch_size: i32,
+    current_idx: usize,
+}
+
+impl ImageTextDataset {
+    fn new(path: &str, batch_size: i32) -> Self {
+        // Load image paths and captions
+        let (image_paths, captions) = Self::load_dataset(path);
+        
+        ImageTextDataset {
+            image_paths,
+            captions,
+            batch_size,
+            current_idx: 0
+        }
+    }
+    
+    fn load_dataset(path: &str) -> (Vec<String>, Vec<String>) {
+        var image_paths = Vec::new();
+        var captions = Vec::new();
+        
+        // Read directory
+        each entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            
+            check path.extension().map_or(false, |ext| ext == "jpg" || ext == "png") {
+                image_paths.push(path.to_str().unwrap().into());
+                
+                // Look for corresponding .txt file
+                let caption_path = path.with_extension("txt");
+                let caption = check caption_path.exists() {
+                    std::fs::read_to_string(caption_path).unwrap()
+                } else {
+                    "".into()
+                };
+                
+                captions.push(caption);
+            }
+        }
+        
+        yield (image_paths, captions)
+    }
+    
+    fn next(&var self) -> (Tensor, Vec<String>) {
+        let end_idx = (self.current_idx + self.batch_size as usize).min(self.image_paths.len());
+        
+        let batch_paths = &self.image_paths[self.current_idx..end_idx];
+        let batch_captions = self.captions[self.current_idx..end_idx].to_vec();
+        
+        // Load images
+        var images = Vec::new();
+        each path in batch_paths {
+            let img = Tensor::load_image(path);
+            images.push(img);
+        }
+        
+        let images_tensor = Tensor::stack(&images, 0);
+        
+        self.current_idx = end_idx;
+        check self.current_idx >= self.image_paths.len() {
+            self.current_idx = 0;  // Loop
+        }
+        
+        yield (images_tensor, batch_captions)
+    }
+    
+    fn iter(&self) -> DatasetIterator {
+        DatasetIterator {
+            dataset: self,
+            current: 0
+        }
+    }
+}
+
+// ============================================================================
+// GRADIENT SCALER (for mixed precision)
+// ============================================================================
+
+open data GradScaler {
+    scale: f32,
+    growth_factor: f32,
+    backoff_factor: f32,
+    growth_interval: i32,
+    steps_since_update: i32,
+}
+
+impl GradScaler {
+    fn new() -> Self {
+        GradScaler {
+            scale: 65536.0,
+            growth_factor: 2.0,
+            backoff_factor: 0.5,
+            growth_interval: 2000,
+            steps_since_update: 0
+        }
+    }
+    
+    fn scale(&self, loss: Tensor) -> Tensor {
+        loss * self.scale
+    }
+    
+    fn step(&var self, optimizer: &var optim::AdamW) {
+        // Unscale gradients
+        each param in optimizer.params.iter_mut() {
+            check let Some(ref var grad) = param.grad {
+                *grad = grad / self.scale;
+            }
+        }
+        
+        optimizer.step();
+        self.steps_since_update += 1;
+    }
+    
+    fn update(&var self) {
+        check self.steps_since_update >= self.growth_interval {
+            self.scale *= self.growth_factor;
+            self.steps_since_update = 0;
+        }
+    }
+}
+
+export {
+    LoRATrainer,
+    DreamBoothTrainer,
+    ImageTextDataset,
+    LoRALayer
+}

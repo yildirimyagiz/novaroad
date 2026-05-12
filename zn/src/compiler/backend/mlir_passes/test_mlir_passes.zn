@@ -1,0 +1,603 @@
+//===- test_mlir_passes.zn - MLIR Passes Test Suite --------------------------===//
+//
+// Part of the Nova Formal Kernel - Mobile-Aware Edition
+//
+//===----------------------------------------------------------------------===//
+//
+// This file contains comprehensive tests for Nova's MLIR passes.
+// Tests cover alias safety, effect inference, linear types, and optimizations.
+//
+// Mobile extensions:
+// - Battery-aware test execution
+// - Thermal-aware test validation
+// - Memory-constrained test scenarios
+// - Device-specific test cases
+//
+//===----------------------------------------------------------------------===//
+
+use compiler::core::mlir_passes::nova_passes_impl::*;
+use std::testing::*;
+
+// ============================================================================
+// TEST HELPERS
+// ============================================================================
+
+fn create_test_module() -> MLIRModule {
+    MLIRModule {
+        functions: vec[],
+        types: vec[],
+        attributes: HashMap::new(),
+    }
+}
+
+fn create_test_function(name: String) -> MLIRFunction {
+    MLIRFunction {
+        name,
+        params: vec[],
+        return_type: MLIRType::I64,
+        blocks: vec[],
+        effects: EffectSet::PURE,
+        ownership_attrs: HashMap::new(),
+    }
+}
+
+// ============================================================================
+// BORROW CHECKER TESTS
+// ============================================================================
+
+#[test]
+fn test_borrow_check_valid_shared_borrow() {
+    var module = create_test_module();
+    var func = create_test_function("test_func".into());
+    
+    var block = MLIRBlock {
+        label: "entry".into(),
+        operations: [
+            MLIROperation::Borrow {
+                value: "x".into(),
+                lifetime: "'a".into(),
+                is_mut: false,
+            },
+            MLIROperation::Borrow {
+                value: "x".into(),
+                lifetime: "'b".into(),
+                is_mut: false,
+            },
+        ],
+    };
+    
+    func.params.push(("x".into(), MLIRType::I64));
+    func.blocks.push(block);
+    module.functions.push(func);
+    
+    var pass = BorrowCheckPass::new();
+    let result = pass.run(&var module);
+    
+    assert(matches!(result, PassResult::Success), 
+            "Multiple shared borrows should be allowed");
+}
+
+#[test]
+fn test_borrow_check_mut_aliasing_error() {
+    var module = create_test_module();
+    var func = create_test_function("test_func".into());
+    
+    var block = MLIRBlock {
+        label: "entry".into(),
+        operations: [
+            MLIROperation::Borrow {
+                value: "x".into(),
+                lifetime: "'a".into(),
+                is_mut: false,
+            },
+            MLIROperation::Borrow {
+                value: "x".into(),
+                lifetime: "'b".into(),
+                is_mut: true,  // ERROR: can't var borrow while shared borrow exists
+            },
+        ],
+    };
+    
+    func.params.push(("x".into(), MLIRType::I64));
+    func.blocks.push(block);
+    module.functions.push(func);
+    
+    var pass = BorrowCheckPass::new();
+    let result = pass.run(&var module);
+    
+    assert(matches!(result, PassResult::Failure(_)), 
+            "Mutable borrow with existing shared borrow should fail");
+}
+
+#[test]
+fn test_borrow_check_use_after_move() {
+    var module = create_test_module();
+    var func = create_test_function("test_func".into());
+    
+    var block = MLIRBlock {
+        label: "entry".into(),
+        operations: [
+            MLIROperation::Move {
+                source: "x".into(),
+                dest: "y".into(),
+            },
+            MLIROperation::Borrow {
+                value: "x".into(),  // ERROR: x was moved
+                lifetime: "'a".into(),
+                is_mut: false,
+            },
+        ],
+    };
+    
+    func.params.push(("x".into(), MLIRType::I64));
+    func.blocks.push(block);
+    module.functions.push(func);
+    
+    var pass = BorrowCheckPass::new();
+    let result = pass.run(&var module);
+    
+    assert(matches!(result, PassResult::Failure(_)), 
+            "Use after move should be detected");
+}
+
+// ============================================================================
+// EFFECT INFERENCE TESTS
+// ============================================================================
+
+#[test]
+fn test_effect_inference_pure_function() {
+    var module = create_test_module();
+    var func = create_test_function("pure_func".into());
+    
+    var block = MLIRBlock {
+        label: "entry".into(),
+        operations: [
+            MLIROperation::PureCall {
+                callee: "add".into(),
+                args: ["a".into(), "b".into()],
+            },
+        ],
+    };
+    
+    func.blocks.push(block);
+    func.effects = EffectSet::UNKNOWN;  // Not yet inferred
+    module.functions.push(func);
+    
+    var pass = EffectInferencePass::new(false);
+    let result = pass.run(&var module);
+    
+    assert(matches!(result, PassResult::Modified), 
+            "Effect inference should modify the IR");
+    assert_eq!(module.functions[0].effects, EffectSet::PURE,
+               "Pure calls should result in PURE effect");
+}
+
+#[test]
+fn test_effect_inference_io_function() {
+    var module = create_test_module();
+    var func = create_test_function("io_func".into());
+    
+    var block = MLIRBlock {
+        label: "entry".into(),
+        operations: [
+            MLIROperation::Call {
+                callee: "println".into(),
+                args: ["msg".into()],
+                effects: EffectSet::IO,
+            },
+        ],
+    };
+    
+    func.blocks.push(block);
+    func.effects = EffectSet::UNKNOWN;
+    module.functions.push(func);
+    
+    var pass = EffectInferencePass::new(false);
+    pass.run(&var module);
+    
+    assert(module.functions[0].effects.contains(EffectSet::IO),
+            "Function with IO call should have IO effect");
+}
+
+#[test]
+fn test_effect_inference_combined_effects() {
+    var module = create_test_module();
+    var func = create_test_function("combined_func".into());
+    
+    var block = MLIRBlock {
+        label: "entry".into(),
+        operations: [
+            MLIROperation::Call {
+                callee: "println".into(),
+                args: [],
+                effects: EffectSet::IO,
+            },
+            MLIROperation::Call {
+                callee: "malloc".into(),
+                args: [],
+                effects: EffectSet::MEMORY,
+            },
+        ],
+    };
+    
+    func.blocks.push(block);
+    func.effects = EffectSet::UNKNOWN;
+    module.functions.push(func);
+    
+    var pass = EffectInferencePass::new(false);
+    pass.run(&var module);
+    
+    let expected = EffectSet::IO | EffectSet::MEMORY;
+    assert_eq!(module.functions[0].effects, expected,
+               "Combined effects should be union of all effects");
+}
+
+// ============================================================================
+// LINEAR TYPE CHECKER TESTS
+// ============================================================================
+
+#[test]
+fn test_linear_type_valid_usage() {
+    var module = create_test_module();
+    var func = create_test_function("linear_func".into());
+    
+    var block = MLIRBlock {
+        label: "entry".into(),
+        operations: [
+            MLIROperation::LinearAlloc {
+                result: "resource".into(),
+            },
+            MLIROperation::LinearConsume {
+                resource: "resource".into(),
+            },
+        ],
+    };
+    
+    func.blocks.push(block);
+    module.functions.push(func);
+    
+    var pass = LinearTypeCheckPass::new();
+    let result = pass.run(&var module);
+    
+    assert(matches!(result, PassResult::Success),
+            "Linear resource consumed exactly once should succeed");
+}
+
+#[test]
+fn test_linear_type_double_consume_error() {
+    var module = create_test_module();
+    var func = create_test_function("linear_func".into());
+    
+    var block = MLIRBlock {
+        label: "entry".into(),
+        operations: [
+            MLIROperation::LinearAlloc {
+                result: "resource".into(),
+            },
+            MLIROperation::LinearConsume {
+                resource: "resource".into(),
+            },
+            MLIROperation::LinearConsume {
+                resource: "resource".into(),  // ERROR: double consume
+            },
+        ],
+    };
+    
+    func.blocks.push(block);
+    module.functions.push(func);
+    
+    var pass = LinearTypeCheckPass::new();
+    let result = pass.run(&var module);
+    
+    assert(matches!(result, PassResult::Failure(_)),
+            "Double consume should be detected");
+}
+
+#[test]
+fn test_linear_type_leak_error() {
+    var module = create_test_module();
+    var func = create_test_function("linear_func".into());
+    
+    var block = MLIRBlock {
+        label: "entry".into(),
+        operations: [
+            MLIROperation::LinearAlloc {
+                result: "resource".into(),
+            },
+            // ERROR: resource not consumed
+        ],
+    };
+    
+    func.blocks.push(block);
+    module.functions.push(func);
+    
+    var pass = LinearTypeCheckPass::new();
+    let result = pass.run(&var module);
+    
+    assert(matches!(result, PassResult::Failure(_)),
+            "Unconsumed linear resource should be detected");
+}
+
+// ============================================================================
+// LIFETIME INFERENCE TESTS
+// ============================================================================
+
+#[test]
+fn test_lifetime_inference_valid_nesting() {
+    var module = create_test_module();
+    var func = create_test_function("lifetime_func".into());
+    
+    var block = MLIRBlock {
+        label: "entry".into(),
+        operations: [
+            MLIROperation::LifetimeBegin { lifetime: "'outer".into() },
+            MLIROperation::LifetimeBegin { lifetime: "'inner".into() },
+            MLIROperation::LifetimeEnd { lifetime: "'inner".into() },
+            MLIROperation::LifetimeEnd { lifetime: "'outer".into() },
+        ],
+    };
+    
+    func.blocks.push(block);
+    module.functions.push(func);
+    
+    var pass = LifetimeInferencePass::new();
+    let result = pass.run(&var module);
+    
+    assert(matches!(result, PassResult::Success),
+            "Properly nested lifetimes should succeed");
+}
+
+// ============================================================================
+// AUTO-PARALLELIZATION TESTS
+// ============================================================================
+
+#[test]
+fn test_auto_parallel_pure_code() {
+    var module = create_test_module();
+    var func = create_test_function("compute".into());
+    func.effects = EffectSet::PURE;
+    
+    var ops = [];
+    each i in 0..2000 {  // Large enough for parallelization
+        ops.push(MLIROperation::PureCall {
+            callee: "calc".into(),
+            args: [format("x{}", i)],
+        });
+    }
+    
+    var block = MLIRBlock {
+        label: "entry".into(),
+        operations: ops,
+    };
+    
+    func.blocks.push(block);
+    module.functions.push(func);
+    
+    var pass = AutoParallelizationPass::new(1000);
+    let result = pass.run(&var module);
+    
+    assert(matches!(result, PassResult::Modified),
+            "Large pure code block should be parallelized");
+}
+
+#[test]
+fn test_auto_parallel_skip_small_blocks() {
+    var module = create_test_module();
+    var func = create_test_function("small_func".into());
+    func.effects = EffectSet::PURE;
+    
+    var block = MLIRBlock {
+        label: "entry".into(),
+        operations: [
+            MLIROperation::PureCall {
+                callee: "small".into(),
+                args: [],
+            },
+        ],
+    };
+    
+    func.blocks.push(block);
+    module.functions.push(func);
+    
+    var pass = AutoParallelizationPass::new(1000);
+    let result = pass.run(&var module);
+    
+    assert(matches!(result, PassResult::Success),
+            "Small blocks should not be parallelized");
+}
+
+#[test]
+fn test_auto_parallel_skip_impure_code() {
+    var module = create_test_module();
+    var func = create_test_function("io_func".into());
+    func.effects = EffectSet::IO;  // Not pure
+    
+    var ops = [];
+    each i in 0..2000 {
+        ops.push(MLIROperation::Call {
+            callee: "println".into(),
+            args: [format("msg{}", i)],
+            effects: EffectSet::IO,
+        });
+    }
+    
+    var block = MLIRBlock {
+        label: "entry".into(),
+        operations: ops,
+    };
+    
+    func.blocks.push(block);
+    module.functions.push(func);
+    
+    var pass = AutoParallelizationPass::new(1000);
+    let result = pass.run(&var module);
+    
+    assert(matches!(result, PassResult::Success),
+            "Impure code should not be parallelized");
+}
+
+// ============================================================================
+// PIPELINE INTEGRATION TESTS
+// ============================================================================
+
+#[test]
+fn test_type_safety_pipeline() {
+    var module = create_test_module();
+    
+    // Create a function with various alias safety features
+    var func = create_test_function("complex_func".into());
+    func.params.push(("x".into(), MLIRType::Owned(Box::new(MLIRType::I64))));
+    
+    var block = MLIRBlock {
+        label: "entry".into(),
+        operations: [
+            MLIROperation::Borrow {
+                value: "x".into(),
+                lifetime: "'a".into(),
+                is_mut: false,
+            },
+            MLIROperation::LinearAlloc {
+                result: "resource".into(),
+            },
+            MLIROperation::PureCall {
+                callee: "use_borrow".into(),
+                args: ["x_ref".into()],
+            },
+            MLIROperation::LinearConsume {
+                resource: "resource".into(),
+            },
+        ],
+    };
+    
+    func.blocks.push(block);
+    module.functions.push(func);
+    
+    var pipeline = create_type_safety_pipeline();
+    let success = pipeline.run_pipeline(&var module);
+    
+    assert(success, "Type safety pipeline should pass on valid code");
+}
+
+#[test]
+fn test_full_pipeline() {
+    var module = create_test_module();
+    
+    var func = create_test_function("full_test".into());
+    func.params.push(("data".into(), MLIRType::Owned(Box::new(MLIRType::I64))));
+    
+    var ops = [];
+    each i in 0..2000 {
+        ops.push(MLIROperation::PureCall {
+            callee: "process".into(),
+            args: [format("elem{}", i)],
+        });
+    }
+    
+    var block = MLIRBlock {
+        label: "entry".into(),
+        operations: ops,
+    };
+    
+    func.blocks.push(block);
+    module.functions.push(func);
+    
+    var pipeline = create_full_pipeline();
+    let success = pipeline.run_pipeline(&var module);
+    
+    assert(success, "Full pipeline should complete successfully");
+}
+
+// ============================================================================
+// BENCHMARK TESTS
+// ============================================================================
+
+#[benchmark]
+fn bench_borrow_check_pass(b: &var Bencher) {
+    var module = create_test_module();
+    var func = create_test_function("bench_func".into());
+    
+    // Create 1000 borrow operations
+    var ops = [];
+    each i in 0..1000 {
+        ops.push(MLIROperation::Borrow {
+            value: format("x{}", i),
+            lifetime: format("'a{}", i),
+            is_mut: false,
+        });
+    }
+    
+    func.params = (0..1000).map(|i| (format("x{}", i), MLIRType::I64)).collect();
+    func.blocks.push(MLIRBlock {
+        label: "entry".into(),
+        operations: ops,
+    });
+    module.functions.push(func);
+    
+    b.iter(|| {
+        var pass = BorrowCheckPass::new();
+        pass.run(&var module.clone());
+    });
+}
+
+#[benchmark]
+fn bench_effect_inference_pass(b: &var Bencher) {
+    var module = create_test_module();
+    
+    // Create 100 functions with various effects
+    each i in 0..100 {
+        var func = create_test_function(format("func{}", i));
+        
+        let ops = [
+            MLIROperation::Call {
+                callee: "some_call".into(),
+                args: [],
+                effects: EffectSet::IO | EffectSet::MEMORY,
+            },
+        ];
+        
+        func.blocks.push(MLIRBlock {
+            label: "entry".into(),
+            operations: ops,
+        });
+        
+        module.functions.push(func);
+    }
+    
+    b.iter(|| {
+        var pass = EffectInferencePass::new(false);
+        pass.run(&var module.clone());
+    });
+}
+
+// ============================================================================
+// MAIN TEST RUNNER
+// ============================================================================
+
+open fn main() {
+    println("🧪 Nova MLIR Pass Test Suite");
+    println("================================\n");
+    
+    run_tests!([
+        test_borrow_check_valid_shared_borrow,
+        test_borrow_check_mut_aliasing_error,
+        test_borrow_check_use_after_move,
+        test_effect_inference_pure_function,
+        test_effect_inference_io_function,
+        test_effect_inference_combined_effects,
+        test_linear_type_valid_usage,
+        test_linear_type_double_consume_error,
+        test_linear_type_leak_error,
+        test_lifetime_inference_valid_nesting,
+        test_auto_parallel_pure_code,
+        test_auto_parallel_skip_small_blocks,
+        test_auto_parallel_skip_impure_code,
+        test_type_safety_pipeline,
+        test_full_pipeline,
+    ]);
+    
+    println("\n📊 Running Benchmarks...\n");
+    run_benchmarks!([
+        bench_borrow_check_pass,
+        bench_effect_inference_pass,
+    ]);
+}

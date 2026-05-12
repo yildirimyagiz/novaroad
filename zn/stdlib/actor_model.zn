@@ -1,0 +1,691 @@
+// 🎭 Nova Actor Model — v10.0
+// Erlang-style actor system with message passing
+// + Nova Magic: Type-safe messaging, supervision trees
+
+@module("actor::model")
+@reproducible
+@export
+@inline
+
+use std::collections::{HashMap, Vec};
+use std::sync::Arc;
+use std::result::Result;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  ACTOR CORE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Actor address for messaging
+open data ActorAddress {
+    id: u64,
+    node_id: u64,
+}
+
+impl ActorAddress {
+    open fn new(id: u64, node_id: u64) -> ActorAddress {
+        return ActorAddress { id: id, node_id: node_id };
+    }
+    
+    open fn to_string(&self) -> String {
+        return format!("actor://{}@{}", self.id, self.node_id);
+    }
+    
+    open fn is_local(&self) -> bool {
+        return self.node_id == get_current_node_id();
+    }
+}
+
+/// Actor message
+open data ActorMessage {
+    sender: ActorAddress,
+    receiver: ActorAddress,
+    payload: MessagePayload,
+    timestamp: u64,
+    id: u64,
+}
+
+/// Message payload
+open cases MessagePayload {
+    Text(String),
+    Binary(Vec<u8>),
+    Structured(serde_json::Value),
+    Signal(Signal),
+    Control(ControlMessage),
+}
+
+/// Actor signal
+open cases Signal {
+    Start,
+    Stop,
+    Restart,
+    Shutdown,
+    Ping,
+    Pong,
+}
+
+/// Control message
+open cases ControlMessage {
+    Spawn(SpawnRequest),
+    Kill(KillRequest),
+    Monitor(MonitorRequest),
+    Demonitor(DemonitorRequest),
+    Link(LinkRequest),
+    Unlink(UnlinkRequest),
+}
+
+/// Spawn request
+open data SpawnRequest {
+    actor_type: String,
+    args: Vec<String>,
+    supervisor: Option<ActorAddress>,
+}
+
+/// Kill request
+open data KillRequest {
+    reason: String,
+    force: bool,
+}
+
+/// Monitor request
+open data MonitorRequest {
+    target: ActorAddress,
+    monitor_type: MonitorType,
+}
+
+/// Monitor type
+open cases MonitorType {
+    Process,
+    Node,
+    System,
+}
+
+/// Link request
+open data LinkRequest {
+    target: ActorAddress,
+    link_type: LinkType,
+}
+
+/// Link type
+open cases LinkType {
+    Bidirectional,
+    Unidirectional,
+    Supervisory,
+}
+
+/// Unlink request
+open data UnlinkRequest {
+    target: ActorAddress,
+}
+
+/// Actor state
+open data ActorState {
+    Uninitialized,
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    Crashed(String),
+}
+
+/// Actor behavior trait
+open rules ActorBehavior {
+    fn start(&mut self) -> Result<(), String>;
+    fn handle_message(&mut self, message: ActorMessage) -> Result<(), String>;
+    fn stop(&mut self) -> Result<(), String>;
+    fn handle_signal(&mut self, signal: Signal) -> Result<(), String>;
+}
+
+/// Actor implementation
+open data Actor<T: ActorBehavior> {
+    address: ActorAddress,
+    behavior: T,
+    state: ActorState,
+    mailbox: Mailbox,
+    monitors: Vec<ActorAddress>,
+    links: Vec<ActorAddress>,
+    supervisor: Option<ActorAddress>,
+    created_at: u64,
+    last_activity: u64,
+}
+
+impl<T: ActorBehavior> Actor<T> {
+    open fn new(behavior: T, address: ActorAddress) -> Actor<T> {
+        return Actor {
+            address: address,
+            behavior: behavior,
+            state: ActorState::Uninitialized,
+            mailbox: Mailbox::new(address.clone()),
+            monitors: Vec::new(),
+            links: Vec::new(),
+            supervisor: None,
+            created_at: get_current_timestamp(),
+            last_activity: get_current_timestamp(),
+        };
+    }
+    
+    open fn start(&mut self) -> Result<(), String> {
+        match self.behavior.start() {
+            Ok(()) => {
+                self.state = ActorState::Running;
+                self.notify_monitors(Signal::Start);
+                return Ok(());
+            }
+            Err(error) => {
+                self.state = ActorState::Crashed(error.clone());
+                self.notify_supervisor(error);
+                return Err(error);
+            }
+        }
+    }
+    
+    open fn handle_message(&mut self, message: ActorMessage) -> Result<(), String> {
+        self.last_activity = get_current_timestamp();
+        
+        match self.behavior.handle_message(message) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                self.state = ActorState::Crashed(error.clone());
+                self.notify_supervisor(error);
+                return Err(error);
+            }
+        }
+    }
+    
+    open fn handle_signal(&mut self, signal: Signal) -> Result<(), String> {
+        match signal {
+            Signal::Stop => self.stop(),
+            Signal::Restart => self.restart(),
+            Signal::Shutdown => self.shutdown(),
+            Signal::Ping => {
+                let pong = ActorMessage {
+                    sender: self.address.clone(),
+                    receiver: message.sender.clone(),
+                    payload: MessagePayload::Signal(Signal::Pong),
+                    timestamp: get_current_timestamp(),
+                    id: generate_message_id(),
+                };
+                send_message(pong);
+                return Ok(());
+            }
+            Signal::Pong => Ok(()),
+            _ => self.behavior.handle_signal(signal),
+        }
+    }
+    
+    open fn stop(&mut self) -> Result<(), String> {
+        match self.behavior.stop() {
+            Ok(()) => {
+                self.state = ActorState::Stopped;
+                self.notify_monitors(Signal::Stop);
+                return Ok(());
+            }
+            Err(error) => {
+                self.state = ActorState::Crashed(error.clone());
+                self.notify_supervisor(error);
+                return Err(error);
+            }
+        }
+    }
+    
+    fn restart(&mut self) -> Result<(), String> {
+        self.state = ActorState::Starting;
+        self.start()
+    }
+    
+    fn shutdown(&mut self) -> Result<(), String> {
+        self.state = ActorState::Stopping;
+        self.notify_monitors(Signal::Shutdown);
+        self.stop()
+    }
+    
+    fn notify_monitors(&self, signal: Signal) {
+        for monitor in &self.monitors {
+            let message = ActorMessage {
+                sender: self.address.clone(),
+                receiver: monitor.clone(),
+                payload: MessagePayload::Signal(signal.clone()),
+                timestamp: get_current_timestamp(),
+                id: generate_message_id(),
+            };
+            send_message(message);
+        }
+    }
+    
+    fn notify_supervisor(&self, error: String) {
+        if let Some(supervisor) = &self.supervisor {
+            let message = ActorMessage {
+                sender: self.address.clone(),
+                receiver: supervisor.clone(),
+                payload: MessagePayload::Control(ControlMessage::Kill(KillRequest {
+                    reason: error,
+                    force: false,
+                })),
+                timestamp: get_current_timestamp(),
+                id: generate_message_id(),
+            };
+            send_message(message);
+        }
+    }
+    
+    open fn add_monitor(&mut self, monitor: ActorAddress) {
+        if !self.monitors.contains(&monitor) {
+            self.monitors.push(monitor);
+        }
+    }
+    
+    open fn remove_monitor(&mut self, monitor: ActorAddress) {
+        self.monitors.retain(|m| m != &monitor);
+    }
+    
+    open fn add_link(&mut self, link: ActorAddress) {
+        if !self.links.contains(&link) {
+            self.links.push(link);
+        }
+    }
+    
+    open fn remove_link(&mut self, link: ActorAddress) {
+        self.links.retain(|l| l != &link);
+    }
+    
+    open fn set_supervisor(&mut self, supervisor: ActorAddress) {
+        self.supervisor = Some(supervisor);
+    }
+    
+    open fn get_state(&self) -> ActorState {
+        return self.state.clone();
+    }
+    
+    open fn get_address(&self) -> ActorAddress {
+        return self.address.clone();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  MAILBOX SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Actor mailbox
+open data Mailbox {
+    address: ActorAddress,
+    messages: VecDeque<ActorMessage>,
+    capacity: usize,
+    dropped_messages: u64,
+}
+
+impl Mailbox {
+    open fn new(address: ActorAddress) -> Mailbox {
+        return Mailbox {
+            address: address,
+            messages: VecDeque::new(),
+            capacity: 1000,
+            dropped_messages: 0,
+        };
+    }
+    
+    open fn send(&mut self, message: ActorMessage) -> Result<(), String> {
+        if self.messages.len() >= self.capacity {
+            self.dropped_messages = self.dropped_messages + 1;
+            return Err("Mailbox full".into());
+        }
+        
+        self.messages.push_back(message);
+        return Ok(());
+    }
+    
+    open fn receive(&mut self) -> Option<ActorMessage> {
+        return self.messages.pop_front();
+    }
+    
+    open fn try_receive(&mut self) -> Option<ActorMessage> {
+        return self.messages.pop_front();
+    }
+    
+    open fn len(&self) -> usize {
+        return self.messages.len();
+    }
+    
+    open fn is_empty(&self) -> bool {
+        return self.messages.is_empty();
+    }
+    
+    open fn get_stats(&self) -> MailboxStats {
+        return MailboxStats {
+            address: self.address.clone(),
+            message_count: self.messages.len(),
+            capacity: self.capacity,
+            dropped_messages: self.dropped_messages,
+        };
+    }
+}
+
+/// Mailbox statistics
+open data MailboxStats {
+    address: ActorAddress,
+    message_count: usize,
+    capacity: usize,
+    dropped_messages: u64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  ACTOR SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Actor system
+open data ActorSystem {
+    actors: HashMap<ActorAddress, Box<dyn ActorBehavior>>,
+    mailboxes: HashMap<ActorAddress, Mailbox>,
+    next_actor_id: u64,
+    node_id: u64,
+    registry: ActorRegistry,
+    supervisor_tree: SupervisorTree,
+}
+
+impl ActorSystem {
+    open fn new(node_id: u64) -> ActorSystem {
+        return ActorSystem {
+            actors: HashMap::new(),
+            mailboxes: HashMap::new(),
+            next_actor_id: 1,
+            node_id: node_id,
+            registry: ActorRegistry::new(),
+            supervisor_tree: SupervisorTree::new(),
+        };
+    }
+    
+    open fn spawn<T: ActorBehavior + 'static>(&mut self, behavior: T, supervisor: Option<ActorAddress>) -> Result<ActorAddress, String> {
+        let address = ActorAddress::new(self.next_actor_id, self.node_id);
+        self.next_actor_id = self.next_actor_id + 1;
+        
+        let mut actor = Actor::new(behavior, address.clone());
+        actor.set_supervisor(supervisor.unwrap_or(get_root_supervisor()));
+        
+        let mailbox = Mailbox::new(address.clone());
+        
+        self.actors.insert(address.clone(), Box::new(actor));
+        self.mailboxes.insert(address.clone(), mailbox);
+        
+        self.registry.register_actor(address.clone());
+        
+        if let Some(supervisor) = supervisor {
+            self.supervisor_tree.add_child(supervisor, address);
+        }
+        
+        return Ok(address);
+    }
+    
+    open fn send_message(&mut self, message: ActorMessage) -> Result<(), String> {
+        if let Some(mailbox) = self.mailboxes.get_mut(&message.receiver) {
+            return mailbox.send(message);
+        } else {
+            return Err("Actor not found".into());
+        }
+    }
+    
+    open fn process_messages(&mut self) -> Vec<ActorEvent> {
+        let mut events = Vec::new();
+        
+        for (address, mailbox) in &mut self.mailboxes {
+            while let Some(message) = mailbox.receive() {
+                if let Some(actor) = self.actors.get_mut(address) {
+                    match actor.handle_message(message) {
+                        Ok(()) => {
+                            events.push(ActorEvent::MessageProcessed(address.clone()));
+                        }
+                        Err(error) => {
+                            events.push(ActorEvent::ActorError(address.clone(), error));
+                        }
+                    }
+                }
+            }
+        }
+        
+        return events;
+    }
+    
+    open fn get_actor_stats(&self, address: &ActorAddress) -> Option<ActorStats> {
+        if let Some(mailbox) = self.mailboxes.get(address) {
+            return Some(ActorStats {
+                address: address.clone(),
+                mailbox_stats: mailbox.get_stats(),
+                state: self.actors.get(address).map(|a| a.get_state()),
+            });
+        }
+        return None;
+    }
+    
+    open fn kill_actor(&mut self, address: ActorAddress, reason: String) -> Result<(), String> {
+        if let Some(actor) = self.actors.remove(&address) {
+            let _ = actor.stop();
+            self.mailboxes.remove(&address);
+            self.registry.unregister_actor(&address);
+            self.supervisor_tree.remove_actor(&address);
+            return Ok(());
+        } else {
+            return Err("Actor not found".into());
+        }
+    }
+    
+    open fn get_system_stats(&self) -> SystemStats {
+        return SystemStats {
+            total_actors: self.actors.len(),
+            total_messages: self.mailboxes.values().map(|m| m.len()).sum(),
+            node_id: self.node_id,
+            uptime: get_current_timestamp() - self.created_at,
+        };
+    }
+}
+
+/// Actor event
+open cases ActorEvent {
+    MessageProcessed(ActorAddress),
+    ActorError(ActorAddress, String),
+    ActorSpawned(ActorAddress),
+    ActorDied(ActorAddress),
+}
+
+/// Actor statistics
+open data ActorStats {
+    address: ActorAddress,
+    mailbox_stats: MailboxStats,
+    state: Option<ActorState>,
+}
+
+/// System statistics
+open data SystemStats {
+    total_actors: usize,
+    total_messages: usize,
+    node_id: u64,
+    uptime: u64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  SUPERVISION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Supervisor strategy
+open cases SupervisorStrategy {
+    OneForOne,
+    OneForAll,
+    RestForOne,
+}
+
+/// Supervisor specification
+open data SupervisorSpec {
+    strategy: SupervisorStrategy,
+    intensity: u32,
+    period: u64,
+    restart_threshold: u32,
+}
+
+/// Supervisor tree
+open data SupervisorTree {
+    children: HashMap<ActorAddress, Vec<ActorAddress>>,
+    supervisors: HashMap<ActorAddress, SupervisorSpec>,
+}
+
+impl SupervisorTree {
+    open fn new() -> SupervisorTree {
+        return SupervisorTree {
+            children: HashMap::new(),
+            supervisors: HashMap::new(),
+        };
+    }
+    
+    open fn add_child(&mut self, supervisor: ActorAddress, child: ActorAddress) {
+        self.children.entry(supervisor).or_insert(Vec::new()).push(child);
+    }
+    
+    open fn remove_actor(&mut self, address: &ActorAddress) {
+        self.children.remove(address);
+        self.supervisors.remove(address);
+        
+        for children in self.children.values_mut() {
+            children.retain(|child| child != address);
+        }
+    }
+    
+    open fn get_children(&self, supervisor: &ActorAddress) -> Vec<ActorAddress> {
+        return self.children.get(supervisor).cloned().unwrap_or(Vec::new());
+    }
+    
+    open fn handle_child_death(&self, child: &ActorAddress) -> Vec<ActorAddress> {
+        let mut to_restart = Vec::new();
+        
+        for (supervisor, children) in &self.children {
+            if children.contains(child) {
+                if let Some(spec) = self.supervisors.get(supervisor) {
+                    match spec.strategy {
+                        SupervisorStrategy::OneForOne => {
+                            to_restart.push(child.clone());
+                        }
+                        SupervisorStrategy::OneForAll => {
+                            to_restart.extend(children.clone());
+                        }
+                        SupervisorStrategy::RestForOne => {
+                            to_restart.push(child.clone());
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        
+        return to_restart;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §5  ACTOR REGISTRY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Actor registry
+open data ActorRegistry {
+    actors: HashMap<ActorAddress, ActorInfo>,
+    by_name: HashMap<String, ActorAddress>,
+    by_type: HashMap<String, Vec<ActorAddress>>,
+}
+
+/// Actor information
+open data ActorInfo {
+    address: ActorAddress,
+    name: Option<String>,
+    actor_type: String,
+    created_at: u64,
+    last_seen: u64,
+}
+
+impl ActorRegistry {
+    open fn new() -> ActorRegistry {
+        return ActorRegistry {
+            actors: HashMap::new(),
+            by_name: HashMap::new(),
+            by_type: HashMap::new(),
+        };
+    }
+    
+    open fn register_actor(&mut self, address: ActorAddress) {
+        let info = ActorInfo {
+            address: address.clone(),
+            name: None,
+            actor_type: "Unknown".into(),
+            created_at: get_current_timestamp(),
+            last_seen: get_current_timestamp(),
+        };
+        
+        self.actors.insert(address.clone(), info);
+        self.by_type.entry("Unknown".into()).or_insert(Vec::new()).push(address);
+    }
+    
+    open fn unregister_actor(&mut self, address: &ActorAddress) {
+        if let Some(info) = self.actors.remove(address) {
+            if let Some(name) = &info.name {
+                self.by_name.remove(name);
+            }
+            
+            if let Some(actors) = self.by_type.get_mut(&info.actor_type) {
+                actors.retain(|a| a != address);
+            }
+        }
+    }
+    
+    open fn find_by_name(&self, name: &str) -> Option<ActorAddress> {
+        return self.by_name.get(name).cloned();
+    }
+    
+    open fn find_by_type(&self, actor_type: &str) -> Vec<ActorAddress> {
+        return self.by_type.get(actor_type).cloned().unwrap_or(Vec::new());
+    }
+    
+    open fn update_last_seen(&mut self, address: &ActorAddress) {
+        if let Some(info) = self.actors.get_mut(address) {
+            info.last_seen = get_current_timestamp();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §6  GLOBAL INSTANCE AND UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Global actor system
+var ACTOR_SYSTEM: ActorSystem = ActorSystem::new(get_current_node_id());
+
+/// Get global actor system
+open fn get_actor_system() -> &ActorSystem {
+    return &ACTOR_SYSTEM;
+}
+
+/// Get current node ID
+fn get_current_node_id() -> u64 {
+    // In real implementation, would get from configuration
+    return 1;
+}
+
+/// Get current timestamp
+fn get_current_timestamp() -> u64 {
+    // In real implementation, would use system time
+    return 0;
+}
+
+/// Generate message ID
+fn generate_message_id() -> u64 {
+    // In real implementation, would use atomic counter
+    return 0;
+}
+
+/// Get root supervisor
+fn get_root_supervisor() -> ActorAddress {
+    return ActorAddress::new(0, get_current_node_id());
+}
+
+/// Send message
+fn send_message(message: ActorMessage) {
+    let _ = ACTOR_SYSTEM.send_message(message);
+}
+
+/// Initialize actor system
+open fn init_actor_system() {
+    // Initialize root supervisor
+    let root_supervisor = get_root_supervisor();
+    // Would create actual root supervisor actor
+}

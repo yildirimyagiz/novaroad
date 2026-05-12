@@ -1,0 +1,292 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova Native Platform Bindings                                                 ║
+// ║ Platform-specific system calls and native libraries                           ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use core::result::{Result, Ok, Err};
+use core::option::{Option, Some, None};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Platform Detection (Nova style - compile-time constants)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+expose cases Platform {
+    Linux,
+    MacOS,
+    Windows,
+    iOS,
+    Android,
+    WebAssembly,
+    Unknown,
+}
+
+// Platform detection at compile time - implemented via compiler flags
+extern "C" {
+    fn nova_platform_get() -> i32;
+}
+
+open fn current_platform() -> Platform {
+    let platform_id = unsafe { nova_platform_get() };
+    match platform_id {
+        1 => Platform::Linux,
+        2 => Platform::MacOS,
+        3 => Platform::Windows,
+        4 => Platform::iOS,
+        5 => Platform::Android,
+        6 => Platform::WebAssembly,
+        _ => Platform::Unknown,
+    }
+}
+
+open fn platform_name() -> String {
+    match current_platform() {
+        Platform::Linux => "Linux".into(),
+        Platform::MacOS => "macOS".into(),
+        Platform::Windows => "Windows".into(),
+        Platform::iOS => "iOS".into(),
+        Platform::Android => "Android".into(),
+        Platform::WebAssembly => "WebAssembly".into(),
+        Platform::Unknown => "Unknown".into(),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// System Calls (Common interface, platform-specific implementation)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[link(name = "c")]
+extern "C" {
+    open fn getpid() -> i32;
+    open fn malloc(size: usize) -> *var u8;
+    open fn free(ptr: *var u8);
+    open fn memcpy(dest: *var u8, src: *const u8, n: usize) -> *var u8;
+}
+
+open fn get_process_id() -> u32 {
+    unsafe { getpid() as u32 }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// File System Operations
+// ═══════════════════════════════════════════════════════════════════════════════
+
+expose data StatBuf {
+    st_dev: u64,
+    st_ino: u64,
+    st_mode: u32,
+    st_size: i64,
+    st_mtime: i64,
+}
+
+#[link(name = "c")]
+extern "C" {
+    open fn open(path: *const i8, flags: i32, mode: i32) -> i32;
+    open fn close(fd: i32) -> i32;
+    open fn read(fd: i32, buf: *var u8, count: usize) -> isize;
+    open fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+}
+
+open const O_RDONLY: i32 = 0;
+open const O_WRONLY: i32 = 1;
+open const O_RDWR: i32 = 2;
+open const O_CREAT: i32 = 64;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Networking
+// ═══════════════════════════════════════════════════════════════════════════════
+
+expose data SockAddr {
+    sa_family: u16,
+    sa_data: [u8; 14],
+}
+
+#[link(name = "c")]
+extern "C" {
+    open fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
+    open fn bind(sockfd: i32, addr: *const SockAddr, addrlen: u32) -> i32;
+    open fn listen(sockfd: i32, backlog: i32) -> i32;
+    open fn accept(sockfd: i32, addr: *var SockAddr, addrlen: *var u32) -> i32;
+    open fn connect(sockfd: i32, addr: *const SockAddr, addrlen: u32) -> i32;
+    open fn send(sockfd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
+    open fn recv(sockfd: i32, buf: *var u8, len: usize, flags: i32) -> isize;
+}
+
+open const AF_INET: i32 = 2;
+open const SOCK_STREAM: i32 = 1;
+open const SOCK_DGRAM: i32 = 2;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Memory Management (Platform-agnostic interface)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open fn allocate_executable(size: usize) -> Result<*var u8, String> {
+    let platform = current_platform();
+    
+    match platform {
+        Platform::Linux | Platform::MacOS | Platform::iOS | Platform::Android => {
+            // Unix-like mmap
+            extern "C" {
+                fn mmap(addr: *var u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *var u8;
+            }
+            
+            const PROT_READ: i32 = 1;
+            const PROT_WRITE: i32 = 2;
+            const PROT_EXEC: i32 = 4;
+            const MAP_PRIVATE: i32 = 2;
+            const MAP_ANONYMOUS: i32 = 0x20;
+            
+            unsafe {
+                let ptr = mmap(
+                    core::ptr::null_mut(),
+                    size,
+                    PROT_READ | PROT_WRITE | PROT_EXEC,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                
+                check ptr as isize == -1 {
+                    Err("mmap failed".into())
+                } else {
+                    Ok(ptr)
+                }
+            }
+        },
+        
+        Platform::Windows => {
+            // Windows VirtualAlloc
+            extern "C" {
+                fn VirtualAlloc(addr: *var u8, size: usize, alloc_type: u32, protect: u32) -> *var u8;
+            }
+            
+            const MEM_COMMIT: u32 = 0x1000;
+            const MEM_RESERVE: u32 = 0x2000;
+            const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+            
+            unsafe {
+                let ptr = VirtualAlloc(
+                    core::ptr::null_mut(),
+                    size,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_EXECUTE_READWRITE,
+                );
+                
+                check ptr.is_null() {
+                    Err("VirtualAlloc failed".into())
+                } else {
+                    Ok(ptr)
+                }
+            }
+        },
+        
+        _ => Err("Unsupported platform".into()),
+    }
+}
+
+open fn free_executable(ptr: *var u8, size: usize) -> Result<(), String> {
+    let platform = current_platform();
+    
+    match platform {
+        Platform::Linux | Platform::MacOS | Platform::iOS | Platform::Android => {
+            extern "C" {
+                fn munmap(addr: *var u8, len: usize) -> i32;
+            }
+            
+            unsafe {
+                check munmap(ptr, size) == 0 {
+                    Ok(())
+                } else {
+                    Err("munmap failed".into())
+                }
+            }
+        },
+        
+        Platform::Windows => {
+            extern "C" {
+                fn VirtualFree(addr: *var u8, size: usize, free_type: u32) -> i32;
+            }
+            
+            const MEM_RELEASE: u32 = 0x8000;
+            
+            unsafe {
+                check VirtualFree(ptr, 0, MEM_RELEASE) != 0 {
+                    Ok(())
+                } else {
+                    Err("VirtualFree failed".into())
+                }
+            }
+        },
+        
+        _ => Err("Unsupported platform".into()),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Threading (Simplified cross-platform)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open alias ThreadFunc = extern "C" fn(*var u8) -> *var u8;
+
+expose data Thread {
+    handle: *var u8,
+}
+
+impl Thread {
+    open fn spawn(func: ThreadFunc, arg: *var u8) -> Result<Self, String> {
+        let platform = current_platform();
+        
+        match platform {
+            Platform::Linux | Platform::MacOS | Platform::iOS | Platform::Android => {
+                extern "C" {
+                    fn pthread_create(
+                        thread: *var usize,
+                        attr: *const u8,
+                        start: ThreadFunc,
+                        arg: *var u8,
+                    ) -> i32;
+                }
+                
+                var thread_id: usize = 0;
+                unsafe {
+                    check pthread_create(&var thread_id, core::ptr::null(), func, arg) == 0 {
+                        Ok(Thread { handle: thread_id as *var u8 })
+                    } else {
+                        Err("pthread_create failed".into())
+                    }
+                }
+            },
+            
+            Platform::Windows => {
+                extern "C" {
+                    fn CreateThread(
+                        attr: *var u8,
+                        stack: usize,
+                        start: ThreadFunc,
+                        param: *var u8,
+                        flags: u32,
+                        id: *var u32,
+                    ) -> *var u8;
+                }
+                
+                unsafe {
+                    let handle = CreateThread(
+                        core::ptr::null_mut(),
+                        0,
+                        func,
+                        arg,
+                        0,
+                        core::ptr::null_mut(),
+                    );
+                    
+                    check handle.is_null() {
+                        Err("CreateThread failed".into())
+                    } else {
+                        Ok(Thread { handle })
+                    }
+                }
+            },
+            
+            _ => Err("Unsupported platform".into()),
+        }
+    }
+}

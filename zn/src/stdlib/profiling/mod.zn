@@ -1,0 +1,410 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Nova Performance Profiling - Type-Safe Wrapper
+// ═══════════════════════════════════════════════════════════════════════════
+
+import stdlib.time::{Instant, Duration}
+import ffi.native::*
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Profiler Configuration
+// ═══════════════════════════════════════════════════════════════════════════
+
+open cases ProfileMode {
+    CPU,
+    GPU,
+    Memory,
+    All
+}
+
+open data ProfilerConfig {
+    mode: ProfileMode,
+    enable_stack_trace: bool,
+    enable_memory_tracking: bool,
+    enable_gpu_events: bool,
+    sampling_interval_us: u64,
+    output_file: String
+}
+
+impl ProfilerConfig {
+    fn default() -> ProfilerConfig {
+        ProfilerConfig {
+            mode: ProfileMode::All,
+            enable_stack_trace: true,
+            enable_memory_tracking: true,
+            enable_gpu_events: true,
+            sampling_interval_us: 1000,
+            output_file: "profile_results.json".into()
+        }
+    }
+    
+    fn cpu_only() -> ProfilerConfig {
+        var config = ProfilerConfig.default()
+        config.mode = ProfileMode::CPU
+        config.enable_gpu_events = false
+        yield config
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Profiler
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Profiler {
+    config: ProfilerConfig,
+    is_running: bool
+}
+
+impl Profiler {
+    fn new(config: ProfilerConfig) -> Profiler {
+        unsafe {
+            @extern("nova_profiler_init")(config.to_c_struct())
+        }
+        
+        Profiler {
+            config,
+            is_running: false
+        }
+    }
+    
+    fn start(var self) {
+        unsafe {
+            @extern("nova_profiler_start")()
+        }
+        self.is_running = true
+        println("🔍 Profiler started")
+    }
+    
+    fn stop(var self) {
+        unsafe {
+            @extern("nova_profiler_stop")()
+        }
+        self.is_running = false
+        println("⏹️  Profiler stopped")
+    }
+    
+    fn generate_report(self, format: ReportFormat, output: String) {
+        unsafe {
+            @extern("nova_profiler_generate_report")(
+                format as i32,
+                output.as_cstr()
+            )
+        }
+        println(f"📊 Report generated: {output}")
+    }
+    
+    fn print_summary(self) {
+        unsafe {
+            @extern("nova_profiler_print_summary")()
+        }
+    }
+    
+    fn detect_hotspots(self) -> Vec<Hotspot> {
+        unsafe {
+            var count: usize = 0
+            let ptr = @extern("nova_profiler_detect_hotspots")(&var count)
+            
+            var hotspots = Vec.new()
+            each i in 0..count {
+                hotspots.push(Hotspot::from_c_ptr(ptr.offset(i)))
+            }
+            
+            yield hotspots
+        }
+    }
+}
+
+impl Drop for Profiler {
+    fn drop(var self) {
+        check self.is_running {
+            self.stop()
+        }
+        
+        unsafe {
+            @extern("nova_profiler_cleanup")()
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Function Profiling
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data FunctionProfile {
+    name: String,
+    file: String,
+    line: i32,
+    call_count: u64,
+    total_time_ns: u64,
+    avg_time_ns: f64,
+    min_time_ns: u64,
+    max_time_ns: u64
+}
+
+impl FunctionProfile {
+    fn print(self) {
+        println(f"  {self.name} ({self.file}:{self.line})")
+        println(f"    Calls: {self.call_count}")
+        println(f"    Total: {self.total_time_ns / 1_000_000} ms")
+        println(f"    Avg:   {self.avg_time_ns / 1_000_000:.2f} ms")
+        println(f"    Min:   {self.min_time_ns / 1_000_000:.2f} ms")
+        println(f"    Max:   {self.max_time_ns / 1_000_000:.2f} ms")
+    }
+}
+
+/**
+ * Attribute for automatic function profiling
+ * 
+ * Example:
+ * ```nova
+ * #[profile]
+ * fn expensive_function() {
+ *     // Automatically profiled
+ * }
+ * ```
+ */
+open attr profile;
+
+/**
+ * Profile a code block
+ * 
+ * Example:
+ * ```nova
+ * profile!("my_operation") {
+ *     // Code to profile
+ * }
+ * ```
+ */
+open macro profile($name:expr, $block:block) {
+    let start = Instant.now()
+    $block
+    let elapsed = start.elapsed()
+    println(f"⏱️  {$name}: {elapsed.as_millis()} ms")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Memory Profiling
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data MemoryStats {
+    total_allocated: usize,
+    total_freed: usize,
+    current_usage: usize,
+    peak_usage: usize,
+    allocation_count: usize,
+    deallocation_count: usize,
+    live_allocations: usize
+}
+
+impl MemoryStats {
+    fn print(self) {
+        println("💾 Memory Statistics:")
+        println(f"  Current Usage:   {self.current_usage / 1024 / 1024} MB")
+        println(f"  Peak Usage:      {self.peak_usage / 1024 / 1024} MB")
+        println(f"  Total Allocated: {self.total_allocated / 1024 / 1024} MB")
+        println(f"  Total Freed:     {self.total_freed / 1024 / 1024} MB")
+        println(f"  Live Allocations: {self.live_allocations}")
+        println(f"  Allocation Count: {self.allocation_count}")
+    }
+    
+    fn check_leaks(self) -> bool {
+        check self.live_allocations > 0 {
+            println(f"⚠️  Memory Leak Detected: {self.live_allocations} allocations not freed")
+            yield true
+        } else {
+            println("✅ No memory leaks detected")
+            yield false
+        }
+    }
+}
+
+open fn get_memory_stats() -> MemoryStats {
+    unsafe {
+        let stats_ptr = @extern("nova_profiler_get_memory_stats")()
+        yield MemoryStats::from_c_ptr(stats_ptr)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GPU Profiling
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data GPUKernelProfile {
+    name: String,
+    launch_count: u64,
+    total_time_ns: u64,
+    avg_time_ns: f64
+}
+
+impl GPUKernelProfile {
+    fn print(self) {
+        println(f"  {self.name}")
+        println(f"    Launches: {self.launch_count}")
+        println(f"    Total:    {self.total_time_ns / 1_000_000} ms")
+        println(f"    Avg:      {self.avg_time_ns / 1_000_000:.2f} ms")
+    }
+}
+
+open data GPUMemoryStats {
+    total_transfers: usize,
+    bytes_h2d: usize,
+    bytes_d2h: usize,
+    transfer_time_ns: u64,
+    bandwidth_gbps: f64
+}
+
+impl GPUMemoryStats {
+    fn print(self) {
+        println("🎮 GPU Memory Statistics:")
+        println(f"  Host→Device: {self.bytes_h2d / 1024 / 1024} MB")
+        println(f"  Device→Host: {self.bytes_d2h / 1024 / 1024} MB")
+        println(f"  Bandwidth:   {self.bandwidth_gbps:.2f} GB/s")
+        println(f"  Transfers:   {self.total_transfers}")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Hotspot Detection
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Hotspot {
+    location: String,
+    cpu_time_percent: f64,
+    execution_count: u64,
+    recommendation: String
+}
+
+impl Hotspot {
+    fn print(self) {
+        let emoji = check self.cpu_time_percent > 10.0 { "🔥" } else { "⚡" }
+        
+        println(f"{emoji} {self.location}")
+        println(f"  CPU Time: {self.cpu_time_percent:.1f}%")
+        println(f"  Executions: {self.execution_count}")
+        println(f"  💡 {self.recommendation}")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Report Formats
+// ═══════════════════════════════════════════════════════════════════════════
+
+open cases ReportFormat {
+    Text,
+    JSON,
+    HTML,
+    Flamegraph
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Performance Counters
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data PerfCounters {
+    cycles: u64,
+    instructions: u64,
+    cache_misses: u64,
+    branch_misses: u64,
+    ipc: f64,
+    cache_miss_rate: f64
+}
+
+impl PerfCounters {
+    fn read() -> PerfCounters {
+        unsafe {
+            let ptr = @extern("nova_profiler_read_counters")()
+            yield PerfCounters::from_c_ptr(ptr)
+        }
+    }
+    
+    fn print(self) {
+        println("📈 Performance Counters:")
+        println(f"  Instructions: {self.instructions}")
+        println(f"  Cycles:       {self.cycles}")
+        println(f"  IPC:          {self.ipc:.2f}")
+        println(f"  Cache Misses: {self.cache_misses} ({self.cache_miss_rate:.2f}%)")
+        println(f"  Branch Misses: {self.branch_misses}")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Example Usage
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Example 1: Basic Profiling
+ * 
+ * ```nova
+ * import profiling::*
+ * 
+ * let profiler = Profiler.new(ProfilerConfig.default())
+ * profiler.start()
+ * 
+ * // Your code here
+ * train_model()
+ * 
+ * profiler.stop()
+ * profiler.print_summary()
+ * profiler.generate_report(ReportFormat::HTML, "profile.html")
+ * ```
+ */
+
+/**
+ * Example 2: Function Profiling
+ * 
+ * ```nova
+ * import profiling::*
+ * 
+ * #[profile]
+ * fn expensive_computation() {
+ *     // Automatically profiled
+ * }
+ * 
+ * // Or manual profiling
+ * profile!("my_operation") {
+ *     each i in 0..1000 {
+ *         expensive_computation()
+ *     }
+ * }
+ * ```
+ */
+
+/**
+ * Example 3: Memory Leak Detection
+ * 
+ * ```nova
+ * import profiling::*
+ * 
+ * let profiler = Profiler.new(ProfilerConfig.default())
+ * profiler.start()
+ * 
+ * // Run your program
+ * main_loop()
+ * 
+ * profiler.stop()
+ * 
+ * let mem_stats = get_memory_stats()
+ * mem_stats.print()
+ * mem_stats.check_leaks()
+ * ```
+ */
+
+/**
+ * Example 4: Hotspot Detection
+ * 
+ * ```nova
+ * import profiling::*
+ * 
+ * let profiler = Profiler.new(ProfilerConfig.default())
+ * profiler.start()
+ * 
+ * train_model()
+ * 
+ * profiler.stop()
+ * 
+ * let hotspots = profiler.detect_hotspots()
+ * println("\n🔥 Performance Hotspots:")
+ * each hotspot in hotspots {
+ *     hotspot.print()
+ * }
+ * ```
+ */

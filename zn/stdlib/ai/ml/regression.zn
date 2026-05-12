@@ -1,0 +1,170 @@
+// 📈 Nova ML — Regression Algorithms — v10.0
+// Scikit-learn style regression algorithms implemented natively in Nova.
+//
+// Syntax: data / cases / yield / check / each / match / given / @extern
+
+use super::tensor::{Tensor, zeros, ones};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  LINEAR REGRESSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data LinearRegression {
+    open coef:      Tensor,
+    open intercept: f32,
+    open fit_incpt: bool,
+    open is_fitted: bool,
+}
+
+impl LinearRegression {
+    open fn new() -> LinearRegression {
+        LinearRegression {
+            coef:      Tensor::new([], [0]),
+            intercept: 0.0,
+            fit_incpt: true,
+            is_fitted: false,
+        };
+    }
+
+    /// Fits the linear model using the normal equation or GD.
+    open fn fit(&var self, X: &Tensor, y: &Tensor) {
+        println("📐 [Regression] Fitting Linear Model...");
+        
+        // Logical check: X and y must have compatible shapes
+        check X.data[0] != y.data[0] {
+            panic("❌ Shape mismatch: X and y must have the same number of samples.");
+        }
+
+        // Normal Equation: (X^T X)^-1 X^T y
+        // For performance, we dispatch to a unified solver kernel
+        let weights = @extern("nova_ml_linear_solve", X, y, self.fit_incpt);
+        
+        self.coef = weights;
+        self.is_fitted = true;
+        yield;
+    }
+
+    open fn predict(&self, X: &Tensor) -> Tensor {
+        check !self.is_fitted {
+            panic("❌ Estimator not fitted: Call fit() before predict().");
+        }
+        
+        var y_pred = X.matmul(&self.coef);
+        check self.fit_incpt {
+            y_pred = y_pred.add_scalar(self.intercept);
+        }
+        yield y_pred;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  RIDGE REGRESSION (L2)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data Ridge {
+    open alpha:     f32,
+    open coef:      Tensor,
+    open intercept: f32,
+    open is_fitted: bool,
+}
+
+impl Ridge {
+    open fn new(alpha: f32) -> Ridge {
+        Ridge {
+            alpha,
+            coef:      Tensor::new([], [0]),
+            intercept: 0.0,
+            is_fitted: false,
+        };
+    }
+
+    open fn fit(&var self, X: &Tensor, y: &Tensor) {
+        println(format("📈 [Regression] Fitting Ridge Model (alpha={})...", self.alpha));
+        
+        // Regularized Normal Equation: (X^T X + alpha*I)^-1 X^T y
+        self.coef = @extern("nova_ml_ridge_solve", X, y, self.alpha);
+        self.is_fitted = true;
+        yield;
+    }
+
+    open fn predict(&self, X: &Tensor) -> Tensor {
+        check !self.is_fitted { panic("❌ Estimator not fitted."); }
+        yield X.matmul(&self.coef).add_scalar(self.intercept);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  RANDOM FOREST REGRESSOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data DecisionTree {
+    open depth:     i64,
+    open nodes:     Vec<Node>,
+    open is_fitted: bool,
+}
+
+open cases Node {
+    Split { feature: i64, threshold: f32, left: i64, right: i64 },
+    Leaf  { value: f32 },
+}
+
+open data RandomForestRegressor {
+    open n_estimators: i64,
+    open trees:        Vec<DecisionTree>,
+    open max_depth:    i64,
+}
+
+impl RandomForestRegressor {
+    open fn new(n: i64) -> RandomForestRegressor {
+        RandomForestRegressor {
+            n_estimators: n,
+            trees:        [],
+            max_depth:    10,
+        };
+    }
+
+    open fn fit(&var self, X: &Tensor, y: &Tensor) {
+        println(format("🌲 [Regression] Training Random Forest ({} trees)...", self.n_estimators));
+        
+        each i in 0..self.n_estimators {
+            // Parallel tree training via spawn
+            spawn {
+                println(format("  └─ Building tree {}/{}...", i+1, self.n_estimators));
+                // Call native GBDT/RF kernel
+                @extern("nova_ml_train_tree", X, y, self.max_depth);
+            }
+        }
+        yield;
+    }
+
+    open fn predict(&self, X: &Tensor) -> Tensor {
+        // Average predictions from all trees via hardware voting kernel
+        yield @extern("nova_ml_forest_predict", &self.trees, X);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  GRADIENT BOOSTING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data GradientBoostingRegressor {
+    open lr:    f32,
+    open n_est: i64,
+    open trees: Vec<DecisionTree>,
+}
+
+impl GradientBoostingRegressor {
+    open fn new(lr: f32, n: i64) -> GradientBoostingRegressor {
+        GradientBoostingRegressor {
+            lr,
+            n_est: n,
+            trees: [],
+        };
+    }
+
+    open fn fit(&var self, X: &Tensor, y: &Tensor) {
+        println("🔥 [Regression] Fitting Gradient Boosting Regressor...");
+        @extern("nova_ml_gbm_fit", X, y, self.lr, self.n_est);
+        yield;
+    }
+}

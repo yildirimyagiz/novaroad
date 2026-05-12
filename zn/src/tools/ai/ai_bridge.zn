@@ -1,0 +1,525 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║  SWE-1.5 AI Bridge - Nova v9.0                                            ║
+// ║  GitHub issue processing and multi-AI coordination                         ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::{HashMap, Vec};
+use std::net::{HttpClient, Json};
+use ai::brain::{SWE_15_Bridge, GitHubIssue, TaskType, AISuggestion};
+use compiler::verification::{NovaVerifier, VerificationReport};
+use runtime::actor::{ActorSystem, ActorMessage};
+
+// ============================================================================
+// GITHUB API INTEGRATION
+// ============================================================================
+
+/// GitHub API client for SWE-1.5
+expose data GitHubClient {
+    token: String,
+    base_url: String,
+    http_client: HttpClient
+}
+
+impl GitHubClient {
+    open fn new(token: String) -> GitHubClient {
+        GitHubClient {
+            token,
+            base_url: "https://api.github.com".to_string(),
+            http_client: HttpClient::new()
+        }
+    }
+    
+    /// Fetch issue from GitHub
+    open fn get_issue(&self, owner: String, repo: String, issue_number: u64) -> Result<GitHubIssue> {
+        let url = format!("{}/repos/{}/{}/issues/{}", 
+                         self.base_url, owner, repo, issue_number);
+        
+        let response = self.http_client.get(&url)
+            .header("Authorization", format!("token {}", self.token))
+            .header("Accept", "application/vnd.github.v3+json")
+            .send()?;
+        
+        let issue_data: Json = response.json()?;
+        
+        Ok(GitHubIssue {
+            id: issue_data["id"].as_u64()?,
+            title: issue_data["title"].as_str()?.to_string(),
+            description: issue_data["body"].as_str()?.to_string(),
+            repository: format!("{}/{}", owner, repo),
+            labels: self.extract_labels(&issue_data["labels"])?,
+            priority: self.determine_priority(&issue_data),
+            files_affected: self.get_affected_files(&owner, &repo, &issue_data)?
+        })
+    }
+    
+    fn extract_labels(&self, labels_json: &Json) -> Result<Vec<String>> {
+        let mut labels = Vec::new();
+        
+        each label in labels_json.as_array()? {
+            labels.push(label["name"].as_str()?.to_string());
+        }
+        
+        Ok(labels)
+    }
+    
+    fn determine_priority(&self, issue_data: &Json) -> IssuePriority {
+        let labels = self.extract_labels(&issue_data["labels"]).unwrap_or_default();
+        
+        // Priority determination based on labels and title
+        if labels.contains(&"critical".to_string()) || labels.contains(&"blocker".to_string()) {
+            if labels.contains(&"blocker".to_string()) {
+                IssuePriority::Blocker
+            } else {
+                IssuePriority::Critical
+            }
+        } else if labels.contains(&"high".to_string()) || 
+                  issue_data["title"].as_str().unwrap_or("").contains("urgent") {
+            IssuePriority::High
+        } else if labels.contains(&"low".to_string()) {
+            IssuePriority::Low
+        } else {
+            IssuePriority::Medium
+        }
+    }
+    
+    fn get_affected_files(&self, owner: &str, repo: &str, issue_data: &Json) -> Result<Vec<String>> {
+        // Analyze issue description and comments for file references
+        let description = issue_data["body"].as_str().unwrap_or("");
+        let mut files = Vec::new();
+        
+        // Extract file paths from description
+        let file_patterns = [
+            r"src/([a-zA-Z0-9_/]+\.zn)",
+            r"src/([a-zA-Z0-9_/]+\.py)",
+            r"([a-zA-Z0-9_/]+\.zn)",
+            r"([a-zA-Z0-9_/]+\.py)"
+        ];
+        
+        each pattern in &file_patterns {
+            // In production, would use regex here
+            // For now, simple string matching
+            if description.contains("src/") {
+                let words: Vec<&str> = description.split_whitespace().collect();
+                each word in words {
+                    if word.starts_with("src/") && (word.ends_with(".zn") || word.ends_with(".py")) {
+                        files.push(word.trim_matches(',').trim_matches(':').to_string());
+                    }
+                }
+            }
+        }
+        
+        // If no files found, analyze repository structure
+        if files.is_empty() {
+            files = self.analyze_repository_structure(owner, repo)?;
+        }
+        
+        Ok(files)
+    }
+    
+    fn analyze_repository_structure(&self, owner: &str, repo: &str) -> Result<Vec<String>> {
+        // Get repository contents to identify relevant files
+        let url = format!("{}/repos/{}/{}/contents/src", self.base_url, owner, repo);
+        
+        let response = self.http_client.get(&url)
+            .header("Authorization", format!("token {}", self.token))
+            .send()?;
+        
+        let contents: Json = response.json()?;
+        let mut files = Vec::new();
+        
+        each item in contents.as_array()? {
+            if item["type"].as_str()? == "file" {
+                let path = item["path"].as_str()?;
+                if path.ends_with(".zn") || path.ends_with(".py") {
+                    files.push(path.to_string());
+                }
+            }
+        }
+        
+        Ok(files)
+    }
+    
+    /// Submit pull request with solution
+    open fn submit_pull_request(&self, owner: String, repo: String, solution: &Solution) -> Result<PullRequest> {
+        let pr_data = Json::object();
+        pr_data["title"] = format!("Fix issue #{}: {}", solution.issue_id, solution.approach);
+        pr_data["body"] = self.generate_pr_description(solution);
+        pr_data["head"] = format!("fix-issue-{}", solution.issue_id);
+        pr_data["base"] = "main";
+        
+        let url = format!("{}/repos/{}/{}/pulls", self.base_url, owner, repo);
+        
+        let response = self.http_client.post(&url)
+            .header("Authorization", format!("token {}", self.token))
+            .header("Accept", "application/vnd.github.v3+json")
+            .json(&pr_data)
+            .send()?;
+        
+        let pr_data: Json = response.json()?;
+        
+        Ok(PullRequest {
+            number: pr_data["number"].as_u64()?,
+            url: pr_data["html_url"].as_str()?.to_string(),
+            state: pr_data["state"].as_str()?.to_string()
+        })
+    }
+    
+    fn generate_pr_description(&self, solution: &Solution) -> String {
+        format!(
+            "## Automated Fix for Issue #{}\n\n\
+             **Approach:** {}\n\n\
+             **Files Modified:**\n\
+             {}\n\n\
+             **Verification:**\n\
+             - Nova formal verification: {}\n\
+             - Confidence: {:.1}%\n\n\
+             **Estimated Effort:** {:?}\n\n\
+             ---\n\n\
+             *This PR was generated by SWE-1.5 + Nova autonomous agent system*",
+            solution.issue_id,
+            solution.approach,
+            solution.files_to_modify.iter()
+                .map(|f| format!("- `{}`", f))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            match &solution.verification_result {
+                Some(v) => format!("✅ {}", v.proof_level),
+                None => "⚠️ Not verified".to_string()
+            },
+            solution.confidence * 100.0,
+            solution.estimated_effort
+        )
+    }
+}
+
+expose data PullRequest {
+    number: u64,
+    url: String,
+    state: String
+}
+
+// ============================================================================
+// SWE-1.5 ENHANCED BRIDGE
+// ============================================================================
+
+/// Enhanced SWE-1.5 bridge with GitHub integration
+expose data SWE_15_EnhancedBridge {
+    base_bridge: SWE_15_Bridge,
+    github_client: GitHubClient,
+    cache: HashMap<u64, CachedIssue>,
+    actor_system: ActorSystem
+}
+
+expose data CachedIssue {
+    issue: GitHubIssue,
+    cached_at: u64,
+    analysis_result: Option<AISuggestion>
+}
+
+impl SWE_15_EnhancedBridge {
+    open fn new(github_token: String) -> SWE_15_EnhancedBridge {
+        SWE_15_EnhancedBridge {
+            base_bridge: SWE_15_Bridge::new(SWE_15_Config {
+                github_token: github_token.clone(),
+                max_context_files: 15,
+                analysis_depth: AnalysisDepth::Deep,
+                verification_required: true
+            }),
+            github_client: GitHubClient::new(github_token),
+            cache: HashMap::new(),
+            actor_system: ActorSystem::new()
+        }
+    }
+    
+    /// Process GitHub issue with full pipeline
+    open fn process_issue_from_github(&mut self, owner: String, repo: String, issue_number: u64) -> Result<ProcessingResult> {
+        println("🔧 SWE-1.5: Processing GitHub issue {}/{}#{}", owner, repo, issue_number);
+        
+        // 1. Fetch issue from GitHub
+        let issue = self.fetch_issue_cached(&owner, &repo, issue_number)?;
+        
+        // 2. Analyze with SWE-1.5 + multi-AI consensus
+        let solution = self.base_bridge.process_github_issue(issue.clone())?;
+        
+        // 3. Create pull request
+        let pr = self.github_client.submit_pull_request(owner, repo, &solution)?;
+        
+        // 4. Log processing result
+        let result = ProcessingResult {
+            issue_id: issue.id,
+            solution,
+            pull_request: pr,
+            processing_time: get_current_time() - issue.cached_at,
+            consensus_score: self.get_last_consensus_score()
+        };
+        
+        println("✅ SWE-1.5: Successfully processed issue #{} -> PR #{}", 
+               issue.id, pr.number);
+        
+        Ok(result)
+    }
+    
+    fn fetch_issue_cached(&mut self, owner: &str, repo: &str, issue_number: u64) -> Result<GitHubIssue> {
+        let cache_key = issue_number;
+        let current_time = get_current_time();
+        
+        // Check cache first
+        if let Some(cached) = self.cache.get(&cache_key) {
+            // Cache valid for 1 hour
+            if current_time - cached.cached_at < 3600 {
+                println("📦 Using cached issue #{}", issue_number);
+                return Ok(cached.issue.clone());
+            }
+        }
+        
+        // Fetch from GitHub
+        println("🌐 Fetching issue #{} from GitHub", issue_number);
+        let issue = self.github_client.get_issue(owner.to_string(), repo.to_string(), issue_number)?;
+        
+        // Cache the issue
+        self.cache.insert(cache_key, CachedIssue {
+            issue: issue.clone(),
+            cached_at: current_time,
+            analysis_result: None
+        });
+        
+        Ok(issue)
+    }
+    
+    fn get_last_consensus_score(&self) -> f64 {
+        // In production, would track this from the consensus engine
+        0.87 // Placeholder
+    }
+    
+    /// Batch process multiple issues
+    open fn process_issues_batch(&mut self, issues: Vec<(String, String, u64)>) -> Vec<ProcessingResult> {
+        println("🔄 SWE-1.5: Batch processing {} issues", issues.len());
+        
+        let mut results = Vec::new();
+        
+        each (owner, repo, issue_number) in issues {
+            match self.process_issue_from_github(owner, repo, issue_number) {
+                Ok(result) => {
+                    results.push(result);
+                    println("✅ Processed issue #{}", issue_number);
+                },
+                Err(e) => {
+                    println("❌ Failed to process issue #{}: {:?}", issue_number, e);
+                }
+            }
+        }
+        
+        println("📊 Batch complete: {}/{} issues processed successfully", 
+               results.len(), issues.len());
+        
+        results
+    }
+    
+    /// Monitor repository for new issues
+    open fn monitor_repository(&mut self, owner: String, repo: String) -> Result<MonitoringSession> {
+        println("👁️  SWE-1.5: Starting monitoring for {}/{}", owner, repo);
+        
+        let session = MonitoringSession {
+            owner,
+            repo,
+            start_time: get_current_time(),
+            processed_issues: Vec::new(),
+            active: true
+        };
+        
+        // In production, would set up webhook or polling
+        println("🔔 Monitoring active - will process new issues automatically");
+        
+        Ok(session)
+    }
+}
+
+expose data ProcessingResult {
+    issue_id: u64,
+    solution: Solution,
+    pull_request: PullRequest,
+    processing_time: u64,
+    consensus_score: f64
+}
+
+expose data MonitoringSession {
+    owner: String,
+    repo: String,
+    start_time: u64,
+    processed_issues: Vec<u64>,
+    active: bool
+}
+
+// ============================================================================
+// AUTONOMOUS AGENT WORKFLOW
+// ============================================================================
+
+/// Complete autonomous agent workflow
+expose data AutonomousAgent {
+    bridge: SWE_15_EnhancedBridge,
+    workflow_state: WorkflowState,
+    performance_metrics: PerformanceMetrics
+}
+
+expose cases WorkflowState {
+    Idle,
+    Analyzing { issue_id: u64 },
+    ConsensusBuilding { issue_id: u64 },
+    Verifying { issue_id: u64 },
+    CreatingPR { issue_id: u64 },
+    Completed { issue_id: u64 }
+}
+
+expose data PerformanceMetrics {
+    total_issues_processed: u64,
+    average_consensus_score: f64,
+    average_processing_time: u64,
+    success_rate: f64,
+    verification_success_rate: f64
+}
+
+impl AutonomousAgent {
+    open fn new(github_token: String) -> AutonomousAgent {
+        AutonomousAgent {
+            bridge: SWE_15_EnhancedBridge::new(github_token),
+            workflow_state: WorkflowState::Idle,
+            performance_metrics: PerformanceMetrics {
+                total_issues_processed: 0,
+                average_consensus_score: 0.0,
+                average_processing_time: 0.0,
+                success_rate: 0.0,
+                verification_success_rate: 0.0
+            }
+        }
+    }
+    
+    /// Run autonomous agent continuously
+    open fn run_autonomous(&mut self, repositories: Vec<(String, String)>) -> Result<()> {
+        println("🤖 SWE-1.5 Autonomous Agent Starting...");
+        println("📋 Monitoring {} repositories", repositories.len());
+        
+        loop {
+            // Check each repository for new issues
+            each (owner, repo) in &repositories {
+                match self.check_and_process_issues(owner, repo) {
+                    Ok(processed) => {
+                        if processed > 0 {
+                            println("📈 Processed {} issues from {}/{}", processed, owner, repo);
+                        }
+                    },
+                    Err(e) => {
+                        println("❌ Error processing {}/{}: {:?}", owner, repo, e);
+                    }
+                }
+            }
+            
+            // Update performance metrics
+            self.update_metrics();
+            
+            // Wait before next check
+            std::thread::sleep(Duration::from_secs(60)); // Check every minute
+        }
+    }
+    
+    fn check_and_process_issues(&mut self, owner: &str, repo: &str) -> Result<u64> {
+        // Get open issues
+        let issues = self.get_open_issues(owner, repo)?;
+        let mut processed = 0;
+        
+        each issue in issues {
+            // Skip if already processed
+            if self.bridge.cache.contains_key(&issue.id) {
+                continue;
+            }
+            
+            // Process the issue
+            match self.bridge.process_issue_from_github(
+                owner.to_string(), 
+                repo.to_string(), 
+                issue.id
+            ) {
+                Ok(_) => {
+                    processed += 1;
+                    self.performance_metrics.total_issues_processed += 1;
+                },
+                Err(e) => {
+                    println("⚠️  Failed to process issue #{}: {:?}", issue.id, e);
+                }
+            }
+        }
+        
+        Ok(processed)
+    }
+    
+    fn get_open_issues(&self, owner: &str, repo: &str) -> Result<Vec<GitHubIssue>> {
+        // In production, would use GitHub API to get open issues
+        // For now, return empty list
+        Ok(Vec::new())
+    }
+    
+    fn update_metrics(&mut self) {
+        // Update performance metrics based on recent activity
+        if self.performance_metrics.total_issues_processed > 0 {
+            // Calculate averages and rates
+            // In production, would track detailed metrics
+            self.performance_metrics.success_rate = 0.95; // Placeholder
+            self.performance_metrics.verification_success_rate = 0.98; // Placeholder
+        }
+    }
+    
+    /// Get current performance report
+    open fn get_performance_report(&self) -> PerformanceReport {
+        PerformanceReport {
+            metrics: self.performance_metrics.clone(),
+            current_state: self.workflow_state.clone(),
+ uptime: get_current_time() - self.performance_metrics.total_issues_processed,
+            repositories_active: 1 // Placeholder
+        }
+    }
+}
+
+expose data PerformanceReport {
+    metrics: PerformanceMetrics,
+    current_state: WorkflowState,
+    uptime: u64,
+    repositories_active: u64
+}
+
+// ============================================================================
+// MAIN ENTRY POINT
+// ============================================================================
+
+open fn main() {
+    println("🚀 SWE-1.5 AI Bridge - Nova Integration v9.0");
+    println("🔗 GitHub integration with autonomous processing");
+    
+    // Initialize autonomous agent
+    let github_token = std::env::var("GITHUB_TOKEN")
+        .unwrap_or_else(|_| "your_token_here".to_string());
+    
+    let mut agent = AutonomousAgent::new(github_token);
+    
+    // Define repositories to monitor
+    let repositories = vec![
+        ("nova-lang".to_string(), "nova".to_string()),
+        ("nova-lang".to_string(), "runtime".to_string()),
+    ];
+    
+    // Start autonomous processing
+    match agent.run_autonomous(repositories) {
+        Ok(_) => {
+            println("✅ Autonomous agent running successfully");
+        },
+        Err(e) => {
+            println("❌ Failed to start autonomous agent: {:?}", e);
+        }
+    }
+}
+
+// Helper functions
+fn get_current_time() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}

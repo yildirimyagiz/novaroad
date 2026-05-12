@@ -1,0 +1,191 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Nova License System - Software Licensing & DRM
+// ═══════════════════════════════════════════════════════════════════════════
+
+use crypto::{AES256, HMAC, SHA256}
+use std::time::DateTime
+
+open cases LicenseType {
+    Developer,
+    User,
+    Enterprise { company_id: String, seats: u32 },
+    OpenSource { license_name: String },
+    Trial { days_remaining: u32 }
+}
+
+open data License {
+    license_id: String,
+    license_type: LicenseType,
+    owner: String,
+    code_hash: Vec<u8>,
+    issued_at: DateTime,
+    expiry: Option<DateTime>,
+    permissions: Permissions,
+    machine_id: Option<String>,
+    activation_count: u32,
+    max_activations: u32
+}
+
+open data Permissions {
+    can_execute: bool,
+    can_modify: bool,
+    can_distribute: bool,
+    can_sublicense: bool,
+    max_users: Option<u32>,
+    requires_network: bool
+}
+
+impl License {
+    fn generate(
+        license_type: LicenseType,
+        owner: String,
+        code_hash: Vec<u8>
+    ) -> License {
+        let permissions = match &license_type {
+            LicenseType::Developer => Permissions {
+                can_execute: true,
+                can_modify: true,
+                can_distribute: true,
+                can_sublicense: false,
+                max_users: None,
+                requires_network: false
+            },
+            LicenseType::User => Permissions {
+                can_execute: true,
+                can_modify: false,
+                can_distribute: false,
+                can_sublicense: false,
+                max_users: Some(1),
+                requires_network: true
+            },
+            LicenseType::Enterprise { seats, .. } => Permissions {
+                can_execute: true,
+                can_modify: false,
+                can_distribute: false,
+                can_sublicense: false,
+                max_users: Some(*seats),
+                requires_network: true
+            },
+            LicenseType::OpenSource { .. } => Permissions {
+                can_execute: true,
+                can_modify: true,
+                can_distribute: true,
+                can_sublicense: false,
+                max_users: None,
+                requires_network: false
+            },
+            LicenseType::Trial { .. } => Permissions {
+                can_execute: true,
+                can_modify: false,
+                can_distribute: false,
+                can_sublicense: false,
+                max_users: Some(1),
+                requires_network: true
+            }
+        };
+        
+        License {
+            license_id: generate_license_id(),
+            license_type,
+            owner,
+            code_hash,
+            issued_at: DateTime::now(),
+            expiry: None,
+            permissions,
+            machine_id: None,
+            activation_count: 0,
+            max_activations: 3
+        }
+    }
+    
+    fn validate(&self, action: Action) -> Result<(), LicenseViolation> {
+        // 1. Expiry check
+        check let Some(expiry) = self.expiry {
+            check DateTime::now() > expiry {
+                Err(LicenseViolation::Expired);
+            }
+        }
+        
+        // 2. Trial check
+        check let LicenseType::Trial { days_remaining } = self.license_type {
+            check days_remaining == 0 {
+                Err(LicenseViolation::TrialExpired);
+            }
+        }
+        
+        // 3. Permission check
+        match action {
+            Action::Execute => {
+                check !self.permissions.can_execute {
+                    Err(LicenseViolation::NoExecutePermission);
+                }
+            },
+            Action::Modify => {
+                check !self.permissions.can_modify {
+                    Err(LicenseViolation::NoModifyPermission);
+                }
+            },
+            Action::Distribute => {
+                check !self.permissions.can_distribute {
+                    Err(LicenseViolation::NoDistributePermission);
+                }
+            }
+        }
+        
+        // 4. Machine binding
+        check let Some(bound_machine) = &self.machine_id {
+            let current_machine = get_machine_id();
+            check bound_machine != &current_machine {
+                Err(LicenseViolation::MachineIdMismatch);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn activate(&var self, machine_id: String) -> Result<(), ActivationError> {
+        check self.activation_count >= self.max_activations {
+            Err(ActivationError::MaxActivationsReached);
+        }
+        
+        self.machine_id = Some(machine_id);
+        self.activation_count += 1;
+        Ok(())
+    }
+}
+
+open cases Action { Execute, Modify, Distribute }
+open cases LicenseViolation { 
+    Expired, 
+    TrialExpired,
+    NoExecutePermission,
+    NoModifyPermission,
+    NoDistributePermission,
+    MachineIdMismatch,
+    Revoked
+}
+
+open cases ActivationError { MaxActivationsReached }
+
+fn generate_license_id() -> String {
+    format("ZEN-{}", random_string(16))
+}
+
+fn get_machine_id() -> String {
+    // Platform-specific machine ID
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string("/etc/machine-id").unwrap_or_default().trim().into()
+    }
+    
+    #[cfg(target_os = "windows")]
+    {
+        // Use WMIC to get UUID
+        "WINDOWS-MACHINE-ID".into()
+    }
+    
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        "UNKNOWN-MACHINE".into()
+    }
+}

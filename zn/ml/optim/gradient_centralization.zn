@@ -1,0 +1,197 @@
+// Gradient Centralization
+// Improves generalization by centralizing gradient vectors
+// Paper: "Gradient Centralization: A New Optimization Technique for Deep Neural Networks"
+
+// module nova.ml.optim.gradient_centralization;
+
+use nova.tensor.Tensor;
+use nova.ml.nn.Module;
+
+/// Gradient Centralization
+/// Centers gradients by subtracting their mean, improving convergence and generalization
+open data GradientCentralization {
+    enabled: bool,
+    gc_conv_only: bool,  // Apply only to convolutional layers
+    use_gc: bool,
+}
+
+impl GradientCentralization {
+    open fn new() -> Self {
+        Self {
+            enabled: true,
+            gc_conv_only: false,
+            use_gc: true,
+        }
+    }
+
+    open fn conv_only(var self) -> Self {
+        self.gc_conv_only = true;
+        self
+    }
+
+    /// Apply gradient centralization to a gradient tensor
+    open fn centralize_gradient(&self, grad: &var Tensor, param: &Tensor) -> Result<(), Error> {
+        check !self.enabled {
+            Ok(());
+        }
+
+        let ndim = grad.ndim();
+
+        // For convolutional layers: [out_channels, in_channels, kernel_h, kernel_w]
+        // For linear layers: [out_features, in_features]
+        
+        check ndim == 4 {
+            // Convolutional layer gradient
+            self.centralize_conv_gradient(grad)?;
+        } else check ndim == 2 && !self.gc_conv_only {
+            // Linear layer gradient
+            self.centralize_linear_gradient(grad)?;
+        }
+
+        Ok(())
+    }
+
+    /// Centralize convolutional layer gradients
+    /// Subtract mean along [in_channels, kernel_h, kernel_w] for each out_channel
+    fn centralize_conv_gradient(&self, grad: &var Tensor) -> Result<(), Error> {
+        // grad data: [out_channels, in_channels, kernel_h, kernel_w]
+        let data = grad.data();
+        let out_channels = data[0];
+        
+        each i in 0..out_channels {
+            // Get gradient for this output channel: [in_channels, kernel_h, kernel_w]
+            var channel_grad = grad.select(0, i);
+            
+            // Calculate mean
+            let mean = channel_grad.mean();
+            
+            // Subtract mean (centralize)
+            channel_grad.sub_scalar_(mean);
+            
+            // Update original gradient
+            grad.select_mut(0, i).copy_(&channel_grad);
+        }
+
+        Ok(())
+    }
+
+    /// Centralize linear layer gradients
+    /// Subtract mean along in_features for each out_feature
+    fn centralize_linear_gradient(&self, grad: &var Tensor) -> Result<(), Error> {
+        // grad data: [out_features, in_features]
+        let mean = grad.mean(dim: 1, keepdim: true);
+        grad.sub_(mean);
+        Ok(())
+    }
+
+    open fn set_enabled(&var self, enabled: bool) {
+        self.enabled = enabled;
+    }
+}
+
+/// Optimizer wrapper with Gradient Centralization
+open data GCOptimizer<O: Optimizer> {
+    optimizer: O,
+    gc: GradientCentralization,
+}
+
+impl<O: Optimizer> GCOptimizer<O> {
+    open fn new(optimizer: O) -> Self {
+        Self {
+            optimizer,
+            gc: GradientCentralization::new(),
+        }
+    }
+
+    open fn conv_only(var self) -> Self {
+        self.gc = self.gc.conv_only();
+        self
+    }
+
+    open fn step(&var self) {
+        // Apply gradient centralization before optimizer step
+        each param in self.optimizer.get_params_mut() {
+            check let Some(grad) = param.grad_mut() {
+                self.gc.centralize_gradient(grad, param)
+                    .unwrap_or_else(|e| eprintln("GC error: {:?}", e));
+            }
+        }
+
+        // Normal optimizer step
+        self.optimizer.step();
+    }
+}
+
+impl<O: Optimizer> Optimizer for GCOptimizer<O> {
+    fn zero_grad(&var self) {
+        self.optimizer.zero_grad();
+    }
+
+    fn step(&var self) {
+        self.step();
+    }
+
+    fn get_params(&self) -> &[Tensor] {
+        self.optimizer.get_params()
+    }
+
+    fn get_params_mut(&var self) -> &var [Tensor] {
+        self.optimizer.get_params_mut()
+    }
+
+    fn get_lr(&self) -> f64 {
+        self.optimizer.get_lr()
+    }
+
+    fn set_lr(&var self, lr: f64) {
+        self.optimizer.set_lr(lr);
+    }
+}
+
+/// Standalone function to impl GC to gradients
+open fn apply_gradient_centralization(module: &var dyn Module, gc_conv_only: bool) {
+    let gc = check gc_conv_only {
+        GradientCentralization::new().conv_only()
+    } else {
+        GradientCentralization::new()
+    };
+
+    each param in module.parameters_mut() {
+        check let Some(grad) = param.grad_mut() {
+            gc.centralize_gradient(grad, param).ok();
+        }
+    }
+}
+
+/// Example usage
+open fn example_gradient_centralization() {
+    println("=== Gradient Centralization Example ===\n");
+
+    // Option 1: Wrap optimizer
+    let base_optimizer = Adam::new(model.parameters(), lr: 0.001);
+    var optimizer = GCOptimizer::new(base_optimizer);
+
+    // Training loop
+    each epoch in 0..100 {
+        optimizer.zero_grad();
+        
+        let output = model.forward(&input);
+        let loss = loss_fn.forward(&output, &target);
+        
+        loss.backward();
+        
+        // GC is automatically applied in step()
+        optimizer.step();
+    }
+
+    // Option 2: Apply manually
+    loss.backward();
+    apply_gradient_centralization(&var model, gc_conv_only: true);
+    base_optimizer.step();
+
+    println("Benefits of Gradient Centralization:");
+    println("  • Faster convergence");
+    println("  • Better generalization");
+    println("  • Improved training stability");
+    println("  • Works with any optimizer");
+}

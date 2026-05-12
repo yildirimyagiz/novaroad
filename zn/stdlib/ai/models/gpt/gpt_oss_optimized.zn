@@ -1,0 +1,545 @@
+/**
+ * GPT-OSS Performance Optimizations
+ * Advanced optimizations for production deployment
+ */
+
+use models::gpt_oss::{GPTOSSModel, GPTOSSConfig, KVCache};
+use tensor::core::{Tensor, Device};
+use tensor::triton_gpt_oss;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MEMORY-EFFICIENT KV CACHE
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data PagedKVCache {
+    // Paged attention-style cache (like vLLM)
+    page_size: i64,
+    num_pages: i64,
+    k_pages: Vec<Tensor>,
+    v_pages: Vec<Tensor>,
+    page_table: HashMap<i64, Vec<i64>>,  // sequence_id -> page_ids
+    free_pages: Vec<i64>,
+    num_kv_heads: i64,
+    head_dim: i64
+}
+
+impl PagedKVCache {
+    fn new(
+        max_num_pages: i64,
+        page_size: i64,
+        num_kv_heads: i64,
+        head_dim: i64,
+        device: Device
+    ) -> Self {
+        var k_pages = [];
+        var v_pages = [];
+        var free_pages = [];
+        
+        // Pre-allocate pages
+        each i in 0..max_num_pages {
+            k_pages.push(Tensor::zeros(
+                [page_size, num_kv_heads, head_dim],
+                device,
+                DType::BFloat16
+            ));
+            v_pages.push(Tensor::zeros(
+                [page_size, num_kv_heads, head_dim],
+                device,
+                DType::BFloat16
+            ));
+            free_pages.push(i);
+        }
+        
+        PagedKVCache {
+            page_size,
+            num_pages: max_num_pages,
+            k_pages,
+            v_pages,
+            page_table: HashMap::new(),
+            free_pages,
+            num_kv_heads,
+            head_dim
+        }
+    }
+    
+    fn allocate_sequence(var self, sequence_id: i64, num_tokens: i64) -> bool {
+        let num_pages_needed = (num_tokens + self.page_size - 1) / self.page_size;
+        
+        check self.free_pages.len() < num_pages_needed as usize {
+            yield false;  // Out of memory
+        }
+        
+        var allocated_pages = [];
+        each _ in 0..num_pages_needed {
+            allocated_pages.push(self.free_pages.pop().unwrap());
+        }
+        
+        self.page_table.insert(sequence_id, allocated_pages);
+        yield true;
+    }
+    
+    fn free_sequence(var self, sequence_id: i64) {
+        check let Some(pages) = self.page_table.remove(&sequence_id) {
+            self.free_pages.extend(pages);
+        }
+    }
+    
+    fn append(var self, sequence_id: i64, k: Tensor, v: Tensor) {
+        let pages = self.page_table.get_mut(&sequence_id).unwrap();
+        let num_tokens = k.data[0];
+        
+        var token_idx = 0;
+        each page_id in pages.iter() {
+            let tokens_in_page = i64::min(self.page_size, num_tokens - token_idx);
+            
+            check tokens_in_page > 0 {
+                // Copy to page
+                self.k_pages[*page_id as usize][0..tokens_in_page] = k[token_idx..token_idx + tokens_in_page];
+                self.v_pages[*page_id as usize][0..tokens_in_page] = v[token_idx..token_idx + tokens_in_page];
+                
+                token_idx += tokens_in_page;
+            }
+        }
+    }
+    
+    fn get_kv(self, sequence_id: i64) -> (Tensor, Tensor) {
+        let pages = self.page_table.get(&sequence_id).unwrap();
+        
+        var k_list = [];
+        var v_list = [];
+        
+        each page_id in pages {
+            k_list.push(self.k_pages[*page_id as usize].clone());
+            v_list.push(self.v_pages[*page_id as usize].clone());
+        }
+        
+        yield (
+            Tensor::cat(k_list, dim=0),
+            Tensor::cat(v_list, dim=0)
+        );
+    }
+    
+    fn memory_usage(self) -> i64 {
+        // Return used memory in bytes
+        let bytes_per_element = 2;  // bfloat16
+        let elements_per_page = self.page_size * self.num_kv_heads * self.head_dim;
+        let used_pages = self.num_pages - self.free_pages.len() as i64;
+        
+        yield used_pages * elements_per_page * bytes_per_element * 2;  // k + v
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONTINUOUS BATCHING
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data ContinuousBatcher {
+    model: GPTOSSModel,
+    cache: PagedKVCache,
+    max_batch_size: i64,
+    max_total_tokens: i64,
+    running_requests: HashMap<i64, Request>
+}
+
+data Request {
+    sequence_id: i64,
+    prompt_tokens: Vec<i64>,
+    generated_tokens: Vec<i64>,
+    max_tokens: i64,
+    temperature: f64,
+    created_at: f64
+}
+
+impl ContinuousBatcher {
+    fn new(model: GPTOSSModel, max_batch_size: i64, max_total_tokens: i64) -> Self {
+        let config = model.config;
+        let cache = PagedKVCache::new(
+            max_num_pages=1000,
+            page_size=16,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            model.device
+        );
+        
+        ContinuousBatcher {
+            model,
+            cache,
+            max_batch_size,
+            max_total_tokens,
+            running_requests: HashMap::new()
+        }
+    }
+    
+    fn add_request(
+        var self,
+        sequence_id: i64,
+        prompt_tokens: Vec<i64>,
+        max_tokens: i64,
+        temperature: f64
+    ) -> bool {
+        // Check capacity
+        check self.running_requests.len() >= self.max_batch_size as usize {
+            yield false;
+        }
+        
+        // Allocate cache
+        check !self.cache.allocate_sequence(sequence_id, max_tokens + prompt_tokens.len() as i64) {
+            yield false;
+        }
+        
+        self.running_requests.insert(sequence_id, Request {
+            sequence_id,
+            prompt_tokens,
+            generated_tokens: [],
+            max_tokens,
+            temperature,
+            created_at: time::now()
+        });
+        
+        yield true;
+    }
+    
+    fn step(var self) -> HashMap<i64, Vec<i64>> {
+        check self.running_requests.is_empty() {
+            yield HashMap::new();
+        }
+        
+        // Prepare batch
+        var input_ids = [];
+        var sequence_ids = [];
+        
+        each entry in &self.running_requests  { let (seq_id, request) = entry;
+            check request.generated_tokens.is_empty() {
+                // First iteration: use full prompt
+                input_ids.push(request.prompt_tokens.clone());
+            } else {
+                // Subsequent iterations: use last generated token
+                input_ids.push([*request.generated_tokens.last().unwrap()]);
+            }
+            sequence_ids.push(*seq_id);
+        }
+        
+        // Pad to same length
+        let max_len = input_ids.iter().map(|x| x.len()).max().unwrap();
+        each tokens in &var input_ids {
+            while tokens.len() < max_len {
+                tokens.push(0);  // padding
+            }
+        }
+        
+        let input_tensor = Tensor::from_nested_vec(input_ids);
+        
+        // Forward pass
+        let logits = self.model.forward_batched(input_tensor, &var self.cache, &sequence_ids);
+        
+        // Sample next tokens
+        var results = HashMap::new();
+        
+        each entry in sequence_ids.iter().enumerate()  { let (i, seq_id) = entry;
+            let request = self.running_requests.get_mut(seq_id).unwrap();
+            
+            // Get logits for this sequence
+            let next_token_logits = logits[i, -1, :] / request.temperature;
+            
+            // Sample
+            let next_token = check request.temperature > 0.0 {
+                next_token_logits.softmax(0).multinomial(1).item()
+            } else {
+                next_token_logits.argmax(0).item()
+            };
+            
+            request.generated_tokens.push(next_token);
+            
+            // Check completion
+            check request.generated_tokens.len() >= request.max_tokens as usize ||
+               next_token == 200007 {  // <|end|>
+                // Complete
+                results.insert(*seq_id, request.generated_tokens.clone());
+                self.cache.free_sequence(*seq_id);
+                self.running_requests.remove(seq_id);
+            }
+        }
+        
+        yield results;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SPECULATIVE DECODING
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data SpeculativeDecoder {
+    draft_model: GPTOSSModel,  // Small, fast model (gpt-oss-20b)
+    target_model: GPTOSSModel,  // Large, accurate model (gpt-oss-120b)
+    num_draft_tokens: i64
+}
+
+impl SpeculativeDecoder {
+    fn new(
+        draft_model: GPTOSSModel,
+        target_model: GPTOSSModel,
+        num_draft_tokens: i64 = 4
+    ) -> Self {
+        SpeculativeDecoder {
+            draft_model,
+            target_model,
+            num_draft_tokens
+        }
+    }
+    
+    fn generate(self, prompt: Tensor, max_tokens: i64) -> Tensor {
+        var generated = prompt.clone();
+        var cache_draft = [];
+        var cache_target = [];
+        
+        while generated.data[1] < max_tokens {
+            // Phase 1: Draft model generates K tokens quickly
+            let draft_tokens = [];
+            let draft_probs = [];
+            
+            each _ in 0..self.num_draft_tokens {
+                let logits = self.draft_model.forward(generated, &var cache_draft);
+                let probs = logits[:, -1, :].softmax(-1);
+                let token = probs.multinomial(1);
+                
+                draft_tokens.push(token);
+                draft_probs.push(probs);
+                generated = Tensor::cat([generated, token.unsqueeze(1)], dim=1);
+            }
+            
+            // Phase 2: Target model verifies in parallel
+            let target_logits = self.target_model.forward(generated, &var cache_target);
+            let target_probs = target_logits[:, -self.num_draft_tokens.., :].softmax(-1);
+            
+            // Phase 3: Accept/reject draft tokens
+            var accepted = 0;
+            
+            each i in 0..self.num_draft_tokens {
+                let draft_prob = draft_probs[i as usize];
+                let target_prob = target_probs[:, i, :];
+                
+                // Acceptance probability
+                let accept_prob = (target_prob / draft_prob).min(1.0);
+                
+                check random::uniform() < accept_prob.item() {
+                    accepted += 1;
+                } else {
+                    // Reject: resample from adjusted distribution
+                    let adjusted_prob = (target_prob - draft_prob).clamp_min(0.0);
+                    let new_token = adjusted_prob.multinomial(1);
+                    
+                    // Truncate and replace
+                    generated = Tensor::cat([
+                        generated[:, 0..-self.num_draft_tokens + i],
+                        new_token.unsqueeze(1)
+                    ], dim=1);
+                    
+                    abort;
+                }
+            }
+            
+            // Speedup = accepted / num_draft_tokens
+            // Typically 2-3x faster
+        }
+        
+        yield generated;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TENSOR PARALLELISM
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data TensorParallelModel {
+    world_size: i64,
+    rank: i64,
+    model_shards: GPTOSSModel
+}
+
+impl TensorParallelModel {
+    fn new(config: GPTOSSConfig, devices: Vec<Device>) -> Self {
+        let world_size = devices.len() as i64;
+        let rank = get_rank();
+        
+        // Shard model across devices
+        let model = GPTOSSModel::new(config, devices[rank as usize]);
+        
+        // Shard attention heads
+        let heads_per_rank = config.num_attention_heads / world_size;
+        model.shard_attention_heads(rank * heads_per_rank, heads_per_rank);
+        
+        // Shard MLP
+        model.shard_mlp(rank, world_size);
+        
+        TensorParallelModel {
+            world_size,
+            rank,
+            model_shards: model
+        }
+    }
+    
+    fn forward(self, input: Tensor) -> Tensor {
+        // Broadcast input to all ranks
+        let input = broadcast(input, src=0);
+        
+        // Each rank processes its shard
+        let output_shard = self.model_shards.forward(input);
+        
+        // All-reduce to combine results
+        let output = all_reduce(output_shard, op=Sum);
+        
+        yield output;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KERNEL AUTO-TUNING
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data KernelAutoTuner {
+    device: Device,
+    cache: HashMap<str, TuningConfig>
+}
+
+data TuningConfig {
+    block_m: i64,
+    block_n: i64,
+    block_k: i64,
+    num_warps: i64,
+    num_stages: i64
+}
+
+impl KernelAutoTuner {
+    fn new(device: Device) -> Self {
+        KernelAutoTuner {
+            device,
+            cache: HashMap::new()
+        }
+    }
+    
+    fn tune_attention(
+        var self,
+        seq_len: i64,
+        num_heads: i64,
+        head_dim: i64
+    ) -> TuningConfig {
+        let key = format("attn_{}_{}", seq_len, head_dim);
+        
+        check let Some(config) = self.cache.get(&key) {
+            yield config.clone();
+        }
+        
+        // Grid search over configurations
+        let configs = [
+            TuningConfig { block_m: 64, block_n: 64, block_k: 32, num_warps: 4, num_stages: 2 },
+            TuningConfig { block_m: 128, block_n: 64, block_k: 32, num_warps: 8, num_stages: 3 },
+            TuningConfig { block_m: 128, block_n: 128, block_k: 32, num_warps: 8, num_stages: 3 },
+            TuningConfig { block_m: 64, block_n: 128, block_k: 64, num_warps: 4, num_stages: 4 },
+        ];
+        
+        var best_config = configs[0].clone();
+        var best_time = f64::INFINITY;
+        
+        // Create dummy inputs
+        let q = Tensor::randn([1, num_heads, seq_len, head_dim]).to(self.device);
+        let k = Tensor::randn([1, num_heads, seq_len, head_dim]).to(self.device);
+        let v = Tensor::randn([1, num_heads, seq_len, head_dim]).to(self.device);
+        
+        each config in configs {
+            // Warmup
+            each _ in 0..3 {
+                let _ = run_attention_with_config(q, k, v, &config);
+            }
+            
+            // Benchmark
+            let start = time::now();
+            each _ in 0..10 {
+                let _ = run_attention_with_config(q, k, v, &config);
+            }
+            cuda_synchronize();
+            let elapsed = time::now() - start;
+            
+            check elapsed < best_time {
+                best_time = elapsed;
+                best_config = config.clone();
+            }
+        }
+        
+        self.cache.insert(key, best_config.clone());
+        yield best_config;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MIXED PRECISION TRAINING
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data MixedPrecisionOptimizer {
+    optimizer: AdamW,
+    loss_scale: f32,
+    scale_window: i64,
+    min_loss_scale: f32,
+    steps_since_scale: i64
+}
+
+impl MixedPrecisionOptimizer {
+    fn new(optimizer: AdamW, initial_scale: f32 = 65536.0) -> Self {
+        MixedPrecisionOptimizer {
+            optimizer,
+            loss_scale: initial_scale,
+            scale_window: 2000,
+            min_loss_scale: 1.0,
+            steps_since_scale: 0
+        }
+    }
+    
+    fn step(var self, loss: Tensor) -> bool {
+        // Scale loss
+        let scaled_loss = loss * self.loss_scale;
+        
+        // Backward
+        scaled_loss.backward();
+        
+        // Check for overflow
+        let has_overflow = self.check_overflow();
+        
+        check has_overflow {
+            // Reduce scale and skip update
+            self.loss_scale = f32::max(self.loss_scale / 2.0, self.min_loss_scale);
+            self.optimizer.zero_grad();
+            self.steps_since_scale = 0;
+            yield false;
+        }
+        
+        // Unscale gradients
+        each param in self.optimizer.params {
+            check let Some(grad) = param.grad {
+                param.grad = grad / self.loss_scale;
+            }
+        }
+        
+        // Update
+        self.optimizer.step();
+        self.optimizer.zero_grad();
+        
+        // Increase scale periodically
+        self.steps_since_scale += 1;
+        check self.steps_since_scale >= self.scale_window {
+            self.loss_scale = f32::min(self.loss_scale * 2.0, 65536.0);
+            self.steps_since_scale = 0;
+        }
+        
+        yield true;
+    }
+    
+    fn check_overflow(self) -> bool {
+        each param in &self.optimizer.params {
+            check let Some(grad) = &param.grad {
+                check grad.isnan().any() || grad.isinf().any() {
+                    yield true;
+                }
+            }
+        }
+        yield false;
+    }
+}

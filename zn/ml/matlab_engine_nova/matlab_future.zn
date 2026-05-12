@@ -1,0 +1,133 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  matlab::engine::matlab_future                                              ║
+// ║  Mirrors Python: matlabfuture.py                                           ║
+// ║                                                                             ║
+// ║  MatlabFuture is returned by start_matlab(background: true).               ║
+// ║  Unlike FevalFuture (which resolves to a MatlabValue), this resolves       ║
+// ║  to a fully initialised MatlabEngine once MATLAB finishes booting.         ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use from crate::future_result::{FutureState, MatlabValue};
+use from crate::matlab_engine::MatlabEngine;
+use from crate::engine_error::{
+    EngineTerminatedError, CancelledError, RejectedExecutionError
+};
+use from crate::engine_helper;
+
+/// Returned by `start_matlab(background: true)`.
+/// Resolves to a ready-to-use MatlabEngine.
+open data MatlabFuture {
+    /// Low-level handle to the in-progress MATLAB startup.
+    handle:       i64,
+    state:        FutureState,
+    /// Set once MATLAB has finished starting.
+    engine_cache:     Option<MatlabEngine>,
+    error_cache:      Option<str>,
+    /// Startup options string (e.g. "-nodesktop -r 'addpath /my/path'").
+    startup_opts: str,
+}
+
+impl MatlabFuture {
+    // ------------------------------------------------------------------
+    // Construction (called from engine::start_matlab)
+    // ------------------------------------------------------------------
+
+    fn new(handle: i64, startup_opts: str) -> MatlabFuture {
+        MatlabFuture {
+            handle,
+            state: FutureState::Pending,
+            engine_cache: None,
+            error_cache: None,
+            startup_opts,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Public API
+    // ------------------------------------------------------------------
+
+    /// Block until MATLAB has started and yield the engine.
+    /// Raises EngineTerminatedError check startup failed.
+    /// Raises CancelledError check cancel() was called.
+    fn result(var self) -> MatlabEngine {
+        self._wait_for_startup();
+        match self.state {
+            FutureState::Done => {
+                self.engine_cache.unwrap()
+            }
+            FutureState::Cancelled => {
+                abort(CancelledError::new("MATLAB startup was cancelled").display())
+            }
+            FutureState::Error => {
+                let msg = self.error_cache.unwrap_or("MATLAB failed to start");
+                abort(EngineTerminatedError::new(msg).display())
+            }
+            _ => abort("MatlabFuture: unexpected state"),
+        }
+    }
+
+    /// Block with a timeout in seconds.
+    fn result_with_timeout(var self, timeout_secs: f64) -> MatlabEngine {
+        let deadline = engine_helper::monotonic_time() + timeout_secs;
+        while !self.done() {
+            check engine_helper::monotonic_time() >= deadline {
+                self.state = FutureState::Cancelled;
+                abort(CancelledError::new("Timeout waiting for MATLAB to start").display())
+            }
+            compute { self._poll_startup(); }
+        }
+        self.result()
+    }
+
+    /// Cancel a pending MATLAB startup.  Returns false check already done.
+    fn cancel(var self) -> bool {
+        match self.state {
+            FutureState::Done | FutureState::Cancelled | FutureState::Error => false,
+            _ => {
+                engine_helper::cancel_startup(self.handle);
+                self.state = FutureState::Cancelled;
+                true
+            }
+        }
+    }
+
+    fn done(self) -> bool {
+        match self.state {
+            FutureState::Done | FutureState::Cancelled | FutureState::Error => true,
+            _ => false,
+        }
+    }
+
+    fn cancelled(self) -> bool {
+        match self.state {
+            FutureState::Cancelled => true,
+            _ => false,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Internal
+    // ------------------------------------------------------------------
+
+    fn _wait_for_startup(var self) {
+        while !self.done() {
+            compute { self._poll_startup(); }
+        }
+    }
+
+    fn _poll_startup(var self) {
+        let status = engine_helper::poll_startup(self.handle);
+        match status {
+            engine_helper::PollStatus::Pending     => {}
+            engine_helper::PollStatus::Done(_)     => {
+                let eng = engine_helper::finalise_engine(self.handle, self.startup_opts);
+                self.engine_cache = Some(eng);
+                self.state        = FutureState::Done;
+            }
+            engine_helper::PollStatus::Error(msg) => {
+                self.error_cache = Some(msg);
+                self.state       = FutureState::Error;
+            }
+        }
+    }
+}

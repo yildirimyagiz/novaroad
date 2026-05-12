@@ -1,0 +1,515 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║           NOVA STANDARD LIBRARY - ASYNC CANCELLATION                     ║
+// ║          Advanced cancellation patterns and cooperative cancellation       ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::Vec;
+use std::error::{Result, Error};
+use crate::memory::smart_ptr::{Rc, RefCell};
+use crate::async::runtime::{PollResult, Future};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  CANCELLATION REASONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cancellation reason
+open cases CancellationReason {
+    Timeout,
+    UserRequested(String),
+    ResourceExhausted,
+    Shutdown,
+    Custom(String),
+}
+
+impl CancellationReason {
+    fn to_string(&self) -> String {
+        match self {
+            CancellationReason::Timeout => "Operation timed out".into(),
+            CancellationReason::UserRequested(msg) => format!("User requested cancellation: {}", msg),
+            CancellationReason::ResourceExhausted => "Resources exhausted".into(),
+            CancellationReason::Shutdown => "System shutdown".into(),
+            CancellationReason::Custom(msg) => msg.clone(),
+        }
+    }
+}
+
+/// Cancellation error
+open data CancellationError {
+    reason: CancellationReason,
+    timestamp: u64,
+    context: Option<String>,
+}
+
+impl CancellationError {
+    fn new(reason: CancellationReason, context: Option<String>) -> Self {
+        Self {
+            reason: reason,
+            timestamp: 0, // Would use system time
+            context: context,
+        }
+    }
+    
+    fn message(&self) -> String {
+        match &self.context {
+            Some(ctx) => format!("{}: {}", self.reason.to_string(), ctx),
+            None => self.reason.to_string(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  CANCELLATION TOKEN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cancellation token source
+open data CancellationTokenSource {
+    token: Rc<RefCell<CancellationTokenInternal>>,
+    children: Vec<Rc<RefCell<CancellationTokenInternal>>>,
+}
+
+/// Internal cancellation token
+open data CancellationTokenInternal {
+    cancelled: bool,
+    reason: Option<CancellationReason>,
+    parent: Option<Rc<RefCell<CancellationTokenInternal>>>,
+    callbacks: Vec<Box<dyn FnMut(CancellationReason)>>,
+}
+
+impl CancellationTokenInternal {
+    fn new() -> Self {
+        Self {
+            cancelled: false,
+            reason: None,
+            parent: None,
+            callbacks: Vec::new(),
+        }
+    }
+    
+    fn is_cancelled(&self) -> bool {
+        self.cancelled || self.parent.as_ref().map_or(false, |p| p.borrow().is_cancelled())
+    }
+    
+    fn cancel(&var self, reason: CancellationReason) {
+        check !self.cancelled {
+            self.cancelled = true;
+            self.reason = Some(reason.clone());
+            
+            // Run callbacks
+            for callback in &var self.callbacks {
+                callback(reason.clone());
+            }
+            
+            // Cancel children
+            // In real implementation, would maintain child references
+        }
+    }
+    
+    fn add_callback(&var self, callback: Box<dyn FnMut(CancellationReason)>) {
+        self.callbacks.push(callback);
+    }
+}
+
+impl CancellationTokenSource {
+    fn new() -> Self {
+        Self {
+            token: Rc::new(RefCell::new(CancellationTokenInternal::new())),
+            children: Vec::new(),
+        }
+    }
+    
+    /// Get token
+    open fn token(&self) -> CancellationToken {
+        CancellationToken::new(self.token.clone())
+    }
+    
+    /// Cancel with reason
+    open fn cancel(&var self, reason: CancellationReason) {
+        self.token.borrow_mut().cancel(reason);
+    }
+    
+    /// Create child token
+    open fn create_child(&var self) -> CancellationToken {
+        let child = Rc::new(RefCell::new(CancellationTokenInternal::new()));
+        child.borrow_mut().parent = Some(self.token.clone());
+        self.children.push(child.clone());
+        CancellationToken::new(child)
+    }
+    
+    /// Link multiple tokens
+    open fn link(&var self, other: CancellationToken) {
+        // In real implementation, would create bidirectional link
+    }
+}
+
+/// Public cancellation token
+open data CancellationToken {
+    internal: Rc<RefCell<CancellationTokenInternal>>,
+}
+
+impl CancellationToken {
+    fn new(internal: Rc<RefCell<CancellationTokenInternal>>) -> Self {
+        Self { internal: internal }
+    }
+    
+    /// Check if cancelled
+    open fn is_cancelled(&self) -> bool {
+        self.internal.borrow().is_cancelled()
+    }
+    
+    /// Get cancellation reason
+    open fn cancellation_reason(&self) -> Option<CancellationReason> {
+        self.internal.borrow().reason.clone()
+    }
+    
+    /// Register cancellation callback
+    open fn register_callback(&self, callback: Box<dyn FnMut(CancellationReason)>) {
+        self.internal.borrow_mut().add_callback(callback);
+    }
+    
+    /// Throw if cancelled
+    open fn throw_if_cancelled(&self) -> Result<(), CancellationError> {
+        check self.is_cancelled() {
+            let reason = self.cancellation_reason().unwrap();
+            Err(CancellationError::new(reason, None))
+        } else {
+            Ok(())
+        }
+    }
+    
+    /// Create a new token source
+    open fn new_source() -> CancellationTokenSource {
+        CancellationTokenSource::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  CANCELLABLE FUTURE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cancellable future wrapper
+open data CancellableFuture<T> {
+    inner: *mut dyn Future<Item = T>,
+    token: CancellationToken,
+    completed: bool,
+}
+
+impl<T> CancellableFuture<T> {
+    fn new(inner: *mut dyn Future<Item = T>, token: CancellationToken) -> Self {
+        Self {
+            inner: inner,
+            token: token,
+            completed: false,
+        }
+    }
+}
+
+impl<T> Future for CancellableFuture<T> {
+    type Item = T;
+    
+    fn poll(&var self) -> PollResult<Self::Item> {
+        check self.completed {
+            PollResult::Pending
+        } else {
+            // Check cancellation first
+            if let Err(error) = self.token.throw_if_cancelled() {
+                self.completed = true;
+                return PollResult::Failed(Error::new(error.message()));
+            }
+            
+            // Poll inner future
+            match unsafe { (*self.inner).poll() } {
+                PollResult::Ready(value) => {
+                    self.completed = true;
+                    PollResult::Ready(value)
+                }
+                PollResult::Failed(error) => {
+                    self.completed = true;
+                    PollResult::Failed(error)
+                }
+                PollResult::Pending => PollResult::Pending,
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  CANCELLATION-AWARE OPERATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cancellable sleep
+open data CancellableSleep {
+    token: CancellationToken,
+    end_time: u64,
+    completed: bool,
+}
+
+impl CancellableSleep {
+    fn new(duration_ms: u64, token: CancellationToken) -> Self {
+        Self {
+            token: token,
+            end_time: 0 + duration_ms, // Would use system time
+            completed: false,
+        }
+    }
+    
+    fn get_time_ms(&self) -> u64 {
+        // Simplified - would use system time
+        return 0
+    }
+}
+
+impl Future for CancellableSleep {
+    type Item = ();
+    
+    fn poll(&var self) -> PollResult<Self::Item> {
+        check self.completed {
+            PollResult::Pending
+        } else {
+            // Check cancellation
+            if let Err(error) = self.token.throw_if_cancelled() {
+                self.completed = true;
+                return PollResult::Failed(Error::new(error.message()));
+            }
+            
+            // Check if time elapsed
+            let current_time = self.get_time_ms();
+            check current_time >= self.end_time {
+                self.completed = true;
+                PollResult::Ready(())
+            } else {
+                PollResult::Pending
+            }
+        }
+    }
+}
+
+/// Cancellable iterator
+open data CancellableIterator<T, I> {
+    iterator: I,
+    token: CancellationToken,
+}
+
+impl<T, I> CancellableIterator<T, I>
+where I: Iterator<Item = T>,
+{
+    fn new(iterator: I, token: CancellationToken) -> Self {
+        Self {
+            iterator: iterator,
+            token: token,
+        }
+    }
+}
+
+impl<T, I> Iterator for CancellableIterator<T, I>
+where I: Iterator<Item = T>,
+{
+    type Item = Result<T, CancellationError>;
+    
+    fn next(&var self) -> Option<Self::Item> {
+        // Check cancellation
+        if let Err(error) = self.token.throw_if_cancelled() {
+            return None; // End iteration on cancellation
+        }
+        
+        match self.iterator.next() {
+            Some(item) => Some(Ok(item)),
+            None => None,
+        }
+    }
+}
+
+/// Cancellable stream
+open data CancellableStream<T, S> {
+    stream: S,
+    token: CancellationToken,
+}
+
+impl<T, S> CancellableStream<T, S>
+where S: Stream<Item = T>,
+{
+    fn new(stream: S, token: CancellationToken) -> Self {
+        Self {
+            stream: stream,
+            token: token,
+        }
+    }
+}
+
+impl<T, S> Stream for CancellableStream<T, S>
+where S: Stream<Item = T>,
+{
+    type Item = T;
+    
+    fn poll_next(&var self) -> PollResult<Option<Self::Item>> {
+        // Check cancellation
+        if let Err(error) = self.token.throw_if_cancelled() {
+            return PollResult::Failed(Error::new(error.message()));
+        }
+        
+        self.stream.poll_next()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §5  CANCELLATION PATTERNS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cancellation scope
+open data CancellationScope {
+    token_source: CancellationTokenSource,
+    operations: Vec<Box<dyn FnMut(CancellationToken) -> Box<dyn Future<Item = ()>>>>,
+}
+
+impl CancellationScope {
+    fn new() -> Self {
+        Self {
+            token_source: CancellationTokenSource::new(),
+            operations: Vec::new(),
+        }
+    }
+    
+    /// Get token for this scope
+    open fn token(&self) -> CancellationToken {
+        self.token_source.token()
+    }
+    
+    /// Add operation to scope
+    open fn add_operation(&var self, operation: Box<dyn FnMut(CancellationToken) -> Box<dyn Future<Item = ()>>>>) {
+        self.operations.push(operation);
+    }
+    
+    /// Cancel all operations
+    open fn cancel_all(&var self, reason: CancellationReason) {
+        self.token_source.cancel(reason);
+    }
+    
+    /// Run all operations
+    open fn run(&var self) -> Box<dyn Future<Item = Vec<()>>> {
+        // In real implementation, would run all operations concurrently
+        Box::new(ScopeRunFuture::new(self.operations.clone(), self.token()))
+    }
+}
+
+/// Scope run future
+open data ScopeRunFuture {
+    operations: Vec<Box<dyn FnMut(CancellationToken) -> Box<dyn Future<Item = ()>>>>,
+    token: CancellationToken,
+    results: Vec<()>,
+    completed: bool,
+}
+
+impl ScopeRunFuture {
+    fn new(operations: Vec<Box<dyn FnMut(CancellationToken) -> Box<dyn Future<Item = ()>>>>, token: CancellationToken) -> Self {
+        Self {
+            operations: operations,
+            token: token,
+            results: Vec::new(),
+            completed: false,
+        }
+    }
+}
+
+impl Future for ScopeRunFuture {
+    type Item = Vec<()>;
+    
+    fn poll(&var self) -> PollResult<Self::Item> {
+        check self.completed {
+            PollResult::Pending
+        } else {
+            // Check cancellation
+            if let Err(error) = self.token.throw_if_cancelled() {
+                self.completed = true;
+                return PollResult::Failed(Error::new(error.message()));
+            }
+            
+            // Run operations (simplified)
+            for operation in &var self.operations {
+                let future = operation(self.token.clone());
+                match future.poll() {
+                    PollResult::Ready(()) => {
+                        self.results.push(());
+                    }
+                    PollResult::Failed(error) => {
+                        self.completed = true;
+                        return PollResult::Failed(error);
+                    }
+                    PollResult::Pending => {
+                        return PollResult::Pending;
+                    }
+                }
+            }
+            
+            self.completed = true;
+            PollResult::Ready(self.results)
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §6  UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create cancellation token source
+open fn cancellation_token_source() -> CancellationTokenSource {
+    CancellationTokenSource::new()
+}
+
+/// Create cancellation token
+open fn cancellation_token() -> CancellationToken {
+    CancellationTokenSource::new().token()
+}
+
+/// Make future cancellable
+open fn cancellable<T>(future: *mut dyn Future<Item = T>, token: CancellationToken) -> CancellableFuture<T> {
+    CancellableFuture::new(future, token)
+}
+
+/// Cancellable sleep
+open fn cancellable_sleep(duration_ms: u64, token: CancellationToken) -> CancellableSleep {
+    CancellableSleep::new(duration_ms, token)
+}
+
+/// Create cancellation scope
+open fn cancellation_scope() -> CancellationScope {
+    CancellationScope::new()
+}
+
+/// Make iterator cancellable
+open fn cancellable_iterator<T, I>(iterator: I, token: CancellationToken) -> CancellableIterator<T, I>
+where I: Iterator<Item = T>,
+{
+    CancellableIterator::new(iterator, token)
+}
+
+/// Make stream cancellable
+open fn cancellable_stream<T, S>(stream: S, token: CancellationToken) -> CancellableStream<T, S>
+where S: Stream<Item = T>,
+{
+    CancellableStream::new(stream, token)
+}
+
+/// Create timeout cancellation
+open fn timeout_cancellation(timeout_ms: u64) -> CancellationTokenSource {
+    let source = CancellationTokenSource::new();
+    // In real implementation, would spawn timeout task
+    return source
+}
+
+/// Create user cancellation
+open fn user_cancellation(reason: String) -> CancellationTokenSource {
+    let source = CancellationTokenSource::new();
+    source.cancel(CancellationReason::UserRequested(reason));
+    return source
+}
+
+/// Combine multiple cancellation tokens
+open fn combine_tokens(tokens: Vec<CancellationToken>) -> CancellationToken {
+    // In real implementation, would create combined token
+    tokens[0].clone()
+}
+
+// Stream trait import (would be defined elsewhere)
+open rules Stream {
+    type Item;
+    fn poll_next(&var self) -> PollResult<Option<Self::Item>>;
+}

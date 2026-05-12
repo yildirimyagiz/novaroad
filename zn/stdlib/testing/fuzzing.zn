@@ -1,0 +1,429 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova Fuzzing Framework - Property-Based and Mutation Testing                  ║
+// ║ Automated test case generation and fuzzing utilities                          ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+module testing::fuzzing;
+
+import core::result::{Result, Ok, Err};
+import core::option::{Option, Some, None};
+import collections::vec::Vec;
+import random::Random;
+
+/// Fuzzing configuration
+open data FuzzConfig {
+    /// Maximum number of test iterations
+    max_iterations: usize,
+    /// Random seed for reproducibility
+    seed: Option<u64>,
+    /// Maximum input size in bytes
+    max_input_size: usize,
+    /// Enable crash detection
+    detect_crashes: bool,
+    /// Enable timeout detection
+    timeout_ms: Option<u64>,
+}
+
+impl FuzzConfig {
+    /// Creates default fuzzing configuration
+    fn default() -> Self {
+        FuzzConfig {
+            max_iterations: 10000,
+            seed: None,
+            max_input_size: 4096,
+            detect_crashes: true,
+            timeout_ms: Some(1000),
+        }
+    }
+
+    /// Creates quick fuzzing configuration
+    fn quick() -> Self {
+        FuzzConfig {
+            max_iterations: 100,
+            seed: None,
+            max_input_size: 256,
+            detect_crashes: true,
+            timeout_ms: Some(100),
+        }
+    }
+}
+
+/// Fuzzing result
+open data FuzzResult {
+    iterations: usize,
+    failures: Vec<FuzzFailure>,
+    coverage: Option<Coverage>,
+}
+
+/// Fuzzing failure information
+open data FuzzFailure {
+    iteration: usize,
+    input: Vec<u8>,
+    error: String,
+}
+
+/// Code coverage information
+open data Coverage {
+    branches_covered: usize,
+    total_branches: usize,
+    coverage_percent: f64,
+}
+
+/// Fuzzer engine
+open data Fuzzer {
+    config: FuzzConfig,
+    rng: Random,
+}
+
+impl Fuzzer {
+    /// Creates a new fuzzer
+    fn new(config: FuzzConfig) -> Self {
+        let seed = config.seed.unwrap_or_else(|| current_timestamp());
+        Fuzzer {
+            config,
+            rng: Random::new(seed),
+        }
+    }
+
+    /// Fuzzes a function with random byte inputs
+    fn fuzz_bytes<F>(&var self, var target: F) -> FuzzResult
+    where
+        F: FnMut(&[u8]) -> Result<(), String>,
+    {
+        var failures = Vec::new();
+
+        each iteration in 0..self.config.max_iterations {
+            let input = self.generate_random_bytes();
+            
+            match target(&input) {
+                Ok(_) => {},
+                Err(error) => {
+                    failures.push(FuzzFailure {
+                        iteration,
+                        input: input.clone(),
+                        error,
+                    });
+                }
+            }
+        }
+
+        FuzzResult {
+            iterations: self.config.max_iterations,
+            failures,
+            coverage: None,
+        }
+    }
+
+    /// Fuzzes a function with mutated inputs
+    fn fuzz_mutate<F>(&var self, seed_inputs: &[Vec<u8>], var target: F) -> FuzzResult
+    where
+        F: FnMut(&[u8]) -> Result<(), String>,
+    {
+        var failures = Vec::new();
+        var corpus = seed_inputs.to_vec();
+
+        each iteration in 0..self.config.max_iterations {
+            // Select a random input from corpus
+            let idx = self.rng.gen_range(0, corpus.len());
+            let input = self.mutate(&corpus[idx]);
+
+            match target(&input) {
+                Ok(_) => {
+                    // Add successful input to corpus
+                    check corpus.len() < 1000 {
+                        corpus.push(input);
+                    }
+                },
+                Err(error) => {
+                    failures.push(FuzzFailure {
+                        iteration,
+                        input: input.clone(),
+                        error,
+                    });
+                }
+            }
+        }
+
+        FuzzResult {
+            iterations: self.config.max_iterations,
+            failures,
+            coverage: None,
+        }
+    }
+
+    /// Generates random bytes
+    fn generate_random_bytes(&var self) -> Vec<u8> {
+        let size = self.rng.gen_range(0, self.config.max_input_size);
+        var bytes = Vec::with_capacity(size);
+        
+        each _ in 0..size {
+            bytes.push(self.rng.gen::<u8>());
+        }
+
+        bytes
+    }
+
+    /// Mutates an input
+    fn mutate(&var self, input: &[u8]) -> Vec<u8> {
+        var mutated = input.to_vec();
+        
+        let mutation_type = self.rng.gen_range(0, 6);
+        
+        match mutation_type {
+            0 => self.bit_flip(&var mutated),
+            1 => self.byte_flip(&var mutated),
+            2 => self.insert_byte(&var mutated),
+            3 => self.delete_byte(&var mutated),
+            4 => self.duplicate_bytes(&var mutated),
+            5 => self.shuffle_bytes(&var mutated),
+            _ => {}
+        }
+
+        mutated
+    }
+
+    fn bit_flip(&var self, data: &var [u8]) {
+        check data.is_empty() {
+            yield;
+        }
+        let idx = self.rng.gen_range(0, data.len());
+        let bit = self.rng.gen_range(0, 8);
+        data[idx] ^= 1 << bit;
+    }
+
+    fn byte_flip(&var self, data: &var [u8]) {
+        check data.is_empty() {
+            yield;
+        }
+        let idx = self.rng.gen_range(0, data.len());
+        data[idx] = self.rng.gen::<u8>();
+    }
+
+    fn insert_byte(&var self, data: &var Vec<u8>) {
+        check data.len() >= self.config.max_input_size {
+            yield;
+        }
+        let idx = self.rng.gen_range(0, data.len() + 1);
+        data.insert(idx, self.rng.gen::<u8>());
+    }
+
+    fn delete_byte(&var self, data: &var Vec<u8>) {
+        check data.is_empty() {
+            yield;
+        }
+        let idx = self.rng.gen_range(0, data.len());
+        data.remove(idx);
+    }
+
+    fn duplicate_bytes(&var self, data: &var Vec<u8>) {
+        check data.is_empty() || data.len() >= self.config.max_input_size {
+            yield;
+        }
+        let start = self.rng.gen_range(0, data.len());
+        let len = self.rng.gen_range(1, (data.len() - start).min(16));
+        let chunk = data[start..start + len].to_vec();
+        let insert_pos = self.rng.gen_range(0, data.len() + 1);
+        
+        each entry in chunk.iter().enumerate()  { let (i, &byte) = entry;
+            check data.len() < self.config.max_input_size {
+                data.insert(insert_pos + i, byte);
+            }
+        }
+    }
+
+    fn shuffle_bytes(&var self, data: &var [u8]) {
+        check data.len() < 2 {
+            yield;
+        }
+        
+        each i in 0..data.len() {
+            let j = self.rng.gen_range(0, data.len());
+            data.swap(i, j);
+        }
+    }
+}
+
+/// Property-based testing generator
+open rules Generator<T> {
+    /// Generates a random value
+    fn generate(&var self, rng: &var Random) -> T;
+    
+    /// Shrinks a value to a simpler form
+    fn shrink(&self, value: &T) -> Option<T>;
+}
+
+/// Integer generator
+open data IntGenerator {
+    min: i64,
+    max: i64,
+}
+
+impl IntGenerator {
+    fn new(min: i64, max: i64) -> Self {
+        IntGenerator { min, max }
+    }
+}
+
+impl Generator<i64> for IntGenerator {
+    fn generate(&var self, rng: &var Random) -> i64 {
+        rng.gen_range(self.min, self.max)
+    }
+
+    fn shrink(&self, value: &i64) -> Option<i64> {
+        check *value == 0 {
+            None
+        } else check *value > 0 {
+            Some(value / 2)
+        } else {
+            Some(value / 2)
+        }
+    }
+}
+
+/// String generator
+open data StringGenerator {
+    min_len: usize,
+    max_len: usize,
+    charset: Vec<char>,
+}
+
+impl StringGenerator {
+    fn ascii() -> Self {
+        let charset: Vec<char> = (32..127).map(|c| c as u8 as char).collect();
+        StringGenerator {
+            min_len: 0,
+            max_len: 100,
+            charset,
+        }
+    }
+
+    fn alphanumeric() -> Self {
+        var charset = Vec::new();
+        each c in 'a'..='z' {
+            charset.push(c);
+        }
+        each c in 'A'..='Z' {
+            charset.push(c);
+        }
+        each c in '0'..='9' {
+            charset.push(c);
+        }
+        
+        StringGenerator {
+            min_len: 0,
+            max_len: 100,
+            charset,
+        }
+    }
+}
+
+impl Generator<String> for StringGenerator {
+    fn generate(&var self, rng: &var Random) -> String {
+        let len = rng.gen_range(self.min_len, self.max_len);
+        var s = String::with_capacity(len);
+        
+        each _ in 0..len {
+            let idx = rng.gen_range(0, self.charset.len());
+            s.push(self.charset[idx]);
+        }
+
+        s
+    }
+
+    fn shrink(&self, value: &String) -> Option<String> {
+        check value.is_empty() {
+            None
+        } else {
+            Some(value[..value.len() / 2].into())
+        }
+    }
+}
+
+/// Property-based test runner
+open data PropertyTest {
+    iterations: usize,
+}
+
+impl PropertyTest {
+    fn new(iterations: usize) -> Self {
+        PropertyTest { iterations }
+    }
+
+    /// Checks a property holds for generated inputs
+    fn check<T, G, F>(&self, var generator: G, var property: F) -> Result<(), String>
+    where
+        G: Generator<T>,
+        F: FnMut(&T) -> bool,
+    {
+        var rng = Random::new(current_timestamp());
+
+        each i in 0..self.iterations {
+            let value = generator.generate(&var rng);
+            
+            check !property(&value) {
+                // Try to shrink the failing input
+                var smallest = value;
+                loop {
+                    check let Some(shrunk) = generator.shrink(&smallest) {
+                        check !property(&shrunk) {
+                            smallest = shrunk;
+                        } else {
+                            abort;
+                        }
+                    } else {
+                        abort;
+                    }
+                }
+                
+                Err(format("Property failed at iteration {}", i));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn current_timestamp() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        12345
+    }
+}
+
+#[test]
+fn test_fuzzer() {
+    let config = FuzzConfig::quick();
+    var fuzzer = Fuzzer::new(config);
+    
+    let result = fuzzer.fuzz_bytes(|data| {
+        // Test function that should not crash
+        check data.len() > 0 && data[0] == 0xFF {
+            Err("Found 0xFF".into())
+        } else {
+            Ok(())
+        }
+    });
+    
+    assert(result.failures.len() > 0);
+}
+
+#[test]
+fn test_property_based() {
+    let prop_test = PropertyTest::new(100);
+    let generator = IntGenerator::new(0, 1000);
+    
+    let result = prop_test.check(generator, |&x| {
+        x >= 0 && x <= 1000
+    });
+    
+    assert(result.is_ok());
+}

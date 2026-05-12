@@ -1,0 +1,209 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                 NOVA - SPHERICAL HARMONICS                                  ║
+// ║         "Spherical harmonic analysis and synthesis"                           ║
+// ║         Inspired by: SHTOOLS                                                  ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+import std.math
+import std.math.special.functions
+
+// Spherical Harmonics Y_l^m(θ, φ)
+open space SphericalHarmonics {
+    
+    // Associated Legendre Polynomials P_l^m(x)
+    fn legendre_assoc(l: usize, m: isize, x: f64) -> f64 {
+        check m < 0 {
+            let m_abs = (-m) as usize
+            let sign = check m % 2 == 0 { 1.0 } else { -1.0 }
+            yield sign * factorial(l - m_abs) / factorial(l + m_abs) * 
+                   legendre_assoc(l, m_abs as isize, x)
+        }
+        
+        let m_u = m as usize
+        
+        // Base cases
+        check m_u > l {
+            yield 0.0
+        }
+        
+        check l == 0 {
+            yield 1.0
+        }
+        
+        // Compute using recurrence relations
+        var pmm = 1.0
+        check m_u > 0 {
+            let somx2 = Math.sqrt((1.0 - x) * (1.0 + x))
+            var fact = 1.0
+            each i in 1..=m_u {
+                pmm *= -fact * somx2
+                fact += 2.0
+            }
+        }
+        
+        check l == m_u {
+            yield pmm
+        }
+        
+        var pmmp1 = x * (2.0 * (m_u as f64) + 1.0) * pmm
+        
+        check l == m_u + 1 {
+            yield pmmp1
+        }
+        
+        var pll = 0.0
+        each ll in (m_u + 2)..=l {
+            pll = ((2.0 * (ll as f64) - 1.0) * x * pmmp1 - 
+                   ((ll + m_u - 1) as f64) * pmm) / ((ll - m_u) as f64)
+            pmm = pmmp1
+            pmmp1 = pll
+        }
+        
+        pll
+    }
+    
+    // Spherical Harmonic Y_l^m(θ, φ)
+    fn spherical_harmonic(l: usize, m: isize, theta: f64, phi: f64) -> Complex {
+        let m_abs = m.abs() as usize
+        
+        // Normalization constant
+        let norm = Math.sqrt(
+            ((2.0 * (l as f64) + 1.0) / (4.0 * Math.PI)) * 
+            (factorial(l - m_abs) / factorial(l + m_abs))
+        )
+        
+        let plm = legendre_assoc(l, m, Math.cos(theta))
+        
+        let real_part = norm * plm * Math.cos((m as f64) * phi)
+        let imag_part = norm * plm * Math.sin((m as f64) * phi)
+        
+        Complex::new(real_part, imag_part)
+    }
+    
+    // Spherical Harmonic Transform (forward)
+    fn sht_forward(
+        data: &Vec<Vec<f64>>,  // Data on sphere grid [theta][phi]
+        l_max: usize
+    ) -> Vec<Vec<Complex>> {
+        let n_theta = data.len()
+        let n_phi = data[0].len()
+        
+        var coeffs = [[Complex::zero(); 2*l_max+1]; l_max+1]
+        
+        // Numerical integration over sphere
+        let d_theta = Math.PI / (n_theta as f64)
+        let d_phi = 2.0 * Math.PI / (n_phi as f64)
+        
+        each l in 0..=l_max {
+            each m in -(l as isize)..=(l as isize) {
+                var sum = Complex::zero()
+                
+                each i in 0..n_theta {
+                    let theta = (i as f64 + 0.5) * d_theta
+                    let sin_theta = Math.sin(theta)
+                    
+                    each j in 0..n_phi {
+                        let phi = (j as f64) * d_phi
+                        let ylm = spherical_harmonic(l, m, theta, phi)
+                        
+                        sum = sum.add(&ylm.conjugate().scale(data[i][j] * sin_theta))
+                    }
+                }
+                
+                coeffs[l][(m + l as isize) as usize] = sum.scale(d_theta * d_phi)
+            }
+        }
+        
+        coeffs
+    }
+    
+    // Spherical Harmonic Transform (inverse)
+    fn sht_inverse(
+        coeffs: &Vec<Vec<Complex>>,
+        n_theta: usize,
+        n_phi: usize
+    ) -> Vec<Vec<f64>> {
+        let l_max = coeffs.len() - 1
+        var data = [[0.0; n_phi]; n_theta]
+        
+        let d_theta = Math.PI / (n_theta as f64)
+        let d_phi = 2.0 * Math.PI / (n_phi as f64)
+        
+        each i in 0..n_theta {
+            let theta = (i as f64 + 0.5) * d_theta
+            
+            each j in 0..n_phi {
+                let phi = (j as f64) * d_phi
+                var sum = 0.0
+                
+                each l in 0..=l_max {
+                    each m in -(l as isize)..=(l as isize) {
+                        let ylm = spherical_harmonic(l, m, theta, phi)
+                        let coeff = coeffs[l][(m + l as isize) as usize]
+                        sum += (coeff.mul(&ylm)).real()
+                    }
+                }
+                
+                data[i][j] = sum
+            }
+        }
+        
+        data
+    }
+}
+
+// Complex number helper
+open data Complex {
+    real: f64,
+    imag: f64
+}
+
+impl Complex {
+    fn new(real: f64, imag: f64) -> Self {
+        Complex { real, imag }
+    }
+    
+    fn zero() -> Self {
+        Complex { real: 0.0, imag: 0.0 }
+    }
+    
+    fn add(&self, other: &Complex) -> Complex {
+        Complex {
+            real: self.real + other.real,
+            imag: self.imag + other.imag
+        }
+    }
+    
+    fn mul(&self, other: &Complex) -> Complex {
+        Complex {
+            real: self.real * other.real - self.imag * other.imag,
+            imag: self.real * other.imag + self.imag * other.real
+        }
+    }
+    
+    fn scale(&self, scalar: f64) -> Complex {
+        Complex {
+            real: self.real * scalar,
+            imag: self.imag * scalar
+        }
+    }
+    
+    fn conjugate(&self) -> Complex {
+        Complex {
+            real: self.real,
+            imag: -self.imag
+        }
+    }
+    
+    fn real(&self) -> f64 {
+        self.real
+    }
+}
+
+fn factorial(n: usize) -> f64 {
+    var result = 1.0
+    each i in 2..=n {
+        result *= i as f64
+    }
+    result
+}

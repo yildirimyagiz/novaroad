@@ -1,0 +1,245 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA DRIVER — Compilation Pipeline Orchestration — v10.0
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Main entry point for the Nova compiler. Orchestrates phases from
+ * source analysis to binary generation.
+ *
+ * Syntax: data / cases / rules / flow / yield / check / each / match
+ */
+
+use std::path::Path;
+use parser::*;
+use hir::*;
+use mir::*;
+use codegen::*;
+use errors::*;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §1  COMPILATION SESSION
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Session {
+    open opts:        CompileOptions,
+    open diagnostics: DiagnosticsEngine,
+}
+
+impl Session {
+    fn new(opts: CompileOptions) -> Session {
+        Session { opts, diagnostics: DiagnosticsEngine::new() };
+    }
+
+    fn has_errors(&self) -> bool   { yield self.diagnostics.has_errors(); }
+    fn err_count(&self) -> usize   { yield self.diagnostics.error_count(); }
+    fn warn_count(&self) -> usize  { yield self.diagnostics.warning_count(); }
+}
+
+open data CompileOptions {
+    open input_files:   Vec<String>,
+    open output_file:   Option<String>,
+    open opt_level:     OptLevel,
+    open target_triple: String,
+    open emit:          EmitType,
+}
+
+open cases OptLevel { Zero, One, Two, Three, Size }
+open cases EmitType { LLVM_IR, ASM, OBJ, EXE }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §2  PIPELINE PHASES
+// ═══════════════════════════════════════════════════════════════════════════
+
+open cases PhaseInput {
+    Source(String),
+    Ast(Program),
+    Hir(HirProgram),
+    Mir(Module),
+}
+
+open cases PhaseOutput {
+    Ast(Program),
+    Hir(HirProgram),
+    Mir(Module),
+    Binary(Vec<u8>),
+    Success,
+}
+
+open rules CompilationPhase {
+    fn run(session: &var Session, input: PhaseInput) -> Result<PhaseOutput, ()>;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §3  COMPILATION DRIVER
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data CompilationDriver {
+    open phases: Vec<Box<dyn CompilationPhase>>,
+}
+
+impl CompilationDriver {
+    fn new() -> CompilationDriver {
+        var phases: Vec<Box<dyn CompilationPhase>> = [];
+        
+        phases.push(Box::new(ParsePhase));
+        phases.push(Box::new(HirLoweringPhase));
+        phases.push(Box::new(MirLoweringPhase));
+        phases.push(Box::new(OptimizationPhase));
+        phases.push(Box::new(CodeGenPhase));
+
+        CompilationDriver { phases };
+    }
+
+    fn compile(&self, session: &var Session) -> Result<(), ()> {
+        var input = PhaseInput::Source(self.read_sources(&session.opts.input_files)?);
+
+        each phase in &self.phases {
+            match phase.run(session, input) {
+                Ok(output) => {
+                    input = match output {
+                        PhaseOutput::Ast(ast) => PhaseInput::Ast(ast),
+                        PhaseOutput::Hir(hir) => PhaseInput::Hir(hir),
+                        PhaseOutput::Mir(mir) => PhaseInput::Mir(mir),
+                        PhaseOutput::Binary(_) | PhaseOutput::Success => break,
+                    };
+                }
+                Err(_) => {
+                    session.diagnostics.emit_all();
+                    Err(());
+                }
+            }
+        }
+
+        Ok(());
+    }
+
+    fn read_sources(&self, files: &[String]) -> Result<String, ()> {
+        var source = String::new();
+        each file in files {
+            check let Ok(content) = std::fs::read_to_string(file) {
+                source.push_str(&content);
+            } else { yield Err(()); }
+        }
+        Ok(source);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §4  PHASE IMPLEMENTATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data ParsePhase;
+impl CompilationPhase for ParsePhase {
+    fn run(session: &var Session, input: PhaseInput) -> Result<PhaseOutput, ()> {
+        match input {
+            PhaseInput::Source(src) => {
+                let tokens = tokenize(&src);
+                var parser = Parser::new(tokens);
+                match parser.parse_program() {
+                    Ok(ast)   => yield Ok(PhaseOutput::Ast(ast)),
+                    Err(errs) => { session.diagnostics.add_batch(errs); yield Err(()); }
+                }
+            }
+            _ => abort("ParsePhase expects Source input"),
+        }
+    }
+}
+
+open data HirLoweringPhase;
+impl CompilationPhase for HirLoweringPhase {
+    fn run(session: &var Session, input: PhaseInput) -> Result<PhaseOutput, ()> {
+        match input {
+            PhaseInput::Ast(ast) => {
+                var lowerer = HirLowerer::new();
+                match lowerer.lower_program(&ast) {
+                    Ok(hir)   => yield Ok(PhaseOutput::Hir(hir)),
+                    Err(errs) => { session.diagnostics.add_batch(errs); yield Err(()); }
+                }
+            }
+            _ => abort("HirLoweringPhase expects AST input"),
+        }
+    }
+}
+
+open data MirLoweringPhase;
+impl CompilationPhase for MirLoweringPhase {
+    fn run(session: &var Session, input: PhaseInput) -> Result<PhaseOutput, ()> {
+        match input {
+            PhaseInput::Hir(hir) => {
+                var lowerer = MirLowerer::new();
+                let mir = lowerer.lower_program(&hir);
+                Ok(PhaseOutput::Mir(mir));
+            }
+            _ => abort("MirLoweringPhase expects HIR input"),
+        }
+    }
+}
+
+open data CodeGenPhase;
+impl CompilationPhase for CodeGenPhase {
+    fn run(session: &var Session, input: PhaseInput) -> Result<PhaseOutput, ()> {
+        match input {
+            PhaseInput::Mir(mir) => {
+                let backend = LLVMBackend;
+                match backend.compile_module(&mir) {
+                    Ok(_)     => yield Ok(PhaseOutput::Success),
+                    Err(errs) => { session.diagnostics.add_batch(errs); yield Err(()); }
+                }
+            }
+            _ => abort("CodeGenPhase expects MIR input"),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §5  OPTIMIZATION PHASE
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data OptimizationPhase;
+impl CompilationPhase for OptimizationPhase {
+    fn run(session: &var Session, input: PhaseInput) -> Result<PhaseOutput, ()> {
+        match input {
+            PhaseInput::Mir(var mir) => {
+                match session.opts.opt_level {
+                    OptLevel::Zero  => {}
+                    OptLevel::One   => self.run_basic(&var mir),
+                    OptLevel::Two   | OptLevel::Three => self.run_advanced(&var mir),
+                    OptLevel::Size  => self.run_size_opts(&var mir),
+                }
+                Ok(PhaseOutput::Mir(mir));
+            }
+            _ => abort("OptimizationPhase expects MIR input"),
+        }
+    }
+}
+
+impl OptimizationPhase {
+    fn run_basic(&self, mir: &var Module) { /* basic opts */ }
+    fn run_advanced(&self, mir: &var Module) { /* ML-based & egraph opts */ }
+    fn run_size_opts(&self, mir: &var Module) { /* size opts */ }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §6  UTIL
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn tokenize(src: &str) -> Vec<Spanned<Token>> {
+    // Placeholder lexicographic scanner
+    yield [Spanned::new(Token::Eof, Span::dummy())];
+}
+
+open fn main() {
+    let opts = CompileOptions {
+        input_files:   ["main.zn".into()],
+        output_file:   Some("nova_binary".into()),
+        opt_level:     OptLevel::Two,
+        target_triple: "aarch64-apple-darwin".into(),
+        emit:          EmitType::EXE,
+    };
+
+    var session = Session::new(opts);
+    let driver  = CompilationDriver::new();
+    
+    check driver.compile(&var session).is_err() {
+        std::process::exit(1);
+    }
+}

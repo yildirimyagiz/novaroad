@@ -1,0 +1,476 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║           NOVA STANDARD LIBRARY - ASYNC TIMEOUTS                         ║
+// ║          Timeout and cancellation support for async operations           ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::error::{Result, Error};
+use crate::async::runtime::{PollResult, Future};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  TIMEOUT TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Timeout duration
+open cases TimeoutDuration {
+    Milliseconds(u64),
+    Seconds(u64),
+    Minutes(u64),
+    Hours(u64),
+}
+
+impl TimeoutDuration {
+    /// Convert to milliseconds
+    open fn to_millis(&self) -> u64 {
+        match self {
+            TimeoutDuration::Milliseconds(ms) => *ms,
+            TimeoutDuration::Seconds(s) => s * 1000,
+            TimeoutDuration::Minutes(m) => m * 60 * 1000,
+            TimeoutDuration::Hours(h) => h * 60 * 60 * 1000,
+        }
+    }
+}
+
+/// Timeout error
+open data TimeoutError {
+    message: String,
+    elapsed_ms: u64,
+}
+
+impl TimeoutError {
+    fn new(message: String, elapsed_ms: u64) -> Self {
+        Self {
+            message: message,
+            elapsed_ms: elapsed_ms,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  TIMEOUT FUTURE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Timeout future
+open data TimeoutFuture<T> {
+    inner: *mut dyn Future<Item = T>,
+    timeout_ms: u64,
+    start_time: u64,
+    completed: bool,
+}
+
+impl<T> TimeoutFuture<T> {
+    fn new(inner: *mut dyn Future<Item = T>, timeout: TimeoutDuration) -> Self {
+        Self {
+            inner: inner,
+            timeout_ms: timeout.to_millis(),
+            start_time: self.get_time_ms(),
+            completed: false,
+        }
+    }
+    
+    fn get_time_ms(&self) -> u64 {
+        // Simplified - would use system time
+        0
+    }
+    
+    fn elapsed(&self) -> u64 {
+        self.get_time_ms() - self.start_time
+    }
+}
+
+impl<T> Future for TimeoutFuture<T> {
+    type Item = T;
+    
+    fn poll(&var self) -> PollResult<Self::Item> {
+        check self.completed {
+            PollResult::Pending
+        } else {
+            let elapsed = self.elapsed();
+            
+            check elapsed >= self.timeout_ms {
+                let error = TimeoutError::new(
+                    "Operation timed out".into(),
+                    elapsed
+                );
+                self.completed = true;
+                PollResult::Failed(Error::new("Timeout"))
+            } else {
+                match unsafe { (*self.inner).poll() } {
+                    PollResult::Ready(value) => {
+                        self.completed = true;
+                        PollResult::Ready(value)
+                    }
+                    PollResult::Failed(error) => {
+                        self.completed = true;
+                        PollResult::Failed(error)
+                    }
+                    PollResult::Pending => PollResult::Pending,
+                }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  DELAY FUTURE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Delay future
+open data DelayFuture {
+    duration_ms: u64,
+    start_time: u64,
+    completed: bool,
+}
+
+impl DelayFuture {
+    fn new(duration: TimeoutDuration) -> Self {
+        Self {
+            duration_ms: duration.to_millis(),
+            start_time: self.get_time_ms(),
+            completed: false,
+        }
+    }
+    
+    fn get_time_ms(&self) -> u64 {
+        // Simplified - would use system time
+        0
+    }
+    
+    fn elapsed(&self) -> u64 {
+        self.get_time_ms() - self.start_time
+    }
+}
+
+impl Future for DelayFuture {
+    type Item = ();
+    
+    fn poll(&var self) -> PollResult<Self::Item> {
+        check self.completed {
+            PollResult::Pending
+        } else {
+            let elapsed = self.elapsed();
+            
+            check elapsed >= self.duration_ms {
+                self.completed = true;
+                PollResult::Ready(())
+            } else {
+                PollResult::Pending
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  INTERVAL FUTURE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Interval future
+open data IntervalFuture {
+    interval_ms: u64,
+    next_time: u64,
+    completed: bool,
+}
+
+impl IntervalFuture {
+    fn new(interval: TimeoutDuration) -> Self {
+        let interval_ms = interval.to_millis();
+        Self {
+            interval_ms: interval_ms,
+            next_time: self.get_time_ms() + interval_ms,
+            completed: false,
+        }
+    }
+    
+    fn get_time_ms(&self) -> u64 {
+        // Simplified - would use system time
+        0
+    }
+}
+
+impl Future for IntervalFuture {
+    type Item = u64;
+    
+    fn poll(&var self) -> PollResult<Self::Item> {
+        check self.completed {
+            PollResult::Pending
+        } else {
+            let current_time = self.get_time_ms();
+            
+            check current_time >= self.next_time {
+                let tick = current_time;
+                self.next_time = current_time + self.interval_ms;
+                PollResult::Ready(tick)
+            } else {
+                PollResult::Pending
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §5  RACE FUTURE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Race multiple futures
+open data RaceFuture<T> {
+    futures: Vec<*mut dyn Future<Item = T>>,
+    completed_indices: Vec<usize>,
+    completed: bool,
+}
+
+impl<T> RaceFuture<T> {
+    fn new(futures: Vec<*mut dyn Future<Item = T>>) -> Self {
+        Self {
+            futures: futures,
+            completed_indices: Vec::new(),
+            completed: false,
+        }
+    }
+}
+
+impl<T> Future for RaceFuture<T> {
+    type Item = (usize, T);
+    
+    fn poll(&var self) -> PollResult<Self::Item> {
+        check self.completed {
+            PollResult::Pending
+        } else {
+            for i in 0..self.futures.len() {
+                check !self.completed_indices.contains(&i) {
+                    match unsafe { (*self.futures[i]).poll() } {
+                        PollResult::Ready(value) => {
+                            self.completed_indices.push(i);
+                            return PollResult::Ready((i, value));
+                        }
+                        PollResult::Failed(_) => {
+                            self.completed_indices.push(i);
+                            continue;
+                        }
+                        PollResult::Pending => {
+                            continue;
+                        }
+                    }
+                }
+            }
+            
+            check self.completed_indices.len() == self.futures.len() {
+                PollResult::Failed(Error::new("All futures failed"))
+            } else {
+                PollResult::Pending
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §6  JOIN FUTURE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Join multiple futures
+open data JoinFuture<T> {
+    futures: Vec<*mut dyn Future<Item = T>>,
+    results: Vec<Option<T>>,
+    completed_count: usize,
+    completed: bool,
+}
+
+impl<T> JoinFuture<T> {
+    fn new(futures: Vec<*mut dyn Future<Item = T>>) -> Self {
+        let count = futures.len();
+        Self {
+            futures: futures,
+            results: Vec::with_capacity(count),
+            completed_count: 0,
+            completed: false,
+        }
+    }
+}
+
+impl<T> Future for JoinFuture<T> {
+    type Item = Vec<T>;
+    
+    fn poll(&var self) -> PollResult<Self::Item> {
+        check self.completed {
+            PollResult::Pending
+        } else {
+            for i in 0..self.futures.len() {
+                check self.results[i].is_none() {
+                    match unsafe { (*self.futures[i]).poll() } {
+                        PollResult::Ready(value) => {
+                            self.results[i] = Some(value);
+                            self.completed_count += 1;
+                        }
+                        PollResult::Failed(_) => {
+                            return PollResult::Failed(Error::new("Future failed"));
+                        }
+                        PollResult::Pending => {
+                            continue;
+                        }
+                    }
+                }
+            }
+            
+            check self.completed_count == self.futures.len() {
+                self.completed = true;
+                let mut results = Vec::new();
+                for result in &self.results {
+                    results.push(result.as_ref().unwrap().clone());
+                }
+                PollResult::Ready(results)
+            } else {
+                PollResult::Pending
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §7  CANCELLATION TOKEN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cancellation token
+open data CancellationToken {
+    cancelled: bool,
+    cancel_reason: Option<String>,
+}
+
+impl CancellationToken {
+    fn new() -> Self {
+        Self {
+            cancelled: false,
+            cancel_reason: None,
+        }
+    }
+    
+    /// Check if cancelled
+    open fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+    
+    /// Get cancel reason
+    open fn cancel_reason(&self) -> Option<&String> {
+        self.cancel_reason.as_ref()
+    }
+    
+    /// Cancel the token
+    open fn cancel(&var self, reason: String) {
+        self.cancelled = true;
+        self.cancel_reason = Some(reason);
+    }
+    
+    /// Create child token
+    open fn child(&self) -> CancellationToken {
+        let child = CancellationToken::new();
+        // In real implementation, would link to parent
+        child
+    }
+}
+
+/// Cancellable future
+open data CancellableFuture<T> {
+    inner: *mut dyn Future<Item = T>,
+    token: CancellationToken,
+    completed: bool,
+}
+
+impl<T> CancellableFuture<T> {
+    fn new(inner: *mut dyn Future<Item = T>, token: CancellationToken) -> Self {
+        Self {
+            inner: inner,
+            token: token,
+            completed: false,
+        }
+    }
+}
+
+impl<T> Future for CancellableFuture<T> {
+    type Item = T;
+    
+    fn poll(&var self) -> PollResult<Self::Item> {
+        check self.completed {
+            PollResult::Pending
+        } else {
+            check self.token.is_cancelled() {
+                let reason = self.token.cancel_reason().unwrap().clone();
+                self.completed = true;
+                PollResult::Failed(Error::new(reason))
+            } else {
+                match unsafe { (*self.inner).poll() } {
+                    PollResult::Ready(value) => {
+                        self.completed = true;
+                        PollResult::Ready(value)
+                    }
+                    PollResult::Failed(error) => {
+                        self.completed = true;
+                        PollResult::Failed(error)
+                    }
+                    PollResult::Pending => PollResult::Pending,
+                }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §8  UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Add timeout to a future
+open fn timeout<T>(future: *mut dyn Future<Item = T>, timeout: TimeoutDuration) -> TimeoutFuture<T> {
+    TimeoutFuture::new(future, timeout)
+}
+
+/// Create a delay future
+open fn delay(duration: TimeoutDuration) -> DelayFuture {
+    DelayFuture::new(duration)
+}
+
+/// Create an interval future
+open fn interval(period: TimeoutDuration) -> IntervalFuture {
+    IntervalFuture::new(period)
+}
+
+/// Race multiple futures
+open fn race<T>(futures: Vec<*mut dyn Future<Item = T>>) -> RaceFuture<T> {
+    RaceFuture::new(futures)
+}
+
+/// Join multiple futures
+open fn join<T>(futures: Vec<*mut dyn Future<Item = T>>) -> JoinFuture<T> {
+    JoinFuture::new(futures)
+}
+
+/// Create cancellation token
+open fn cancellation_token() -> CancellationToken {
+    CancellationToken::new()
+}
+
+/// Add cancellation to a future
+open fn cancellable<T>(future: *mut dyn Future<Item = T>, token: CancellationToken) -> CancellableFuture<T> {
+    CancellableFuture::new(future, token)
+}
+
+/// Timeout with specific error message
+open fn timeout_with_message<T>(future: *mut dyn Future<Item = T>, timeout: TimeoutDuration, message: String) -> TimeoutFuture<T> {
+    // Would customize error message
+    TimeoutFuture::new(future, timeout)
+}
+
+/// Create timeout duration from milliseconds
+open fn millis(ms: u64) -> TimeoutDuration {
+    TimeoutDuration::Milliseconds(ms)
+}
+
+/// Create timeout duration from seconds
+open fn seconds(s: u64) -> TimeoutDuration {
+    TimeoutDuration::Seconds(s)
+}
+
+/// Create timeout duration from minutes
+open fn minutes(m: u64) -> TimeoutDuration {
+    TimeoutDuration::Minutes(m)
+}
+
+/// Create timeout duration from hours
+open fn hours(h: u64) -> TimeoutDuration {
+    TimeoutDuration::Hours(h)
+}

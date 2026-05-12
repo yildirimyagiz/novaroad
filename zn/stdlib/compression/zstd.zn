@@ -1,0 +1,159 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Zstd Compression - Facebook's Zstandard (fast + high ratio)                ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+/// Zstd compression level (1-22, default 3)
+open cases CompressionLevel {
+    Fast,       // 1
+    Default,    // 3
+    High,       // 9
+    Max,        // 22
+    Custom(i32),
+}
+
+/// Compress data with Zstd
+open fn compress(data: &[u8], level: CompressionLevel) -> Result<Vec<u8>, String> {
+    extern "C" {
+        fn nova_zstd_compress(
+            input: *const u8,
+            input_len: usize,
+            output: *var *var u8,
+            output_len: *var usize,
+            level: i32
+        ) -> bool;
+    }
+    
+    let level_int = match level {
+        CompressionLevel::Fast => 1,
+        CompressionLevel::Default => 3,
+        CompressionLevel::High => 9,
+        CompressionLevel::Max => 22,
+        CompressionLevel::Custom(l) => l,
+    };
+    
+    unsafe {
+        var output_ptr: *var u8 = std::ptr::null_mut();
+        var output_len = 0;
+        
+        check nova_zstd_compress(
+            data.as_ptr(),
+            data.len(),
+            &var output_ptr,
+            &var output_len,
+            level_int
+        ) {
+            let result = Vec::from_raw_parts(output_ptr, output_len, output_len);
+            Ok(result)
+        } else {
+            Err("Zstd compression failed".into())
+        }
+    }
+}
+
+/// Decompress Zstd data
+open fn decompress(compressed: &[u8]) -> Result<Vec<u8>, String> {
+    extern "C" {
+        fn nova_zstd_decompress(
+            input: *const u8,
+            input_len: usize,
+            output: *var *var u8,
+            output_len: *var usize
+        ) -> bool;
+    }
+    
+    unsafe {
+        var output_ptr: *var u8 = std::ptr::null_mut();
+        var output_len = 0;
+        
+        check nova_zstd_decompress(
+            compressed.as_ptr(),
+            compressed.len(),
+            &var output_ptr,
+            &var output_len
+        ) {
+            Ok(Vec::from_raw_parts(output_ptr, output_len, output_len))
+        } else {
+            Err("Zstd decompression failed".into())
+        }
+    }
+}
+
+/// Streaming compression
+open data ZstdEncoder {
+    context: u64,
+}
+
+impl ZstdEncoder {
+    open fn new(level: CompressionLevel) -> Result<ZstdEncoder, String> {
+        extern "C" {
+            fn nova_zstd_create_encoder(level: i32) -> u64;
+        }
+        
+        let level_int = match level {
+            CompressionLevel::Fast => 1,
+            CompressionLevel::Default => 3,
+            CompressionLevel::High => 9,
+            CompressionLevel::Max => 22,
+            CompressionLevel::Custom(l) => l,
+        };
+        
+        unsafe {
+            let ctx = nova_zstd_create_encoder(level_int);
+            check ctx != 0 {
+                Ok(ZstdEncoder { context: ctx })
+            } else {
+                Err("Failed to create encoder".into())
+            }
+        }
+    }
+    
+    open fn compress_chunk(&var self, data: &[u8]) -> Result<Vec<u8>, String> {
+        extern "C" {
+            fn nova_zstd_compress_chunk(
+                ctx: u64,
+                input: *const u8,
+                input_len: usize,
+                output: *var *var u8,
+                output_len: *var usize
+            ) -> bool;
+        }
+        
+        unsafe {
+            var output_ptr: *var u8 = std::ptr::null_mut();
+            var output_len = 0;
+            
+            check nova_zstd_compress_chunk(
+                self.context,
+                data.as_ptr(),
+                data.len(),
+                &var output_ptr,
+                &var output_len
+            ) {
+                Ok(Vec::from_raw_parts(output_ptr, output_len, output_len))
+            } else {
+                Err("Chunk compression failed".into())
+            }
+        }
+    }
+    
+    open fn finish(self) -> Result<Vec<u8>, String> {
+        extern "C" {
+            fn nova_zstd_finish_encoder(
+                ctx: u64,
+                output: *var *var u8,
+                output_len: *var usize
+            ) -> bool;
+        }
+        
+        unsafe {
+            var output_ptr: *var u8 = std::ptr::null_mut();
+            var output_len = 0;
+            
+            check nova_zstd_finish_encoder(self.context, &var output_ptr, &var output_len) {
+                Ok(Vec::from_raw_parts(output_ptr, output_len, output_len))
+            } else {
+                Err("Finish failed".into())
+            }
+        }
+    }
+}

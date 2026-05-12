@@ -1,0 +1,409 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Nova AI Backend Wrapper - Neural Network Layers
+// ═══════════════════════════════════════════════════════════════════════════
+// Type-safe wrapper for C AI backend (src/ai/nn/)
+// 
+// Features:
+// - Pooling layers (MaxPool, AvgPool, Adaptive, Global)
+// - Normalization (LayerNorm, BatchNorm, GroupNorm, RMSNorm)
+// - Loss functions (MSE, CrossEntropy, BCE, Huber, etc.)
+// - Optimizers (SGD, Adam, AdamW, RMSprop, Adagrad)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Updated to v9.0 - Modern Nova Syntax
+use stdlib.ml.tensor::{Tensor, TensorShape, Dtype}
+use ffi.native::*
+// use crate::core_ir::{IRModule, create_ir_optimizer}; // For advanced optimization
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pooling Layers
+// ═══════════════════════════════════════════════════════════════════════════
+
+expose cases PoolType {
+    Max,
+    Avg,
+    AdaptiveMax,
+    AdaptiveAvg,
+    Global
+}
+
+expose data PoolingLayer {
+    pool_type: PoolType,
+    kernel_size: u32,
+    stride: u32,
+    padding: u32
+}
+
+impl PoolingLayer {
+    fn new(pool_type: PoolType, kernel_size: u32, stride: u32, padding: u32) -> PoolingLayer {
+        PoolingLayer {
+            pool_type,
+            kernel_size,
+            stride,
+            padding
+        }
+    }
+    
+    fn max_pool2d(kernel_size: u32, stride: u32, padding: u32) -> PoolingLayer {
+        yield PoolingLayer.new(PoolType::Max, kernel_size, stride, padding)
+    }
+    
+    fn avg_pool2d(kernel_size: u32, stride: u32, padding: u32) -> PoolingLayer {
+        yield PoolingLayer.new(PoolType::Avg, kernel_size, stride, padding)
+    }
+    
+    fn global_avg_pool() -> PoolingLayer {
+        yield PoolingLayer.new(PoolType::Global, 0, 0, 0)
+    }
+    
+    fn adaptive_avg_pool(output_size: u32) -> PoolingLayer {
+        yield PoolingLayer.new(PoolType::AdaptiveAvg, output_size, 0, 0)
+    }
+    
+    fn forward(self, input: Tensor) -> Tensor {
+        // Type safety: ensure input is 4D (batch, channels, height, width)
+        assert(input.ndim() == 4, "Pooling requires 4D tensor (NCHW format)")
+        
+        yield match self.pool_type {
+            PoolType::Max => self.call_max_pool(input),
+            PoolType::Avg => self.call_avg_pool(input),
+            PoolType::AdaptiveMax => self.call_adaptive_max_pool(input),
+            PoolType::AdaptiveAvg => self.call_adaptive_avg_pool(input),
+            PoolType::Global => self.call_global_avg_pool(input)
+        }
+    }
+    
+    fn call_max_pool(self, input: Tensor) -> Tensor {
+        unsafe {
+            let output_ptr = @extern("nova_pool2d_max")(
+                input.raw_ptr(),
+                self.kernel_size as usize,
+                self.stride as usize,
+                self.padding as usize
+            )
+            yield Tensor.from_raw_ptr(output_ptr)
+        }
+    }
+    
+    fn call_avg_pool(self, input: Tensor) -> Tensor {
+        unsafe {
+            let output_ptr = @extern("nova_pool2d_avg")(
+                input.raw_ptr(),
+                self.kernel_size as usize,
+                self.stride as usize,
+                self.padding as usize
+            )
+            yield Tensor.from_raw_ptr(output_ptr)
+        }
+    }
+    
+    fn call_adaptive_avg_pool(self, input: Tensor) -> Tensor {
+        unsafe {
+            let output_ptr = @extern("nova_pool2d_adaptive_avg")(
+                input.raw_ptr(),
+                self.kernel_size as usize,
+                self.kernel_size as usize
+            )
+            yield Tensor.from_raw_ptr(output_ptr)
+        }
+    }
+    
+    fn call_adaptive_max_pool(self, input: Tensor) -> Tensor {
+        unsafe {
+            let output_ptr = @extern("nova_pool2d_adaptive_max")(
+                input.raw_ptr(),
+                self.kernel_size as usize,
+                self.kernel_size as usize
+            )
+            yield Tensor.from_raw_ptr(output_ptr)
+        }
+    }
+    
+    fn call_global_avg_pool(self, input: Tensor) -> Tensor {
+        unsafe {
+            let output_ptr = @extern("nova_pool2d_global_avg")(input.raw_ptr())
+            yield Tensor.from_raw_ptr(output_ptr)
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Normalization Layers
+// ═══════════════════════════════════════════════════════════════════════════
+
+expose cases NormType {
+    Layer,
+    Batch,
+    Group,
+    Instance,
+    RMS
+}
+
+expose data NormalizationLayer {
+    norm_type: NormType,
+    normalized_shape: u32,
+    num_groups: u32,
+    eps: f32,
+    momentum: f32,
+    training: bool
+}
+
+impl NormalizationLayer {
+    fn layer_norm(normalized_shape: u32, eps: f32) -> NormalizationLayer {
+        NormalizationLayer {
+            norm_type: NormType::Layer,
+            normalized_shape,
+            num_groups: 0,
+            eps,
+            momentum: 0.0,
+            training: false
+        }
+    }
+    
+    fn batch_norm(num_features: u32, eps: f32, momentum: f32) -> NormalizationLayer {
+        NormalizationLayer {
+            norm_type: NormType::Batch,
+            normalized_shape: num_features,
+            num_groups: 0,
+            eps,
+            momentum,
+            training: true
+        }
+    }
+    
+    fn group_norm(num_groups: u32, eps: f32) -> NormalizationLayer {
+        NormalizationLayer {
+            norm_type: NormType::Group,
+            normalized_shape: 0,
+            num_groups,
+            eps,
+            momentum: 0.0,
+            training: false
+        }
+    }
+    
+    fn rms_norm(eps: f32) -> NormalizationLayer {
+        NormalizationLayer {
+            norm_type: NormType::RMS,
+            normalized_shape: 0,
+            num_groups: 0,
+            eps,
+            momentum: 0.0,
+            training: false
+        }
+    }
+    
+    fn forward(self, input: Tensor) -> Tensor {
+        yield match self.norm_type {
+            NormType::Layer => self.call_layer_norm(input),
+            NormType::Batch => self.call_batch_norm(input),
+            NormType::Group => self.call_group_norm(input),
+            NormType::Instance => self.call_instance_norm(input),
+            NormType::RMS => self.call_rms_norm(input)
+        }
+    }
+    
+    fn call_layer_norm(self, input: Tensor) -> Tensor {
+        unsafe {
+            let output_ptr = @extern("nova_layer_norm")(
+                input.raw_ptr(),
+                self.normalized_shape as usize,
+                self.eps
+            )
+            yield Tensor.from_raw_ptr(output_ptr)
+        }
+    }
+    
+    fn call_batch_norm(self, input: Tensor) -> Tensor {
+        unsafe {
+            // For simplicity, using NULL for running stats
+            let output_ptr = @extern("nova_batch_norm")(
+                input.raw_ptr(),
+                null,  // running_mean
+                null,  // running_var
+                null,  // gamma
+                null,  // beta
+                self.eps,
+                self.momentum,
+                self.training
+            )
+            yield Tensor.from_raw_ptr(output_ptr)
+        }
+    }
+    
+    fn call_group_norm(self, input: Tensor) -> Tensor {
+        unsafe {
+            let output_ptr = @extern("nova_group_norm")(
+                input.raw_ptr(),
+                self.num_groups as usize,
+                self.eps
+            )
+            yield Tensor.from_raw_ptr(output_ptr)
+        }
+    }
+    
+    fn call_instance_norm(self, input: Tensor) -> Tensor {
+        unsafe {
+            let output_ptr = @extern("nova_instance_norm")(
+                input.raw_ptr(),
+                self.eps
+            )
+            yield Tensor.from_raw_ptr(output_ptr)
+        }
+    }
+    
+    fn call_rms_norm(self, input: Tensor) -> Tensor {
+        unsafe {
+            let output_ptr = @extern("nova_rms_norm")(
+                input.raw_ptr(),
+                self.eps
+            )
+            yield Tensor.from_raw_ptr(output_ptr)
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Loss Functions
+// ═══════════════════════════════════════════════════════════════════════════
+
+expose cases LossType {
+    MSE,
+    MAE,
+    CrossEntropy,
+    BCE,
+    BCEWithLogits,
+    NLL,
+    Huber,
+    SmoothL1,
+    KLDiv
+}
+
+expose data LossFunction {
+    loss_type: LossType,
+    delta: f32  // For Huber loss
+}
+
+impl LossFunction {
+    fn mse() -> LossFunction {
+        LossFunction { loss_type: LossType::MSE, delta: 0.0 }
+    }
+    
+    fn cross_entropy() -> LossFunction {
+        LossFunction { loss_type: LossType::CrossEntropy, delta: 0.0 }
+    }
+    
+    fn bce_with_logits() -> LossFunction {
+        LossFunction { loss_type: LossType::BCEWithLogits, delta: 0.0 }
+    }
+    
+    fn huber(delta: f32) -> LossFunction {
+        LossFunction { loss_type: LossType::Huber, delta }
+    }
+    
+    fn compute(self, predictions: Tensor, targets: Tensor) -> f32 {
+        yield match self.loss_type {
+            LossType::MSE => self.call_mse(predictions, targets),
+            LossType::MAE => self.call_mae(predictions, targets),
+            LossType::CrossEntropy => self.call_cross_entropy(predictions, targets),
+            LossType::BCE => self.call_bce(predictions, targets),
+            LossType::BCEWithLogits => self.call_bce_logits(predictions, targets),
+            LossType::NLL => self.call_nll(predictions, targets),
+            LossType::Huber => self.call_huber(predictions, targets),
+            LossType::SmoothL1 => self.call_smooth_l1(predictions, targets),
+            LossType::KLDiv => self.call_kl_div(predictions, targets)
+        }
+    }
+    
+    fn call_mse(self, pred: Tensor, target: Tensor) -> f32 {
+        unsafe {
+            yield @extern("nova_loss_mse")(pred.raw_ptr(), target.raw_ptr())
+        }
+    }
+    
+    fn call_mae(self, pred: Tensor, target: Tensor) -> f32 {
+        unsafe {
+            yield @extern("nova_loss_mae")(pred.raw_ptr(), target.raw_ptr())
+        }
+    }
+    
+    fn call_cross_entropy(self, pred: Tensor, target: Tensor) -> f32 {
+        unsafe {
+            yield @extern("nova_loss_cross_entropy")(pred.raw_ptr(), target.raw_ptr())
+        }
+    }
+    
+    fn call_bce(self, pred: Tensor, target: Tensor) -> f32 {
+        unsafe {
+            yield @extern("nova_loss_bce")(pred.raw_ptr(), target.raw_ptr())
+        }
+    }
+    
+    fn call_bce_logits(self, pred: Tensor, target: Tensor) -> f32 {
+        unsafe {
+            yield @extern("nova_loss_bce_with_logits")(pred.raw_ptr(), target.raw_ptr())
+        }
+    }
+    
+    fn call_nll(self, pred: Tensor, target: Tensor) -> f32 {
+        unsafe {
+            yield @extern("nova_loss_nll")(pred.raw_ptr(), target.raw_ptr())
+        }
+    }
+    
+    fn call_huber(self, pred: Tensor, target: Tensor) -> f32 {
+        unsafe {
+            yield @extern("nova_loss_huber")(pred.raw_ptr(), target.raw_ptr(), self.delta)
+        }
+    }
+    
+    fn call_smooth_l1(self, pred: Tensor, target: Tensor) -> f32 {
+        unsafe {
+            yield @extern("nova_loss_smooth_l1")(pred.raw_ptr(), target.raw_ptr())
+        }
+    }
+    
+    fn call_kl_div(self, pred: Tensor, target: Tensor) -> f32 {
+        unsafe {
+            yield @extern("nova_loss_kl_div")(pred.raw_ptr(), target.raw_ptr())
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Example Usage
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Example 1: Pooling
+ * 
+ * ```nova
+ * import ai.backend.nn_wrapper::*
+ * 
+ * let pool = PoolingLayer.max_pool2d(kernel_size: 2, stride: 2, padding: 0)
+ * let output = pool.forward(input_tensor)
+ * ```
+ */
+
+/**
+ * Example 2: Normalization
+ * 
+ * ```nova
+ * import ai.backend.nn_wrapper::*
+ * 
+ * let norm = NormalizationLayer.layer_norm(normalized_shape: 512, eps: 1e-5)
+ * let normalized = norm.forward(input_tensor)
+ * ```
+ */
+
+/**
+ * Example 3: Loss Function
+ * 
+ * ```nova
+ * import ai.backend.nn_wrapper::*
+ * 
+ * let loss_fn = LossFunction.cross_entropy()
+ * let loss = loss_fn.compute(predictions, targets)
+ * println(f"Loss: {loss}")
+ * ```
+ */

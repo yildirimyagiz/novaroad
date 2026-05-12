@@ -1,0 +1,5 @@
+#ifndef NOVA_MULTILINGUAL_TAGS_H
+#define NOVA_MULTILINGUAL_TAGS_H
+
+#endif
+

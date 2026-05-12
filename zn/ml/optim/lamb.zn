@@ -1,0 +1,337 @@
+// LAMB Optimizer (Layer-wise Adaptive Moments optimizer for Batch training)
+// Enables large batch training without loss of accuracy
+// Paper: "Large Batch Optimization for Deep Learning: Training BERT in 76 minutes"
+
+// module nova.ml.optim.lamb;
+
+use nova.tensor.Tensor;
+use nova.ml.optim.Optimizer;
+
+/// LAMB Optimizer
+/// Combines Layer-wise Adaptive Rate Scaling (LARS) with Adam
+/// Designed for large batch training (e.g., batch size > 8192)
+open data LAMB {
+    params: Vec<Tensor>,
+    
+    // Hyperparameters
+    lr: f64,
+    betas: (f64, f64),
+    eps: f64,
+    weight_decay: f64,
+    adam: bool,  // Use Adam mode (bias correction)
+    
+    // State
+    step_count: int,
+    exp_avg: Vec<Tensor>,      // First moment estimates (m_t)
+    exp_avg_sq: Vec<Tensor>,   // Second moment estimates (v_t)
+}
+
+impl LAMB {
+    open fn new(params: Vec<Tensor>, lr: f64) -> Self {
+        let n_params = params.len();
+        
+        Self {
+            params,
+            lr,
+            betas: (0.9, 0.999),
+            eps: 1e-6,
+            weight_decay: 0.01,
+            adam: false,
+            step_count: 0,
+            exp_avg: [Tensor::zeros_like(&params[0]); n_params],
+            exp_avg_sq: [Tensor::zeros_like(&params[0]); n_params],
+        }
+    }
+
+    open fn with_betas(var self, beta1: f64, beta2: f64) -> Self {
+        self.betas = (beta1, beta2);
+        self
+    }
+
+    open fn with_weight_decay(var self, weight_decay: f64) -> Self {
+        self.weight_decay = weight_decay;
+        self
+    }
+
+    open fn with_eps(var self, eps: f64) -> Self {
+        self.eps = eps;
+        self
+    }
+
+    open fn adam_mode(var self, adam: bool) -> Self {
+        self.adam = adam;
+        self
+    }
+}
+
+impl Optimizer for LAMB {
+    fn step(&var self) {
+        self.step_count += 1;
+        let (beta1, beta2) = self.betas;
+
+        each entry in self.params.iter_mut().enumerate()  { let (i, param) = entry;
+            let grad = match param.grad() {
+                Some(g) => g,
+                None => continue,
+            };
+
+            // L2 weight decay
+            let grad_with_decay = check self.weight_decay > 0.0 {
+                grad.clone() + param.clone() * self.weight_decay
+            } else {
+                grad.clone()
+            };
+
+            // Update biased first moment estimate
+            self.exp_avg[i] = self.exp_avg[i].clone() * beta1 + 
+                              grad_with_decay.clone() * (1.0 - beta1);
+
+            // Update biased second raw moment estimate
+            self.exp_avg_sq[i] = self.exp_avg_sq[i].clone() * beta2 + 
+                                 grad_with_decay.clone().pow(2.0) * (1.0 - beta2);
+
+            // Compute bias-corrected moments (Adam-style)
+            let m_t = check self.adam {
+                self.exp_avg[i].clone() / (1.0 - beta1.powi(self.step_count))
+            } else {
+                self.exp_avg[i].clone()
+            };
+
+            let v_t = check self.adam {
+                self.exp_avg_sq[i].clone() / (1.0 - beta2.powi(self.step_count))
+            } else {
+                self.exp_avg_sq[i].clone()
+            };
+
+            // Compute adaptive learning rate (LARS-style)
+            let update = m_t / (v_t.sqrt() + self.eps);
+
+            // Layer-wise adaptation
+            let param_norm = param.norm();
+            let update_norm = update.norm();
+
+            let trust_ratio = check param_norm > 0.0 && update_norm > 0.0 {
+                param_norm / update_norm
+            } else {
+                1.0
+            };
+
+            // Apply update with layer-wise learning rate
+            let effective_lr = self.lr * trust_ratio;
+            *param = param.clone() - update * effective_lr;
+        }
+    }
+
+    fn zero_grad(&var self) {
+        each param in &var self.params {
+            param.zero_grad();
+        }
+    }
+
+    fn get_params(&self) -> &[Tensor] {
+        &self.params
+    }
+
+    fn get_params_mut(&var self) -> &var [Tensor] {
+        &var self.params
+    }
+
+    fn get_lr(&self) -> f64 {
+        self.lr
+    }
+
+    fn set_lr(&var self, lr: f64) {
+        self.lr = lr;
+    }
+}
+
+/// LARS Optimizer (Layer-wise Adaptive Rate Scaling)
+/// Simpler variant without Adam moments
+open data LARS {
+    params: Vec<Tensor>,
+    
+    lr: f64,
+    momentum: f64,
+    weight_decay: f64,
+    eta: f64,  // Trust coefficient
+    eps: f64,
+    
+    // Momentum buffer
+    velocity: Vec<Tensor>,
+}
+
+impl LARS {
+    open fn new(params: Vec<Tensor>, lr: f64) -> Self {
+        let n_params = params.len();
+        
+        Self {
+            params,
+            lr,
+            momentum: 0.9,
+            weight_decay: 0.0001,
+            eta: 0.001,
+            eps: 1e-8,
+            velocity: [Tensor::zeros_like(&params[0]); n_params],
+        }
+    }
+
+    open fn with_momentum(var self, momentum: f64) -> Self {
+        self.momentum = momentum;
+        self
+    }
+
+    open fn with_weight_decay(var self, weight_decay: f64) -> Self {
+        self.weight_decay = weight_decay;
+        self
+    }
+
+    open fn with_eta(var self, eta: f64) -> Self {
+        self.eta = eta;
+        self
+    }
+}
+
+impl Optimizer for LARS {
+    fn step(&var self) {
+        each entry in self.params.iter_mut().enumerate()  { let (i, param) = entry;
+            let grad = match param.grad() {
+                Some(g) => g,
+                None => continue,
+            };
+
+            // Add weight decay to gradient
+            let grad_with_decay = check self.weight_decay > 0.0 {
+                grad.clone() + param.clone() * self.weight_decay
+            } else {
+                grad.clone()
+            };
+
+            // Compute local learning rate
+            let param_norm = param.norm();
+            let grad_norm = grad_with_decay.norm();
+
+            let local_lr = check param_norm > 0.0 && grad_norm > 0.0 {
+                self.eta * param_norm / (grad_norm + self.eps)
+            } else {
+                1.0
+            };
+
+            // Update velocity with momentum
+            self.velocity[i] = self.velocity[i].clone() * self.momentum + 
+                               grad_with_decay * local_lr * self.lr;
+
+            // Update parameters
+            *param = param.clone() - self.velocity[i].clone();
+        }
+    }
+
+    fn zero_grad(&var self) {
+        each param in &var self.params {
+            param.zero_grad();
+        }
+    }
+
+    fn get_params(&self) -> &[Tensor] {
+        &self.params
+    }
+
+    fn get_params_mut(&var self) -> &var [Tensor] {
+        &var self.params
+    }
+
+    fn get_lr(&self) -> f64 {
+        self.lr
+    }
+
+    fn set_lr(&var self, lr: f64) {
+        self.lr = lr;
+    }
+}
+
+/// Example: Large Batch Training with LAMB
+open fn example_lamb_training() {
+    println("=== LAMB Optimizer: Large Batch Training ===\n");
+
+    let model = create_bert_model();
+    
+    // LAMB optimizer for large batch training
+    let optimizer = LAMB::new(model.parameters(), lr: 0.00176)
+        .with_betas(0.9, 0.999)
+        .with_weight_decay(0.01)
+        .adam_mode(true);
+
+    // Large batch configuration
+    let batch_size = 65536;  // Very large batch!
+    let accumulation_steps = 64;  // 65536 = 1024 per step × 64 steps
+
+    println("Large Batch Training Configuration:");
+    println("  • Total batch size: {}", batch_size);
+    println("  • Accumulation steps: {}", accumulation_steps);
+    println("  • Batch per step: {}", batch_size / accumulation_steps);
+    println("  • Optimizer: LAMB");
+    println("  • Learning rate: {}", optimizer.get_lr());
+    
+    // Training loop
+    each epoch in 0..100 {
+        optimizer.zero_grad();
+        
+        each step in 0..accumulation_steps {
+            let output = model.forward(&input);
+            let loss = loss_fn.forward(&output, &target);
+            
+            // Scale loss for accumulation
+            let scaled_loss = loss / (accumulation_steps as f64);
+            scaled_loss.backward();
+        }
+        
+        // Update after accumulating gradients
+        optimizer.step();
+    }
+
+    println("\nBenefits of LAMB:");
+    println("  ✓ Train with very large batches (32K-64K)");
+    println("  ✓ Linear scaling of learning rate");
+    println("  ✓ Maintains accuracy at large batch sizes");
+    println("  ✓ Faster training on multi-GPU setups");
+}
+
+/// Utility: Compute optimal LAMB learning rate
+open fn compute_lamb_lr(base_lr: f64, batch_size: int, base_batch_size: int) -> f64 {
+    // Linear scaling rule for LAMB
+    base_lr * (batch_size as f64 / base_batch_size as f64)
+}
+
+/// Warmup scheduler for LAMB (important for stability)
+open data LAMBWarmup {
+    optimizer: LAMB,
+    warmup_steps: int,
+    base_lr: f64,
+    current_step: int,
+}
+
+impl LAMBWarmup {
+    open fn new(optimizer: LAMB, warmup_steps: int) -> Self {
+        let base_lr = optimizer.get_lr();
+        
+        Self {
+            optimizer,
+            warmup_steps,
+            base_lr,
+            current_step: 0,
+        }
+    }
+
+    open fn step(&var self) {
+        self.current_step += 1;
+        
+        check self.current_step <= self.warmup_steps {
+            // Linear warmup
+            let lr = self.base_lr * (self.current_step as f64 / self.warmup_steps as f64);
+            self.optimizer.set_lr(lr);
+        }
+    }
+
+    open fn get_optimizer_mut(&var self) -> &var LAMB {
+        &var self.optimizer
+    }
+}

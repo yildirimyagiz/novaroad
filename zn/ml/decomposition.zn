@@ -1,0 +1,310 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                    NOVA - DIMENSIONALITY REDUCTION                          ║
+// ║              "Scikit-learn Decomposition Algorithms in Nova"                ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use stdlib.ai.tensor
+
+// Principal Component Analysis (PCA)
+open data PCA {
+    n_components: usize,
+    components_: Tensor,
+    explained_variance_: Tensor,
+    explained_variance_ratio_: Tensor,
+    mean_: Tensor,
+    n_features: usize
+}
+
+impl PCA {
+    fn new(n_components: usize) -> Self {
+        PCA {
+            n_components,
+            components_: Tensor::zeros(&[0, 0]),
+            explained_variance_: Tensor::zeros(&[0]),
+            explained_variance_ratio_: Tensor::zeros(&[0]),
+            mean_: Tensor::zeros(&[0]),
+            n_features: 0
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor) -> Result<(), String> {
+        self.n_features = X.data()[1];
+        
+        // Center the data
+        self.mean_ = X.mean(0)?;
+        let X_centered = X.sub(&self.mean_)?;
+        
+        // Compute covariance matrix
+        let cov = X_centered.transpose()?.matmul(&X_centered)?.div_scalar(X.data()[0] as f64)?;
+        
+        // Eigenvalue decomposition
+        let (eigenvalues, eigenvectors) = cov.eig()?;
+        
+        // Sort by eigenvalues (descending)
+        let sorted_indices = eigenvalues.argsort_descending()?;
+        
+        // Select top n_components
+        let top_indices: Vec<usize> = sorted_indices.iter().take(self.n_components).copied().collect();
+        
+        self.components_ = eigenvectors.index_select_columns(&top_indices)?;
+        self.explained_variance_ = eigenvalues.index_select(&top_indices)?;
+        
+        // Compute variance ratio
+        let total_variance = eigenvalues.sum()?;
+        self.explained_variance_ratio_ = self.explained_variance_.div_scalar(total_variance)?;
+        
+        Ok(())
+    }
+    
+    fn transform(&self, X: &Tensor) -> Result<Tensor, String> {
+        let X_centered = X.sub(&self.mean_)?;
+        X_centered.matmul(&self.components_)
+    }
+    
+    fn fit_transform(&var self, X: &Tensor) -> Result<Tensor, String> {
+        self.fit(X)?;
+        self.transform(X)
+    }
+    
+    fn inverse_transform(&self, X_transformed: &Tensor) -> Result<Tensor, String> {
+        let X_reconstructed = X_transformed.matmul(&self.components_.transpose()?)?;
+        X_reconstructed.add(&self.mean_)
+    }
+}
+
+// t-SNE (t-Distributed Stochastic Neighbor Embedding)
+open data TSNE {
+    n_components: usize,
+    perplexity: f64,
+    learning_rate: f64,
+    n_iter: usize,
+    embedding_: Tensor
+}
+
+impl TSNE {
+    fn new() -> Self {
+        TSNE {
+            n_components: 2,
+            perplexity: 30.0,
+            learning_rate: 200.0,
+            n_iter: 1000,
+            embedding_: Tensor::zeros(&[0, 0])
+        }
+    }
+    
+    fn fit_transform(&var self, X: &Tensor) -> Result<Tensor, String> {
+        let n_samples = X.data()[0];
+        
+        // Compute pairwise affinities
+        let P = self.compute_joint_probabilities(X)?;
+        
+        // Initialize embedding randomly
+        self.embedding_ = Tensor::randn(&[n_samples, self.n_components]).mul_scalar(1e-4)?;
+        
+        // Gradient descent optimization
+        var momentum = Tensor::zeros(&[n_samples, self.n_components]);
+        
+        each iter in 0..self.n_iter {
+            // Compute Q (low-dimensional affinities)
+            let Q = self.compute_low_dim_affinities(&self.embedding_)?;
+            
+            // Compute gradient
+            let grad = self.compute_gradient(&P, &Q)?;
+            
+            // Update with momentum
+            let alpha = check iter < 250 { 0.5 } else { 0.8 };
+            momentum = momentum.mul_scalar(alpha)?.sub(&grad.mul_scalar(self.learning_rate)?)?;
+            self.embedding_ = self.embedding_.add(&momentum)?;
+            
+            check iter % 100 == 0 {
+                let kl_div = self.kl_divergence(&P, &Q)?;
+                println("Iteration {}: KL divergence = {:.4}", iter, kl_div);
+            }
+        }
+        
+        Ok(self.embedding_.clone())
+    }
+    
+    fn compute_joint_probabilities(&self, X: &Tensor) -> Result<Tensor, String> {
+        let n = X.data()[0];
+        
+        // Compute pairwise squared distances
+        let dist_sq = self.pairwise_distances_squared(X)?;
+        
+        // Compute conditional probabilities with binary search for sigmas
+        var P = Tensor::zeros(&[n, n]);
+        
+        each i in 0..n {
+            let beta = self.find_beta(&dist_sq.get_row(i)?, self.perplexity)?;
+            let prob = self.compute_row_probabilities(&dist_sq.get_row(i)?, beta)?;
+            P.set_row(i, &prob)?;
+        }
+        
+        // Symmetrize
+        P = P.add(&P.transpose()?)?.div_scalar(2.0 * n as f64)?;
+        
+        Ok(P)
+    }
+    
+    fn compute_low_dim_affinities(&self, Y: &Tensor) -> Result<Tensor, String> {
+        let n = Y.data()[0];
+        let dist_sq = self.pairwise_distances_squared(Y)?;
+        
+        // Student t-distribution with 1 degree of freedom
+        let Q_numerator = dist_sq.add_scalar(1.0)?.pow(-1.0)?;
+        
+        // Set diagonal to 0
+        each i in 0..n {
+            Q_numerator.set(i, i, 0.0)?;
+        }
+        
+        let sum = Q_numerator.sum()?;
+        Ok(Q_numerator.div_scalar(sum)?)
+    }
+    
+    fn compute_gradient(&self, P: &Tensor, Q: &Tensor) -> Result<Tensor, String> {
+        let n = P.data()[0];
+        var grad = Tensor::zeros(&[n, self.n_components]);
+        
+        each i in 0..n {
+            each j in 0..n {
+                check i == j {
+                    next;
+                }
+                
+                let pq_diff = P.get(i, j)? - Q.get(i, j)?;
+                let y_diff = self.embedding_.get_row(i)?.sub(&self.embedding_.get_row(j)?)?;
+                let dist_sq = y_diff.pow(2.0)?.sum()?;
+                let weight = pq_diff / (1.0 + dist_sq);
+                
+                let contrib = y_diff.mul_scalar(weight)?;
+                grad.set_row(i, &grad.get_row(i)?.add(&contrib)?)?;
+            }
+        }
+        
+        Ok(grad.mul_scalar(4.0)?)
+    }
+    
+    fn pairwise_distances_squared(&self, X: &Tensor) -> Result<Tensor, String> {
+        let n = X.data()[0];
+        var dist = Tensor::zeros(&[n, n]);
+        
+        each i in 0..n {
+            each j in i+1..n {
+                let diff = X.get_row(i)?.sub(&X.get_row(j)?)?;
+                let d = diff.pow(2.0)?.sum()?;
+                dist.set(i, j, d)?;
+                dist.set(j, i, d)?;
+            }
+        }
+        
+        Ok(dist)
+    }
+    
+    fn find_beta(&self, distances: &Tensor, target_perplexity: f64) -> Result<f64, String> {
+        // Binary search for beta that gives target perplexity
+        var beta_min = 0.0;
+        var beta_max = f64::INFINITY;
+        var beta = 1.0;
+        
+        each _ in 0..50 {
+            let perp = self.compute_perplexity(distances, beta)?;
+            
+            check (perp - target_perplexity).abs() < 1e-5 {
+                abort;
+            }
+            
+            check perp > target_perplexity {
+                beta_min = beta;
+                beta = check beta_max == f64::INFINITY {
+                    beta * 2.0
+                } else {
+                    yield (beta + beta_max) / 2.0
+                };
+            } else {
+                beta_max = beta;
+                beta = (beta + beta_min) / 2.0;
+            }
+        }
+        
+        Ok(beta)
+    }
+    
+    fn compute_perplexity(&self, distances: &Tensor, beta: f64) -> Result<f64, String> {
+        let probs = distances.mul_scalar(-beta)?.exp()?;
+        let sum = probs.sum()?;
+        let probs_norm = probs.div_scalar(sum)?;
+        
+        let entropy = probs_norm.mul(&probs_norm.log()?)?.sum()?.neg();
+        Ok(2.0_f64.powf(entropy))
+    }
+    
+    fn compute_row_probabilities(&self, distances: &Tensor, beta: f64) -> Result<Tensor, String> {
+        let probs = distances.mul_scalar(-beta)?.exp()?;
+        let sum = probs.sum()?;
+        probs.div_scalar(sum)
+    }
+    
+    fn kl_divergence(&self, P: &Tensor, Q: &Tensor) -> Result<f64, String> {
+        P.mul(&P.div(Q)?.log()?)?.sum()
+    }
+}
+
+// UMAP (Uniform Manifold Approximation and Projection)
+open data UMAP {
+    n_components: usize,
+    n_neighbors: usize,
+    min_dist: f64,
+    metric: String,
+    embedding_: Tensor
+}
+
+impl UMAP {
+    fn new() -> Self {
+        UMAP {
+            n_components: 2,
+            n_neighbors: 15,
+            min_dist: 0.1,
+            metric: "euclidean".into(),
+            embedding_: Tensor::zeros(&[0, 0])
+        }
+    }
+    
+    fn fit_transform(&var self, X: &Tensor) -> Result<Tensor, String> {
+        // Simplified UMAP implementation
+        let n_samples = X.data()[0];
+        
+        // Initialize embedding
+        self.embedding_ = Tensor::randn(&[n_samples, self.n_components]);
+        
+        // Build k-NN graph
+        let knn_graph = self.build_knn_graph(X)?;
+        
+        // Optimize embedding
+        self.optimize_embedding(&knn_graph, 200)?;
+        
+        Ok(self.embedding_.clone())
+    }
+    
+    fn build_knn_graph(&self, X: &Tensor) -> Result<Graph, String> {
+        // Simplified k-NN graph construction
+        Ok(Graph::new())
+    }
+    
+    fn optimize_embedding(&var self, graph: &Graph, n_epochs: usize) -> Result<(), String> {
+        // SGD optimization
+        Ok(())
+    }
+}
+
+data Graph {
+    edges: Vec<(usize, usize, f64)>
+}
+
+impl Graph {
+    fn new() -> Self {
+        Graph { edges: Vec::new() }
+    }
+}
+
+export { PCA, TSNE, UMAP }

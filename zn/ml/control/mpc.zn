@@ -1,0 +1,407 @@
+"""
+Model Predictive Control (MPC)
+Optimal control for robotics (Boston Dynamics / MIT Cheetah style)
+
+Reference: 
+    - "Dynamic Locomotion in the MIT Cheetah 3" (2018)
+    - "Convex Optimization for Robot Motion Planning" (Boyd)
+
+Features:
+    - Real-time trajectory optimization
+    - Constraint handling
+    - Receding horizon control
+    - Quadratic Programming (QP)
+"""
+
+use ml.tensor as zt
+from ml.nn import Linear
+use std.collections.{Vec, HashMap}
+
+// ═══════════════════════════════════════════════════════════════════════
+// QUADRATIC PROGRAMMING SOLVER
+// ═══════════════════════════════════════════════════════════════════════
+
+class QPSolver:
+    """
+    Quadratic Programming Solver
+    
+    Solves: minimize  (1/2) x^T H x + f^T x
+           subject to: A_eq x = b_eq
+                      A_ineq x <= b_ineq
+                      lb <= x <= ub
+    
+    Uses active-set or interior-point method.
+    """
+    
+    max_iter: int
+    tolerance: f32
+    
+    def __init__(self, max_iter: int = 100, tolerance: f32 = 1e-6):
+        self.max_iter = max_iter
+        self.tolerance = tolerance
+    
+    def solve(
+        self,
+        H: Tensor,  // Hessian (n x n)
+        f: Tensor,  // Linear term (n,)
+        A_eq: ?Tensor = None,    // Equality constraints (m x n)
+        b_eq: ?Tensor = None,    // Equality RHS (m,)
+        A_ineq: ?Tensor = None,  // Inequality constraints (p x n)
+        b_ineq: ?Tensor = None,  // Inequality RHS (p,)
+        lb: ?Tensor = None,      // Lower bounds (n,)
+        ub: ?Tensor = None,      // Upper bounds (n,)
+    ) -> Tensor:
+        """
+        Solve QP problem
+        
+        Returns:
+            Optimal solution x
+        """
+        n = H.data[0]
+        
+        // Initialize with unconstrained solution
+        // H x = -f  →  x = -H^{-1} f
+        var x = -zt.solve(H, f)  // Uses Cholesky decomposition
+        
+        // Active-set method (simplified)
+        each iter in 0..self.max_iter:
+            // Compute gradient
+            let grad = H @ x + f
+            
+            // Check KKT conditions
+            check grad.abs().max() < self.tolerance:
+                break
+            }
+            
+            // Project onto constraints
+            check lb is not None:
+                x = zt.maximum(x, lb)
+            }
+            check ub is not None:
+                x = zt.minimum(x, ub)
+            }
+            
+            // Equality constraints (check any)
+            check A_eq is not None && b_eq is not None:
+                // Solve with Lagrange multipliers
+                // [H   A^T] [x]   [-f]
+                // [A   0  ] [λ] = [b ]
+                
+                let m = A_eq.data[0]
+                let KKT = zt.zeros(n + m, n + m)
+                KKT[:n, :n] = H
+                KKT[:n, n:] = A_eq.T
+                KKT[n:, :n] = A_eq
+                
+                let rhs = zt.cat([-f, b_eq])
+                let sol = zt.solve(KKT, rhs)
+                x = sol[:n]
+            }
+        }
+        
+        yield x
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// MODEL PREDICTIVE CONTROL
+// ═══════════════════════════════════════════════════════════════════════
+
+class MPC:
+    """
+    Model Predictive Control for Robotics
+    
+    Optimizes control inputs over a prediction horizon to minimize cost
+    while respecting system dynamics and constraints.
+    
+    Example:
+        ```nova
+        // Robot dynamics: x_{t+1} = A x_t + B u_t
+        mpc = MPC(
+            state_dim=12,      // Robot state (position, velocity, etc.)
+            control_dim=4,     // Control inputs (forces, torques)
+            horizon=20,        // Predict 20 steps ahead
+            dt=0.01,          // 100 Hz control
+        )
+        
+        // Set cost matrices
+        mpc.set_costs(
+            Q=Q_matrix,  // State cost
+            R=R_matrix,  // Control cost
+        )
+        
+        // Compute optimal control
+        u_opt = mpc.solve(current_state, reference_trajectory)
+        
+        // Apply first control input
+        robot.apply_control(u_opt[0])
+        ```
+    """
+    
+    state_dim: int
+    control_dim: int
+    horizon: int
+    dt: f32
+    
+    // System dynamics (linearized)
+    A: Tensor  // State transition matrix
+    B: Tensor  // Control input matrix
+    
+    // Cost matrices
+    Q: Tensor  // State cost
+    R: Tensor  // Control cost
+    Qf: Tensor // Terminal cost
+    
+    // Constraints
+    u_min: Tensor  // Min control
+    u_max: Tensor  // Max control
+    x_min: ?Tensor // Min state (optional)
+    x_max: ?Tensor // Max state (optional)
+    
+    // Solver
+    qp_solver: QPSolver
+    
+    def __init__(
+        self,
+        state_dim: int,
+        control_dim: int,
+        horizon: int = 20,
+        dt: f32 = 0.01,
+    ):
+        self.state_dim = state_dim
+        self.control_dim = control_dim
+        self.horizon = horizon
+        self.dt = dt
+        
+        // Initialize as identity (will be set by user)
+        self.A = zt.eye(state_dim)
+        self.B = zt.zeros(state_dim, control_dim)
+        
+        // Default costs (identity)
+        self.Q = zt.eye(state_dim)
+        self.R = zt.eye(control_dim)
+        self.Qf = zt.eye(state_dim) * 10.0  // Higher terminal cost
+        
+        // No constraints by default
+        self.u_min = zt.ones(control_dim) * -10.0
+        self.u_max = zt.ones(control_dim) * 10.0
+        self.x_min = None
+        self.x_max = None
+        
+        self.qp_solver = QPSolver()
+    
+    def set_dynamics(self, A: Tensor, B: Tensor):
+        """
+        Set linear system dynamics: x_{t+1} = A x_t + B u_t
+        
+        For nonlinear systems, linearize around operating point.
+        """
+        assert A.data == [self.state_dim, self.state_dim]
+        assert B.data == [self.state_dim, self.control_dim]
+        
+        self.A = A
+        self.B = B
+    }
+    
+    def set_costs(
+        self,
+        Q: Tensor,
+        R: Tensor,
+        Qf: ?Tensor = None,
+    ):
+        """Set cost matrices for MPC"""
+        self.Q = Q
+        self.R = R
+        check Qf is not None:
+            self.Qf = Qf
+        }
+    }
+    
+    def set_constraints(
+        self,
+        u_min: Tensor,
+        u_max: Tensor,
+        x_min: ?Tensor = None,
+        x_max: ?Tensor = None,
+    ):
+        """Set control and state constraints"""
+        self.u_min = u_min
+        self.u_max = u_max
+        self.x_min = x_min
+        self.x_max = x_max
+    }
+    
+    def solve(
+        self,
+        x0: Tensor,           // Initial state
+        x_ref: ?Tensor = None, // Reference trajectory (horizon x state_dim)
+    ) -> Tensor:
+        """
+        Solve MPC optimization problem
+        
+        Returns:
+            Optimal control sequence (horizon x control_dim)
+        """
+        // Build QP matrices
+        let (H, f, A_ineq, b_ineq) = self._build_qp(x0, x_ref)
+        
+        // Solve QP
+        let u_flat = self.qp_solver.solve(
+            H, f,
+            A_ineq=A_ineq,
+            b_ineq=b_ineq,
+            lb=self.u_min.repeat(self.horizon),
+            ub=self.u_max.repeat(self.horizon),
+        )
+        
+        // Reshape to (horizon, control_dim)
+        let u_opt = u_flat.reshape(self.horizon, self.control_dim)
+        
+        yield u_opt
+    }
+    
+    def _build_qp(
+        self,
+        x0: Tensor,
+        x_ref: ?Tensor,
+    ) -> (Tensor, Tensor, Tensor, Tensor):
+        """
+        Build QP matrices for MPC problem
+        
+        Cost: sum_{t=0}^{N-1} [(x_t - x_ref)^T Q (x_t - x_ref) + u_t^T R u_t]
+              + (x_N - x_ref)^T Qf (x_N - x_ref)
+        
+        This is converted to: (1/2) u^T H u + f^T u
+        where u = [u_0, u_1, ..., u_{N-1}] is the decision variable
+        """
+        N = self.horizon
+        n = self.state_dim
+        m = self.control_dim
+        
+        // Precompute state predictions: x_t = A^t x0 + sum_{k=0}^{t-1} A^{t-k-1} B u_k
+        // This gives x = Sx * x0 + Su * u
+        // where Su is a sparse lower-triangular matrix
+        
+        // Build Su matrix (prediction of states from controls)
+        Su = zt.zeros(N * n, N * m)
+        
+        var A_power = zt.eye(n)
+        each t in 0..N:
+            each k in 0..=t:
+                check t == 0:
+                    Su[t*n:(t+1)*n, k*m:(k+1)*m] = self.B
+                } else {
+                    Su[t*n:(t+1)*n, k*m:(k+1)*m] = A_power @ self.B
+                }
+                A_power = A_power @ self.A
+            }
+        }
+        
+        // Build cost matrices
+        let Q_bar = zt.kron(zt.eye(N), self.Q)  // Block diagonal Q
+        Q_bar[-(n).., -(n)..] = self.Qf  // Terminal cost
+        
+        let R_bar = zt.kron(zt.eye(N), self.R)  // Block diagonal R
+        
+        // Hessian: H = Su^T Q_bar Su + R_bar
+        let H = Su.T @ Q_bar @ Su + R_bar
+        
+        // Linear term: f = Su^T Q_bar (Sx x0 - x_ref)
+        let Sx = self._compute_sx()  // State prediction from x0
+        let x_pred = Sx @ x0
+        
+        let x_ref_flat = check x_ref is not None:
+            x_ref.flatten()
+        } else {
+            zt.zeros(N * n)
+        }
+        
+        let f = Su.T @ Q_bar @ (x_pred - x_ref_flat)
+        
+        // Inequality constraints (simple box constraints on u)
+        // Will be handled by lb, ub in solver
+        let A_ineq = zt.zeros(1, N * m)  // Placeholder
+        let b_ineq = zt.zeros(1)
+        
+        yield (H, f, A_ineq, b_ineq)
+    }
+    
+    def _compute_sx(&self) -> Tensor:
+        """Compute state prediction matrix from initial state"""
+        N = self.horizon
+        n = self.state_dim
+        
+        Sx = zt.zeros(N * n, n)
+        var A_power = zt.eye(n)
+        
+        each t in 0..N:
+            Sx[t*n:(t+1)*n, :] = A_power
+            A_power = A_power @ self.A
+        }
+        
+        Sx
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// LEGGED ROBOT MPC (Specialized)
+// ═══════════════════════════════════════════════════════════════════════
+
+class LeggedRobotMPC(MPC):
+    """
+    MPC for legged robots (quadrupeds, bipeds)
+    
+    Handles:
+        - Ground reaction forces
+        - Contact constraints
+        - Center of mass dynamics
+        - Friction cones
+    
+    Based on MIT Cheetah / ANYmal controllers
+    """
+    
+    num_legs: int
+    mu: f32  // Friction coefficient
+    
+    def __init__(
+        self,
+        num_legs: int = 4,
+        horizon: int = 10,
+        dt: f32 = 0.02,  // 50 Hz typical for legged
+    ):
+        // State: [position, velocity, orientation, angular_velocity]
+        // Control: ground reaction forces (3 per leg)
+        super().__init__(
+            state_dim=13,  // 3 pos + 3 vel + 4 quat + 3 omega
+            control_dim=num_legs * 3,  // 3D force per leg
+            horizon=horizon,
+            dt=dt,
+        )
+        
+        self.num_legs = num_legs
+        self.mu = 0.5  // Friction coefficient (concrete)
+    
+    def set_contact_schedule(self, contacts: Vec[Vec[bool]]):
+        """
+        Set which legs are in contact for each timestep
+        
+        Args:
+            contacts: [horizon x num_legs] boolean array
+        """
+        // Modify constraints based on contact
+        // No force check leg in swing phase
+        // Friction cone check leg in stance
+        
+        // TODO: Implement contact-aware constraints
+    }
+    
+    def add_friction_cone_constraints(self):
+        """
+        Add friction cone constraints: |f_tangential| <= mu * f_normal
+        
+        Ensures forces don't cause slipping
+        """
+        // TODO: Convert to linear inequality constraints
+        // Approximate cone with pyramid
+    }
+}

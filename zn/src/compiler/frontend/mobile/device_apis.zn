@@ -1,0 +1,807 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                        Nova DEVICE APIs                              ║
+// ║                   Sensors, Camera, Notifications & Storage                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// Device API wrappers for Nova mobile applications
+// High-level, alias-safe interfaces to device hardware and services
+
+use std::collections::HashMap;
+use crate::frontend::ast::*;
+
+// ============================================================================
+// SENSOR APIs
+// ============================================================================
+
+/// Sensor manager for device sensors
+expose data SensorManager {
+    active_sensors: HashMap<SensorType, Box<dyn SensorCallback>>,
+}
+
+expose cases SensorType {
+    Accelerometer,
+    Gyroscope,
+    Magnetometer,
+    GPS,
+    Barometer,
+    Proximity,
+    AmbientLight,
+    Thermometer,
+    HeartRate,
+}
+
+/// Sensor data callback rules
+expose ability SensorCallback {
+    fn on_sensor_data(&var self, data: SensorData);
+    fn on_sensor_error(&var self, error: SensorError);
+}
+
+/// Unified sensor data
+expose cases SensorData {
+    Acceleration(Point3D),
+    Rotation(Point3D),
+    MagneticField(Point3D),
+    Location(GPSData),
+    Pressure(f64),
+    Proximity(bool),
+    LightLevel(f64),
+    Temperature(f64),
+    HeartRate(i32),
+}
+
+/// 3D point for sensor data
+expose data Point3D {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+/// GPS location data
+expose data GPSData {
+    latitude: f64,
+    longitude: f64,
+    altitude: f64,
+    accuracy: f64,
+    speed: f64,
+    heading: f64,
+    timestamp: i64,
+}
+
+/// Sensor errors
+expose cases SensorError {
+    NotAvailable,
+    PermissionDenied,
+    HardwareFailure,
+    Timeout,
+}
+
+impl SensorManager {
+    fn new() -> SensorManager {
+        SensorManager {
+            active_sensors: HashMap::new(),
+        }
+    }
+
+    fn start_sensor(&var self, sensor_type: SensorType, callback: Box<dyn SensorCallback>) -> Result<(), SensorError> {
+        check self.active_sensors.contains_key(&sensor_type) {
+            Err(SensorError::HardwareFailure); // Already active
+        }
+
+        // Platform-specific sensor initialization
+        unsafe {
+            match sensor_type {
+                SensorType::Accelerometer => {
+                    sensor_start_accelerometer();
+                }
+                SensorType::GPS => {
+                    sensor_start_gps();
+                }
+                SensorType::Gyroscope => {
+                    sensor_start_gyroscope();
+                }
+                _ => yield Err(SensorError::NotAvailable),
+            }
+        }
+
+        self.active_sensors.insert(sensor_type, callback);
+        Ok(())
+    }
+
+    fn stop_sensor(&var self, sensor_type: SensorType) {
+        check self.active_sensors.remove(&sensor_type).is_some() {
+            unsafe {
+                match sensor_type {
+                    SensorType::Accelerometer => sensor_stop_accelerometer(),
+                    SensorType::GPS => sensor_stop_gps(),
+                    SensorType::Gyroscope => sensor_stop_gyroscope(),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn get_sensor_data(&self, sensor_type: SensorType) -> Option<SensorData> {
+        unsafe {
+            match sensor_type {
+                SensorType::Accelerometer => {
+                    let data = sensor_get_accelerometer();
+                    Some(SensorData::Acceleration(Point3D {
+                        x: data.x,
+                        y: data.y,
+                        z: data.z,
+                    }))
+                }
+                SensorType::GPS => {
+                    let data = sensor_get_gps();
+                    Some(SensorData::Location(GPSData {
+                        latitude: data.latitude,
+                        longitude: data.longitude,
+                        altitude: data.altitude,
+                        accuracy: data.accuracy,
+                        speed: data.speed,
+                        heading: data.heading,
+                        timestamp: data.timestamp,
+                    }))
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+// ============================================================================
+// CAMERA API
+// ============================================================================
+
+/// Camera manager for device camera access
+expose data CameraManager {
+    is_recording: bool,
+    current_camera: CameraPosition,
+}
+
+expose cases CameraPosition {
+    Front,
+    Back,
+}
+
+/// Camera configuration
+expose data CameraConfig {
+    position: CameraPosition,
+    resolution: Resolution,
+    flash_mode: FlashMode,
+    focus_mode: FocusMode,
+}
+
+expose data Resolution {
+    width: i32,
+    height: i32,
+}
+
+expose cases FlashMode {
+    Off,
+    On,
+    Auto,
+}
+
+expose cases FocusMode {
+    Auto,
+    Manual,
+    Continuous,
+}
+
+/// Camera callback rules
+expose ability CameraCallback {
+    fn on_photo_captured(&var self, image_data: Vec<u8>, metadata: ImageMetadata);
+    fn on_video_recorded(&var self, video_path: String, duration: i64);
+    fn on_camera_error(&var self, error: CameraError);
+}
+
+expose data ImageMetadata {
+    timestamp: i64,
+    location: Option<GPSData>,
+    orientation: i32,
+    exposure: f64,
+    iso: i32,
+}
+
+expose cases CameraError {
+    NotAvailable,
+    PermissionDenied,
+    HardwareFailure,
+    InvalidConfiguration,
+}
+
+impl CameraManager {
+    fn new() -> CameraManager {
+        CameraManager {
+            is_recording: false,
+            current_camera: CameraPosition::Back,
+        }
+    }
+
+    fn configure_camera(&var self, config: CameraConfig) -> Result<(), CameraError> {
+        unsafe {
+            let result = camera_configure(
+                match config.position {
+                    CameraPosition::Front => 1,
+                    CameraPosition::Back => 0,
+                },
+                config.resolution.width,
+                config.resolution.height,
+                match config.flash_mode {
+                    FlashMode::Off => 0,
+                    FlashMode::On => 1,
+                    FlashMode::Auto => 2,
+                },
+                match config.focus_mode {
+                    FocusMode::Auto => 0,
+                    FocusMode::Manual => 1,
+                    FocusMode::Continuous => 2,
+                }
+            );
+
+            check result == 0 {
+                self.current_camera = config.position;
+                Ok(())
+            } else {
+                Err(CameraError::InvalidConfiguration)
+            }
+        }
+    }
+
+    fn capture_photo(&self, callback: Box<dyn CameraCallback>) {
+        unsafe {
+            camera_capture_photo(callback as *var dyn CameraCallback as *var ());
+        }
+    }
+
+    fn start_video_recording(&var self, output_path: String) -> Result<(), CameraError> {
+        check self.is_recording {
+            Err(CameraError::HardwareFailure);
+        }
+
+        unsafe {
+            let result = camera_start_recording(output_path.as_ptr(), output_path.len());
+            check result == 0 {
+                self.is_recording = true;
+                Ok(())
+            } else {
+                Err(CameraError::HardwareFailure)
+            }
+        }
+    }
+
+    fn stop_video_recording(&var self) -> Result<String, CameraError> {
+        check !self.is_recording {
+            Err(CameraError::HardwareFailure);
+        }
+
+        unsafe {
+            let path_ptr = camera_stop_recording();
+            check !path_ptr.is_null() {
+                self.is_recording = false;
+                let path = String::from_utf8_lossy(&std::ffi::CStr::from_ptr(path_ptr).to_bytes()).into();
+                Ok(path)
+            } else {
+                Err(CameraError::HardwareFailure)
+            }
+        }
+    }
+
+    fn get_available_resolutions(&self) -> Vec<Resolution> {
+        unsafe {
+            let count = camera_get_resolution_count();
+            var resolutions = Vec::new();
+
+            each i in 0..count {
+                let res = camera_get_resolution(i);
+                resolutions.push(Resolution {
+                    width: res.width,
+                    height: res.height,
+                });
+            }
+
+            resolutions
+        }
+    }
+}
+
+// ============================================================================
+// NOTIFICATION API
+// ============================================================================
+
+/// Notification manager for push notifications and alerts
+expose data NotificationManager {
+    pending_notifications: Vec<NotificationRequest>,
+}
+
+expose data NotificationRequest {
+    id: String,
+    title: String,
+    body: String,
+    sound: Option<String>,
+    badge: Option<i32>,
+    user_info: HashMap<String, String>,
+    delay_seconds: i64,
+}
+
+expose data NotificationResponse {
+    notification_id: String,
+    action: NotificationAction,
+    user_info: HashMap<String, String>,
+}
+
+expose cases NotificationAction {
+    Opened,
+    Dismissed,
+    Custom(String),
+}
+
+/// Notification callback rules
+expose ability NotificationCallback {
+    fn on_notification_received(&var self, response: NotificationResponse);
+}
+
+impl NotificationManager {
+    fn new() -> NotificationManager {
+        NotificationManager {
+            pending_notifications: Vec::new(),
+        }
+    }
+
+    fn request_permission(&self) -> Result<bool, NotificationError> {
+        unsafe {
+            let result = notification_request_permission();
+            match result {
+                0 => Ok(false), // Denied
+                1 => Ok(true),  // Granted
+                _ => Err(NotificationError::SystemError),
+            }
+        }
+    }
+
+    fn schedule_notification(&var self, request: NotificationRequest) -> Result<(), NotificationError> {
+        self.pending_notifications.push(request.clone());
+
+        unsafe {
+            let result = notification_schedule(
+                request.id.as_ptr(),
+                request.id.len(),
+                request.title.as_ptr(),
+                request.title.len(),
+                request.body.as_ptr(),
+                request.body.len(),
+                request.sound.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null()),
+                request.sound.as_ref().map(|s| s.len()).unwrap_or(0),
+                request.badge.unwrap_or(0),
+                request.delay_seconds
+            );
+
+            match result {
+                0 => Ok(()),
+                _ => Err(NotificationError::SchedulingFailed),
+            }
+        }
+    }
+
+    fn cancel_notification(&var self, notification_id: String) -> Result<(), NotificationError> {
+        self.pending_notifications.retain(|n| n.id != notification_id);
+
+        unsafe {
+            let result = notification_cancel(notification_id.as_ptr(), notification_id.len());
+            match result {
+                0 => Ok(()),
+                _ => Err(NotificationError::NotFound),
+            }
+        }
+    }
+
+    fn set_badge_count(&self, count: i32) {
+        unsafe {
+            notification_set_badge(count);
+        }
+    }
+
+    fn register_callback(&self, callback: Box<dyn NotificationCallback>) {
+        unsafe {
+            notification_register_callback(callback as *var dyn NotificationCallback as *var ());
+        }
+    }
+}
+
+expose cases NotificationError {
+    PermissionDenied,
+    SchedulingFailed,
+    NotFound,
+    SystemError,
+}
+
+// ============================================================================
+// STORAGE API
+// ============================================================================
+
+/// Storage manager for file system access
+expose data StorageManager {
+    documents_path: String,
+    cache_path: String,
+    temp_path: String,
+}
+
+expose data FileInfo {
+    name: String,
+    path: String,
+    size: i64,
+    modified_time: i64,
+    is_directory: bool,
+}
+
+impl StorageManager {
+    fn new() -> StorageManager {
+        unsafe {
+            let docs_ptr = storage_get_documents_path();
+            let cache_ptr = storage_get_cache_path();
+            let temp_ptr = storage_get_temp_path();
+
+            StorageManager {
+                documents_path: std::ffi::CStr::from_ptr(docs_ptr).to_string_lossy().into(),
+                cache_path: std::ffi::CStr::from_ptr(cache_ptr).to_string_lossy().into(),
+                temp_path: std::ffi::CStr::from_ptr(temp_ptr).to_string_lossy().into(),
+            }
+        }
+    }
+
+    fn read_file(&self, path: String) -> Result<Vec<u8>, StorageError> {
+        unsafe {
+            var buffer = Vec::new();
+            let result = storage_read_file(path.as_ptr(), path.len(), &var buffer);
+            match result {
+                0 => Ok(buffer),
+                _ => Err(StorageError::FileNotFound),
+            }
+        }
+    }
+
+    fn write_file(&self, path: String, data: Vec<u8>) -> Result<(), StorageError> {
+        unsafe {
+            let result = storage_write_file(path.as_ptr(), path.len(), data.as_ptr(), data.len());
+            match result {
+                0 => Ok(()),
+                _ => Err(StorageError::WriteFailed),
+            }
+        }
+    }
+
+    fn list_directory(&self, path: String) -> Result<Vec<FileInfo>, StorageError> {
+        unsafe {
+            var files = Vec::new();
+            let result = storage_list_directory(path.as_ptr(), path.len(), &var files);
+            match result {
+                0 => Ok(files),
+                _ => Err(StorageError::DirectoryNotFound),
+            }
+        }
+    }
+
+    fn create_directory(&self, path: String) -> Result<(), StorageError> {
+        unsafe {
+            let result = storage_create_directory(path.as_ptr(), path.len());
+            match result {
+                0 => Ok(()),
+                _ => Err(StorageError::CreateFailed),
+            }
+        }
+    }
+
+    fn delete_file(&self, path: String) -> Result<(), StorageError> {
+        unsafe {
+            let result = storage_delete_file(path.as_ptr(), path.len());
+            match result {
+                0 => Ok(()),
+                _ => Err(StorageError::DeleteFailed),
+            }
+        }
+    }
+
+    fn file_exists(&self, path: String) -> bool {
+        unsafe {
+            storage_file_exists(path.as_ptr(), path.len()) != 0
+        }
+    }
+
+    fn get_file_info(&self, path: String) -> Result<FileInfo, StorageError> {
+        unsafe {
+            let info = storage_get_file_info(path.as_ptr(), path.len());
+            check info.is_valid {
+                Ok(FileInfo {
+                    name: std::ffi::CStr::from_ptr(info.name).to_string_lossy().into(),
+                    path,
+                    size: info.size,
+                    modified_time: info.modified_time,
+                    is_directory: info.is_directory,
+                })
+            } else {
+                Err(StorageError::FileNotFound)
+            }
+        }
+    }
+}
+
+expose cases StorageError {
+    FileNotFound,
+    DirectoryNotFound,
+    PermissionDenied,
+    WriteFailed,
+    ReadFailed,
+    CreateFailed,
+    DeleteFailed,
+}
+
+// ============================================================================
+// NETWORK API
+// ============================================================================
+
+/// Network manager for connectivity and HTTP requests
+expose data NetworkManager {
+    is_online: bool,
+    connection_type: ConnectionType,
+}
+
+expose cases ConnectionType {
+    None,
+    WiFi,
+    Cellular,
+    Ethernet,
+    Unknown,
+}
+
+expose data HTTPRequest {
+    method: HTTPMethod,
+    url: String,
+    headers: HashMap<String, String>,
+    body: Option<Vec<u8>>,
+    timeout_seconds: i32,
+}
+
+expose cases HTTPMethod {
+    GET,
+    POST,
+    PUT,
+    DELETE,
+    PATCH,
+}
+
+expose data HTTPResponse {
+    status_code: i32,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+    error: Option<String>,
+}
+
+/// HTTP callback rules
+expose ability HTTPCallback {
+    fn on_response(&var self, response: HTTPResponse);
+    fn on_error(&var self, error: NetworkError);
+}
+
+expose cases NetworkError {
+    NoConnection,
+    Timeout,
+    InvalidURL,
+    ServerError,
+    Unknown,
+}
+
+impl NetworkManager {
+    fn new() -> NetworkManager {
+        unsafe {
+            let online = network_is_online();
+            let conn_type = match network_get_connection_type() {
+                0 => ConnectionType::None,
+                1 => ConnectionType::WiFi,
+                2 => ConnectionType::Cellular,
+                3 => ConnectionType::Ethernet,
+                _ => ConnectionType::Unknown,
+            };
+
+            NetworkManager {
+                is_online: online != 0,
+                connection_type: conn_type,
+            }
+        }
+    }
+
+    fn make_request(&self, request: HTTPRequest, callback: Box<dyn HTTPCallback>) -> Result<(), NetworkError> {
+        check !self.is_online {
+            Err(NetworkError::NoConnection);
+        }
+
+        unsafe {
+            let method_code = match request.method {
+                HTTPMethod::GET => 0,
+                HTTPMethod::POST => 1,
+                HTTPMethod::PUT => 2,
+                HTTPMethod::DELETE => 3,
+                HTTPMethod::PATCH => 4,
+            };
+
+            let result = network_make_request(
+                method_code,
+                request.url.as_ptr(),
+                request.url.len(),
+                request.timeout_seconds,
+                callback as *var dyn HTTPCallback as *var (),
+            );
+
+            match result {
+                0 => Ok(()),
+                _ => Err(NetworkError::InvalidURL),
+            }
+        }
+    }
+
+    fn download_file(&self, url: String, local_path: String, callback: Box<dyn HTTPCallback>) -> Result<(), NetworkError> {
+        unsafe {
+            let result = network_download_file(
+                url.as_ptr(),
+                url.len(),
+                local_path.as_ptr(),
+                local_path.len(),
+                callback as *var dyn HTTPCallback as *var (),
+            );
+
+            match result {
+                0 => Ok(()),
+                _ => Err(NetworkError::InvalidURL),
+            }
+        }
+    }
+
+    fn get_connection_info(&self) -> (bool, ConnectionType) {
+        yield (self.is_online, self.connection_type)
+    }
+}
+
+// ============================================================================
+// FFI DECLARATIONS
+// ============================================================================
+
+// Sensor FFI
+extern "C" {
+    fn sensor_start_accelerometer() -> i32;
+    fn sensor_stop_accelerometer();
+    fn sensor_get_accelerometer() -> Point3D;
+    fn sensor_start_gps() -> i32;
+    fn sensor_stop_gps();
+    fn sensor_get_gps() -> GPSData;
+    fn sensor_start_gyroscope() -> i32;
+    fn sensor_stop_gyroscope();
+    fn sensor_get_gyroscope() -> Point3D;
+}
+
+// Camera FFI
+extern "C" {
+    fn camera_configure(position: i32, width: i32, height: i32, flash: i32, focus: i32) -> i32;
+    fn camera_capture_photo(callback: *var ()) -> i32;
+    fn camera_start_recording(path: *const u8, len: usize) -> i32;
+    fn camera_stop_recording() -> *var i8;
+    fn camera_get_resolution_count() -> i32;
+    fn camera_get_resolution(index: i32) -> Resolution;
+}
+
+// Notification FFI
+extern "C" {
+    fn notification_request_permission() -> i32;
+    fn notification_schedule(id: *const u8, id_len: usize, title: *const u8, title_len: usize, body: *const u8, body_len: usize, sound: *const u8, sound_len: usize, badge: i32, delay: i64) -> i32;
+    fn notification_cancel(id: *const u8, id_len: usize) -> i32;
+    fn notification_set_badge(count: i32);
+    fn notification_register_callback(callback: *var ());
+}
+
+// Storage FFI
+extern "C" {
+    fn storage_get_documents_path() -> *var i8;
+    fn storage_get_cache_path() -> *var i8;
+    fn storage_get_temp_path() -> *var i8;
+    fn storage_read_file(path: *const u8, len: usize, buffer: *var Vec<u8>) -> i32;
+    fn storage_write_file(path: *const u8, path_len: usize, data: *const u8, data_len: usize) -> i32;
+    fn storage_list_directory(path: *const u8, len: usize, files: *var Vec<FileInfo>) -> i32;
+    fn storage_create_directory(path: *const u8, len: usize) -> i32;
+    fn storage_delete_file(path: *const u8, len: usize) -> i32;
+    fn storage_file_exists(path: *const u8, len: usize) -> i32;
+    fn storage_get_file_info(path: *const u8, len: usize) -> FileInfoRaw;
+}
+
+// Network FFI
+extern "C" {
+    fn network_is_online() -> i32;
+    fn network_get_connection_type() -> i32;
+    fn network_make_request(method: i32, url: *const u8, url_len: usize, timeout: i32, callback: *var ()) -> i32;
+    fn network_download_file(url: *const u8, url_len: usize, path: *const u8, path_len: usize, callback: *var ()) -> i32;
+}
+
+// Raw structs for FFI
+expose data FileInfoRaw {
+    name: *var i8,
+    size: i64,
+    modified_time: i64,
+    is_directory: bool,
+    is_valid: bool,
+}
+
+// ============================================================================
+// HIGH-LEVEL DEVICE API
+// ============================================================================
+
+/// Unified device API for mobile applications
+expose data DeviceAPI {
+    sensors: SensorManager,
+    camera: CameraManager,
+    notifications: NotificationManager,
+    storage: StorageManager,
+    network: NetworkManager,
+}
+
+impl DeviceAPI {
+    fn new() -> DeviceAPI {
+        DeviceAPI {
+            sensors: SensorManager::new(),
+            camera: CameraManager::new(),
+            notifications: NotificationManager::new(),
+            storage: StorageManager::new(),
+            network: NetworkManager::new(),
+        }
+    }
+
+    /// Request all necessary permissions
+    fn request_permissions(&self) -> HashMap<String, bool> {
+        var results = HashMap::new();
+
+        // Camera permission
+        results.insert("camera".into(), self.camera.configure_camera(CameraConfig {
+            position: CameraPosition::Back,
+            resolution: Resolution { width: 1920, height: 1080 },
+            flash_mode: FlashMode::Auto,
+            focus_mode: FocusMode::Auto,
+        }).is_ok());
+
+        // Notification permission
+        results.insert("notifications".into(), self.notifications.request_permission().unwrap_or(false));
+
+        // Location permission (would need separate GPS sensor permission)
+        results.insert("location".into(), true); // Assume granted for now
+
+        results
+    }
+
+    /// Get device capabilities
+    fn get_capabilities(&self) -> DeviceCapabilities {
+        DeviceCapabilities {
+            has_camera: unsafe { camera_configure(0, 1920, 1080, 0, 0) == 0 },
+            has_gps: unsafe { sensor_start_gps() == 0 },
+            has_accelerometer: unsafe { sensor_start_accelerometer() == 0 },
+            available_resolutions: self.camera.get_available_resolutions(),
+            connection_type: self.network.connection_type,
+            storage_available: self.storage.documents_path.len() > 0,
+        }
+    }
+}
+
+expose data DeviceCapabilities {
+    has_camera: bool,
+    has_gps: bool,
+    has_accelerometer: bool,
+    available_resolutions: Vec<Resolution>,
+    connection_type: ConnectionType,
+    storage_available: bool,
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+fn init_device_api() -> DeviceAPI {
+    println("🔌 Initializing Device APIs...");
+    let api = DeviceAPI::new();
+    println("   ✅ Device APIs Ready");
+    api
+}

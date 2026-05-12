@@ -1,0 +1,179 @@
+// Nova Gradient Boosting Implementation
+// Based on Friedmans Gradient Boosting Machine
+// Compatible with sklearn GradientBoostingClassifier API
+
+// module nova.ml.ensemble.gradient_boosting;
+
+use nova.array.{Array, Matrix};
+use nova.math.{exp, log, sigmoid};
+use nova.ml.base.{BaseEstimator, ClassifierMixin};
+use nova.ml.tree.DecisionTreeRegressor;
+use nova.concurrent.parallel_for;
+
+/// Gradient Boosting Classifier
+open data GradientBoostingClassifier {
+    // Hyperparameters
+    n_estimators: int,
+    learning_rate: f64,
+    max_depth: int,
+    min_samples_split: int,
+    min_samples_leaf: int,
+    subsample: f64,
+    max_features: ?string,
+    
+    // Internal state
+    estimators: [][]DecisionTreeRegressor,
+    classes_: []int,
+    n_classes_: int,
+    init_estimator: ?BaseEstimator,
+    
+    // Loss function properties
+    loss: string,
+}
+
+impl GradientBoostingClassifier {
+    /// Create a new GradientBoostingClassifier
+    fn new() -> GradientBoostingClassifierBuilder {
+        GradientBoostingClassifierBuilder::default()
+    }
+
+    /// Fit the model
+    fn fit(&var self, X: &Matrix<f64>, y: &Array<int>) -> Result<(), Error> {
+        self.classes_ = y.unique().sort();
+        self.n_classes_ = self.classes_.len();
+        let n_samples = X.n_rows();
+        
+        // Multi-class uses One-vs-Rest ish approach in GBDT
+        // We train n_classes_ trees at each iteration
+        self.estimators = Vec::with_capacity(self.n_estimators);
+        
+        // Initialize predictions (p0)
+        var predictions = Matrix::zeros((n_samples, self.n_classes_));
+        
+        // Target encoding
+        let y_onehot = self.one_hot_encode(y);
+        
+        each i in 0..self.n_estimators {
+            var iteration_trees = Vec::with_capacity(self.n_classes_);
+            
+            each k in 0..self.n_classes_ {
+                // Compute negative gradient (residuals)
+                // For log-loss: residual = y - p
+                let probas = self.softmax(&predictions);
+                let residuals = y_onehot.col(k) - probas.col(k);
+                
+                // Fit a regressor to the residuals
+                var tree = DecisionTreeRegressor::new()
+                    .max_depth(self.max_depth)
+                    .min_samples_split(self.min_samples_split)
+                    .build();
+                
+                tree.fit(X, &residuals)?;
+                
+                // Update predictions
+                let tree_preds = tree.predict(X)?;
+                each j in 0..n_samples {
+                    predictions[j, k] += self.learning_rate * tree_preds[j];
+                }
+                
+                iteration_trees.push(tree);
+            }
+            
+            self.estimators.push(iteration_trees);
+        }
+        
+        Ok(())
+    }
+
+    /// Predict class labels
+    fn predict(&self, X: &Matrix<f64>) -> Array<int> {
+        let probas = self.predict_proba(X);
+        probas.argmax(axis=1).map(|idx| self.classes_[idx])
+    }
+
+    /// Predict class probabilities
+    fn predict_proba(&self, X: &Matrix<f64>) -> Matrix<f64> {
+        let n_samples = X.n_rows();
+        var scores = Matrix::zeros((n_samples, self.n_classes_));
+        
+        each iteration in &self.estimators {
+            each (k, tree) in iteration.iter().enumerate() {
+                let tree_preds = tree.predict(X).unwrap_or(Array::zeros(n_samples));
+                each i in 0..n_samples {
+                    scores[i, k] += self.learning_rate * tree_preds[i];
+                }
+            }
+        }
+        
+        self.softmax(&scores)
+    }
+
+    fn softmax(&self, x: &Matrix<f64>) -> Matrix<f64> {
+        let exp_x = x.map(|v| exp(v));
+        let sum_exp = exp_x.sum(axis=1);
+        exp_x / sum_exp.broadcast()
+    }
+
+    fn one_hot_encode(&self, y: &Array<int>) -> Matrix<f64> {
+        let n_samples = y.len();
+        var encoded = Matrix::zeros((n_samples, self.n_classes_));
+        each (i, &label) in y.iter().enumerate() {
+            let class_idx = self.classes_.iter().position(|&c| c == label).unwrap();
+            encoded[i, class_idx] = 1.0;
+        }
+        encoded
+    }
+}
+
+/// Builder for GradientBoostingClassifier
+open data GradientBoostingClassifierBuilder {
+    n_estimators: int,
+    learning_rate: f64,
+    max_depth: int,
+    min_samples_split: int,
+    min_samples_leaf: int,
+}
+
+impl GradientBoostingClassifierBuilder {
+    fn default() -> Self {
+        Self {
+            n_estimators: 100,
+            learning_rate: 0.1,
+            max_depth: 3,
+            min_samples_split: 2,
+            min_samples_leaf: 1,
+        }
+    }
+
+    fn n_estimators(var self, val: int) -> Self {
+        self.n_estimators = val;
+        self
+    }
+
+    fn learning_rate(var self, val: f64) -> Self {
+        self.learning_rate = val;
+        self
+    }
+
+    fn max_depth(var self, val: int) -> Self {
+        self.max_depth = val;
+        self
+    }
+
+    fn build(self) -> GradientBoostingClassifier {
+        GradientBoostingClassifier {
+            n_estimators: self.n_estimators,
+            learning_rate: self.learning_rate,
+            max_depth: self.max_depth,
+            min_samples_split: self.min_samples_split,
+            min_samples_leaf: self.min_samples_leaf,
+            subsample: 1.0,
+            max_features: None,
+            estimators: [],
+            classes_: [],
+            n_classes_: 0,
+            init_estimator: None,
+            loss: "deviance".into(),
+        }
+    }
+}

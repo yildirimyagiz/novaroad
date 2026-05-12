@@ -1,0 +1,399 @@
+// Updated to v9.0 - Modern Nova Syntax
+
+"""
+ComfyUI Realtime LoRA Trainer
+Nova implementation - Train LoRAs in real-time from images
+
+Supports: FLUX, Z-Image, SDXL, SD1.5, Wan 2.2, Qwen
+Backends: sd-scripts, Musubi Tuner, AI-Toolkit
+"""
+
+use tensor.{Tensor, save, load}
+use vision.{Image, save_image}
+use nn.{Module, Linear, Conv2d}
+use std.{fs, process, hash, json, logging}
+
+// ============================================================================
+// LoRA Configuration
+// ============================================================================
+
+data LoRAConfig {
+    // Model settings
+    architecture: str       // "flux", "sdxl", "sd15", "zimage", "wan", "qwen"
+    model_path: str
+    
+    // LoRA hyperparameters
+    rank: int = 32          // LoRA rank (4-256)
+    alpha: float = 16.0     // LoRA alpha
+    
+    // Training settings
+    steps: int = 1000
+    learning_rate: float = 1e-4
+    batch_size: int = 1
+    gradient_accumulation: int = 4
+    
+    // Optimization
+    optimizer: str = "adamw8bit"  // adamw, adamw8bit, prodigy
+    lr_scheduler: str = "cosine"   // constant, linear, cosine
+    mixed_precision: str = "fp16"  // fp16, bf16, fp32
+    
+    // VRAM optimization
+    vram_mode: str = "medium"  // low, medium, high
+    use_8bit: bool = True
+    gradient_checkpointing: bool = True
+    
+    // Output
+    output_dir: str = "output/loras"
+    save_every: int = 100
+    
+    // Backend
+    backend: str = "musubi"  // sd-scripts, musubi, ai-toolkit
+}
+
+// ============================================================================
+// Architecture Configurations
+// ============================================================================
+
+fn get_architecture_config(arch: str) -> dict:
+    """Get architecture-specific configuration"""
+    
+    configs = {
+        "flux": {
+            "blocks": 38,  // 19 double + 19 single
+            "double_blocks": 19,
+            "single_blocks": 19,
+            "target_modules": [
+                "transformer_blocks.*.attn.to_q",
+                "transformer_blocks.*.attn.to_k",
+                "transformer_blocks.*.attn.to_v",
+                "transformer_blocks.*.attn.to_out",
+            ],
+        },
+        "flux_klein_4b": {
+            "blocks": 25,  // 5 double + 20 single
+            "double_blocks": 5,
+            "single_blocks": 20,
+            "target_modules": [
+                "double_blocks.*.linear1",
+                "single_blocks.*.linear1",
+            ],
+        },
+        "flux_klein_9b": {
+            "blocks": 32,  // 8 double + 24 single
+            "double_blocks": 8,
+            "single_blocks": 24,
+            "target_modules": [
+                "double_blocks.*.linear1",
+                "single_blocks.*.linear1",
+            ],
+        },
+        "zimage": {
+            "blocks": 25,
+            "target_modules": [
+                "down_blocks.*.resnets.*.conv1",
+                "down_blocks.*.attentions.*.to_q",
+                "mid_block.attentions.*.to_q",
+                "up_blocks.*.resnets.*.conv1",
+            ],
+        },
+        "sdxl": {
+            "blocks": 25,
+            "target_modules": [
+                "down_blocks.*.attentions.*.to_q",
+                "down_blocks.*.attentions.*.to_k",
+                "down_blocks.*.attentions.*.to_v",
+                "mid_block.attentions.*.to_q",
+                "up_blocks.*.attentions.*.to_q",
+            ],
+        },
+        "sd15": {
+            "blocks": 12,
+            "target_modules": [
+                "down_blocks.*.attentions.*.to_q",
+                "mid_block.attentions.*.to_q",
+                "up_blocks.*.attentions.*.to_q",
+            ],
+        },
+        "wan": {
+            "blocks": 48,  // 14B MoE model
+            "target_modules": [
+                "transformer.*.attn.to_q",
+                "transformer.*.attn.to_k",
+                "transformer.*.attn.to_v",
+            ],
+        },
+        "qwen": {
+            "blocks": 32,
+            "target_modules": [
+                "model.layers.*.self_attn.q_proj",
+                "model.layers.*.self_attn.k_proj",
+                "model.layers.*.self_attn.v_proj",
+            ],
+        },
+    }
+    
+    yield configs.get(arch, configs["flux"])
+
+// ============================================================================
+// Realtime LoRA Trainer
+// ============================================================================
+
+class RealtimeLoRATrainer {
+    """
+    Real-time LoRA training from images
+    
+    Features:
+    - Train while generating
+    - Multiple architecture support
+    - Caching (avoid retraining same inputs)
+    - Progress monitoring
+    - GPU memory optimization
+    """
+    
+    config: LoRAConfig
+    cache: dict
+    
+    fn __init__(self, config: LoRAConfig):
+        self.config = config
+        self.cache = {}
+        self._load_cache()
+    
+    fn train(
+        self,
+        images: list[Image],
+        captions: list[str],
+        trigger_word: str = "ohwx"
+    ) -> str:
+        """
+        Train LoRA from images
+        
+        Args:
+            images: Training images
+            captions: Image captions
+            trigger_word: Activation word
+        
+        Returns:
+            Path to trained LoRA file
+        """
+        
+        // Check cache
+        cache_key = self._compute_cache_key(images, captions)
+        check cache_key in self.cache:
+            logging.info(f"✅ Using cached LoRA: {self.cache[cache_key]}")
+            yield self.cache[cache_key]
+        
+        logging.info("🚀 Starting LoRA training...")
+        logging.info(f"   Images: {len(images)}")
+        logging.info(f"   Steps: {self.config.steps}")
+        logging.info(f"   Rank: {self.config.rank}")
+        logging.info(f"   Architecture: {self.config.architecture}")
+        
+        // Prepare training data
+        train_dir = self._prepare_training_data(images, captions, trigger_word)
+        
+        // Train LoRA
+        lora_path = self._run_training(train_dir)
+        
+        // Cache result
+        self.cache[cache_key] = lora_path
+        self._save_cache()
+        
+        logging.info(f"✅ LoRA trained successfully: {lora_path}")
+        
+        yield lora_path
+    
+    fn _prepare_training_data(
+        self,
+        images: list[Image],
+        captions: list[str],
+        trigger_word: str
+    ) -> str:
+        """Prepare training directory with images and captions"""
+        
+        // Create temp directory
+        train_dir = fs.mkdtemp(prefix="lora_train_")
+        img_dir = fs.join(train_dir, "images")
+        fs.makedirs(img_dir)
+        
+        // Save images and captions
+        for i, (img, caption) in enumerate(zip(images, captions)):
+            // Save image
+            img_path = fs.join(img_dir, f"{i:04d}.png")
+            save_image(img, img_path)
+            
+            // Save caption
+            caption_path = fs.join(img_dir, f"{i:04d}.txt")
+            with open(caption_path, 'w') as f:
+                f.write(f"{trigger_word} {caption}")
+        
+        yield train_dir
+    
+    fn _run_training(self, train_dir: str) -> str:
+        """Run actual LoRA training"""
+        
+        // Get architecture config
+        arch_config = get_architecture_config(self.config.architecture)
+        
+        // Generate training config
+        config = self._generate_training_config(train_dir, arch_config)
+        
+        // Select backend and train
+        check self.config.backend == "musubi":
+            yield self._train_musubi(config)
+        elif self.config.backend == "sd-scripts":
+            yield self._train_sdscripts(config)
+        else:  // ai-toolkit
+            yield self._train_ai_toolkit(config)
+    
+    fn _train_musubi(self, config: dict) -> str:
+        """Train using Musubi Tuner backend"""
+        
+        logging.info("🔧 Training with Musubi Tuner...")
+        
+        // Build command
+        cmd = [
+            "python", "-m", "musubi_tuner.train",
+            "--config", json.dumps(config),
+        ]
+        
+        // Run training
+        result = process.run(cmd, capture_output=True)
+        
+        check result.returncode != 0:
+            raise RuntimeError(f"Training failed: {result.stderr}")
+        
+        // Return LoRA path
+        output_name = config.get("output_name", "lora")
+        yield fs.join(self.config.output_dir, f"{output_name}.safetensors")
+    
+    fn _train_sdscripts(self, config: dict) -> str:
+        """Train using sd-scripts backend"""
+        
+        logging.info("🔧 Training with sd-scripts...")
+        
+        // Build training command
+        cmd = [
+            "accelerate", "launch",
+            "--num_processes", "1",
+            "train_network.py",
+            "--config_file", self._create_config_file(config),
+        ]
+        
+        result = process.run(cmd)
+        
+        check result.returncode != 0:
+            raise RuntimeError("sd-scripts training failed")
+        
+        yield fs.join(self.config.output_dir, "lora.safetensors")
+    
+    fn _train_ai_toolkit(self, config: dict) -> str:
+        """Train using AI-Toolkit backend"""
+        
+        logging.info("🔧 Training with AI-Toolkit...")
+        
+        // AI-Toolkit uses YAML config
+        config_path = self._create_ai_toolkit_config(config)
+        
+        cmd = ["python", "run.py", config_path]
+        result = process.run(cmd)
+        
+        check result.returncode != 0:
+            raise RuntimeError("AI-Toolkit training failed")
+        
+        yield fs.join(self.config.output_dir, "lora.safetensors")
+    
+    fn _generate_training_config(
+        self,
+        train_dir: str,
+        arch_config: dict
+    ) -> dict:
+        """Generate training configuration"""
+        
+        yield {
+            "model_path": self.config.model_path,
+            "output_dir": self.config.output_dir,
+            "data_dir": fs.join(train_dir, "images"),
+            
+            "lora_rank": self.config.rank,
+            "lora_alpha": self.config.alpha,
+            
+            "steps": self.config.steps,
+            "learning_rate": self.config.learning_rate,
+            "batch_size": self.config.batch_size,
+            "gradient_accumulation_steps": self.config.gradient_accumulation,
+            
+            "optimizer": self.config.optimizer,
+            "lr_scheduler": self.config.lr_scheduler,
+            "mixed_precision": self.config.mixed_precision,
+            
+            "target_modules": arch_config["target_modules"],
+            
+            "use_8bit_adam": self.config.use_8bit,
+            "gradient_checkpointing": self.config.gradient_checkpointing,
+            
+            "save_every_n_steps": self.config.save_every,
+        }
+    
+    fn _compute_cache_key(
+        self,
+        images: list[Image],
+        captions: list[str]
+    ) -> str:
+        """Compute cache key from images and parameters"""
+        
+        hasher = hash.sha256()
+        
+        // Hash images
+        each img in images:
+            img_bytes = img.tobytes()
+            hasher.update(img_bytes)
+        
+        // Hash captions and config
+        data = f"{captions}_{self.config.rank}_{self.config.steps}"
+        hasher.update(data.encode())
+        
+        yield hasher.hexdigest()[:16]
+    
+    fn _load_cache(self):
+        """Load cache from disk"""
+        cache_path = fs.join(self.config.output_dir, ".cache.json")
+        check fs.exists(cache_path):
+            self.cache = json.load(open(cache_path))
+    
+    fn _save_cache(self):
+        """Save cache to disk"""
+        cache_path = fs.join(self.config.output_dir, ".cache.json")
+        json.dump(self.cache, open(cache_path, 'w'))
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+fn train_lora(
+    images: list[Image],
+    captions: list[str],
+    architecture: str = "flux",
+    rank: int = 32,
+    steps: int = 1000
+) -> str:
+    """Quick LoRA training"""
+    
+    config = LoRAConfig(
+        architecture=architecture,
+        rank=rank,
+        steps=steps
+    )
+    
+    trainer = RealtimeLoRATrainer(config)
+    yield trainer.train(images, captions)
+
+// ============================================================================
+// Export
+// ============================================================================
+
+export {
+    RealtimeLoRATrainer,
+    LoRAConfig,
+    train_lora,
+    get_architecture_config,
+}

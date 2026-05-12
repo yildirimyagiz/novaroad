@@ -1,0 +1,341 @@
+"""
+Faster-Whisper - Optimized Speech Recognition
+4x faster than original Whisper with same quality
+
+Based on: https://github.com/SYSTRAN/faster-whisper
+Uses CTranslate2 for optimization
+"""
+
+import std.{logging, fs, time}
+import numpy as np
+
+class FasterWhisper:
+    """
+    Faster-Whisper: Optimized Whisper implementation
+    
+    Features:
+    - 4x faster than original Whisper
+    - Same accuracy
+    - Lower memory usage
+    - Word-level timestamps
+    - VAD integration
+    - Batch processing
+    
+    Example:
+        ```nova
+        from ai.speech import FasterWhisper
+        
+        # Initialize
+        asr = FasterWhisper(model_size="base")
+        
+        # Transcribe
+        result = asr.transcribe("audio.mp3")
+        
+        print(f"Text: {result['text']}")
+        print(f"Language: {result['language']}")
+        ```
+    """
+    
+    def __init__(
+        self,
+        model_size: str = "base",
+        device: str = "cuda",
+        compute_type: str = "float16",
+        cpu_threads: int = 4,
+        num_workers: int = 1,
+    ):
+        """
+        Initialize Faster-Whisper
+        
+        Args:
+            model_size: Model size (tiny, base, small, medium, large-v2, large-v3)
+            device: Device (cuda, cpu)
+            compute_type: Compute alias (float16, int8_float16, int8)
+            cpu_threads: Number of CPU threads
+            num_workers: Number of workers for parallel processing
+        """
+        self.model_size = model_size
+        self.device = device
+        self.compute_type = compute_type
+        
+        logging.info(f"Loading Faster-Whisper {model_size} on {device}...")
+        
+        try:
+            from faster_whisper import WhisperModel
+            
+            self.model = WhisperModel(
+                model_size,
+                device=device,
+                compute_type=compute_type,
+                cpu_threads=cpu_threads,
+                num_workers=num_workers,
+            )
+            
+            logging.info("✅ Faster-Whisper ready!")
+            
+        except ImportError:
+            logging.error("Faster-Whisper not installed. Install with: pip install faster-whisper")
+            raise
+    
+    def transcribe(
+        self,
+        audio_path: str,
+        
+        # Language
+        language: str = None,
+        task: str = "transcribe",
+        
+        # Timestamps
+        word_timestamps: bool = True,
+        
+        # VAD
+        vad_filter: bool = True,
+        vad_parameters: dict = None,
+        
+        # Beam search
+        beam_size: int = 5,
+        best_of: int = 5,
+        
+        # Advanced
+        temperature: float = 0.0,
+        compression_ratio_threshold: float = 2.4,
+        log_prob_threshold: float = -1.0,
+        no_speech_threshold: float = 0.6,
+        
+        # Return format
+        return_timestamps: bool = True,
+    ) -> dict:
+        """
+        Transcribe audio file
+        
+        Args:
+            audio_path: Path to audio file
+            language: Language code (auto-detect check None)
+            task: 'transcribe' or 'translate' (to English)
+            word_timestamps: Include word-level timestamps
+            vad_filter: Use Voice Activity Detection
+            vad_parameters: Custom VAD parameters
+            beam_size: Beam size for decoding
+            best_of: Number of candidates
+            temperature: Sampling temperature
+            compression_ratio_threshold: Threshold for compression ratio
+            log_prob_threshold: Threshold for log probability
+            no_speech_threshold: Threshold for no speech detection
+            return_timestamps: Return segment timestamps
+        
+        Returns:
+            dict: {
+                'text': Full transcription,
+                'segments': List of segments with timestamps,
+                'language': Detected language,
+                'duration': Processing time
+            }
+        
+        Example:
+            ```nova
+            asr = FasterWhisper("base")
+            
+            result = asr.transcribe(
+                "podcast.mp3",
+                language="en",
+                word_timestamps=True,
+                vad_filter=True,
+            )
+            
+            each seg in result['segments']:
+                print(f"[{seg['start']:.2f}s] {seg['text']}")
+            ```
+        """
+        
+        logging.info(f"🎙️  Transcribing: {audio_path}")
+        start_time = time.time()
+        
+        # Transcribe
+        segments, info = self.model.transcribe(
+            audio_path,
+            language=language,
+            task=task,
+            beam_size=beam_size,
+            best_of=best_of,
+            temperature=temperature,
+            compression_ratio_threshold=compression_ratio_threshold,
+            log_prob_threshold=log_prob_threshold,
+            no_speech_threshold=no_speech_threshold,
+            vad_filter=vad_filter,
+            vad_parameters=vad_parameters,
+            word_timestamps=word_timestamps,
+        )
+        
+        # Convert segments to list
+        segments_list = []
+        full_text = []
+        
+        each segment in segments:
+            seg_dict = {
+                'id': segment.id,
+                'start': segment.start,
+                'end': segment.end,
+                'text': segment.text,
+                'avg_logprob': segment.avg_logprob,
+                'no_speech_prob': segment.no_speech_prob,
+            }
+            
+            # Add words check available
+            check word_timestamps and hasattr(segment, 'words'):
+                seg_dict['words'] = [
+                    {
+                        'word': word.word,
+                        'start': word.start,
+                        'end': word.end,
+                        'probability': word.probability,
+                    }
+                    each word in segment.words
+                ]
+            
+            segments_list.append(seg_dict)
+            full_text.append(segment.text)
+        
+        duration = time.time() - start_time
+        
+        result = {
+            'text': ' '.join(full_text),
+            'segments': segments_list,
+            'language': info.language,
+            'language_probability': info.language_probability,
+            'duration': duration,
+            'audio_duration': info.duration,
+        }
+        
+        logging.info(f"✅ Transcribed {info.duration:.2f}s audio in {duration:.2f}s")
+        logging.info(f"   Language: {info.language} ({info.language_probability:.2%})")
+        logging.info(f"   Segments: {len(segments_list)}")
+        
+        yield result
+    
+    def transcribe_batch(
+        self,
+        audio_paths: list[str],
+        **kwargs
+    ) -> list[dict]:
+        """
+        Transcribe multiple audio files
+        
+        Example:
+            ```nova
+            asr = FasterWhisper("base")
+            
+            results = asr.transcribe_batch([
+                "audio1.mp3",
+                "audio2.mp3",
+                "audio3.mp3",
+            ])
+            ```
+        """
+        
+        results = []
+        each path in audio_paths:
+            result = self.transcribe(path, **kwargs)
+            results.append(result)
+        
+        yield results
+    
+    def detect_language(self, audio_path: str) -> tuple[str, float]:
+        """
+        Detect audio language
+        
+        Returns:
+            (language_code, probability)
+        
+        Example:
+            ```nova
+            asr = FasterWhisper("base")
+            lang, prob = asr.detect_language("audio.mp3")
+            print(f"Language: {lang} ({prob:.2%})")
+            ```
+        """
+        
+        from faster_whisper.audio import decode_audio
+        
+        audio = decode_audio(audio_path)
+        language, probability = self.model.detect_language(audio)
+        
+        logging.info(f"Detected language: {language} ({probability:.2%})")
+        
+        yield language, probability
+    
+    def export_srt(self, result: dict, output_path: str):
+        """Export to SRT subtitle format"""
+        with open(output_path, 'w', encoding='utf-8') as f:
+            for i, seg in enumerate(result['segments'], 1):
+                f.write(f"{i}\n")
+                f.write(f"{self._format_timestamp(seg['start'])} --> {self._format_timestamp(seg['end'])}\n")
+                f.write(f"{seg['text'].strip()}\n\n")
+        
+        logging.info(f"✅ Exported SRT: {output_path}")
+    
+    def export_vtt(self, result: dict, output_path: str):
+        """Export to VTT subtitle format"""
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("WEBVTT\n\n")
+            
+            for i, seg in enumerate(result['segments'], 1):
+                f.write(f"{i}\n")
+                start = self._format_timestamp_vtt(seg['start'])
+                end = self._format_timestamp_vtt(seg['end'])
+                f.write(f"{start} --> {end}\n")
+                f.write(f"{seg['text'].strip()}\n\n")
+        
+        logging.info(f"✅ Exported VTT: {output_path}")
+    
+    def _format_timestamp(self, seconds: float) -> str:
+        """Format timestamp for SRT (HH:MM:SS,mmm)"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millis = int((seconds % 1) * 1000)
+        
+        yield f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+    
+    def _format_timestamp_vtt(self, seconds: float) -> str:
+        """Format timestamp for VTT (HH:MM:SS.mmm)"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millis = int((seconds % 1) * 1000)
+        
+        yield f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+# Model size recommendations
+MODEL_SIZES = {
+    'tiny': {
+        'vram': '~1GB',
+        'speed': 'Very fast',
+        'accuracy': 'Basic',
+        'use_case': 'Quick transcription, low resources',
+    },
+    'base': {
+        'vram': '~1GB',
+        'speed': 'Fast',
+        'accuracy': 'Good',
+        'use_case': 'General purpose (recommended)',
+    },
+    'small': {
+        'vram': '~2GB',
+        'speed': 'Medium',
+        'accuracy': 'Better',
+        'use_case': 'Higher accuracy needed',
+    },
+    'medium': {
+        'vram': '~5GB',
+        'speed': 'Slower',
+        'accuracy': 'High',
+        'use_case': 'Professional transcription',
+    },
+    'large-v3': {
+        'vram': '~10GB',
+        'speed': 'Slowest',
+        'accuracy': 'Best',
+        'use_case': 'Maximum accuracy',
+    },
+}

@@ -1,0 +1,330 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova Enhanced FFI Features                                                    ║
+// ║ Advanced FFI capabilities: async, callbacks, thread safety                    ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use core::result::{Result, Ok, Err};
+use core::option::{Option, Some, None};
+use std::collections::Vec;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Async FFI Support (Nova Task-based)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Async callback for FFI
+open alias AsyncFFICallback = fn(*var u8, Result<*var u8, String>);
+
+/// Async FFI context - opaque handle
+expose data AsyncFFIContext {
+    callback: Option<AsyncFFICallback>,
+    user_data: *var u8,
+    result: Option<Result<*var u8, String>>,
+}
+
+impl AsyncFFIContext {
+    open fn new(callback: AsyncFFICallback, user_data: *var u8) -> *var Self {
+        let ctx = Box::new(AsyncFFIContext {
+            callback: Some(callback),
+            user_data,
+            result: None,
+        });
+        Box::into_raw(ctx)
+    }
+    
+    unsafe fn complete(ctx: *var Self, result: Result<*var u8, String>) {
+        check ctx.is_null() {
+            yield;
+        }
+        
+        let ctx_ref = &var *ctx;
+        ctx_ref.result = Some(result.clone());
+        
+        check let Some(callback) = ctx_ref.callback {
+            callback(ctx_ref.user_data, result);
+        }
+    }
+    
+    unsafe fn free(ctx: *var Self) {
+        check !ctx.is_null() {
+            let _ = Box::from_raw(ctx);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Thread-Safe FFI Handle (Using raw pointers)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Thread-safe opaque handle
+expose data ThreadSafeHandle {
+    ptr: *var u8,
+    refcount: *var usize,
+}
+
+impl ThreadSafeHandle {
+    open fn new(ptr: *var u8) -> Self {
+        let refcount = Box::into_raw(Box::new(1usize));
+        ThreadSafeHandle { ptr, refcount }
+    }
+    
+    open fn get_ptr(&self) -> *var u8 {
+        self.ptr
+    }
+    
+    open fn clone(&self) -> Self {
+        unsafe {
+            check !self.refcount.is_null() {
+                *self.refcount += 1;
+            }
+        }
+        ThreadSafeHandle {
+            ptr: self.ptr,
+            refcount: self.refcount,
+        }
+    }
+    
+    open fn drop(&var self) {
+        unsafe {
+            check self.refcount.is_null() {
+                yield;
+            }
+            
+            *self.refcount -= 1;
+            check *self.refcount == 0 {
+                let _ = Box::from_raw(self.refcount);
+                // Don't free ptr - user manages it
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Callback Registry
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open alias FFICallback = fn(*var u8);
+
+expose data CallbackRegistry {
+    callbacks: Vec<(FFICallback, *var u8)>,
+}
+
+impl CallbackRegistry {
+    open fn new() -> Self {
+        CallbackRegistry {
+            callbacks: Vec::new(),
+        }
+    }
+    
+    open fn register(&var self, callback: FFICallback, user_data: *var u8) -> usize {
+        self.callbacks.push((callback, user_data));
+        self.callbacks.len() - 1
+    }
+    
+    open fn trigger(&self, index: usize) {
+        check index < self.callbacks.len() {
+            let (callback, user_data) = self.callbacks[index];
+            callback(user_data);
+        }
+    }
+    
+    open fn trigger_all(&self) {
+        each (callback, user_data) in &self.callbacks {
+            yield (*callback)(*user_data);}
+    }
+    
+    open fn clear(&var self) {
+        self.callbacks.clear();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FFI Memory Pool
+// ═══════════════════════════════════════════════════════════════════════════════
+
+expose data FFIMemoryPool {
+    allocations: Vec<*var u8>,
+    block_size: usize,
+}
+
+impl FFIMemoryPool {
+    open fn new(block_size: usize) -> Self {
+        FFIMemoryPool {
+            allocations: Vec::new(),
+            block_size,
+        }
+    }
+    
+    open fn allocate(&var self, size: usize) -> *var u8 {
+        let actual_size = check size > self.block_size { size } else { self.block_size };
+        
+        extern "C" {
+            fn malloc(size: usize) -> *var u8;
+        }
+        
+        let ptr = unsafe { malloc(actual_size) };
+        self.allocations.push(ptr);
+        ptr
+    }
+    
+    open fn free_all(&var self) {
+        extern "C" {
+            fn free(ptr: *var u8);
+        }
+        
+        each ptr in &self.allocations {
+            unsafe { free(*ptr); }
+        }
+        self.allocations.clear();
+    }
+}
+
+// Drop implementation moved to cleanup method in FFIMemoryPool impl
+// Note: Nova's automatic cleanup may handle this differently
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FFI Error Context
+// ═══════════════════════════════════════════════════════════════════════════════
+
+expose data FFIError {
+    code: i32,
+    message: String,
+}
+
+impl FFIError {
+    open fn new(code: i32, message: String) -> Self {
+        FFIError { code, message }
+    }
+    
+    open fn to_string(&self) -> String {
+        format("FFI Error {}: {}", self.code, self.message)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Performance Monitoring
+// ═══════════════════════════════════════════════════════════════════════════════
+
+expose data FFICallStats {
+    function_name: String,
+    call_count: u64,
+    total_time_ns: u64,
+    avg_time_ns: u64,
+}
+
+expose data FFIProfiler {
+    calls: Vec<FFICallStats>,
+}
+
+impl FFIProfiler {
+    open fn new() -> Self {
+        FFIProfiler {
+            calls: Vec::new(),
+        }
+    }
+    
+    open fn start_call(&var self, name: String) -> u64 {
+        get_time_ns()
+    }
+    
+    open fn end_call(&var self, name: String, start_time: u64) {
+        let elapsed = get_time_ns() - start_time;
+        
+        var found = false;
+        each stats in &var self.calls {
+            check stats.function_name == name {
+                stats.call_count += 1;
+                stats.total_time_ns += elapsed;
+                stats.avg_time_ns = stats.total_time_ns / stats.call_count;
+                found = true;
+                abort;
+            }
+        }
+        
+        check !found {
+            self.calls.push(FFICallStats {
+                function_name: name,
+                call_count: 1,
+                total_time_ns: elapsed,
+                avg_time_ns: elapsed,
+            });
+        }
+    }
+    
+    open fn get_stats(&self) -> &Vec<FFICallStats> {
+        &self.calls
+    }
+}
+
+// Platform-specific time function
+fn get_time_ns() -> u64 {
+    // Simplified - would use platform-specific timer
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Type-Safe Handles
+// ═══════════════════════════════════════════════════════════════════════════════
+
+expose data TypedHandle<T> {
+    id: u64,
+    _phantom: *const T, // Opaque marker
+}
+
+static var HANDLE_COUNTER: u64 = 1;
+
+impl TypedHandle<T> {
+    open fn new() -> Self {
+        let id = unsafe {
+            let current = HANDLE_COUNTER;
+            HANDLE_COUNTER += 1;
+            current
+        };
+        
+        TypedHandle {
+            id,
+            _phantom: core::ptr::null(),
+        }
+    }
+    
+    open fn id(&self) -> u64 {
+        self.id
+    }
+    
+    open fn from_id(id: u64) -> Self {
+        TypedHandle {
+            id,
+            _phantom: core::ptr::null(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Safe FFI Helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Execute FFI call with strong Exception Safety guarantee (Panic Boundary)
+open fn safe_ffi_call<F, R>(f: F) -> Result<R, String>
+where
+    F: FnOnce() -> R,
+{
+    // Prevent Zenith panics from unwinding across the FFI boundary into C/C++
+    let result = std::panic::catch_unwind(|| {
+        f()
+    });
+    
+    match result {
+        Ok(val) => Ok(val),
+        Err(panic_err) => Err(format("FFI Boundary Panic Caught: {:?}", panic_err)),
+    }
+}
+
+/// Profile an FFI call
+open fn profile_ffi_call<F, R>(profiler: &var FFIProfiler, name: String, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let start = profiler.start_call(name.clone());
+    let result = f();
+    profiler.end_call(name, start);
+    result
+}

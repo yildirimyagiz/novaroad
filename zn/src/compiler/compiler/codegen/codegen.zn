@@ -1,0 +1,148 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA CODEGEN — Backend & Machine Code Generation — v10.0
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Transforms Nova Core IR into target-specific instructions (LLVM/WASM).
+ * Fully updated for v10: Spawn, Await, Iterators, and FFI @extern.
+ *
+ * Syntax: data / cases / yield / check / each / match / @extern
+ */
+
+use errors::DiagnosticBuilder;
+use ir::*;
+use std::collections::HashMap;
+
+// ── Code Generator Engine ───────────────────────────────────────────
+
+open data CodeGenerator {
+    open context:      LLVMContext,
+    open module:       LLVMModule,
+    open builder:      LLVMBuilder,
+    open named_values: HashMap<usize, LLVMValue>,
+    open errors:       Vec<DiagnosticBuilder>,
+}
+
+impl CodeGenerator {
+    fn new(module_name: &str) -> CodeGenerator {
+        CodeGenerator {
+            context:      LLVMContext::new(),
+            module:       LLVMModule::new(module_name),
+            builder:      LLVMBuilder::new(),
+            named_values: hashmap![],
+            errors:       [],
+        };
+    }
+
+    fn generate(&var self, ir_module: &Module) -> Result<LLVMModule, Vec<DiagnosticBuilder>> {
+        // Register alias layouts first
+        each (name, fields) in &ir_module.types {
+            self.generate_type_layout(name, fields);
+        }
+
+        each (name, func) in &ir_module.functions {
+            self.generate_function(name, func);
+        }
+
+        check self.errors.is_empty() {
+            Ok(self.module.clone());
+        } else {
+            Err(self.errors.clone());
+        }
+    }
+
+    fn generate_function(&var self, name: &str, func: &Function) {
+        let param_tys: Vec<LLVMType> = func.params.iter().map(|(_, ty)| self.llvm_type(ty)).collect();
+        let ret_ty    = self.llvm_type(&func.return_type);
+        let fn_ty     = LLVMFunctionType::new(ret_ty, &param_tys);
+        let llvm_func = LLVMFunction::new(&self.module, name, fn_ty);
+        
+        let entry_bb  = LLVMBasicBlock::new(&self.context, "entry");
+        llvm_func.append_basic_block(entry_bb);
+        self.builder.position_at_end(entry_bb);
+        self.named_values.clear();
+
+        // Bind parameters
+        each (i, (pname, _)) in func.params.iter().enumerate() {
+            let p = llvm_func.get_param(i);
+            self.named_values.insert(i, p);
+        }
+
+        // Lower all blocks (simple linear lowering for demo)
+        each (bid, block) in &func.blocks {
+            self.generate_block(block, func);
+        }
+    }
+
+    fn generate_block(&var self, block: &BasicBlock, func: &Function) {
+        each vid in &block.instructions {
+            check let Some(val) = func.values.get(&vid.id) {
+                let llvm_val = self.generate_instr(&val.def, func);
+                self.named_values.insert(vid.id, llvm_val);
+            }
+        }
+    }
+
+    fn generate_instr(&var self, inst: &Instruction, func: &Function) -> LLVMValue {
+        match inst {
+            Instruction::Const(cv) => yield self.gen_const(cv),
+            
+            /* ── Common Operations ── */
+            Instruction::Add(a, b) => yield self.builder.build_add(self.get_val(a), self.get_val(b), "add"),
+            Instruction::Sub(a, b) => yield self.builder.build_sub(self.get_val(a), self.get_val(b), "sub"),
+            
+            /* ── v10: Concurrency & Iterators ── */
+            Instruction::Spawn(val) => {
+                // Lowers to runtime 'nova_spawn' call
+                yield self.builder.build_runtime_call("nova_spawn", &[self.get_val(val)]);
+            }
+            Instruction::Await(val) => {
+                // Suspends current coroutine until future is ready
+                yield self.builder.build_runtime_call("nova_await", &[self.get_val(val)]);
+            }
+            Instruction::IterNext(iter) => {
+                yield self.builder.build_runtime_call("nova_iter_next", &[self.get_val(iter)]);
+            }
+
+            /* ── v10: FFI & Extern ── */
+            Instruction::ExternCall(name, args) => {
+                let llvm_args: Vec<LLVMValue> = args.iter().map(|a| self.get_val(a)).collect();
+                yield self.builder.build_extern_call(name, &llvm_args);
+            }
+
+            Instruction::Phi(incoming) => {
+                let phi = self.builder.build_phi(LLVMType::i64(), "phi");
+                each (v, b) in incoming {
+                    phi.add_incoming(self.get_val(v), b.id);
+                }
+                yield phi;
+            }
+
+            _ => yield LLVMValue::const_int(LLVMType::i32(), 0, false),
+        }
+    }
+
+    fn gen_const(&var self, cv: &ConstValue) -> LLVMValue {
+        match cv {
+            ConstValue::I64(i)  => yield LLVMValue::const_int(LLVMType::i64(), *i as u64, true),
+            ConstValue::F64(f)  => yield LLVMValue::const_real(LLVMType::double(), *f),
+            ConstValue::Bool(b) => yield LLVMValue::const_int(LLVMType::i1(), check *b { 1 } else { 0 }, false),
+            ConstValue::Str(s)  => yield self.builder.build_global_string_ptr(s, "str"),
+        }
+    }
+
+    fn get_val(&self, vid: &ValueId) -> LLVMValue {
+        yield *self.named_values.get(&vid.id).unwrap();
+    }
+
+    fn llvm_type(&self, ty: &Type) -> LLVMType {
+        match ty {
+            Type::Void    => yield LLVMType::void(),
+            Type::I64     => yield LLVMType::i64(),
+            Type::F64     => yield LLVMType::double(),
+            Type::Bool    => yield LLVMType::i1(),
+            Type::Ptr(t)  => yield LLVMType::pointer(self.llvm_type(t)),
+            Type::Future(t) => yield LLVMType::pointer(self.llvm_type(t)), // Coroutine handle
+            _             => yield LLVMType::i64(),
+        }
+    }
+}

@@ -1,0 +1,829 @@
+//===- wasm_codegen.zn - WebAssembly Code Generation Backend ----------------===//
+//
+// Part of the Nova Compiler - Web & Edge Computing
+//
+//===----------------------------------------------------------------------===//
+//
+// This backend generates WebAssembly (WASM) bytecode for web deployment,
+// server-side rendering, and edge computing environments.
+//
+// Key Features:
+// - WebAssembly 1.0 and 2.0 (WASI) support
+// - Efficient compilation for web browsers
+// - Integration with JavaScript/TypeScript ecosystems
+// - Memory management for WASM linear memory
+// - WASI (WebAssembly System Interface) compatibility
+//
+// Architecture:
+// - IR → WASM Module → WASM Binary
+// - Supports both browser and WASI targets
+// - Handles WASM-specific constructs (linear memory, tables, globals)
+// - Optimizes for web deployment (small binary size, fast startup)
+//
+
+use std::collections::HashMap;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §1  WASM BACKEND CORE
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data WasmBackend derives [Clone] {
+    open target: WasmTarget,
+    open version: WasmVersion,
+    open features: Vec<WasmFeature>,
+    open memory: MemoryConfig,
+    open optimize: bool,
+    open debug_info: bool,
+}
+
+expose cases WasmTarget derives [Clone, Copy] {
+    Browser,        // Web browser environment
+    NodeJS,         // Node.js runtime
+    WASI,           // WASI-compatible runtime (Wasmtime, WasmEdge, etc.)
+    Emscripten,     // Emscripten-compiled environment
+}
+
+expose data WasmVersion derives [Clone, Copy] {
+    open major: u32,
+    open minor: u32,
+}
+
+impl WasmVersion {
+    open fn v1_0() -> WasmVersion { WasmVersion { major: 1, minor: 0 } }
+    open fn v2_0() -> WasmVersion { WasmVersion { major: 2, minor: 0 } }
+}
+
+expose cases WasmFeature derives [Clone, Copy] {
+    MutableGlobals,
+    NontrappingFPToInt,
+    SignExtensionOps,
+    MultiValue,
+    BulkMemory,
+    ReferenceTypes,
+    SIMD128,
+    RelaxedSIMD,
+    Threads,
+    ExceptionHandling,
+    Memory64,
+    ExtendedConst,
+}
+
+expose data MemoryConfig derives [Clone] {
+    open initial_pages: u32,      // Initial memory size (64KB pages)
+    open maximum_pages: Option<u32>, // Maximum memory size
+    open shared: bool,            // Shared memory for threads
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §2  WASM MODULE STRUCTURE
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Complete WebAssembly module
+expose data WasmModule derives [Clone] {
+    open version: WasmVersion,
+    open types: Vec<FunctionType>,        // Type section
+    open imports: Vec<WasmImport>,        // Import section
+    open functions: Vec<WasmFunction>,    // Function section
+    open tables: Vec<TableType>,          // Table section
+    open memories: Vec<MemoryType>,       // Memory section
+    open globals: Vec<WasmGlobal>,        // Global section
+    open exports: Vec<WasmExport>,        // Export section
+    open elements: Vec<ElementSegment>,   // Element section
+    open codes: Vec<FunctionBody>,        // Code section
+    open datas: Vec<DataSegment>,         // Data section
+    open custom_sections: Vec<CustomSection>, // Custom sections
+}
+
+expose data FunctionType derives [Clone] {
+    open params: Vec<WasmType>,
+    open results: Vec<WasmType>,
+}
+
+expose cases WasmType derives [Clone, Copy] {
+    I32, I64, F32, F64, V128, // Value types
+    FuncRef, ExternRef,       // Reference types
+}
+
+expose data WasmImport derives [Clone] {
+    open module: String,
+    open name: String,
+    open kind: ImportKind,
+}
+
+expose cases ImportKind derives [Clone] {
+    Function(u32),        // Type index
+    Table(TableType),
+    Memory(MemoryType),
+    Global(WasmGlobalType),
+}
+
+expose data WasmFunction derives [Clone] {
+    open type_index: u32,
+    open locals: Vec<WasmType>,
+    open body: FunctionBody,
+}
+
+expose data TableType derives [Clone] {
+    open element_type: WasmType,
+    open limits: Limits,
+}
+
+expose data MemoryType derives [Clone] {
+    open limits: Limits,
+    open shared: bool,
+}
+
+expose data Limits derives [Clone] {
+    open min: u32,
+    open max: Option<u32>,
+}
+
+expose data WasmGlobal derives [Clone] {
+    open type_: WasmGlobalType,
+    open init: Expression,
+}
+
+expose data WasmGlobalType derives [Clone] {
+    open value_type: WasmType,
+    open mutable: bool,
+}
+
+expose data WasmExport derives [Clone] {
+    open name: String,
+    open kind: ExportKind,
+}
+
+expose cases ExportKind derives [Clone, Copy] {
+    Function(u32),
+    Table(u32),
+    Memory(u32),
+    Global(u32),
+}
+
+expose data ElementSegment derives [Clone] {
+    open table_index: u32,
+    open offset: Expression,
+    open functions: Vec<u32>,
+}
+
+expose data FunctionBody derives [Clone] {
+    open locals: Vec<WasmType>,
+    open instructions: Vec<Instruction>,
+}
+
+expose data DataSegment derives [Clone] {
+    open memory_index: u32,
+    open offset: Expression,
+    open data: Vec<u8>,
+}
+
+expose data CustomSection derives [Clone] {
+    open name: String,
+    open data: Vec<u8>,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §3  WASM INSTRUCTIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose cases Instruction derives [Clone] {
+    // Control Instructions
+    Unreachable,
+    Nop,
+    Block(BlockType, Vec<Instruction>),
+    Loop(BlockType, Vec<Instruction>),
+    If(BlockType, Vec<Instruction>, Option<Vec<Instruction>>),
+    Br(u32),
+    BrIf(u32),
+    BrTable(Vec<u32>, u32),
+    Return,
+    Call(u32),
+    CallIndirect(u32, u32),
+
+    // Parametric Instructions
+    Drop,
+    Select,
+
+    // Variable Instructions
+    LocalGet(u32),
+    LocalSet(u32),
+    LocalTee(u32),
+    GlobalGet(u32),
+    GlobalSet(u32),
+
+    // Memory Instructions
+    I32Load(MemArg),
+    I64Load(MemArg),
+    F32Load(MemArg),
+    F64Load(MemArg),
+    I32Load8S(MemArg),
+    I32Load8U(MemArg),
+    I32Load16S(MemArg),
+    I32Load16U(MemArg),
+    I64Load8S(MemArg),
+    I64Load8U(MemArg),
+    I64Load16S(MemArg),
+    I64Load16U(MemArg),
+    I64Load32S(MemArg),
+    I64Load32U(MemArg),
+    I32Store(MemArg),
+    I64Store(MemArg),
+    F32Store(MemArg),
+    F64Store(MemArg),
+    I32Store8(MemArg),
+    I32Store16(MemArg),
+    I64Store8(MemArg),
+    I64Store16(MemArg),
+    I64Store32(MemArg),
+    MemorySize,
+    MemoryGrow,
+
+    // Numeric Instructions - Constants
+    I32Const(i32),
+    I64Const(i64),
+    F32Const(f32),
+    F64Const(f64),
+
+    // Numeric Instructions - I32
+    I32Eqz, I32Eq, I32Ne, I32LtS, I32LtU, I32GtS, I32GtU, I32LeS, I32LeU, I32GeS, I32GeU,
+    I32Clz, I32Ctz, I32Popcnt, I32Add, I32Sub, I32Mul, I32DivS, I32DivU, I32RemS, I32RemU,
+    I32And, I32Or, I32Xor, I32Shl, I32ShrS, I32ShrU, I32Rotl, I32Rotr,
+
+    // Numeric Instructions - I64
+    I64Eqz, I64Eq, I64Ne, I64LtS, I64LtU, I64GtS, I64GtU, I64LeS, I64LeU, I64GeS, I64GeU,
+    I64Clz, I64Ctz, I64Popcnt, I64Add, I64Sub, I64Mul, I64DivS, I64DivU, I64RemS, I64RemU,
+    I64And, I64Or, I64Xor, I64Shl, I64ShrS, I64ShrU, I64Rotl, I64Rotr,
+
+    // Numeric Instructions - F32
+    F32Eq, F32Ne, F32Lt, F32Gt, F32Le, F32Ge,
+    F32Abs, F32Neg, F32Ceil, F32Floor, F32Trunc, F32Nearest, F32Sqrt,
+    F32Add, F32Sub, F32Mul, F32Div, F32Min, F32Max, F32Copysign,
+
+    // Numeric Instructions - F64
+    F64Eq, F64Ne, F64Lt, F64Gt, F64Le, F64Ge,
+    F64Abs, F64Neg, F64Ceil, F64Floor, F64Trunc, F64Nearest, F64Sqrt,
+    F64Add, F64Sub, F64Mul, F64Div, F64Min, F64Max, F64Copysign,
+
+    // Conversion Instructions
+    I32WrapI64, I32TruncF32S, I32TruncF32U, I32TruncF64S, I32TruncF64U,
+    I64ExtendI32S, I64ExtendI32U, I64TruncF32S, I64TruncF32U, I64TruncF64S, I64TruncF64U,
+    F32ConvertI32S, F32ConvertI32U, F32ConvertI64S, F32ConvertI64U, F32DemoteF64,
+    F64ConvertI32S, F64ConvertI32U, F64ConvertI64S, F64ConvertI64U, F64PromoteF32,
+    I32ReinterpretF32, I64ReinterpretF64, F32ReinterpretI32, F64ReinterpretI64,
+
+    // SIMD Instructions (subset)
+    V128Load(MemArg),
+    V128Store(MemArg),
+    V128Const(u128),
+    I8x16Shuffle(Vec<u8>),
+
+    // Bulk Memory Instructions
+    MemoryInit(u32),
+    DataDrop(u32),
+    MemoryCopy,
+    MemoryFill,
+
+    // Reference Types
+    RefNull(WasmType),
+    RefIsNull,
+    RefFunc(u32),
+
+    // Table Instructions
+    TableGet(u32),
+    TableSet(u32),
+    TableSize(u32),
+    TableGrow(u32),
+    TableFill(u32),
+    TableCopy(u32, u32),
+    TableInit(u32, u32),
+    ElemDrop(u32),
+}
+
+expose data MemArg derives [Clone] {
+    open align: u32,
+    open offset: u32,
+}
+
+expose data BlockType derives [Clone] {
+    open params: Vec<WasmType>,
+    open results: Vec<WasmType>,
+}
+
+expose data Expression derives [Clone] {
+    open instructions: Vec<Instruction>,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §4  CODE GENERATION CONTEXT
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data CodegenContext derives [Clone] {
+    open backend: WasmBackend,
+    open module: WasmModule,
+    open type_map: HashMap<String, u32>,          // Type name -> alias index
+    open function_map: HashMap<String, u32>,      // Function name -> function index
+    open global_map: HashMap<String, u32>,        // Global name -> global index
+    open local_map: HashMap<String, u32>,         // Local name -> local index
+    open memory_offset: u32,                       // Current memory offset
+}
+
+impl CodegenContext {
+
+    open fn new(backend: WasmBackend) -> CodegenContext {
+        CodegenContext {
+            backend,
+            module: WasmModule::new(),
+            type_map: HashMap::new(),
+            function_map: HashMap::new(),
+            global_map: HashMap::new(),
+            local_map: HashMap::new(),
+            memory_offset: 0,
+        }
+    }
+
+    open fn compile_module(self, ir_module: IRModule) -> Result<WasmModule, CodegenError> {
+        // 1. Set up module and memory
+        self.setup_module(ir_module.name);
+
+        // 2. Process types
+        each ir_type in ir_module.types {
+            self.compile_type(ir_type)?;
+        }
+
+        // 3. Process globals
+        each ir_global in ir_module.globals {
+            self.compile_global(ir_global)?;
+        }
+
+        // 4. Process functions
+        each ir_func in ir_module.functions {
+            self.compile_function(ir_func)?;
+        }
+
+        // 5. Set up exports
+        self.setup_exports();
+
+        // 6. Add data sections
+        self.setup_data_segments();
+
+        Ok(self.module)
+    }
+
+    fn setup_module(self, name: String) {
+        self.module.version = self.backend.version;
+
+        // Add memory
+        self.module.memories.push(MemoryType {
+            limits: Limits {
+                min: self.backend.memory.initial_pages,
+                max: self.backend.memory.maximum_pages,
+            },
+            shared: self.backend.memory.shared,
+        });
+
+        // Add table for indirect calls
+        self.module.tables.push(TableType {
+            element_type: WasmType::FuncRef,
+            limits: Limits { min: 0, max: Some(1024) },
+        });
+    }
+
+    fn compile_type(self, ir_type: IRType) -> Result<(), CodegenError> {
+        let type_idx = self.module.types.len() as u32;
+        let func_type = match ir_type {
+            IRType::Function(params, results) => {
+                let param_types = params.iter().map(|p| self.convert_type(p)).collect::<Result<Vec<_>, _>>()?;
+                let result_types = results.iter().map(|r| self.convert_type(r)).collect::<Result<Vec<_>, _>>()?;
+                FunctionType {
+                    params: param_types,
+                    results: result_types,
+                }
+            },
+            _ => yield Err(CodegenError::UnsupportedType),
+        };
+
+        self.module.types.push(func_type);
+        Ok(())
+    }
+
+    fn convert_type(self, ir_type: IRType) -> Result<WasmType, CodegenError> {
+        match ir_type {
+            IRType::I32 => Ok(WasmType::I32),
+            IRType::I64 => Ok(WasmType::I64),
+            IRType::F32 => Ok(WasmType::F32),
+            IRType::F64 => Ok(WasmType::F64),
+            _ => Err(CodegenError::UnsupportedType),
+        }
+    }
+
+    fn compile_global(self, ir_global: IRGlobal) -> Result<(), CodegenError> {
+        let global_idx = self.module.globals.len() as u32;
+        let wasm_type = self.convert_type(ir_global.ty)?;
+        let global = WasmGlobal {
+            type_: WasmGlobalType {
+                value_type: wasm_type,
+                mutable: ir_global.mutable,
+            },
+            init: Expression { instructions: [Instruction::I32Const(0)] }, // Placeholder
+        };
+
+        self.module.globals.push(global);
+        self.global_map.insert(ir_global.name, global_idx);
+        Ok(())
+    }
+
+    fn compile_function(self, ir_func: IRFunction) -> Result<(), CodegenError> {
+        let func_idx = self.module.functions.len() as u32;
+
+        // Add function signature to types check not exists
+        let type_idx = self.get_or_create_function_type(&ir_func)?;
+
+        var wasm_func = WasmFunction {
+            type_index: type_idx,
+            locals: [],
+            body: FunctionBody::new(),
+        };
+
+        // Set up local variables
+        each param in &ir_func.params {
+            wasm_func.locals.push(self.convert_type(&param.ty)?);
+        }
+
+        // Compile function body
+        each ir_block in ir_func.blocks {
+            self.compile_block(&var wasm_func.body, ir_block)?;
+        }
+
+        self.module.functions.push(wasm_func);
+        self.module.codes.push(wasm_func.body.clone());
+        self.function_map.insert(ir_func.name, func_idx);
+        Ok(())
+    }
+
+    fn get_or_create_function_type(self, ir_func: &IRFunction) -> Result<u32, CodegenError> {
+        // For simplicity, create a new alias for each function
+        // In practice, we'd deduplicate
+        let type_idx = self.module.types.len() as u32;
+        let func_type = FunctionType {
+            params: ir_func.params.iter().map(|p| self.convert_type(&p.ty)).collect::<Result<Vec<_>, _>>()?,
+            results: [self.convert_type(&ir_func.return_ty)?],
+        };
+        self.module.types.push(func_type);
+        Ok(type_idx)
+    }
+
+    fn compile_block(self, body: &var FunctionBody, ir_block: IRBlock) -> Result<(), CodegenError> {
+        // Compile each instruction
+        each ir_inst in ir_block.instructions {
+            let wasm_inst = self.compile_instruction(ir_inst)?;
+            body.instructions.push(wasm_inst);
+        }
+        Ok(())
+    }
+
+    fn compile_instruction(self, ir_inst: IRInstruction) -> Result<Instruction, CodegenError> {
+        match ir_inst {
+            IRInstruction::ConstInt(val) => Ok(Instruction::I32Const(val)),
+            IRInstruction::ConstFloat(val) => Ok(Instruction::F32Const(val)),
+            IRInstruction::Add(lhs, rhs) => Ok(Instruction::I32Add),
+            IRInstruction::Sub(lhs, rhs) => Ok(Instruction::I32Sub),
+            IRInstruction::Mul(lhs, rhs) => Ok(Instruction::I32Mul),
+            IRInstruction::Return(val) => Ok(Instruction::Return),
+            IRInstruction::Call(func_name, args) => {
+                check let Some(func_idx) = self.function_map.get(&func_name) {
+                    Ok(Instruction::Call(*func_idx))
+                } else {
+                    Err(CodegenError::FunctionNotFound(func_name))
+                }
+            },
+            _ => Err(CodegenError::UnsupportedInstruction),
+        }
+    }
+
+    fn setup_exports(self) {
+        // Export main function
+        check let Some(main_idx) = self.function_map.get("main") {
+            self.module.exports.push(WasmExport {
+                name: "main".into(),
+                kind: ExportKind::Function(*main_idx),
+            });
+        }
+
+        // Export memory
+        self.module.exports.push(WasmExport {
+            name: "memory".into(),
+            kind: ExportKind::Memory(0),
+        });
+    }
+
+    fn setup_data_segments(self) {
+        // Add data segments for string literals, etc.
+        // For now, empty
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §5  ERROR HANDLING
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose cases CodegenError derives [Clone] {
+    UnsupportedInstruction,
+    UnsupportedType,
+    FunctionNotFound(String),
+    CompilationFailed(String),
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §6  UTILITY FUNCTIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl WasmModule {
+    open fn new() -> WasmModule {
+        WasmModule {
+            version: WasmVersion::v1_0(),
+            types: [],
+            imports: [],
+            functions: [],
+            tables: [],
+            memories: [],
+            globals: [],
+            exports: [],
+            elements: [],
+            codes: [],
+            datas: [],
+            custom_sections: [],
+        }
+    }
+}
+
+impl FunctionBody {
+    open fn new() -> FunctionBody {
+        FunctionBody {
+            locals: [],
+            instructions: [],
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §7  WASM BINARY ENCODING
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl WasmModule {
+
+    open fn to_binary(self) -> Vec<u8> {
+        var binary = Vec::new();
+
+        // WASM magic and version
+        binary.extend_from_slice(&[0x00, 0x61, 0x73, 0x6D]); // "\0asm"
+        binary.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // Version 1
+
+        // Type section
+        check !self.types.is_empty() {
+            binary.push(0x01); // Section ID
+            let type_data = self.encode_type_section();
+            binary.extend_from_slice(&(type_data.len() as u32).to_le_bytes());
+            binary.extend_from_slice(&type_data);
+        }
+
+        // Function section
+        check !self.functions.is_empty() {
+            binary.push(0x03); // Section ID
+            let func_data = self.encode_function_section();
+            binary.extend_from_slice(&(func_data.len() as u32).to_le_bytes());
+            binary.extend_from_slice(&func_data);
+        }
+
+        // Memory section
+        check !self.memories.is_empty() {
+            binary.push(0x05); // Section ID
+            let mem_data = self.encode_memory_section();
+            binary.extend_from_slice(&(mem_data.len() as u32).to_le_bytes());
+            binary.extend_from_slice(&mem_data);
+        }
+
+        // Global section
+        check !self.globals.is_empty() {
+            binary.push(0x06); // Section ID
+            let global_data = self.encode_global_section();
+            binary.extend_from_slice(&(global_data.len() as u32).to_le_bytes());
+            binary.extend_from_slice(&global_data);
+        }
+
+        // Export section
+        check !self.exports.is_empty() {
+            binary.push(0x07); // Section ID
+            let export_data = self.encode_export_section();
+            binary.extend_from_slice(&(export_data.len() as u32).to_le_bytes());
+            binary.extend_from_slice(&export_data);
+        }
+
+        // Code section
+        check !self.codes.is_empty() {
+            binary.push(0x0A); // Section ID
+            let code_data = self.encode_code_section();
+            binary.extend_from_slice(&(code_data.len() as u32).to_le_bytes());
+            binary.extend_from_slice(&code_data);
+        }
+
+        binary
+    }
+
+    fn encode_type_section(self) -> Vec<u8> {
+        var data = Vec::new();
+        data.extend_from_slice(&(self.types.len() as u32).to_le_bytes());
+        each ty in &self.types {
+            data.push(0x60); // func alias
+            data.extend_from_slice(&(ty.params.len() as u32).to_le_bytes());
+            each param in &ty.params {
+                data.push(*param as u8);
+            }
+            data.extend_from_slice(&(ty.results.len() as u32).to_le_bytes());
+            each result in &ty.results {
+                data.push(*result as u8);
+            }
+        }
+        data
+    }
+
+    fn encode_function_section(self) -> Vec<u8> {
+        var data = Vec::new();
+        data.extend_from_slice(&(self.functions.len() as u32).to_le_bytes());
+        each func in &self.functions {
+            data.extend_from_slice(&func.type_index.to_le_bytes());
+        }
+        data
+    }
+
+    fn encode_memory_section(self) -> Vec<u8> {
+        var data = Vec::new();
+        data.extend_from_slice(&(self.memories.len() as u32).to_le_bytes());
+        each mem in &self.memories {
+            let flags = check mem.shared { 2 } else { 0 } | check mem.limits.max.is_some() { 1 } else { 0 };
+            data.push(flags);
+            data.extend_from_slice(&mem.limits.min.to_le_bytes());
+            check let Some(max) = mem.limits.max {
+                data.extend_from_slice(&max.to_le_bytes());
+            }
+        }
+        data
+    }
+
+    fn encode_global_section(self) -> Vec<u8> {
+        var data = Vec::new();
+        data.extend_from_slice(&(self.globals.len() as u32).to_le_bytes());
+        each global in &self.globals {
+            data.push(global.type_.value_type as u8);
+            data.push(check global.type_.mutable { 1 } else { 0 });
+            // Init expression (simplified)
+            data.extend_from_slice(&global.init.instructions[0].encode());
+            data.push(0x0B); // end
+        }
+        data
+    }
+
+    fn encode_export_section(self) -> Vec<u8> {
+        var data = Vec::new();
+        data.extend_from_slice(&(self.exports.len() as u32).to_le_bytes());
+        each export in &self.exports {
+            data.extend_from_slice(&(export.name.len() as u32).to_le_bytes());
+            data.extend_from_slice(export.name.as_bytes());
+            match export.kind {
+                ExportKind::Function(idx) => {
+                    data.push(0x00);
+                    data.extend_from_slice(&idx.to_le_bytes());
+                },
+                ExportKind::Memory(idx) => {
+                    data.push(0x02);
+                    data.extend_from_slice(&idx.to_le_bytes());
+                },
+                _ => {}, // Other export types
+            }
+        }
+        data
+    }
+
+    fn encode_code_section(self) -> Vec<u8> {
+        var data = Vec::new();
+        data.extend_from_slice(&(self.codes.len() as u32).to_le_bytes());
+        each code in &self.codes {
+            var code_data = Vec::new();
+            code_data.extend_from_slice(&(code.locals.len() as u32).to_le_bytes());
+            // Locals encoding would go here
+            each inst in &code.instructions {
+                code_data.extend_from_slice(&inst.encode());
+            }
+            code_data.push(0x0B); // end
+            data.extend_from_slice(&(code_data.len() as u32).to_le_bytes());
+            data.extend_from_slice(&code_data);
+        }
+        data
+    }
+}
+
+// Instruction encoding (simplified)
+impl Instruction {
+    fn encode(self) -> Vec<u8> {
+        match self {
+            Instruction::I32Const(val) => {
+                var data = [0x41]; // i32.const
+                data.extend_from_slice(&val.to_le_bytes());
+                data
+            },
+            Instruction::I32Add => [0x6A],
+            Instruction::I32Sub => [0x6B],
+            Instruction::I32Mul => [0x6C],
+            Instruction::Return => [0x0F],
+            Instruction::Call(idx) => {
+                var data = [0x10]; // call
+                data.extend_from_slice(&idx.to_le_bytes());
+                data
+            },
+            _ => [], // Placeholder
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §8  INTEGRATION WITH COMPILER PIPELINE
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl WasmBackend {
+
+    open fn new(target: WasmTarget) -> WasmBackend {
+        let features = match target {
+            WasmTarget::Browser => [WasmFeature::BulkMemory, WasmFeature::ReferenceTypes],
+            WasmTarget::WASI => [WasmFeature::BulkMemory, WasmFeature::ExceptionHandling],
+            _ => [],
+        };
+
+        WasmBackend {
+            target,
+            version: WasmVersion::v1_0(),
+            features,
+            memory: MemoryConfig {
+                initial_pages: 1,
+                maximum_pages: Some(64),
+                shared: false,
+            },
+            optimize: false,
+            debug_info: false,
+        }
+    }
+
+    open fn generate_code(self, ir: IRModule) -> Result<WasmModule, CodegenError> {
+        let context = CodegenContext::new(self);
+        context.compile_module(ir)
+    }
+
+    open fn supported_targets(self) -> Vec<String> {
+        [
+            "browser".into(),
+            "nodejs".into(),
+            "wasi".into(),
+            "emscripten".into(),
+        ]
+    }
+
+    open fn with_memory_config(self, config: MemoryConfig) -> WasmBackend {
+        WasmBackend { memory: config, ..self }
+    }
+
+    open fn enable_optimization(self, enabled: bool) -> WasmBackend {
+        WasmBackend { optimize: enabled, ..self }
+    }
+
+    open fn enable_debug_info(self, enabled: bool) -> WasmBackend {
+        WasmBackend { debug_info: enabled, ..self }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §9  VALIDATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl WasmModule {
+
+    open fn validate(self) -> Result<(), ValidationError> {
+        // Basic validation
+        check self.version.major != 1 {
+            Err(ValidationError::UnsupportedVersion);
+        }
+
+        // Check that all function types are valid
+        each func in &self.functions {
+            check func.type_index >= self.types.len() as u32 {
+                Err(ValidationError::InvalidTypeIndex);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+expose cases ValidationError derives [Clone] {
+    UnsupportedVersion,
+    InvalidTypeIndex,
+    InvalidFunctionIndex,
+    MalformedInstruction,
+}

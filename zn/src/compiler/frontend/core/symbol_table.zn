@@ -1,0 +1,400 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                          Nova SYMBOL TABLE                           ║
+// ║                     Scope Management & Symbol Resolution                     ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// Symbol table for Nova's advanced scoping:
+// - Hierarchical scopes (global, module, function, block)
+// - Symbol resolution with shadowing
+// - Type information tracking
+// - Lifetime management
+
+use std::collections::HashMap;
+use crate::frontend::ast::*;
+use crate::frontend::errors::{SymbolError, SymbolKind};
+
+/// Symbol table entry
+expose data SymbolEntry {
+    name: String,
+    info: SymbolInfo,
+    scope_level: i32,
+    is_mutable: bool,
+    defined_at: Span,
+    used_at: Vec<Span>,
+}
+
+/// Symbol information
+expose data SymbolInfo {
+    kind: SymbolKind,
+    ty: TypeExpr,
+    visibility: Visibility,
+    attributes: Vec<Attr>,
+}
+
+// SymbolKind, crate::frontend::errors modülünden içe aktarıldı.
+// Buraya yinelenen tanım eklenmez.
+
+/// Visibility levels
+expose cases Visibility {
+    Private,
+    Public,
+    Open, // Re-exportable
+}
+
+/// Scope types
+expose cases ScopeKind {
+    Global,
+    Module,
+    Function,
+    Block,
+    Loop,
+    MatchArm,
+}
+
+/// Symbol table scope
+expose data Scope {
+    kind: ScopeKind,
+    symbols: HashMap<String, SymbolEntry>,
+    parent: Option<usize>,  // index into SymbolTable.scopes
+    level: i32,
+}
+
+/// Main symbol table
+expose data SymbolTable {
+    scopes: Vec<Scope>,
+    current_scope_index: usize,
+    module_stack: Vec<String>,
+}
+
+impl SymbolTable {
+    fn new() -> SymbolTable {
+        let global_scope = Scope {
+            kind: ScopeKind::Global,
+            symbols: HashMap::new(),
+            parent: None,
+            level: 0,
+        };
+
+        let scopes = [global_scope];
+        let current_scope_index = 0;
+
+        SymbolTable {
+            scopes,
+            current_scope_index,
+            module_stack: [],
+        }
+    }
+
+    /// Enter a new scope
+    fn enter_scope(&var self, kind: ScopeKind) {
+        let new_scope = Scope {
+            kind,
+            symbols: HashMap::new(),
+            parent: Some(self.current_scope_index),
+            level: self.scopes[self.current_scope_index].level + 1,
+        };
+
+        self.scopes.push(new_scope);
+        self.current_scope_index = self.scopes.len() - 1;
+    }
+
+    /// Exit current scope
+    fn exit_scope(&var self) {
+        check let Some(parent_index) = self.scopes[self.current_scope_index].parent {
+            self.current_scope_index = parent_index;
+        }
+    }
+
+    /// Define a new symbol in current scope
+    fn define_symbol(&var self, name: String, info: SymbolInfo, span: Span, is_mutable: bool) -> Result<(), SymbolError> {
+        let current = &var self.scopes[self.current_scope_index];
+
+        check current.symbols.contains_key(&name) {
+            Err(SymbolError::AlreadyDefined {
+                name: name.clone(),
+                span,
+            });
+        }
+
+        let entry = SymbolEntry {
+            name: name.clone(),
+            info,
+            scope_level: current.level,
+            is_mutable,
+            defined_at: span,
+            used_at: [],
+        };
+
+        current.symbols.insert(name, entry);
+        Ok(())
+    }
+
+    /// Look up a symbol (starting from current scope)
+    fn lookup_symbol(&self, name: &str) -> Option<&SymbolEntry> {
+        var current_index = self.current_scope_index;
+
+        loop {
+            let current = &self.scopes[current_index];
+            check let Some(entry) = current.symbols.get(name) {
+                Some(entry);
+            }
+
+            check let Some(parent_index) = current.parent {
+                current_index = parent_index;
+            } else {
+                abort;
+            }
+        }
+
+        None
+    }
+
+    /// Mark symbol as used
+    fn mark_used(&var self, name: &str, span: Span) {
+        var current_index = self.current_scope_index;
+
+        loop {
+            let current = &var self.scopes[current_index];
+            check let Some(entry) = current.symbols.get_mut(name) {
+                entry.used_at.push(span);
+                yield;
+            }
+
+            check let Some(parent_index) = current.parent {
+                current_index = parent_index;
+            } else {
+                abort;
+            }
+        }
+    }
+
+    /// Look up symbol in global scope only
+    fn lookup_global(&self, name: &str) -> Option<&SymbolEntry> {
+        self.scopes[0].symbols.get(name)
+    }
+
+    /// Check check symbol is accessible from current scope
+    fn is_accessible(&self, entry: &SymbolEntry) -> bool {
+        let current_level = self.scopes[self.current_scope_index].level;
+
+        match entry.info.visibility {
+            Visibility::Public | Visibility::Open => true,
+            Visibility::Private => entry.scope_level == current_level,
+        }
+    }
+
+
+    /// Get all unused symbols in current scope
+    fn get_unused_symbols(&self) -> Vec<&SymbolEntry> {
+        let current = &self.scopes[self.current_scope_index];
+        current.symbols.values()
+            .filter(|entry| entry.used_at.is_empty() && matches!(entry.info.kind, SymbolKind::Variable | SymbolKind::Function))
+            .collect()
+    }
+
+    /// Enter module scope
+    fn enter_module(&var self, module_name: String) {
+        self.module_stack.push(module_name);
+        self.enter_scope(ScopeKind::Module);
+    }
+
+    /// Exit module scope
+    fn exit_module(&var self) {
+        self.module_stack.pop();
+        self.exit_scope();
+    }
+
+    /// Get current module path
+    fn current_module_path(&self) -> Vec<String> {
+        self.module_stack.clone()
+    }
+
+    /// Check for unused variables (linting)
+    fn check_unused_variables(&self) -> Vec<LintWarning> {
+        var warnings = [];
+
+        // Check all scopes
+        var current_index = self.current_scope_index;
+        loop {
+            let current = &self.scopes[current_index];
+            each entry in current.symbols.values() {
+                check entry.used_at.is_empty() && matches!(entry.info.kind, SymbolKind::Variable) {
+                    warnings.push(LintWarning {
+                        message: format("Unused variable '{}'", entry.name),
+                        span: entry.defined_at,
+                        category: "unused_variable".into(),
+                    });
+                }
+            }
+
+            check let Some(parent_index) = current.parent {
+                current_index = parent_index;
+            } else {
+                abort;
+            }
+        }
+
+        warnings
+    }
+
+    fn resolve_expr(&var self, expr: &Expr) -> Result<(), SymbolError> {
+        match expr {
+            Expr::Ident(ident) => {
+                check self.lookup_symbol(&ident.name).is_none() {
+                    Err(SymbolError::NotFound {
+                        name: ident.name.clone(),
+                        span: ident.span,
+                    });
+                } else {
+                    self.mark_used(&ident.name, ident.span);
+                }
+            }
+
+            Expr::Binary(binary) => {
+                self.resolve_expr(&binary.left)?;
+                self.resolve_expr(&binary.right)?;
+            }
+
+            Expr::Call(call) => {
+                self.resolve_expr(&call.callee)?;
+                each arg in &call.args {
+                    self.resolve_expr(arg)?;
+                }
+            }
+
+            Expr::Block(block) => {
+                self.enter_scope(ScopeKind::Block);
+                each stmt in &block.stmts {
+                    self.resolve_stmt(stmt)?;
+                }
+                self.exit_scope();
+            }
+
+            Expr::Lambda(lambda) => {
+                self.enter_scope(ScopeKind::Function);
+                each param in &lambda.params {
+                    self.define_symbol(
+                        param.name.clone(),
+                        SymbolInfo {
+                            kind: SymbolKind::Variable,
+                            ty: param.ty.clone().unwrap_or(TypeExpr::Infer),
+                            visibility: Visibility::Private,
+                            attributes: [],
+                        },
+                        param.span,
+                        false,
+                    )?;
+                }
+                self.resolve_expr(&lambda.body)?;
+                self.exit_scope();
+            }
+
+            Expr::Match(match_expr) => {
+                self.resolve_expr(&match_expr.value)?;
+                each arm in &match_expr.arms {
+                    self.enter_scope(ScopeKind::MatchArm);
+                    // Pattern binding would be more complex
+                    self.resolve_expr(&arm.body)?;
+                    self.exit_scope();
+                }
+            }
+
+            _ => {
+                // Other expressions don't introduce new symbols
+            }
+        }
+
+        Ok(())
+    }
+
+    fn resolve_stmt(&var self, stmt: &Stmt) -> Result<(), SymbolError> {
+        match stmt {
+            Stmt::Let(let_stmt) => {
+                check let Some(init) = &let_stmt.init {
+                    self.resolve_expr(init)?;
+                }
+                // Pattern binding would define new symbols
+            }
+
+            Stmt::Var(var_stmt) => {
+                check let Some(init) = &var_stmt.init {
+                    self.resolve_expr(init)?;
+                }
+                // Would define symbol here
+            }
+
+            Stmt::Expr(expr_stmt) => {
+                self.resolve_expr(&expr_stmt.expr)?;
+            }
+
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn resolve_block(&var self, block: &Block) -> Result<(), SymbolError> {
+        each stmt in &block.stmts {
+            self.resolve_stmt(stmt)?;
+        }
+        Ok(())
+    }
+
+    fn resolve_top_level(&var self, item: &TopLevel) -> Result<(), SymbolError> {
+        match item {
+            TopLevel::Fn(fn_def) => {
+                // Function name is already in global scope
+                self.enter_scope(ScopeKind::Function);
+
+                // Add parameters
+                each param in &fn_def.params {
+                    self.define_symbol(
+                        param.name.clone(),
+                        SymbolInfo {
+                            kind: SymbolKind::Variable,
+                            ty: param.ty.clone().unwrap_or(TypeExpr::Infer),
+                            visibility: Visibility::Private,
+                            attributes: [],
+                        },
+                        param.span,
+                        false,
+                    )?;
+                }
+
+                // Resolve function body
+                self.resolve_block(&fn_def.body)?;
+                self.exit_scope();
+            }
+
+            TopLevel::Data(data_def) => {
+                self.enter_scope(ScopeKind::Block);
+                // Would add fields as symbols
+                self.exit_scope();
+            }
+
+            _ => {}
+        }
+
+        Ok(())
+    }
+}
+
+/// Public interface for symbol table operations
+fn build_symbol_table(program: &Program) -> Result<SymbolTable, Vec<SymbolError>> {
+    var table = SymbolTable::new();
+    var errors = [];
+
+    // First pass: collect all top-level symbols
+    each item in &program.items {
+        match table.resolve_top_level(item) {
+            Ok(()) => {}
+            Err(e) => errors.push(e),
+        }
+    }
+
+    check errors.is_empty() {
+        Ok(table)
+    } else {
+        Err(errors)
+    }
+}

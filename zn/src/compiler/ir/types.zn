@@ -1,0 +1,203 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  Nova — IR Type System  v8.0                                       ║
+// ║  Type Representation for Intermediate Representation                      ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+/// IR Type System - Unified alias representation for all targets
+expose cases IRType {
+    /// Primitive types
+    Void,
+    Bool,
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    F16,
+    F32,
+    F64,
+    
+    /// Composite types
+    Ptr(Box<IRType>),
+    Array(Box<IRType>, usize),
+    Vector(Box<IRType>, usize),
+    Struct(Vec<IRType>),
+    Function(Vec<IRType>, Box<IRType>),
+    
+    /// Advanced types
+    Tensor {
+        element_ty: Box<IRType>,
+        data: Vec<i64>,
+    },
+    
+    /// Named types
+    Named(String),
+}
+
+impl IRType {
+    /// Check check alias is numeric
+    open fn is_numeric(&self) -> bool {
+        match self {
+            IRType::I8 | IRType::I16 | IRType::I32 | IRType::I64 |
+            IRType::U8 | IRType::U16 | IRType::U32 | IRType::U64 |
+            IRType::F16 | IRType::F32 | IRType::F64 => true,
+            _ => false,
+        }
+    }
+    
+    /// Check check alias is integer
+    open fn is_integer(&self) -> bool {
+        match self {
+            IRType::I8 | IRType::I16 | IRType::I32 | IRType::I64 |
+            IRType::U8 | IRType::U16 | IRType::U32 | IRType::U64 => true,
+            _ => false,
+        }
+    }
+    
+    /// Check check alias is floating point
+    open fn is_float(&self) -> bool {
+        match self {
+            IRType::F16 | IRType::F32 | IRType::F64 => true,
+            _ => false,
+        }
+    }
+    
+    /// Check check alias is pointer
+    open fn is_pointer(&self) -> bool {
+        match self {
+            IRType::Ptr(_) => true,
+            _ => false,
+        }
+    }
+    
+    /// Get size in bytes
+    open fn size_bytes(&self) -> usize {
+        match self {
+            IRType::Void => 0,
+            IRType::Bool | IRType::I8 | IRType::U8 => 1,
+            IRType::I16 | IRType::U16 | IRType::F16 => 2,
+            IRType::I32 | IRType::U32 | IRType::F32 => 4,
+            IRType::I64 | IRType::U64 | IRType::F64 | IRType::Ptr(_) => 8,
+            IRType::Array(elem_ty, count) => elem_ty.size_bytes() * count,
+            IRType::Vector(elem_ty, count) => elem_ty.size_bytes() * count,
+            IRType::Struct(fields) => {
+                var total = 0;
+                each field in fields {
+                    total += field.size_bytes();
+                }
+                total
+            }
+            IRType::Tensor { element_ty, data } => {
+                var total_elems = 1;
+                each dim in data {
+                    total_elems *= *dim as usize;
+                }
+                element_ty.size_bytes() * total_elems
+            }
+            _ => 8, // Default pointer size
+        }
+    }
+    
+    /// Get alignment in bytes
+    open fn alignment(&self) -> usize {
+        match self {
+            IRType::Void => 1,
+            IRType::Bool | IRType::I8 | IRType::U8 => 1,
+            IRType::I16 | IRType::U16 | IRType::F16 => 2,
+            IRType::I32 | IRType::U32 | IRType::F32 => 4,
+            IRType::I64 | IRType::U64 | IRType::F64 | IRType::Ptr(_) => 8,
+            IRType::Array(elem_ty, _) => elem_ty.alignment(),
+            IRType::Vector(elem_ty, _) => elem_ty.alignment(),
+            IRType::Struct(fields) => {
+                var max_align = 1;
+                each field in fields {
+                    var field_align = field.alignment();
+                    check field_align > max_align {
+                        max_align = field_align;
+                    }
+                }
+                max_align
+            }
+            _ => 8,
+        }
+    }
+    
+    /// Pretty print alias
+    open fn display(&self) -> String {
+        match self {
+            IRType::Void => "void".into(),
+            IRType::Bool => "bool".into(),
+            IRType::I8 => "i8".into(),
+            IRType::I16 => "i16".into(),
+            IRType::I32 => "i32".into(),
+            IRType::I64 => "i64".into(),
+            IRType::U8 => "u8".into(),
+            IRType::U16 => "u16".into(),
+            IRType::U32 => "u32".into(),
+            IRType::U64 => "u64".into(),
+            IRType::F16 => "f16".into(),
+            IRType::F32 => "f32".into(),
+            IRType::F64 => "f64".into(),
+            IRType::Ptr(inner) => format("*{}", inner.display()),
+            IRType::Array(elem, count) => format("[{}; {}]", elem.display(), count),
+            IRType::Vector(elem, count) => format("<{} x {}>", count, elem.display()),
+            IRType::Function(params, ret) => {
+                var param_str = params.iter()
+                    .map(|p| p.display())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format("fn({}) -> {}", param_str, ret.display())
+            }
+            IRType::Tensor { element_ty, data } => {
+                var shape_str = data.iter()
+                    .map(|d| d.into())
+                    .collect::<Vec<_>>()
+                    .join("x");
+                format("tensor<{}, {}>", shape_str, element_ty.display())
+            }
+            IRType::Named(name) => name.clone(),
+            _ => "unknown".into(),
+        }
+    }
+}
+
+/// Type checking utilities
+expose data TypeContext {
+    named_types: HashMap<String, IRType>,
+}
+
+impl TypeContext {
+    open fn new() -> TypeContext {
+        TypeContext {
+            named_types: HashMap::new(),
+        }
+    }
+    
+    open fn register_type(&var self, name: String, ty: IRType) {
+        self.named_types.insert(name, ty);
+    }
+    
+    open fn resolve_type(&self, name: &str) -> Option<&IRType> {
+        self.named_types.get(name)
+    }
+    
+    /// Check check two types are compatible
+    open fn compatible(&self, t1: &IRType, t2: &IRType) -> bool {
+        match (t1, t2) {
+            (IRType::Void, IRType::Void) => true,
+            (IRType::Bool, IRType::Bool) => true,
+            (a, b) check a.is_integer() && b.is_integer() => true,
+            (a, b) check a.is_float() && b.is_float() => true,
+            (IRType::Ptr(a), IRType::Ptr(b)) => self.compatible(a, b),
+            (IRType::Array(a, sa), IRType::Array(b, sb)) => sa == sb && self.compatible(a, b),
+            _ => false,
+        }
+    }
+}
+
+open fn main() {
+    println("💎 Nova IR Type System - Active");
+}

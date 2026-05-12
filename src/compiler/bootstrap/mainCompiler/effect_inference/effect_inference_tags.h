@@ -1,0 +1,5 @@
+#ifndef NOVA_EFFECT_INFERENCE_TAGS_H
+#define NOVA_EFFECT_INFERENCE_TAGS_H
+
+#endif
+

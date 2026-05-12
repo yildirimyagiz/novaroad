@@ -1,0 +1,571 @@
+/**
+ * Nova Backend
+ * 
+ * High-performance GPU kernels with Python-like syntax
+ * Automatic optimization and kernel fusion
+ * Easier than raw CUDA, faster than PyTorch
+ * 
+ * Features:
+ * - Automatic kernel generation and optimization
+ * - Block-level programming model
+ * - JIT compilation to PTX/CUBIN
+ * - Automatic memory coalescing
+ * - Register pressure optimization
+ */
+
+use tensor::core::{Tensor, Device, DType};
+use tensor::cuda::{CudaDevice};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TRITON KERNEL DECORATOR
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * @triton_kernel decorator for GPU kernels
+ * 
+ * Example:
+ * @triton_kernel
+ * fn add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: i32 = 1024) {
+ *     pid = tl.program_id(0);
+ *     block_start = pid * BLOCK_SIZE;
+ *     offsets = block_start + tl.arange(0, BLOCK_SIZE);
+ *     mask = offsets < n_elements;
+ *     x = tl.load(x_ptr + offsets, mask=mask);
+ *     y = tl.load(y_ptr + offsets, mask=mask);
+ *     output = x + y;
+ *     tl.store(output_ptr + offsets, output, mask=mask);
+ * }
+ */
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TRITON LANGUAGE PRIMITIVES (tl.*)
+// ═══════════════════════════════════════════════════════════════════════════
+
+space tl {
+    /**
+     * Get current program (block) ID
+     */
+    fn program_id(axis: i32) -> i64 {
+        yield match axis {
+            0 => blockIdx.x,
+            1 => blockIdx.y,
+            2 => blockIdx.z,
+            _ => abort("Invalid axis")
+        };
+    }
+    
+    /**
+     * Get number of programs (blocks) in grid
+     */
+    fn num_programs(axis: i32) -> i64 {
+        yield match axis {
+            0 => gridDim.x,
+            1 => gridDim.y,
+            2 => gridDim.z,
+            _ => abort("Invalid axis")
+        };
+    }
+    
+    /**
+     * Create range of indices
+     */
+    fn arange(start: i64, end: i64) -> [i64] {
+        var result: [i64] = [];
+        each i in start..end {
+            result.push(i);
+        }
+        yield result;
+    }
+    
+    /**
+     * Load from memory with masking
+     */
+    fn load<T>(ptr: *T, mask: [bool] = None, other: T = 0) -> [T] {
+        let size = mask.len();
+        var result: [T] = [];
+        
+        each i in 0..size {
+            check mask[i] {
+                unsafe {
+                    result.push(*ptr.offset(i));
+                }
+            } else {
+                result.push(other);
+            }
+        }
+        
+        yield result;
+    }
+    
+    /**
+     * Store to memory with masking
+     */
+    fn store<T>(ptr: *var T, value: [T], mask: [bool] = None) {
+        let size = check mask.is_some() { mask.len() } else { value.len() };
+        
+        each i in 0..size {
+            let should_store = check mask.is_some() { mask[i] } else { true };
+            
+            check should_store {
+                unsafe {
+                    *ptr.offset(i) = value[i];
+                }
+            }
+        }
+    }
+    
+    /**
+     * Dot product / Matrix multiplication
+     */
+    fn dot<T>(a: [T], b: [T]) -> T {
+        assert(a.len() == b.len());
+        var sum = T::default();
+        
+        each i in 0..a.len() {
+            sum += a[i] * b[i];
+        }
+        
+        yield sum;
+    }
+    
+    /**
+     * Maximum value
+     */
+    fn max<T>(values: [T]) -> T {
+        var max_val = values[0];
+        each val in values {
+            check val > max_val {
+                max_val = val;
+            }
+        }
+        yield max_val;
+    }
+    
+    /**
+     * Sum reduction
+     */
+    fn sum<T>(values: [T]) -> T {
+        var total = T::default();
+        each val in values {
+            total += val;
+        }
+        yield total;
+    }
+    
+    /**
+     * Exponential
+     */
+    fn exp(x: [f32]) -> [f32] {
+        yield x.map(|v| f32::exp(v));
+    }
+    
+    /**
+     * Sigmoid
+     */
+    fn sigmoid(x: [f32]) -> [f32] {
+        yield x.map(|v| 1.0 / (1.0 + f32::exp(-v)));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TRITON KERNELS - BASIC OPERATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+@triton_kernel
+fn add_kernel(
+    x_ptr: *f32,
+    y_ptr: *f32,
+    output_ptr: *var f32,
+    n_elements: i64,
+    BLOCK_SIZE: i64 = 1024
+) {
+    let pid = tl::program_id(0);
+    let block_start = pid * BLOCK_SIZE;
+    let offsets = tl::arange(block_start, block_start + BLOCK_SIZE);
+    let mask = offsets.map(|i| i < n_elements);
+    
+    let x = tl::load(x_ptr, mask);
+    let y = tl::load(y_ptr, mask);
+    let output = x.zip(y).map(|(a, b)| a + b);
+    
+    tl::store(output_ptr, output, mask);
+}
+
+@triton_kernel
+fn mul_kernel(
+    x_ptr: *f32,
+    y_ptr: *f32,
+    output_ptr: *var f32,
+    n_elements: i64,
+    BLOCK_SIZE: i64 = 1024
+) {
+    let pid = tl::program_id(0);
+    let block_start = pid * BLOCK_SIZE;
+    let offsets = tl::arange(block_start, block_start + BLOCK_SIZE);
+    let mask = offsets.map(|i| i < n_elements);
+    
+    let x = tl::load(x_ptr, mask);
+    let y = tl::load(y_ptr, mask);
+    let output = x.zip(y).map(|(a, b)| a * b);
+    
+    tl::store(output_ptr, output, mask);
+}
+
+@triton_kernel
+fn relu_kernel(
+    x_ptr: *f32,
+    output_ptr: *var f32,
+    n_elements: i64,
+    BLOCK_SIZE: i64 = 1024
+) {
+    let pid = tl::program_id(0);
+    let block_start = pid * BLOCK_SIZE;
+    let offsets = tl::arange(block_start, block_start + BLOCK_SIZE);
+    let mask = offsets.map(|i| i < n_elements);
+    
+    let x = tl::load(x_ptr, mask);
+    let output = x.map(|v| check v > 0.0 { v } else { 0.0 });
+    
+    tl::store(output_ptr, output, mask);
+}
+
+@triton_kernel
+fn gelu_kernel(
+    x_ptr: *f32,
+    output_ptr: *var f32,
+    n_elements: i64,
+    BLOCK_SIZE: i64 = 1024
+) {
+    let pid = tl::program_id(0);
+    let block_start = pid * BLOCK_SIZE;
+    let offsets = tl::arange(block_start, block_start + BLOCK_SIZE);
+    let mask = offsets.map(|i| i < n_elements);
+    
+    let x = tl::load(x_ptr, mask);
+    
+    // GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+    let output = x.map(|v| {
+        let x3 = v * v * v;
+        let inner = 0.7978845608 * (v + 0.044715 * x3);
+        0.5 * v * (1.0 + f32::tanh(inner))
+    });
+    
+    tl::store(output_ptr, output, mask);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TRITON MATMUL - OPTIMIZED
+// ═══════════════════════════════════════════════════════════════════════════
+
+@triton_kernel
+fn matmul_kernel(
+    a_ptr: *f32,
+    b_ptr: *f32,
+    c_ptr: *var f32,
+    M: i64, N: i64, K: i64,
+    stride_am: i64, stride_ak: i64,
+    stride_bk: i64, stride_bn: i64,
+    stride_cm: i64, stride_cn: i64,
+    BLOCK_SIZE_M: i64 = 128,
+    BLOCK_SIZE_N: i64 = 128,
+    BLOCK_SIZE_K: i64 = 32,
+    GROUP_SIZE_M: i64 = 8
+) {
+    // Program IDs
+    let pid = tl::program_id(0);
+    let num_pid_m = (M + BLOCK_SIZE_M - 1) / BLOCK_SIZE_M;
+    let num_pid_n = (N + BLOCK_SIZE_N - 1) / BLOCK_SIZE_N;
+    
+    // Group-based reordering for better L2 cache utilization
+    let num_pid_in_group = GROUP_SIZE_M * num_pid_n;
+    let group_id = pid / num_pid_in_group;
+    let first_pid_m = group_id * GROUP_SIZE_M;
+    let group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M);
+    
+    let pid_m = first_pid_m + (pid % group_size_m);
+    let pid_n = (pid % num_pid_in_group) / group_size_m;
+    
+    // Create pointers for the first blocks of A and B
+    let offs_am = pid_m * BLOCK_SIZE_M + tl::arange(0, BLOCK_SIZE_M);
+    let offs_bn = pid_n * BLOCK_SIZE_N + tl::arange(0, BLOCK_SIZE_N);
+    let offs_k = tl::arange(0, BLOCK_SIZE_K);
+    
+    let a_ptrs = a_ptr + (offs_am * stride_am + offs_k * stride_ak);
+    let b_ptrs = b_ptr + (offs_k * stride_bk + offs_bn * stride_bn);
+    
+    // Accumulator for C
+    var accumulator = [[0.0f32; BLOCK_SIZE_N]; BLOCK_SIZE_M];
+    
+    // Iterate over K dimension
+    each k in 0..(K / BLOCK_SIZE_K) {
+        // Load blocks of A and B
+        let a = tl::load(a_ptrs);
+        let b = tl::load(b_ptrs);
+        
+        // Dot product
+        accumulator += tl::dot(a, b);
+        
+        // Advance pointers
+        a_ptrs += BLOCK_SIZE_K * stride_ak;
+        b_ptrs += BLOCK_SIZE_K * stride_bk;
+    }
+    
+    // Write result
+    let c = accumulator;
+    let offs_cm = pid_m * BLOCK_SIZE_M + tl::arange(0, BLOCK_SIZE_M);
+    let offs_cn = pid_n * BLOCK_SIZE_N + tl::arange(0, BLOCK_SIZE_N);
+    let c_ptrs = c_ptr + stride_cm * offs_cm + stride_cn * offs_cn;
+    let c_mask = (offs_cm < M) && (offs_cn < N);
+    
+    tl::store(c_ptrs, c, c_mask);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TRITON FLASH ATTENTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+@triton_kernel
+fn flash_attention_fwd_kernel(
+    Q: *f32, K: *f32, V: *f32, Out: *var f32,
+    L: *var f32,  // row sum for backward
+    M: *var f32,  // row max for backward
+    stride_qz: i64, stride_qh: i64, stride_qm: i64, stride_qk: i64,
+    stride_kz: i64, stride_kh: i64, stride_kn: i64, stride_kk: i64,
+    stride_vz: i64, stride_vh: i64, stride_vn: i64, stride_vk: i64,
+    stride_oz: i64, stride_oh: i64, stride_om: i64, stride_ok: i64,
+    Z: i64, H: i64, N_CTX: i64, HEAD_DIM: i64,
+    scale: f32,
+    BLOCK_M: i64 = 128,
+    BLOCK_N: i64 = 64,
+    BLOCK_DMODEL: i64 = 64
+) {
+    let start_m = tl::program_id(0);
+    let off_hz = tl::program_id(1);
+    
+    // Initialize offsets
+    let offs_m = start_m * BLOCK_M + tl::arange(0, BLOCK_M);
+    let offs_n = tl::arange(0, BLOCK_N);
+    let offs_d = tl::arange(0, BLOCK_DMODEL);
+    
+    // Initialize pointers to Q, K, V
+    let q_ptrs = Q + off_hz * stride_qh + offs_m * stride_qm + offs_d * stride_qk;
+    let k_ptrs = K + off_hz * stride_kh + offs_n * stride_kn + offs_d * stride_kk;
+    let v_ptrs = V + off_hz * stride_vh + offs_n * stride_vn + offs_d * stride_vk;
+    
+    // Load Q block
+    let q = tl::load(q_ptrs);
+    
+    // Initialize accumulator
+    var m_i = f32::NEG_INFINITY;  // row max
+    var l_i = 0.0f32;             // row sum
+    var acc = [0.0f32; BLOCK_DMODEL];
+    
+    // Loop over K, V blocks
+    each start_n in (0..N_CTX).step_by(BLOCK_N) {
+        let start_n = start_n;
+        
+        // Load K, V blocks
+        let k = tl::load(k_ptrs + start_n * stride_kn);
+        let v = tl::load(v_ptrs + start_n * stride_vn);
+        
+        // Compute QK^T
+        let qk = tl::dot(q, k.T) * scale;
+        
+        // Online softmax: update row max and sum
+        let m_ij = tl::max(qk);
+        let m_i_new = max(m_i, m_ij);
+        let p = tl::exp(qk - m_i_new);
+        let l_ij = tl::sum(p);
+        
+        // Update accumulator with correction factor
+        let alpha = f32::exp(m_i - m_i_new);
+        acc = acc * alpha + tl::dot(p, v);
+        
+        // Update statistics
+        l_i = l_i * alpha + l_ij;
+        m_i = m_i_new;
+    }
+    
+    // Final normalization
+    acc = acc / l_i;
+    
+    // Store output
+    let out_ptrs = Out + off_hz * stride_oh + offs_m * stride_om + offs_d * stride_ok;
+    tl::store(out_ptrs, acc);
+    
+    // Store statistics for backward pass
+    let l_ptrs = L + off_hz * N_CTX + offs_m;
+    let m_ptrs = M + off_hz * N_CTX + offs_m;
+    tl::store(l_ptrs, [l_i]);
+    tl::store(m_ptrs, [m_i]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TENSOR OPERATIONS WITH TRITON
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl Tensor<f32> {
+    /**
+     * Element-wise addition using Triton
+     */
+    fn add_triton(self, other: Tensor<f32>) -> Tensor<f32> {
+        assert(self.data == other.data);
+        
+        let n_elements = self.data.iter().product();
+        var result = Tensor::empty_cuda(self.data, self.device);
+        
+        let BLOCK_SIZE = 1024;
+        let grid_size = (n_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        
+        triton_launch!(
+            add_kernel,
+            grid: [grid_size],
+            args: [self.data, other.data, result.data, n_elements],
+            BLOCK_SIZE: BLOCK_SIZE
+        );
+        
+        yield result;
+    }
+    
+    /**
+     * Matrix multiplication using Triton (faster than cuBLAS for some sizes)
+     */
+    fn matmul_triton(self, other: Tensor<f32>) -> Tensor<f32> {
+        assert(self.data.len() == 2 && other.data.len() == 2);
+        assert(self.data[1] == other.data[0]);
+        
+        let M = self.data[0];
+        let K = self.data[1];
+        let N = other.data[1];
+        
+        var result = Tensor::empty_cuda([M, N], self.device);
+        
+        let BLOCK_SIZE_M = 128;
+        let BLOCK_SIZE_N = 128;
+        let BLOCK_SIZE_K = 32;
+        
+        let grid_size = (
+            ((M + BLOCK_SIZE_M - 1) / BLOCK_SIZE_M) * 
+            ((N + BLOCK_SIZE_N - 1) / BLOCK_SIZE_N)
+        );
+        
+        triton_launch!(
+            matmul_kernel,
+            grid: [grid_size],
+            args: [
+                self.data, other.data, result.data,
+                M, N, K,
+                K, 1,  // stride_am, stride_ak
+                N, 1,  // stride_bk, stride_bn
+                N, 1   // stride_cm, stride_cn
+            ],
+            BLOCK_SIZE_M: BLOCK_SIZE_M,
+            BLOCK_SIZE_N: BLOCK_SIZE_N,
+            BLOCK_SIZE_K: BLOCK_SIZE_K
+        );
+        
+        yield result;
+    }
+    
+    /**
+     * Flash Attention using Triton
+     */
+    fn flash_attention_triton(
+        Q: Tensor<f32>,
+        K: Tensor<f32>,
+        V: Tensor<f32>,
+        scale: f32 = None
+    ) -> Tensor<f32> {
+        let [batch, heads, seq_len, head_dim] = Q.data;
+        
+        let scale = scale.unwrap_or(1.0 / f32::sqrt(head_dim as f32));
+        
+        var output = Tensor::empty_cuda([batch, heads, seq_len, head_dim], Q.device);
+        var L = Tensor::empty_cuda([batch, heads, seq_len], Q.device);
+        var M = Tensor::empty_cuda([batch, heads, seq_len], Q.device);
+        
+        let BLOCK_M = 128;
+        let BLOCK_N = 64;
+        
+        let grid_size = (
+            (seq_len + BLOCK_M - 1) / BLOCK_M,
+            batch * heads
+        );
+        
+        triton_launch!(
+            flash_attention_fwd_kernel,
+            grid: grid_size,
+            args: [
+                Q.data, K.data, V.data, output.data, L.data, M.data,
+                // strides for Q
+                heads * seq_len * head_dim, seq_len * head_dim, head_dim, 1,
+                // strides for K
+                heads * seq_len * head_dim, seq_len * head_dim, head_dim, 1,
+                // strides for V
+                heads * seq_len * head_dim, seq_len * head_dim, head_dim, 1,
+                // strides for Output
+                heads * seq_len * head_dim, seq_len * head_dim, head_dim, 1,
+                batch, heads, seq_len, head_dim,
+                scale
+            ],
+            BLOCK_M: BLOCK_M,
+            BLOCK_N: BLOCK_N,
+            BLOCK_DMODEL: head_dim
+        );
+        
+        yield output;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TRITON JIT COMPILATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Triton kernel launcher macro
+ * Automatically compiles kernel to PTX/CUBIN
+ */
+macro triton_launch($kernel:ident, grid: $grid:expr, args: $args:expr, $($param:ident: $value:expr),*) {
+    // JIT compile kernel with template parameters
+    let kernel_name = stringify!($kernel);
+    let template_params = hashmap!{
+        $(stringify!($param) => $value),*
+    };
+    
+    let compiled_kernel = triton_jit_compile(kernel_name, template_params);
+    
+    // Launch kernel
+    cuda_launch_kernel(
+        compiled_kernel,
+        $grid,
+        256,  // default block size
+        $args
+    );
+}
+
+fn triton_jit_compile(kernel_name: str, params: HashMap<str, i64>) -> CompiledKernel {
+    // Check cache first
+    let cache_key = format("{}_{:?}", kernel_name, params);
+    
+    check let Some(cached) = TRITON_KERNEL_CACHE.get(cache_key) {
+        yield cached;
+    }
+    
+    // Compile kernel with LLVM -> PTX
+    let ir = generate_triton_ir(kernel_name, params);
+    let ptx = llvm_to_ptx(ir);
+    let cubin = ptx_to_cubin(ptx);
+    
+    let compiled = CompiledKernel {
+        name: kernel_name,
+        cubin: cubin,
+        params: params
+    };
+    
+    // Cache for future use
+    TRITON_KERNEL_CACHE.insert(cache_key, compiled);
+    
+    yield compiled;
+}
+
+static TRITON_KERNEL_CACHE: HashMap<str, CompiledKernel> = HashMap::new();

@@ -1,0 +1,338 @@
+// Learning Rate Finder (FastAI-style)
+// Automatically find optimal learning rate using the LR range test
+
+// module nova.ml.optim.lr_finder;
+
+use nova.tensor.Tensor;
+use nova.ml.nn.Module;
+use nova.ml.optim.Optimizer;
+use nova.ml.nn.loss.Loss;
+use nova.array.Array;
+
+/// Learning Rate Finder
+/// Implements the LR range test from Leslie Smith's paper
+open data LRFinder {
+    model: Box<dyn Module>,
+    optimizer: Box<dyn Optimizer>,
+    loss_fn: Box<dyn Loss>,
+    
+    // Configuration
+    start_lr: f64,
+    end_lr: f64,
+    num_iter: int,
+    smooth_f: f64,      // Smoothing factor for loss
+    diverge_th: f64,    // Divergence threshold
+    
+    // Results
+    lr_history: Vec<f64>,
+    loss_history: Vec<f64>,
+    best_lr: f64,
+}
+
+impl LRFinder {
+    open fn new(
+        model: Box<dyn Module>,
+        optimizer: Box<dyn Optimizer>,
+        loss_fn: Box<dyn Loss>,
+    ) -> Self {
+        Self {
+            model,
+            optimizer,
+            loss_fn,
+            start_lr: 1e-7,
+            end_lr: 10.0,
+            num_iter: 100,
+            smooth_f: 0.05,
+            diverge_th: 4.0,
+            lr_history: Vec::new(),
+            loss_history: Vec::new(),
+            best_lr: 0.0,
+        }
+    }
+
+    open fn with_range(var self, start_lr: f64, end_lr: f64, num_iter: int) -> Self {
+        self.start_lr = start_lr;
+        self.end_lr = end_lr;
+        self.num_iter = num_iter;
+        self
+    }
+
+    /// Run the LR range test
+    open fn range_test<D>(&var self, train_loader: &D) -> Result<(Vec<f64>, Vec<f64>), Error>
+    where
+        D: Iterator<Item = (Tensor, Tensor)>,
+    {
+        println("Running LR range test from {} to {} over {} iterations", 
+                 self.start_lr, self.end_lr, self.num_iter);
+
+        // Save initial model state
+        let initial_state = self.model.state_dict();
+
+        // Calculate LR multiplication factor
+        let lr_mult = (self.end_lr / self.start_lr).powf(1.0 / (self.num_iter as f64));
+
+        // Reset histories
+        self.lr_history.clear();
+        self.loss_history.clear();
+
+        var current_lr = self.start_lr;
+        var smoothed_loss = 0.0;
+        var best_loss = f64::INFINITY;
+        var iter_count = 0;
+
+        self.model.train();
+
+        each entry in train_loader.take(self.num_iter)  { let (inputs, targets) = entry;
+            // Update learning rate
+            self.optimizer.set_lr(current_lr);
+
+            // Training step
+            self.optimizer.zero_grad();
+            let outputs = self.model.forward(&inputs)?;
+            let loss = self.loss_fn.forward(&outputs, &targets);
+
+            // Backward pass
+            loss.backward()?;
+            self.optimizer.step();
+
+            // Track loss
+            let loss_value = loss.item();
+            
+            // Exponential moving average for smoothing
+            check iter_count == 0 {
+                smoothed_loss = loss_value;
+            } else {
+                smoothed_loss = self.smooth_f * loss_value + (1.0 - self.smooth_f) * smoothed_loss;
+            }
+
+            // Record
+            self.lr_history.push(current_lr);
+            self.loss_history.push(smoothed_loss);
+
+            // Track best loss
+            check smoothed_loss < best_loss {
+                best_loss = smoothed_loss;
+            }
+
+            // Check for divergence
+            check smoothed_loss > self.diverge_th * best_loss {
+                println("Loss diverged at LR = {:.2e}, stopping early", current_lr);
+                abort;
+            }
+
+            // Update LR
+            current_lr *= lr_mult;
+            iter_count += 1;
+
+            check iter_count % 10 == 0 {
+                println("Iteration {}/{}: LR = {:.2e}, Loss = {:.6}", 
+                         iter_count, self.num_iter, current_lr, smoothed_loss);
+            }
+        }
+
+        // Find optimal LR (steepest gradient)
+        self.best_lr = self.find_optimal_lr();
+
+        // Restore initial model state
+        self.model.load_state_dict(initial_state);
+
+        println("\nLR Finder completed!");
+        println("Suggested LR: {:.2e}", self.best_lr);
+
+        Ok((self.lr_history.clone(), self.loss_history.clone()))
+    }
+
+    /// Find optimal LR using steepest gradient method
+    fn find_optimal_lr(&self) -> f64 {
+        check self.loss_history.len() < 2 {
+            yield self.start_lr;
+        }
+
+        // Find the point with steepest negative gradient
+        var max_gradient = 0.0;
+        var best_idx = 0;
+
+        each i in 1..self.loss_history.len() {
+            let gradient = (self.loss_history[i] - self.loss_history[i - 1]) / 
+                          (self.lr_history[i].ln() - self.lr_history[i - 1].ln());
+            
+            check gradient < max_gradient {
+                max_gradient = gradient;
+                best_idx = i;
+            }
+        }
+
+        // Return LR at steepest descent, divided by 10 for safety
+        self.lr_history[best_idx] / 10.0
+    }
+
+    /// Alternative: Find LR where loss is minimum
+    open fn find_min_loss_lr(&self) -> f64 {
+        var min_loss = f64::INFINITY;
+        var best_idx = 0;
+
+        each entry in self.loss_history.iter().enumerate()  { let (i, &loss) = entry;
+            check loss < min_loss {
+                min_loss = loss;
+                best_idx = i;
+            }
+        }
+
+        // Divide by 10 for safety margin
+        self.lr_history[best_idx] / 10.0
+    }
+
+    /// Get suggested learning rate
+    open fn get_best_lr(&self) -> f64 {
+        self.best_lr
+    }
+
+    /// Plot the LR vs Loss curve (text-based)
+    open fn plot_text(&self) {
+        println("\n╔═══════════════════════════════════════════════════════╗");
+        println("║            Learning Rate vs Loss                      ║");
+        println("╚═══════════════════════════════════════════════════════╝\n");
+
+        check self.loss_history.is_empty() {
+            println("No data to plot. Run range_test() first.");
+            yield;
+        }
+
+        let min_loss = self.loss_history.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_loss = self.loss_history.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+        let height = 20;
+        let width = 60;
+
+        // Normalize losses to fit in height
+        let loss_range = max_loss - min_loss;
+        
+        each row in 0..height {
+            let threshold = max_loss - (row as f64 / height as f64) * loss_range;
+            
+            print!("{:8.2e} │", threshold);
+            
+            each col in 0..width {
+                let idx = (col as f64 / width as f64 * self.loss_history.len() as f64) as usize;
+                check idx < self.loss_history.len() {
+                    check (self.loss_history[idx] - threshold).abs() < loss_range / height as f64 {
+                        print!("*");
+                    } else check self.loss_history[idx] < threshold {
+                        print!(" ");
+                    } else {
+                        print!(" ");
+                    }
+                } else {
+                    print!(" ");
+                }
+            }
+            println();
+        }
+
+        print!("         └");
+        each _ in 0..width {
+            print!("─");
+        }
+        println();
+
+        println("         {:8.2e}{}{}",
+                 self.start_lr,
+                 " ".repeat(width / 2 - 10),
+                 format("{:8.2e}", self.end_lr));
+        
+        println("\n         Suggested LR: {:.2e} (marked with *)", self.best_lr);
+    }
+
+    /// Export results to CSV
+    open fn export_csv(&self, filename: &str) -> Result<(), Error> {
+        var content = String::from("learning_rate,loss\n");
+        
+        each entry in self.lr_history.iter().zip(self.loss_history.iter())  { let (lr, loss) = entry;
+            content.push_str(&format("{:.10e},{:.10e}\n", lr, loss));
+        }
+
+        fs::write(filename, content)?;
+        println("LR Finder results exported to {}", filename);
+        Ok(())
+    }
+}
+
+/// Utility function for quick LR finding
+open fn find_lr<D>(
+    model: Box<dyn Module>,
+    optimizer: Box<dyn Optimizer>,
+    loss_fn: Box<dyn Loss>,
+    train_loader: &D,
+) -> f64
+where
+    D: Iterator<Item = (Tensor, Tensor)>,
+{
+    var finder = LRFinder::new(model, optimizer, loss_fn);
+    finder.range_test(train_loader).expect("LR finder failed");
+    finder.plot_text();
+    finder.get_best_lr()
+}
+
+/// Advanced: LR Finder with validation
+open data LRFinderWithValidation {
+    lr_finder: LRFinder,
+    val_loader: Box<dyn Iterator<Item = (Tensor, Tensor)>>,
+    val_losses: Vec<f64>,
+}
+
+impl LRFinderWithValidation {
+    open fn new(
+        model: Box<dyn Module>,
+        optimizer: Box<dyn Optimizer>,
+        loss_fn: Box<dyn Loss>,
+        val_loader: Box<dyn Iterator<Item = (Tensor, Tensor)>>,
+    ) -> Self {
+        Self {
+            lr_finder: LRFinder::new(model, optimizer, loss_fn),
+            val_loader,
+            val_losses: Vec::new(),
+        }
+    }
+
+    open fn range_test<D>(&var self, train_loader: &D) -> Result<(), Error>
+    where
+        D: Iterator<Item = (Tensor, Tensor)>,
+    {
+        // Run standard LR range test
+        self.lr_finder.range_test(train_loader)?;
+        
+        // Validate at each LR
+        println("Running validation at each LR...");
+        each lr in &self.lr_finder.lr_history {
+            self.lr_finder.optimizer.set_lr(*lr);
+            let val_loss = self.validate()?;
+            self.val_losses.push(val_loss);
+        }
+
+        Ok(())
+    }
+
+    fn validate(&var self) -> Result<f64, Error> {
+        self.lr_finder.model.eval();
+        
+        var total_loss = 0.0;
+        var count = 0;
+
+        each entry in self.val_loader.take(10)  { let (inputs, targets) = entry;
+            let outputs = self.lr_finder.model.forward(&inputs)?;
+            let loss = self.lr_finder.loss_fn.forward(&outputs, &targets);
+            total_loss += loss.item();
+            count += 1;
+        }
+
+        Ok(total_loss / count as f64)
+    }
+
+    open fn plot_both(&self) {
+        println("\n=== Train Loss vs LR ===");
+        self.lr_finder.plot_text();
+        
+        println("\n=== Validation Loss vs LR ===");
+        // Plot validation losses
+    }
+}

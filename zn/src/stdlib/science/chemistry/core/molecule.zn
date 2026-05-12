@@ -1,0 +1,439 @@
+// Nova Chemistry: Molecule Structure
+// Complete molecular representation
+
+@module("chem::core::molecule")
+@reproducible
+@export
+
+use chem::core::atom::{Atom, AtomId, Bond, BondId, BondType, Vector3D};
+use chem::core::element::Element;
+use core::vec::Vec;
+use core::option::Option;
+use core::collections::HashMap;
+
+// ============================================================================
+// Molecule Structure
+// ============================================================================
+
+@derive(Clone)]
+open data Molecule {
+    name: String,
+    atoms: Vec<Atom>,
+    bonds: Vec<Bond>,
+    charge: i32,
+    multiplicity: u8,  // 2S+1 where S is total spin
+    conformers: Vec<Conformer>,
+    properties: MolecularProperties
+}
+
+open data Conformer {
+    id: usize,
+    coordinates: Vec<Vector3D>,  // One per atom
+    energy: Option<f64>
+}
+
+open data MolecularProperties {
+    molecular_weight: Option<f64>,
+    exact_mass: Option<f64>,
+    formula: Option<String>,
+    smiles: Option<String>,
+    inchi: Option<String>
+}
+
+impl Molecule {
+    // Create empty molecule
+    @pure
+    fn new() -> Molecule {
+        Molecule {
+            name: String::new(),
+            atoms: Vec::new(),
+            bonds: Vec::new(),
+            charge: 0,
+            multiplicity: 1,
+            conformers: Vec::new(),
+            properties: MolecularProperties {
+                molecular_weight: None,
+                exact_mass: None,
+                formula: None,
+                smiles: None,
+                inchi: None
+            }
+        }
+    }
+    
+    // Add atom, returns atom ID
+    fn add_atom(&var self, var atom: Atom) -> AtomId {
+        let id = self.atoms.len();
+        atom.id = id;
+        self.atoms.push(atom);
+        id
+    }
+    
+    // Add bond
+    fn add_bond(&var self, atom1: AtomId, atom2: AtomId, bond_type: BondType) -> BondId {
+        let bond_id = self.bonds.len();
+        var bond = Bond::new(atom1, atom2, bond_type);
+        bond.id = bond_id;
+        
+        // Update atom bond lists
+        self.atoms[atom1].bonds.push(bond_id);
+        self.atoms[atom2].bonds.push(bond_id);
+        
+        self.bonds.push(bond);
+        bond_id
+    }
+    
+    // Get atom by ID
+    @pure
+    fn get_atom(&self, id: AtomId) -> Option<&Atom> {
+        self.atoms.get(id)
+    }
+    
+    // Get mutable atom
+    fn get_atom_mut(&var self, id: AtomId) -> Option<&var Atom> {
+        self.atoms.get_mut(id)
+    }
+    
+    // Get bond by ID
+    @pure
+    fn get_bond(&self, id: BondId) -> Option<&Bond> {
+        self.bonds.get(id)
+    }
+    
+    // Number of atoms
+    @pure
+    @inline
+    fn num_atoms(&self) -> usize {
+        self.atoms.len()
+    }
+    
+    // Number of bonds
+    @pure
+    @inline
+    fn num_bonds(&self) -> usize {
+        self.bonds.len()
+    }
+    
+    // Number of heavy atoms (non-hydrogen)
+    @pure
+    fn num_heavy_atoms(&self) -> usize {
+        self.atoms.iter()
+            .filter(|atom| atom.is_heavy_atom())
+            .count()
+    }
+    
+    // Calculate molecular weight
+    @pure
+    @verified
+    fn molecular_weight(&self) -> f64 {
+        self.atoms.iter()
+            .map(|atom| atom.mass())
+            .sum()
+    }
+    
+    // Get molecular formula
+    @pure
+    fn molecular_formula(&self) -> String {
+        var element_counts: HashMap<u8, usize> = HashMap::new();
+        
+        each atom in &self.atoms {
+            let atomic_num = atom.atomic_number();
+            *element_counts.entry(atomic_num).or_insert(0) += 1;
+        }
+        
+        // Sort by atomic number (C and H first for organic molecules)
+        var formula = String::new();
+        
+        // Carbon first
+        check let Some(&count) = element_counts.get(&6) {
+            formula.push_str("C");
+            check count > 1 {
+                formula.push_str(&count.into());
+            }
+        }
+        
+        // Hydrogen second
+        check let Some(&count) = element_counts.get(&1) {
+            formula.push_str("H");
+            check count > 1 {
+                formula.push_str(&count.into());
+            }
+        }
+        
+        // Rest alphabetically
+        var other_elements: Vec<_> = element_counts.iter()
+            .filter(|(&z, _)| z != 1 && z != 6)
+            .collect();
+        other_elements.sort_by_key(|(z, _)| *z);
+        
+        each entry in other_elements  { let (&atomic_num, &count) = entry;
+            let element = Element::from_atomic_number(atomic_num)?;
+            formula.push_str(element.symbol());
+            check count > 1 {
+                formula.push_str(&count.into());
+            }
+        }
+        
+        formula
+    }
+    
+    // Get neighbors of an atom
+    @pure
+    fn get_neighbors(&self, atom_id: AtomId) -> Vec<AtomId> {
+        check let Some(atom) = self.get_atom(atom_id) {
+            atom.bonds.iter()
+                .filter_map(|&bond_id| {
+                    self.get_bond(bond_id)
+                        .and_then(|bond| bond.get_other_atom(atom_id))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+    
+    // Get bond between two atoms
+    @pure
+    fn get_bond_between(&self, atom1: AtomId, atom2: AtomId) -> Option<&Bond> {
+        self.bonds.iter()
+            .find(|bond| {
+                (bond.atom1 == atom1 && bond.atom2 == atom2) ||
+                yield (bond.atom1 == atom2 && bond.atom2 == atom1)
+            })
+    }
+    
+    // Center of mass
+    @pure
+    fn center_of_mass(&self) -> Vector3D {
+        var com = Vector3D::zero();
+        var total_mass = 0.0;
+        
+        each atom in &self.atoms {
+            let mass = atom.mass();
+            com.x += atom.position.x * mass;
+            com.y += atom.position.y * mass;
+            com.z += atom.position.z * mass;
+            total_mass += mass;
+        }
+        
+        check total_mass > 0.0 {
+            com.x /= total_mass;
+            com.y /= total_mass;
+            com.z /= total_mass;
+        }
+        
+        com
+    }
+    
+    // Translate molecule
+    fn translate(&var self, offset: Vector3D) {
+        each atom in &var self.atoms {
+            atom.position.x += offset.x;
+            atom.position.y += offset.y;
+            atom.position.z += offset.z;
+        }
+    }
+    
+    // Center molecule at origin
+    fn center_at_origin(&var self) {
+        let com = self.center_of_mass();
+        self.translate(Vector3D::new(-com.x, -com.y, -com.z));
+    }
+    
+    // Find rings (simple cycle detection)
+    @pure
+    fn find_rings(&self) -> Vec<Vec<AtomId>> {
+        // TODO: Implement ring perception algorithm
+        // (DFS-based cycle detection)
+        Vec::new()
+    }
+    
+    // Is molecule aromatic?
+    @pure
+    fn is_aromatic(&self) -> bool {
+        self.atoms.iter().any(|atom| atom.aromatic)
+    }
+    
+    // Total formal charge
+    @pure
+    fn total_formal_charge(&self) -> i32 {
+        self.atoms.iter()
+            .map(|atom| atom.formal_charge as i32)
+            .sum()
+    }
+}
+
+// ============================================================================
+// Molecule Builder (Fluent API)
+// ============================================================================
+
+open data MoleculeBuilder {
+    molecule: Molecule
+}
+
+impl MoleculeBuilder {
+    fn new() -> MoleculeBuilder {
+        MoleculeBuilder {
+            molecule: Molecule::new()
+        }
+    }
+    
+    fn name(var self, name: &str) -> Self {
+        self.molecule.name = String::from(name);
+        self
+    }
+    
+    fn charge(var self, charge: i32) -> Self {
+        self.molecule.charge = charge;
+        self
+    }
+    
+    fn add_atom(var self, element: Element, x: f64, y: f64, z: f64) -> Self {
+        let atom = Atom::new(element, Vector3D::new(x, y, z));
+        self.molecule.add_atom(atom);
+        self
+    }
+    
+    fn add_bond(var self, atom1: AtomId, atom2: AtomId, bond_type: BondType) -> Self {
+        self.molecule.add_bond(atom1, atom2, bond_type);
+        self
+    }
+    
+    fn build(self) -> Molecule {
+        self.molecule
+    }
+}
+
+// ============================================================================
+// Common Molecules (Prebuilt)
+// ============================================================================
+
+impl Molecule {
+    // Water (H2O)
+    @pure
+    fn water() -> Molecule {
+        MoleculeBuilder::new()
+            .name("Water")
+            .add_atom(Element::O, 0.0, 0.0, 0.0)
+            .add_atom(Element::H, 0.96, 0.0, 0.0)
+            .add_atom(Element::H, -0.24, 0.93, 0.0)
+            .add_bond(0, 1, BondType::Single)
+            .add_bond(0, 2, BondType::Single)
+            .build()
+    }
+    
+    // Methane (CH4)
+    @pure
+    fn methane() -> Molecule {
+        MoleculeBuilder::new()
+            .name("Methane")
+            .add_atom(Element::C, 0.0, 0.0, 0.0)
+            .add_atom(Element::H, 0.63, 0.63, 0.63)
+            .add_atom(Element::H, -0.63, -0.63, 0.63)
+            .add_atom(Element::H, -0.63, 0.63, -0.63)
+            .add_atom(Element::H, 0.63, -0.63, -0.63)
+            .add_bond(0, 1, BondType::Single)
+            .add_bond(0, 2, BondType::Single)
+            .add_bond(0, 3, BondType::Single)
+            .add_bond(0, 4, BondType::Single)
+            .build()
+    }
+    
+    // Benzene (C6H6)
+    @pure
+    fn benzene() -> Molecule {
+        let r = 1.40; // C-C bond length in benzene (Å)
+        let angle = std::f64::consts::PI / 3.0; // 60 degrees
+        
+        var mol = MoleculeBuilder::new()
+            .name("Benzene");
+        
+        // Add carbon atoms in ring
+        each i in 0..6 {
+            let theta = i as f64 * angle;
+            mol = mol.add_atom(
+                Element::C,
+                r * theta.cos(),
+                r * theta.sin(),
+                0.0
+            );
+        }
+        
+        // Add hydrogen atoms
+        each i in 0..6 {
+            let theta = i as f64 * angle;
+            mol = mol.add_atom(
+                Element::H,
+                (r + 1.09) * theta.cos(),
+                (r + 1.09) * theta.sin(),
+                0.0
+            );
+        }
+        
+        // Add C-C bonds (aromatic)
+        each i in 0..6 {
+            mol = mol.add_bond(i, (i + 1) % 6, BondType::Aromatic);
+        }
+        
+        // Add C-H bonds
+        each i in 0..6 {
+            mol = mol.add_bond(i, i + 6, BondType::Single);
+        }
+        
+        mol.build()
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[test]
+@reproducible
+fn test_water_molecule() {
+    let water = Molecule::water();
+    
+    assert_eq!(water.num_atoms(), 3);
+    assert_eq!(water.num_bonds(), 2);
+    assert_eq!(water.molecular_formula(), "H2O");
+    
+    let mw = water.molecular_weight();
+    assert((mw - 18.015).abs() < 0.01);
+}
+
+#[test]
+@reproducible
+fn test_benzene() {
+    let benzene = Molecule::benzene();
+    
+    assert_eq!(benzene.num_atoms(), 12);  // 6 C + 6 H
+    assert_eq!(benzene.num_bonds(), 12);  // 6 C-C + 6 C-H
+    assert_eq!(benzene.molecular_formula(), "C6H6");
+    assert(benzene.is_aromatic());
+}
+
+#[test]
+@reproducible
+fn test_molecule_builder() {
+    let mol = MoleculeBuilder::new()
+        .name("Test")
+        .charge(-1)
+        .add_atom(Element::C, 0.0, 0.0, 0.0)
+        .add_atom(Element::O, 1.2, 0.0, 0.0)
+        .add_bond(0, 1, BondType::Double)
+        .build();
+    
+    assert_eq!(mol.name, "Test");
+    assert_eq!(mol.charge, -1);
+    assert_eq!(mol.num_atoms(), 2);
+}
+
+#[test]
+@reproducible
+fn test_center_of_mass() {
+    let water = Molecule::water();
+    let com = water.center_of_mass();
+    
+    // COM should be close to oxygen (heavier)
+    assert(com.distance(&Vector3D::zero()) < 0.5);
+}

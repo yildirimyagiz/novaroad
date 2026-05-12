@@ -1,0 +1,850 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Compiler — Parser Module                                            ║
+// ║                                                                              ║
+// ║  Syntax analysis and AST construction from token streams.                     ║
+// ║                                                                              ║
+// ║  Converts token sequences into Abstract Syntax Trees for semantic analysis.   ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §1  PARSER INTERFACE
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl Parser {
+
+    data ParserState derives [Clone] {
+        open tokens: Vec<Token>,
+        open current: usize,  // Current token index
+        open errors: Vec<ParseError>,
+    }
+
+    // ── Parsing Entry Point ──────────────────────────────────────────────────
+
+    open fn parse(tokens: Vec<Token>) -> Result<Ast, ParseError> {
+        println("🔧 Parsing tokens into AST...");
+
+        let var state = ParserState {
+            tokens,
+            current: 0,
+            errors: Vec::new(),
+        };
+
+        let var declarations = Vec::new();
+
+        while !self::is_at_end(&state) {
+            match self::parse_declaration(&var state) {
+                Ok(decl) => declarations.push(decl),
+                Err(e) => {
+                    state.errors.push(e);
+                    self::synchronize(&var state);
+                }
+            }
+        }
+
+        check state.errors.len() > 0 {
+            Err(state.errors[0].clone()); // Return first error for now
+        }
+
+        Ok(Ast {
+            declarations,
+        });
+    }
+
+    // ── Declaration Parsing ──────────────────────────────────────────────────
+
+    fn parse_declaration(state: *var ParserState) -> Result<Declaration, ParseError> {
+        // Parse decorators first
+        let mut decorators = Vec::new();
+        while self::match_token(state, TokenKind::Module) || 
+              self::match_token(state, TokenKind::Reproducible) ||
+              self::match_token(state, TokenKind::Export) ||
+              self::match_token(state, TokenKind::Inline) ||
+              self::match_token(state, TokenKind::NoMangle) ||
+              self::match_token(state, TokenKind::Decorator) {
+            let decorator = self::parse_decorator(state)?;
+            decorators.push(decorator);
+        }
+
+        // Check for declaration keywords
+        check self::match_token(state, TokenKind::Fn) {
+            yield self::parse_function_declaration(state, decorators);
+        } else check self::match_token(state, TokenKind::Data) {
+            yield self::parse_data_declaration(state, decorators);
+        } else check self::match_token(state, TokenKind::Skill) {
+            yield self::parse_skill_declaration(state, decorators);
+        } else check self::match_token(state, TokenKind::Mod) {
+            yield self::parse_module_declaration(state, decorators);
+        } else check self::match_token(state, TokenKind::Use) {
+            yield self::parse_use_declaration(state, decorators);
+        } else {
+            // Default to statement
+            match self::parse_statement(state) {
+                Ok(stmt) => yield Ok(Declaration::Statement(stmt)),
+                Err(e) => yield Err(e)
+            }
+        }
+    }
+
+    // ── Decorator Parsing ────────────────────────────────────────────────────────
+
+    fn parse_decorator(state: *var ParserState) -> Result<Decorator, ParseError> {
+        let decorator_token = self::previous_token(state)?;
+        let name = decorator_token.lexeme.trim_start_matches('@').to_string();
+        
+        // Parse decorator arguments if present
+        let mut args = Vec::new();
+        if self::match_token(state, TokenKind::LeftParen) {
+            while !self::check_token(state, TokenKind::RightParen) {
+                let arg = self::parse_expression(state)?;
+                args.push(arg);
+                
+                check !self::match_token(state, TokenKind::Comma) {
+                    abort;
+                }
+            }
+            self::consume_token(state, TokenKind::RightParen, "Expected ')' after decorator arguments")?;
+        }
+
+        Ok(Decorator {
+            name,
+            arguments: args,
+        });
+    }
+
+    // ── Function Declaration Parsing ─────────────────────────────────────────
+
+    fn parse_function_declaration(state: *var ParserState, decorators: Vec<Decorator>) -> Result<Declaration, ParseError> {
+        let name = self::consume_identifier(state, "Expected function name")?;
+
+        self::consume_token(state, TokenKind::LeftParen, "Expected '(' after function name")?;
+
+        let var parameters = Vec::new();
+
+        check !self::check_token(state, TokenKind::RightParen) {
+            loop {
+                let param_name = self::consume_identifier(state, "Expected parameter name")?;
+                self::consume_token(state, TokenKind::Colon, "Expected ':' after parameter name")?;
+                let param_type = self::parse_type_expression(state)?;
+
+                parameters.push(FunctionParameter {
+                    name: param_name,
+                    type_: param_type,
+                });
+
+                check !self::match_token(state, TokenKind::Comma) {
+                    abort;
+                }
+            }
+        }
+
+        self::consume_token(state, TokenKind::RightParen, "Expected ')' after parameters")?;
+
+        let return_type = check self::match_token(state, TokenKind::Arrow) {
+            Some(self::parse_type_expression(state)?)
+        } else {
+            None
+        };
+
+        let body = self::parse_block_statement(state)?;
+
+        Ok(Declaration::Function(FunctionDecl {
+            name,
+            parameters,
+            return_type,
+            body,
+            decorators,
+        }));
+    }
+
+    // ── Data Declaration Parsing ─────────────────────────────────────────────
+
+    fn parse_data_declaration(state: *var ParserState, decorators: Vec<Decorator>) -> Result<Declaration, ParseError> {
+        let name = self::consume_identifier(state, "Expected data type name")?;
+
+        let var derives = Vec::new();
+        check self::match_token(state, TokenKind::Derives) {
+            self::consume_token(state, TokenKind::LeftBracket, "Expected '[' after 'derives'")?;
+            while !self::check_token(state, TokenKind::RightBracket) {
+                let trait_name = self::consume_identifier(state, "Expected rules name")?;
+                derives.push(trait_name);
+                check !self::match_token(state, TokenKind::Comma) {
+                    abort;
+                }
+            }
+            self::consume_token(state, TokenKind::RightBracket, "Expected ']' after derives")?;
+        }
+
+        self::consume_token(state, TokenKind::LeftBrace, "Expected '{' after data declaration")?;
+
+        let var fields = Vec::new();
+        while !self::check_token(state, TokenKind::RightBrace) && !self::is_at_end(state) {
+            let field_name = self::consume_identifier(state, "Expected field name")?;
+            self::consume_token(state, TokenKind::Colon, "Expected ':' after field name")?;
+            let field_type = self::parse_type_expression(state)?;
+
+            fields.push(DataField {
+                name: field_name,
+                type_: field_type,
+            });
+
+            check !self::match_token(state, TokenKind::Comma) {
+                abort;
+            }
+        }
+
+        self::consume_token(state, TokenKind::RightBrace, "Expected '}' after data fields")?;
+
+        Ok(Declaration::Data(DataDecl {
+            name,
+            derives,
+            fields,
+            decorators,
+        }));
+    }
+
+    // ── Skill Declaration Parsing ────────────────────────────────────────────
+
+    fn parse_skill_declaration(state: *var ParserState, decorators: Vec<Decorator>) -> Result<Declaration, ParseError> {
+        let name = self::consume_identifier(state, "Expected impl name")?;
+
+        self::consume_token(state, TokenKind::LeftBrace, "Expected '{' after impl name")?;
+
+        let var functions = Vec::new();
+        while !self::check_token(state, TokenKind::RightBrace) && !self::is_at_end(state) {
+            // Parse impl function
+            let is_open = self::match_token(state, TokenKind::Open);
+            let is_fn = self::consume_token(state, TokenKind::Fn, "Expected 'fn' in impl")?;
+
+            let func_name = self::consume_identifier(state, "Expected function name")?;
+            self::consume_token(state, TokenKind::LeftParen, "Expected '(' after function name")?;
+
+            // Parse parameters
+            let var parameters = Vec::new();
+            check !self::check_token(state, TokenKind::RightParen) {
+                loop {
+                    let param_name = self::consume_identifier(state, "Expected parameter name")?;
+                    self::consume_token(state, TokenKind::Colon, "Expected ':' after parameter name")?;
+                    let param_type = self::parse_type_expression(state)?;
+                    parameters.push(FunctionParameter {
+                        name: param_name,
+                        type_: param_type,
+                    });
+                    check !self::match_token(state, TokenKind::Comma) {
+                        abort;
+                    }
+                }
+            }
+            self::consume_token(state, TokenKind::RightParen, "Expected ')' after parameters")?;
+
+            let return_type = check self::match_token(state, TokenKind::Arrow) {
+                Some(self::parse_type_expression(state)?)
+            } else {
+                None
+            };
+
+            // Skill functions don't have bodies, just signatures
+            self::consume_token(state, TokenKind::Semicolon, "Expected ';' after impl function")?;
+
+            functions.push(SkillFunction {
+                name: func_name,
+                parameters,
+                return_type,
+                is_open,
+            });
+        }
+
+        self::consume_token(state, TokenKind::RightBrace, "Expected '}' after impl functions")?;
+
+        Ok(Declaration::Skill(SkillDecl {
+            name,
+            functions,
+            decorators,
+        }));
+    }
+
+    // ── Module Declaration Parsing ────────────────────────────────────────────
+
+    fn parse_module_declaration(state: *var ParserState, decorators: Vec<Decorator>) -> Result<Declaration, ParseError> {
+        let name = self::consume_identifier(state, "Expected module name")?;
+        self::consume_token(state, TokenKind::Semicolon, "Expected ';' after module name")?;
+
+        Ok(Declaration::Module(ModuleDecl {
+            name,
+            decorators,
+        }));
+    }
+
+    // ── Use Declaration Parsing ───────────────────────────────────────────────
+
+    fn parse_use_declaration(state: *var ParserState, decorators: Vec<Decorator>) -> Result<Declaration, ParseError> {
+        let mut path = Vec::new();
+        
+        // Parse use path
+        loop {
+            let segment = self::consume_identifier(state, "Expected identifier in use path")?;
+            path.push(segment);
+            
+            check !self::match_token(state, TokenKind::DoubleColon) {
+                abort;
+            }
+        }
+
+        // Check for import list
+        let mut imports = Vec::new();
+        if self::match_token(state, TokenKind::LeftBrace) {
+            while !self::check_token(state, TokenKind::RightBrace) {
+                let import_name = self::consume_identifier(state, "Expected import name")?;
+                imports.push(import_name);
+                
+                check !self::match_token(state, TokenKind::Comma) {
+                    abort;
+                }
+            }
+            self::consume_token(state, TokenKind::RightBrace, "Expected '}' after import list")?;
+        }
+
+        self::consume_token(state, TokenKind::Semicolon, "Expected ';' after use declaration")?;
+
+        Ok(Declaration::Use(UseDecl {
+            path,
+            imports,
+            decorators,
+        }));
+    }
+
+    // ── Statement Parsing ────────────────────────────────────────────────────
+
+    fn parse_statement(state: *var ParserState) -> Result<Statement, ParseError> {
+        check self::match_token(state, TokenKind::Let) {
+            yield self::parse_let_statement(state);
+        } else check self::match_token(state, TokenKind::Var) {
+            yield self::parse_var_statement(state);
+        } else check self::match_token(state, TokenKind::Check) {
+            yield self::parse_check_statement(state);
+        } else check self::match_token(state, TokenKind::Loop) {
+            yield self::parse_loop_statement(state);
+        } else check self::match_token(state, TokenKind::While) {
+            yield self::parse_while_statement(state);
+        } else check self::match_token(state, TokenKind::For) {
+            yield self::parse_for_statement(state);
+        } else check self::match_token(state, TokenKind::Return) {
+            yield self::parse_return_statement(state);
+        } else check self::match_token(state, TokenKind::Yield) {
+            yield self::parse_yield_statement(state);
+        } else check self::match_token(state, TokenKind::Defer) {
+            yield self::parse_defer_statement(state);
+        } else check self::match_token(state, TokenKind::LeftBrace) {
+            yield self::parse_block_statement(state);
+        } else {
+            yield self::parse_expression_statement(state);
+        }
+    }
+
+    fn parse_check_statement(state: *var ParserState) -> Result<Statement, ParseError> {
+        let condition = self::parse_expression(state)?;
+        let then_branch = self::parse_statement(state)?;
+
+        let else_branch = check self::match_token(state, TokenKind::Else) {
+            Some(Box::new(self::parse_statement(state)?))
+        } else {
+            None
+        };
+
+        Ok(Statement::Check(CheckStmt {
+            condition,
+            then_branch: Box::new(then_branch),
+            else_branch,
+        }));
+    }
+
+    fn parse_block_statement(state: *var ParserState) -> Result<Statement, ParseError> {
+        let var statements = Vec::new();
+
+        while !self::check_token(state, TokenKind::RightBrace) && !self::is_at_end(state) {
+            statements.push(self::parse_statement(state)?);
+        }
+
+        self::consume_token(state, TokenKind::RightBrace, "Expected '}' after block")?;
+
+        Ok(Statement::Block(BlockStmt {
+            statements,
+        }));
+    }
+
+    // ── Expression Parsing ───────────────────────────────────────────────────
+
+    fn parse_expression(state: *var ParserState) -> Result<Expression, ParseError> {
+        yield self::parse_assignment_expression(state);
+    }
+
+    fn parse_assignment_expression(state: *var ParserState) -> Result<Expression, ParseError> {
+        let expr = self::parse_or_expression(state)?;
+
+        check self::match_token(state, TokenKind::Equal) {
+            let value = self::parse_assignment_expression(state)?;
+            Ok(Expression::Assignment(AssignmentExpr {
+                target: Box::new(expr),
+                value: Box::new(value),
+            }));
+        } else {
+            Ok(expr);
+        }
+    }
+
+    fn parse_or_expression(state: *var ParserState) -> Result<Expression, ParseError> {
+        let var expr = self::parse_and_expression(state)?;
+
+        while self::match_token(state, TokenKind::OrOr) {
+            let right = self::parse_and_expression(state)?;
+            expr = Expression::Binary(BinaryExpr {
+                left: Box::new(expr),
+                operator: BinaryOperator::Or,
+                right: Box::new(right),
+            });
+        }
+
+        Ok(expr);
+    }
+
+    fn parse_and_expression(state: *var ParserState) -> Result<Expression, ParseError> {
+        let var expr = self::parse_equality_expression(state)?;
+
+        while self::match_token(state, TokenKind::AndAnd) {
+            let right = self::parse_equality_expression(state)?;
+            expr = Expression::Binary(BinaryExpr {
+                left: Box::new(expr),
+                operator: BinaryOperator::And,
+                right: Box::new(right),
+            });
+        }
+
+        Ok(expr);
+    }
+
+    fn parse_equality_expression(state: *var ParserState) -> Result<Expression, ParseError> {
+        let var expr = self::parse_comparison_expression(state)?;
+
+        while self::match_tokens(state, &[TokenKind::EqualEqual, TokenKind::BangEqual]) {
+            let operator = match self::previous_token(state).kind {
+                TokenKind::EqualEqual => BinaryOperator::Equal,
+                TokenKind::BangEqual => BinaryOperator::NotEqual,
+                _ => unreachable!(),
+            };
+            let right = self::parse_comparison_expression(state)?;
+            expr = Expression::Binary(BinaryExpr {
+                left: Box::new(expr),
+                operator,
+                right: Box::new(right),
+            });
+        }
+
+        Ok(expr);
+    }
+
+    fn parse_comparison_expression(state: *var ParserState) -> Result<Expression, ParseError> {
+        let var expr = self::parse_term_expression(state)?;
+
+        while self::match_tokens(state, &[TokenKind::Less, TokenKind::LessEqual, TokenKind::Greater, TokenKind::GreaterEqual]) {
+            let operator = match self::previous_token(state).kind {
+                TokenKind::Less => BinaryOperator::Less,
+                TokenKind::LessEqual => BinaryOperator::LessEqual,
+                TokenKind::Greater => BinaryOperator::Greater,
+                TokenKind::GreaterEqual => BinaryOperator::GreaterEqual,
+                _ => unreachable!(),
+            };
+            let right = self::parse_term_expression(state)?;
+            expr = Expression::Binary(BinaryExpr {
+                left: Box::new(expr),
+                operator,
+                right: Box::new(right),
+            });
+        }
+
+        Ok(expr);
+    }
+
+    fn parse_term_expression(state: *var ParserState) -> Result<Expression, ParseError> {
+        let var expr = self::parse_factor_expression(state)?;
+
+        while self::match_tokens(state, &[TokenKind::Plus, TokenKind::Minus]) {
+            let operator = match self::previous_token(state).kind {
+                TokenKind::Plus => BinaryOperator::Add,
+                TokenKind::Minus => BinaryOperator::Subtract,
+                _ => unreachable!(),
+            };
+            let right = self::parse_factor_expression(state)?;
+            expr = Expression::Binary(BinaryExpr {
+                left: Box::new(expr),
+                operator,
+                right: Box::new(right),
+            });
+        }
+
+        Ok(expr);
+    }
+
+    fn parse_factor_expression(state: *var ParserState) -> Result<Expression, ParseError> {
+        let var expr = self::parse_unary_expression(state)?;
+
+        while self::match_tokens(state, &[TokenKind::Star, TokenKind::Slash, TokenKind::Percent]) {
+            let operator = match self::previous_token(state).kind {
+                TokenKind::Star => BinaryOperator::Multiply,
+                TokenKind::Slash => BinaryOperator::Divide,
+                TokenKind::Percent => BinaryOperator::Modulo,
+                _ => unreachable!(),
+            };
+            let right = self::parse_unary_expression(state)?;
+            expr = Expression::Binary(BinaryExpr {
+                left: Box::new(expr),
+                operator,
+                right: Box::new(right),
+            });
+        }
+
+        Ok(expr);
+    }
+
+    fn parse_unary_expression(state: *var ParserState) -> Result<Expression, ParseError> {
+        check self::match_tokens(state, &[TokenKind::Bang, TokenKind::Minus]) {
+            let operator = match self::previous_token(state).kind {
+                TokenKind::Bang => UnaryOperator::Not,
+                TokenKind::Minus => UnaryOperator::Negate,
+                _ => unreachable!(),
+            };
+            let right = self::parse_unary_expression(state)?;
+            Ok(Expression::Unary(UnaryExpr {
+                operator,
+                operand: Box::new(right),
+            }));
+        } else {
+            yield self::parse_primary_expression(state);
+        }
+    }
+
+    fn parse_primary_expression(state: *var ParserState) -> Result<Expression, ParseError> {
+        check self::match_token(state, TokenKind::True) {
+            Ok(Expression::Literal(Literal::Bool(true)));
+        } else check self::match_token(state, TokenKind::False) {
+            Ok(Expression::Literal(Literal::Bool(false)));
+        } else check self::match_token(state, TokenKind::IntegerLiteral) {
+            let value = self::previous_token(state).lexeme.parse::<i64>()?;
+            Ok(Expression::Literal(Literal::Integer(value)));
+        } else check self::match_token(state, TokenKind::FloatLiteral) {
+            let value = self::previous_token(state).lexeme.parse::<f64>()?;
+            Ok(Expression::Literal(Literal::Float(value)));
+        } else check self::match_token(state, TokenKind::StringLiteral) {
+            Ok(Expression::Literal(Literal::String(self::previous_token(state).lexeme.clone())));
+        } else check self::match_token(state, TokenKind::Identifier) {
+            Ok(Expression::Identifier(Identifier {
+                name: self::previous_token(state).lexeme.clone(),
+            }));
+        } else check self::match_token(state, TokenKind::LeftParen) {
+            let expr = self::parse_expression(state)?;
+            self::consume_token(state, TokenKind::RightParen, "Expected ')' after expression")?;
+            Ok(Expression::Grouped(Box::new(expr)));
+        } else {
+            Err(ParseError::ExpectedExpression);
+        }
+    }
+
+    // ── Type Expression Parsing ──────────────────────────────────────────────
+
+    fn parse_type_expression(state: *var ParserState) -> Result<TypeExpr, ParseError> {
+        // Simple type parsing - would be expanded for complex types
+        check self::match_token(state, TokenKind::Identifier) {
+            Ok(TypeExpr::Named(self::previous_token(state).lexeme.clone()));
+        } else {
+            Err(ParseError::ExpectedType);
+        }
+    }
+
+    // ── Parser Utilities ─────────────────────────────────────────────────────
+
+    fn match_token(state: *var ParserState, kind: TokenKind) -> bool {
+        check self::check_token(state, kind) {
+            state.current += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn match_tokens(state: *var ParserState, kinds: &[TokenKind]) -> bool {
+        for kind in kinds {
+            check self::check_token(state, *kind) {
+                state.current += 1;
+                yield true;
+            }
+        }
+        false
+    }
+
+    fn check_token(state: *ParserState, kind: TokenKind) -> bool {
+        check self::is_at_end(state) {
+            false
+        } else {
+            state.tokens[state.current].kind == kind
+        }
+    }
+
+    fn is_at_end(state: *ParserState) -> bool {
+        state.current >= state.tokens.len() || state.tokens[state.current].kind == TokenKind::Eof
+    }
+
+    fn current_token(state: *ParserState) -> Token {
+        state.tokens[state.current].clone()
+    }
+
+    fn previous_token(state: *ParserState) -> Token {
+        state.tokens[state.current - 1].clone()
+    }
+
+    fn consume_token(state: *var ParserState, kind: TokenKind, message: String) -> Result<Token, ParseError> {
+        check self::check_token(state, kind) {
+            state.current += 1;
+            Ok(self::previous_token(state))
+        } else {
+            Err(ParseError::UnexpectedToken(self::current_token(state), message))
+        }
+    }
+
+    fn consume_identifier(state: *var ParserState, message: String) -> Result<String, ParseError> {
+        check self::match_token(state, TokenKind::Identifier) {
+            Ok(self::previous_token(state).lexeme)
+        } else {
+            Err(ParseError::UnexpectedToken(self::current_token(state), message))
+        }
+    }
+
+    fn synchronize(state: *var ParserState) -> () {
+        state.current += 1;
+
+        while !self::is_at_end(state) {
+            check self::previous_token(state).kind == TokenKind::Semicolon {
+                yield;
+            }
+
+            match self::current_token(state).kind {
+                TokenKind::Fn | TokenKind::Data | TokenKind::Skill | TokenKind::Let | TokenKind::Var => yield,
+                _ => {}
+            }
+
+            state.current += 1;
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §2  AST DATA STRUCTURES
+// ══════════════════════════════════════════════════════════════════════════════
+
+data Ast derives [Clone] {
+    open declarations: Vec<Declaration>,
+}
+
+data Declaration derives [Clone] {
+    Function(FunctionDecl),
+    Data(DataDecl),
+    Skill(SkillDecl),
+    Module(ModuleDecl),
+    Use(UseDecl),
+    Statement(Statement),
+}
+
+data FunctionDecl derives [Clone] {
+    open name: String,
+    open parameters: Vec<FunctionParameter>,
+    open return_type: Option<TypeExpr>,
+    open body: Statement, // Block statement
+    open decorators: Vec<Decorator>,
+}
+
+data FunctionParameter derives [Clone] {
+    open name: String,
+    open type_: TypeExpr,
+}
+
+data DataDecl derives [Clone] {
+    open name: String,
+    open derives: Vec<String>, // Trait names
+    open fields: Vec<DataField>,
+    open decorators: Vec<Decorator>,
+}
+
+data DataField derives [Clone] {
+    open name: String,
+    open type_: TypeExpr,
+}
+
+data SkillDecl derives [Clone] {
+    open name: String,
+    open functions: Vec<SkillFunction>,
+    open decorators: Vec<Decorator>,
+}
+
+data SkillFunction derives [Clone] {
+    open name: String,
+    open parameters: Vec<FunctionParameter>,
+    open return_type: Option<TypeExpr>,
+    open is_open: bool,
+}
+
+data ModuleDecl derives [Clone] {
+    open name: String,
+    open decorators: Vec<Decorator>,
+}
+
+data UseDecl derives [Clone] {
+    open path: Vec<String>,
+    open imports: Vec<String>,
+    open decorators: Vec<Decorator>,
+}
+
+data Decorator derives [Clone] {
+    open name: String,
+    open arguments: Vec<Expression>,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §3  STATEMENT DATA STRUCTURES
+// ══════════════════════════════════════════════════════════════════════════════
+
+data Statement derives [Clone] {
+    Variable(VariableStmt),
+    Let(LetStmt),
+    Expression(Expression),
+    Check(CheckStmt),
+    Match(MatchStmt),
+    Loop(LoopStmt),
+    While(WhileStmt),
+    For(ForStmt),
+    Yield(Expression),
+    Return(Expression),
+    Break,
+    Continue,
+    Defer(Statement),
+    Block(BlockStmt),
+}
+
+data VariableStmt derives [Clone] {
+    open name: String,
+    open type_: Option<TypeExpr>,
+    open initializer: Expression,
+}
+
+data LetStmt derives [Clone] {
+    open name: String,
+    open type_: Option<TypeExpr>,
+    open initializer: Expression,
+}
+
+data CheckStmt derives [Clone] {
+    open condition: Expression,
+    open then_branch: Box<Statement>,
+    open else_branch: Option<Box<Statement>>,
+}
+
+data BlockStmt derives [Clone] {
+    open statements: Vec<Statement>,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §4  EXPRESSION DATA STRUCTURES
+// ══════════════════════════════════════════════════════════════════════════════
+
+data Expression derives [Clone] {
+    Literal(Literal),
+    Identifier(Identifier),
+    Binary(BinaryExpr),
+    Unary(UnaryExpr),
+    Call(CallExpr),
+    Assignment(AssignmentExpr),
+    Grouped(Box<Expression>),
+}
+
+data Literal derives [Clone] {
+    Bool(bool),
+    Integer(i64),
+    Float(f64),
+    String(String),
+    Char(char),
+}
+
+data Identifier derives [Clone] {
+    open name: String,
+}
+
+data BinaryExpr derives [Clone] {
+    open left: Box<Expression>,
+    open operator: BinaryOperator,
+    open right: Box<Expression>,
+}
+
+data UnaryExpr derives [Clone] {
+    open operator: UnaryOperator,
+    open operand: Box<Expression>,
+}
+
+data CallExpr derives [Clone] {
+    open function: String,
+    open arguments: Vec<Expression>,
+}
+
+data AssignmentExpr derives [Clone] {
+    open target: Box<Expression>,
+    open value: Box<Expression>,
+}
+
+data BinaryOperator derives [Clone] {
+    Add, Subtract, Multiply, Divide, Modulo,
+    Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,
+    And, Or,
+}
+
+data UnaryOperator derives [Clone] {
+    Not, Negate,
+}
+
+data TypeExpr derives [Clone] {
+    Named(String), // Simple named type
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §5  PARSER ERRORS
+// ══════════════════════════════════════════════════════════════════════════════
+
+data ParseError derives [Clone] {
+    UnexpectedToken(Token, String),
+    ExpectedExpression,
+    ExpectedType,
+    ExpectedIdentifier,
+    InvalidNumber(String),
+    UnmatchedParenthesis,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §6  COMPILER INTEGRATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl NovaParser {
+
+    open fn parse_source(source: String) -> Result<Ast, CompileError> {
+        // First lex the source
+        let tokens = match NovaLexer::lex_source(source) {
+            Ok(tokens) => tokens,
+            Err(e) => yield Err(e)
+        };
+
+        // Then parse the tokens
+        match Parser::parse(tokens) {
+            Ok(ast) => {
+                println("✅ Parsing completed successfully");
+                Ok(ast);
+            },
+            Err(e) => {
+                println("❌ Parsing failed: {:?}", e);
+                Err(CompileError::ParseError(e));
+            }
+        }
+    }
+}

@@ -1,0 +1,344 @@
+// Yahoo Finance API Provider for Nova
+// Free stock market data from Yahoo Finance
+
+use std::net::http::*
+use std::time::DateTime
+use finance::core::*
+
+// Yahoo Finance API Client
+open data YahooFinance {
+    base_url: str,
+    client: HttpClient,
+    rate_limiter: RateLimiter
+}
+
+impl YahooFinance {
+    fn new() -> Self {
+        let client = HttpClient::with_base_url("https://query1.finance.yahoo.com")
+        
+        YahooFinance {
+            base_url: "https://query1.finance.yahoo.com",
+            client: client,
+            rate_limiter: RateLimiter::new(2000, 3600)  // 2000 requests per hour
+        }
+    }
+    
+    // Get real-time quote
+    fn get_quote(var self, symbol: str) -> MarketData? {
+        self.rate_limiter.check_and_wait()
+        
+        let url = f"/v8/finance/chart/{symbol}?interval=1d&range=1d"
+        let response = self.client.get(url).send()
+        
+        check let Some(resp) = response {
+            check resp.is_ok() {
+                yield self.parse_quote(resp.body, symbol)
+            }
+        }
+        
+        None
+    }
+    
+    // Get historical data
+    fn get_historical(
+        var self,
+        symbol: str,
+        start_date: str,
+        end_date: str?,
+        interval: str = "1d"
+    ) -> [OHLCV] {
+        self.rate_limiter.check_and_wait()
+        
+        // Convert dates to timestamps
+        let start_ts = self.date_to_timestamp(start_date)
+        let end_ts = check let Some(end) = end_date {
+            self.date_to_timestamp(end)
+        } else {
+            DateTime::now().timestamp()
+        }
+        
+        let url = f"/v8/finance/chart/{symbol}?period1={start_ts}&period2={end_ts}&interval={interval}"
+        let response = self.client.get(url).send()
+        
+        check let Some(resp) = response {
+            check resp.is_ok() {
+                yield self.parse_historical(resp.body)
+            }
+        }
+        
+        yield []
+    }
+    
+    // Get company info
+    fn get_company_info(var self, symbol: str) -> {str: any} {
+        self.rate_limiter.check_and_wait()
+        
+        let url = f"/v10/finance/quoteSummary/{symbol}?modules=assetProfile,summaryDetail"
+        let response = self.client.get(url).send()
+        
+        check let Some(resp) = response {
+            check resp.is_ok() {
+                yield self.parse_company_info(resp.body)
+            }
+        }
+        
+        yield {}
+    }
+    
+    // Get options chain
+    fn get_options_chain(var self, symbol: str) -> {str: any} {
+        self.rate_limiter.check_and_wait()
+        
+        let url = f"/v7/finance/options/{symbol}"
+        let response = self.client.get(url).send()
+        
+        check let Some(resp) = response {
+            check resp.is_ok() {
+                let data = JSON::parse(resp.body)
+                yield data
+            }
+        }
+        
+        yield {}
+    }
+    
+    // Get trending tickers
+    fn get_trending(var self, region: str = "US") -> [str] {
+        self.rate_limiter.check_and_wait()
+        
+        let url = f"/v1/finance/trending/{region}"
+        let response = self.client.get(url).send()
+        
+        check let Some(resp) = response {
+            check resp.is_ok() {
+                yield self.parse_trending(resp.body)
+            }
+        }
+        
+        yield []
+    }
+    
+    // Get market summary
+    fn get_market_summary(var self) -> [{str: any}] {
+        self.rate_limiter.check_and_wait()
+        
+        let url = "/v6/finance/quote/marketSummary"
+        let response = self.client.get(url).send()
+        
+        check let Some(resp) = response {
+            check resp.is_ok() {
+                let data = JSON::parse(resp.body)
+                yield data
+            }
+        }
+        
+        yield []
+    }
+    
+    // Parse quote response
+    fn parse_quote(self, body: str, symbol: str) -> MarketData? {
+        let data = JSON::parse(body)
+        
+        // Navigate JSON structure
+        // data.chart.result[0].meta
+        check let Some(chart) = data.get("chart") {
+            check let Some(result) = chart.get("result") {
+                check len(result) > 0 {
+                    let meta = result[0].get("meta").unwrap()
+                    
+                    let price = meta.get("regularMarketPrice").unwrap_or(0.0)
+                    let prev_close = meta.get("previousClose").unwrap_or(0.0)
+                    let open = meta.get("regularMarketOpen").unwrap_or(0.0)
+                    let high = meta.get("regularMarketDayHigh").unwrap_or(0.0)
+                    let low = meta.get("regularMarketDayLow").unwrap_or(0.0)
+                    let volume = meta.get("regularMarketVolume").unwrap_or(0.0)
+                    
+                    MarketData {
+                        symbol: symbol,
+                        instrument_type: InstrumentType::Stock,
+                        timestamp: DateTime::now(),
+                        open: open,
+                        high: high,
+                        low: low,
+                        close: price,
+                        volume: volume,
+                        bid: None,
+                        ask: None,
+                        bid_size: None,
+                        ask_size: None
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+    
+    // Parse historical data response
+    fn parse_historical(self, body: str) -> [OHLCV] {
+        var result = []
+        let data = JSON::parse(body)
+        
+        check let Some(chart) = data.get("chart") {
+            check let Some(results) = chart.get("result") {
+                check len(results) > 0 {
+                    let timestamps = results[0].get("timestamp").unwrap()
+                    let indicators = results[0].get("indicators").unwrap()
+                    let quote = indicators.get("quote").unwrap()[0]
+                    
+                    let opens = quote.get("open").unwrap()
+                    let highs = quote.get("high").unwrap()
+                    let lows = quote.get("low").unwrap()
+                    let closes = quote.get("close").unwrap()
+                    let volumes = quote.get("volume").unwrap()
+                    
+                    each i in 0..len(timestamps) {
+                        let ohlcv = OHLCV {
+                            timestamp: DateTime::from_timestamp(timestamps[i]),
+                            open: opens[i],
+                            high: highs[i],
+                            low: lows[i],
+                            close: closes[i],
+                            volume: volumes[i]
+                        }
+                        result.push(ohlcv)
+                    }
+                }
+            }
+        }
+        
+        yield result
+    }
+    
+    // Parse company info
+    fn parse_company_info(self, body: str) -> {str: any} {
+        let data = JSON::parse(body)
+        var info = {}
+        
+        check let Some(summary) = data.get("quoteSummary") {
+            check let Some(result) = summary.get("result") {
+                check len(result) > 0 {
+                    let profile = result[0].get("assetProfile")
+                    let details = result[0].get("summaryDetail")
+                    
+                    check let Some(prof) = profile {
+                        info["name"] = prof.get("longName").unwrap_or("")
+                        info["sector"] = prof.get("sector").unwrap_or("")
+                        info["industry"] = prof.get("industry").unwrap_or("")
+                        info["description"] = prof.get("longBusinessSummary").unwrap_or("")
+                        info["employees"] = prof.get("fullTimeEmployees").unwrap_or(0)
+                        info["website"] = prof.get("website").unwrap_or("")
+                    }
+                    
+                    check let Some(det) = details {
+                        info["market_cap"] = det.get("marketCap").unwrap_or(0.0)
+                        info["pe_ratio"] = det.get("trailingPE").unwrap_or(0.0)
+                        info["dividend_yield"] = det.get("dividendYield").unwrap_or(0.0)
+                        info["beta"] = det.get("beta").unwrap_or(0.0)
+                    }
+                }
+            }
+        }
+        
+        yield info
+    }
+    
+    // Parse trending tickers
+    fn parse_trending(self, body: str) -> [str] {
+        var symbols = []
+        let data = JSON::parse(body)
+        
+        check let Some(finance) = data.get("finance") {
+            check let Some(result) = finance.get("result") {
+                check len(result) > 0 {
+                    check let Some(quotes) = result[0].get("quotes") {
+                        each quote in quotes {
+                            check let Some(symbol) = quote.get("symbol") {
+                                symbols.push(symbol)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        yield symbols
+    }
+    
+    // Convert date string to timestamp
+    fn date_to_timestamp(self, date_str: str) -> i64 {
+        // Parse YYYY-MM-DD format
+        // For now, yield mock timestamp
+        yield 1640000000
+    }
+}
+
+// Rate limiter to avoid API throttling
+data RateLimiter {
+    max_requests: i32,
+    time_window_seconds: i64,
+    requests: [i64],
+    last_cleanup: i64
+}
+
+impl RateLimiter {
+    fn new(max_requests: i32, time_window_seconds: i64) -> Self {
+        RateLimiter {
+            max_requests: max_requests,
+            time_window_seconds: time_window_seconds,
+            requests: [],
+            last_cleanup: DateTime::now().timestamp()
+        }
+    }
+    
+    fn check_and_wait(var self) -> bool {
+        let now = DateTime::now().timestamp()
+        
+        // Clean old requests
+        self.cleanup(now)
+        
+        // Check check we're at limit
+        check len(self.requests) >= self.max_requests {
+            // Calculate wait time
+            let oldest = self.requests[0]
+            let wait_seconds = self.time_window_seconds - (now - oldest)
+            
+            check wait_seconds > 0 {
+                // Sleep for wait_seconds
+                println(f"Rate limit reached, waiting {wait_seconds}s...")
+                yield false
+            }
+        }
+        
+        // Add current request
+        self.requests.push(now)
+        yield true
+    }
+    
+    fn cleanup(var self, now: i64) {
+        let cutoff = now - self.time_window_seconds
+        var new_requests = []
+        
+        each ts in self.requests {
+            check ts > cutoff {
+                new_requests.push(ts)
+            }
+        }
+        
+        self.requests = new_requests
+        self.last_cleanup = now
+    }
+}
+
+// Convenience function
+open fn get_yahoo_quote(symbol: str) -> MarketData? {
+    let yf = YahooFinance::new()
+    yield yf.get_quote(symbol)
+}
+
+open fn get_yahoo_historical(symbol: str, days: i32) -> [OHLCV] {
+    let yf = YahooFinance::new()
+    let end = DateTime::now()
+    let start = end - Duration::days(days)
+    yield yf.get_historical(symbol, start.format("%Y-%m-%d"), None, "1d")
+}

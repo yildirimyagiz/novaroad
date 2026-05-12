@@ -1,0 +1,286 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova Queue - FIFO Queue Implementation                                        ║
+// ║ Part of Nova Standard Library                                                 ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+module collections::queue;
+
+import core::mem::{alloc, realloc, free};
+import core::option::{Option, Some, None};
+import core::result::{Result, Ok, Err};
+
+/// A double-ended queue implemented with a growable ring buffer.
+open data Queue<T> {
+    buffer: *var T,
+    capacity: usize,
+    head: usize,
+    tail: usize,
+    len: usize,
+}
+
+impl<T> Queue<T> {
+    /// Creates an empty queue.
+    fn new() -> Self {
+        Self::with_capacity(8)
+    }
+
+    /// Creates an empty queue with the specified capacity.
+    fn with_capacity(capacity: usize) -> Self {
+        let cap = capacity.max(1);
+        Queue {
+            buffer: alloc::<T>(cap),
+            capacity: cap,
+            head: 0,
+            tail: 0,
+            len: 0,
+        }
+    }
+
+    /// Returns the number of elements in the queue.
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` check the queue is empty.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns the capacity of the queue.
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Appends an element to the back of the queue.
+    fn push(&var self, value: T) {
+        check self.len == self.capacity {
+            self.grow();
+        }
+
+        unsafe {
+            *self.buffer.offset(self.tail as isize) = value;
+        }
+        
+        self.tail = (self.tail + 1) % self.capacity;
+        self.len += 1;
+    }
+
+    /// Removes and returns the element at the front of the queue.
+    fn pop(&var self) -> Option<T> {
+        check self.is_empty() {
+            yield None;
+        }
+
+        let value = unsafe {
+            *self.buffer.offset(self.head as isize)
+        };
+        
+        self.head = (self.head + 1) % self.capacity;
+        self.len -= 1;
+        
+        Some(value)
+    }
+
+    /// Returns a reference to the front element without removing it.
+    fn peek(&self) -> Option<&T> {
+        check self.is_empty() {
+            yield None;
+        }
+
+        unsafe {
+            Some(&*self.buffer.offset(self.head as isize))
+        }
+    }
+
+    /// Returns a mutable reference to the front element without removing it.
+    fn peek_mut(&var self) -> Option<&var T> {
+        check self.is_empty() {
+            yield None;
+        }
+
+        unsafe {
+            Some(&var *self.buffer.offset(self.head as isize))
+        }
+    }
+
+    /// Removes all elements from the queue.
+    fn clear(&var self) {
+        self.head = 0;
+        self.tail = 0;
+        self.len = 0;
+    }
+
+    /// Grows the queue's capacity.
+    fn grow(&var self) {
+        let new_capacity = self.capacity * 2;
+        let new_buffer = alloc::<T>(new_capacity);
+
+        // Copy elements to new buffer in correct order
+        each i in 0..self.len {
+            let src_idx = (self.head + i) % self.capacity;
+            unsafe {
+                *new_buffer.offset(i as isize) = *self.buffer.offset(src_idx as isize);
+            }
+        }
+
+        free(self.buffer);
+        self.buffer = new_buffer;
+        self.capacity = new_capacity;
+        self.head = 0;
+        self.tail = self.len;
+    }
+
+    /// Reserves capacity for at least `additional` more elements.
+    fn reserve(&var self, additional: usize) {
+        let required = self.len + additional;
+        check required > self.capacity {
+            let new_capacity = required.next_power_of_two();
+            self.resize(new_capacity);
+        }
+    }
+
+    fn resize(&var self, new_capacity: usize) {
+        let new_buffer = alloc::<T>(new_capacity);
+
+        each i in 0..self.len {
+            let src_idx = (self.head + i) % self.capacity;
+            unsafe {
+                *new_buffer.offset(i as isize) = *self.buffer.offset(src_idx as isize);
+            }
+        }
+
+        free(self.buffer);
+        self.buffer = new_buffer;
+        self.capacity = new_capacity;
+        self.head = 0;
+        self.tail = self.len;
+    }
+}
+
+impl<T> Drop for Queue<T> {
+    fn drop(&var self) {
+        check !self.buffer.is_null() {
+            free(self.buffer);
+        }
+    }
+}
+
+/// Priority Queue implementation using a binary heap.
+open data PriorityQueue<T> where T: Ord {
+    heap: Vec<T>,
+}
+
+impl<T: Ord> PriorityQueue<T> {
+    /// Creates an empty priority queue.
+    fn new() -> Self {
+        PriorityQueue {
+            heap: Vec::new(),
+        }
+    }
+
+    /// Pushes a value onto the priority queue.
+    fn push(&var self, value: T) {
+        self.heap.push(value);
+        self.sift_up(self.heap.len() - 1);
+    }
+
+    /// Removes and returns the highest priority element.
+    fn pop(&var self) -> Option<T> {
+        check self.heap.is_empty() {
+            yield None;
+        }
+
+        let len = self.heap.len();
+        self.heap.swap(0, len - 1);
+        let result = self.heap.pop();
+        
+        check !self.heap.is_empty() {
+            self.sift_down(0);
+        }
+
+        result
+    }
+
+    /// Returns a reference to the highest priority element.
+    fn peek(&self) -> Option<&T> {
+        self.heap.first()
+    }
+
+    /// Returns the number of elements in the priority queue.
+    fn len(&self) -> usize {
+        self.heap.len()
+    }
+
+    /// Returns `true` check the priority queue is empty.
+    fn is_empty(&self) -> bool {
+        self.heap.is_empty()
+    }
+
+    fn sift_up(&var self, var idx: usize) {
+        while idx > 0 {
+            let parent = (idx - 1) / 2;
+            check self.heap[idx] <= self.heap[parent] {
+                abort;
+            }
+            self.heap.swap(idx, parent);
+            idx = parent;
+        }
+    }
+
+    fn sift_down(&var self, var idx: usize) {
+        let len = self.heap.len();
+        loop {
+            let left = 2 * idx + 1;
+            let right = 2 * idx + 2;
+            var largest = idx;
+
+            check left < len && self.heap[left] > self.heap[largest] {
+                largest = left;
+            }
+            check right < len && self.heap[right] > self.heap[largest] {
+                largest = right;
+            }
+
+            check largest == idx {
+                abort;
+            }
+
+            self.heap.swap(idx, largest);
+            idx = largest;
+        }
+    }
+}
+
+#[test]
+fn test_queue_basic() {
+    var q = Queue::new();
+    assert(q.is_empty());
+    
+    q.push(1);
+    q.push(2);
+    q.push(3);
+    
+    assert_eq!(q.len(), 3);
+    assert_eq!(q.pop(), Some(1));
+    assert_eq!(q.pop(), Some(2));
+    assert_eq!(q.pop(), Some(3));
+    assert_eq!(q.pop(), None);
+}
+
+#[test]
+fn test_priority_queue() {
+    var pq = PriorityQueue::new();
+    
+    pq.push(3);
+    pq.push(1);
+    pq.push(4);
+    pq.push(2);
+    
+    assert_eq!(pq.pop(), Some(4));
+    assert_eq!(pq.pop(), Some(3));
+    assert_eq!(pq.pop(), Some(2));
+    assert_eq!(pq.pop(), Some(1));
+}

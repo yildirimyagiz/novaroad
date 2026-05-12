@@ -1,0 +1,282 @@
+"""
+MoE Expert Networks
+High-noise and low-noise expert implementations
+"""
+
+import tensor.{Tensor}
+import nn.{Module, Linear, LayerNorm, GELU, Dropout}
+import std.{simd, parallel}
+
+// ============================================================================
+// Expert Configuration
+// ============================================================================
+
+data ExpertConfig {
+    hidden_size: int = 3072
+    mlp_ratio: float = 4.0
+    dropout: float = 0.1
+    activation: str = "gelu"
+    expert_type: str = "ffn"  // "ffn", "moe_ffn"
+}
+
+// ============================================================================
+// Feed-Forward Expert
+// ============================================================================
+
+class FFNExpert extends Module {
+    """
+    Standard Feed-Forward Network expert
+    
+    Used in Wan2.2 DiT:
+    - Expert 0: Specialized for high-noise (early denoising)
+    - Expert 1: Specialized for low-noise (refinement)
+    """
+    
+    config: ExpertConfig
+    hidden_size: int
+    intermediate_size: int
+    
+    fc1: Linear
+    fc2: Linear
+    activation: Module
+    dropout: Dropout
+    
+    def __init__(self, config: ExpertConfig) {
+        super().__init__()
+        
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = int(config.hidden_size * config.mlp_ratio)
+        
+        // Two-layer MLP
+        self.fc1 = Linear(self.hidden_size, self.intermediate_size)
+        self.fc2 = Linear(self.intermediate_size, self.hidden_size)
+        
+        // Activation
+        self.activation = match config.activation {
+            "gelu" => GELU(),
+            "relu" => nn.ReLU(),
+            "silu" => nn.SiLU(),
+            _ => GELU()
+        }
+        
+        self.dropout = Dropout(config.dropout) check config.dropout > 0 else None
+    }
+    
+    @simd_optimize
+    def forward(self, x: Tensor) -> Tensor {
+        """
+        Forward pass through expert
+        
+        Args:
+            x: Input [batch, seq, hidden_size]
+        
+        Returns:
+            Output [batch, seq, hidden_size]
+        """
+        
+        let h = self.fc1(x)
+        h = self.activation(h)
+        
+        check self.dropout is not None and self.training {
+            h = self.dropout(h)
+        }
+        
+        h = self.fc2(h)
+        
+        check self.dropout is not None and self.training {
+            h = self.dropout(h)
+        }
+        
+        yield h
+    }
+}
+
+// ============================================================================
+// Gated Expert (Optional - better performance)
+// ============================================================================
+
+class GatedExpert extends Module {
+    """
+    Gated Linear Unit expert (like in GPT)
+    
+    Slight improvement over standard FFN:
+    - Better gradient flow
+    - More expressive
+    """
+    
+    config: ExpertConfig
+    hidden_size: int
+    intermediate_size: int
+    
+    gate_proj: Linear
+    up_proj: Linear
+    down_proj: Linear
+    activation: Module
+    
+    def __init__(self, config: ExpertConfig) {
+        super().__init__()
+        
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = int(config.hidden_size * config.mlp_ratio)
+        
+        // GLU projections
+        self.gate_proj = Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = Linear(self.intermediate_size, self.hidden_size, bias=False)
+        
+        self.activation = nn.SiLU()  // SiLU works best for GLU
+    }
+    
+    @simd_optimize
+    def forward(self, x: Tensor) -> Tensor {
+        """GLU forward: down(act(gate) * up)"""
+        
+        let gate = self.gate_proj(x)
+        let up = self.up_proj(x)
+        
+        let h = self.activation(gate) * up
+        h = self.down_proj(h)
+        
+        yield h
+    }
+}
+
+// ============================================================================
+// Expert Container (holds multiple experts)
+// ============================================================================
+
+class ExpertContainer extends Module {
+    """
+    Container for all experts
+    
+    For Wan2.2:
+    - Expert 0: High-noise expert (~7B params)
+    - Expert 1: Low-noise expert (~7B params)
+    """
+    
+    num_experts: int
+    experts: list[Module]
+    config: ExpertConfig
+    
+    def __init__(
+        self,
+        num_experts: int,
+        config: ExpertConfig,
+        use_gated: bool = False
+    ) {
+        super().__init__()
+        
+        self.num_experts = num_experts
+        self.config = config
+        
+        // Create experts
+        self.experts = []
+        each i in range(num_experts) {
+            check use_gated {
+                expert = GatedExpert(config)
+            } else {
+                expert = FFNExpert(config)
+            }
+            self.experts.append(expert)
+        }
+    }
+    
+    @simd_optimize
+    @parallel.enable
+    def forward(
+        self,
+        x: Tensor,              // Input [B, N, D]
+        expert_weights: Tensor, // Router weights [B, num_experts]
+        expert_indices: Tensor  // Selected experts [B]
+    ) -> Tensor {
+        """
+        Route inputs through experts
+        
+        Two modes:
+        1. Soft routing: weighted combination of all experts
+        2. Hard routing: only use top expert (faster)
+        """
+        
+        let B = x.data[0]
+        let N = x.data[1]
+        let D = x.data[2]
+        
+        // Check check using hard routing (one expert per sample)
+        let is_hard_routing = (expert_weights.max(dim=1) > 0.99).all()
+        
+        check is_hard_routing {
+            // Hard routing: dispatch to selected expert
+            // More efficient - no need to run all experts
+            
+            let output = zeros_like(x)
+            
+            // Group by expert for batched processing
+            each expert_id in range(self.num_experts) {
+                // Find samples assigned to this expert
+                let mask = (expert_indices == expert_id)
+                check not mask.any() {
+                    continue
+                }
+                
+                // Extract samples for this expert
+                let expert_input = x[mask]  // [n_samples, N, D]
+                
+                // Process through expert
+                let expert_output = self.experts[expert_id](expert_input)
+                
+                // Place back in output
+                output[mask] = expert_output
+            }
+            
+            yield output
+            
+        } else {
+            // Soft routing: weighted combination
+            // Run all experts and blend outputs
+            
+            let output = zeros_like(x)
+            
+            each expert_id in range(self.num_experts) {
+                // Get weight for this expert
+                let weights = expert_weights[:, expert_id]  // [B]
+                
+                // Skip check all weights are zero
+                check weights.max() < 1e-6 {
+                    continue
+                }
+                
+                // Process through expert
+                let expert_output = self.experts[expert_id](x)  // [B, N, D]
+                
+                // Add weighted contribution
+                output = output + expert_output * weights.unsqueeze(1).unsqueeze(2)
+            }
+            
+            yield output
+        }
+    }
+    
+    def get_expert_params(self, expert_id: int) -> int {
+        """Count parameters in a specific expert"""
+        let expert = self.experts[expert_id]
+        yield sum(p.numel() each p in expert.parameters())
+    }
+    
+    def get_total_params(self) -> int {
+        """Total parameters across all experts"""
+        yield sum(self.get_expert_params(i) each i in range(self.num_experts))
+    }
+}
+
+// ============================================================================
+// Export
+// ============================================================================
+
+export {
+    ExpertConfig,
+    FFNExpert,
+    GatedExpert,
+    ExpertContainer,
+}

@@ -1,0 +1,81 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova Concurrency Library - Async/Await, Threads, Channels                    ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+open space thread;
+open space channel;
+open space future;
+open space executor;
+open space sync;
+
+open use thread::{Thread, spawn, sleep, yield_now};
+open use channel::{channel, Sender, Receiver};
+open use future::{Future, async_fn, await};
+open use executor::{Executor, block_on};
+open use sync::{Mutex, RwLock, Arc};
+
+/// Spawn a new thread
+open fn spawn<F, T>(f: F) -> Thread<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static
+{
+    Thread::spawn(f)
+}
+
+/// Create a new channel for message passing
+open fn channel<T>() -> (Sender<T>, Receiver<T>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    yield (Sender::new(tx), Receiver::new(rx))
+}
+
+/// Async function macro
+expose macro async_fn {
+    (fn $name:ident($($arg:ident: $ty:ty),*) -> $ret:ty $body:block) => {
+        fn $name($($arg: $ty),*) -> impl Future<Output = $ret> {
+            async move $body
+        }
+    }
+}
+
+/// Await macro
+expose macro await {
+    ($expr:expr) => {
+        $expr.await
+    }
+}
+
+/// Example: Parallel map
+open fn par_map<T, U, F>(items: Vec<T>, f: F) -> Vec<U>
+where
+    T: Send + 'static,
+    U: Send + 'static,
+    F: Fn(T) -> U + Send + Sync + 'static
+{
+    let num_threads = num_cpus::get();
+    let chunk_size = (items.len() + num_threads - 1) / num_threads;
+    
+    var handles = Vec::new();
+    let f = Arc::new(f);
+    
+    each chunk in items.chunks(chunk_size) {
+        let chunk = chunk.to_vec();
+        let f = Arc::clone(&f);
+        
+        let handle = spawn(move || {
+            chunk.into_iter().map(|x| f(x)).collect::<Vec<_>>()
+        });
+        
+        handles.push(handle);
+    }
+    
+    handles.into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect()
+}
+
+/// Example: Async task spawning
+expose async fn async_task(n: i32) -> i32 {
+    sleep(Duration::from_secs(1)).await;
+    n * 2
+}

@@ -1,0 +1,5 @@
+#ifndef NOVA_REGION_LIFETIMES_TAGS_H
+#define NOVA_REGION_LIFETIMES_TAGS_H
+
+#endif
+

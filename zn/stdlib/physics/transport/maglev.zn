@@ -1,0 +1,738 @@
+// Nova Physics: Magnetic Levitation & High-Speed Transport
+// Maglev trains, electromagnetic propulsion, superconducting magnets
+// Japanese SCMaglev (603 km/h record), Hyperloop, Linear motors
+
+@module("physics::transport::maglev")
+@verified
+@export
+@research_level("advanced")
+
+use physics::core::{constants::*, units::*};
+use physics::electromagnetism::maxwell::*;
+
+// ============================================================================
+// Maglev Technology Types
+// ============================================================================
+
+#[derive(Clone, Copy, PartialEq)]
+open cases MaglevType {
+    /// Electromagnetic Suspension (EMS)
+    /// Attractive force, active control
+    /// Used by: Transrapid (Germany)
+    EMS,
+    
+    /// Electrodynamic Suspension (EDS)
+    /// Repulsive force, passive stability
+    /// Used by: SCMaglev (Japan), Hyperloop
+    EDS,
+    
+    /// Hybrid (EMS + EDS)
+    Hybrid,
+    
+    /// Inductrack (Halbach arrays)
+    Inductrack
+}
+
+// ============================================================================
+// Japanese SCMaglev (L0 Series)
+// ============================================================================
+
+/// Japanese Superconducting Maglev (SCMaglev) - L0 Series
+/// World record: 603 km/h (375 mph) in 2015
+/// Research: JR Central, Railway Technical Research Institute (RTRI)
+@research_citation("JR Central Technical Review, 2015")
+open data SCMaglevL0 {
+    max_speed_kmh: f64,         // 603 km/h (record)
+    operational_speed_kmh: f64, // 505 km/h (planned)
+    levitation_height: f64,     // meters (10 cm typical)
+    guideway_clearance: f64,    // meters
+    superconducting_magnets: SuperconductingMagnetArray,
+    power_consumption: f64,     // kW per train
+    passenger_capacity: u32
+}
+
+impl SCMaglevL0 {
+    /// Create SCMaglev L0 series configuration
+    @verified
+    fn new() -> Self {
+        Self {
+            max_speed_kmh: 603.0,       // World record (2015)
+            operational_speed_kmh: 505.0, // Planned Chuo Shinkansen
+            levitation_height: 0.10,     // 10 cm gap
+            guideway_clearance: 0.15,    // 15 cm total clearance
+            superconducting_magnets: SuperconductingMagnetArray::scmaglev_config(),
+            power_consumption: 24000.0,  // 24 MW for 16-car train
+            passenger_capacity: 1000
+        }
+    }
+    
+    /// Maximum speed in m/s
+    @pure
+    fn max_speed_ms(&self) -> f64 {
+        self.max_speed_kmh / 3.6
+    }
+    
+    /// Kinetic energy at max speed
+    @pure
+    fn kinetic_energy(&self, train_mass: f64) -> f64 {
+        // KE = ½mv²
+        let v = self.max_speed_ms();
+        0.5 * train_mass * v * v
+    }
+    
+    /// Levitation force required
+    /// F_lev > m·g
+    @pure
+    fn levitation_force_required(&self, train_mass: f64) -> f64 {
+        train_mass * 9.81  // N
+    }
+    
+    /// Power consumption per passenger
+    @pure
+    fn power_per_passenger(&self) -> f64 {
+        self.power_consumption / (self.passenger_capacity as f64)
+    }
+    
+    /// Compare to Shinkansen (conventional)
+    @pure
+    fn time_saving_vs_shinkansen(&self, distance_km: f64) -> f64 {
+        // Shinkansen: ~285 km/h average
+        let shinkansen_time = distance_km / 285.0;  // hours
+        let scmaglev_time = distance_km / self.operational_speed_kmh;
+        
+        shinkansen_time - scmaglev_time  // Time saved (hours)
+    }
+}
+
+// ============================================================================
+// Superconducting Magnet Arrays
+// ============================================================================
+
+/// Superconducting magnet configuration for maglev
+@research_citation("Cryogenics, 2012")
+open data SuperconductingMagnetArray {
+    num_magnets: usize,
+    magnet_type: SuperconductorType,
+    field_strength: f64,        // Tesla
+    operating_temperature: f64, // Kelvin
+    current: f64,               // Amperes
+    coil_inductance: f64        // Henries
+}
+
+#[derive(Clone, Copy)]
+open cases SuperconductorType {
+    NbTi,       // Niobium-Titanium (most common, 9.2 K)
+    Nb3Sn,      // Niobium-Tin (18 K)
+    YBCO,       // Yttrium Barium Copper Oxide (HTS, 92 K)
+    BSCCO,      // Bismuth Strontium Calcium Copper Oxide (HTS)
+    MgB2        // Magnesium Diboride (39 K)
+}
+
+impl SuperconductorType {
+    /// Critical temperature (K)
+    @pure
+    fn critical_temperature(&self) -> f64 {
+        match self {
+            SuperconductorType::NbTi => 9.2,
+            SuperconductorType::Nb3Sn => 18.0,
+            SuperconductorType::YBCO => 92.0,
+            SuperconductorType::BSCCO => 110.0,
+            SuperconductorType::MgB2 => 39.0
+        }
+    }
+    
+    /// Critical magnetic field (Tesla)
+    @pure
+    fn critical_field(&self, temperature: f64) -> f64 {
+        // Simplified: Bc(T) = Bc(0) · [1 - (T/Tc)²]
+        let tc = self.critical_temperature();
+        let bc0 = match self {
+            SuperconductorType::NbTi => 15.0,
+            SuperconductorType::Nb3Sn => 30.0,
+            SuperconductorType::YBCO => 120.0,
+            SuperconductorType::BSCCO => 200.0,
+            SuperconductorType::MgB2 => 16.0
+        };
+        
+        bc0 * (1.0 - (temperature / tc).powi(2))
+    }
+}
+
+impl SuperconductingMagnetArray {
+    /// SCMaglev configuration (NbTi at 4.2 K)
+    @pure
+    fn scmaglev_config() -> Self {
+        Self {
+            num_magnets: 20,            // Per car
+            magnet_type: SuperconductorType::NbTi,
+            field_strength: 5.0,        // 5 Tesla
+            operating_temperature: 4.2, // Liquid helium
+            current: 700.0,             // 700 A typical
+            coil_inductance: 0.5        // 0.5 H
+        }
+    }
+    
+    /// Magnetic energy stored
+    /// E = ½LI²
+    @pure
+    fn stored_energy(&self) -> f64 {
+        0.5 * self.coil_inductance * self.current * self.current
+    }
+    
+    /// Total magnetic energy for array
+    @pure
+    fn total_stored_energy(&self) -> f64 {
+        yield (self.num_magnets as f64) * self.stored_energy()
+    }
+    
+    /// Cooling power required (Watts)
+    /// Carnot limit: P_cool = P_load · (T_h - T_c) / T_c
+    @pure
+    fn cooling_power_required(&self, heat_load: f64, ambient_temp: f64) -> f64 {
+        // Carnot coefficient of performance
+        let cop_carnot = self.operating_temperature / (ambient_temp - self.operating_temperature);
+        
+        // Real COP is ~30% of Carnot
+        let cop_real = 0.3 * cop_carnot;
+        
+        heat_load / cop_real
+    }
+}
+
+// ============================================================================
+// Electromagnetic Suspension (EMS) - Transrapid Style
+// ============================================================================
+
+/// EMS system (attractive levitation)
+open data EMSSystem {
+    gap: f64,               // Air gap (m) - typically 8-10 mm
+    magnet_force: f64,      // Levitation force (N)
+    control_bandwidth: f64, // Hz (feedback control)
+    power_per_magnet: f64   // W
+}
+
+impl EMSSystem {
+    /// Transrapid-style EMS
+    @pure
+    fn transrapid() -> Self {
+        Self {
+            gap: 0.010,             // 10 mm
+            magnet_force: 100000.0, // 100 kN per magnet
+            control_bandwidth: 100.0, // 100 Hz control
+            power_per_magnet: 50.0   // 50 W per electromagnet
+        }
+    }
+    
+    /// Levitation force vs gap
+    /// F ∝ 1/gap²
+    @pure
+    fn force_at_gap(&self, gap: f64) -> f64 {
+        self.magnet_force * (self.gap / gap).powi(2)
+    }
+    
+    /// Stability: requires active feedback control
+    @pure
+    fn is_stable(&self) -> bool {
+        // EMS is inherently unstable - needs active control
+        false
+    }
+}
+
+// ============================================================================
+// Electrodynamic Suspension (EDS) - SCMaglev Style
+// ============================================================================
+
+/// EDS system (repulsive levitation)
+/// Passive stability, higher speed capability
+open data EDSSystem {
+    levitation_height: f64,     // m (10 cm typical)
+    critical_speed: f64,        // m/s (speed needed for levitation)
+    guideway_coil_pitch: f64,   // m
+    superconducting_magnets: SuperconductingMagnetArray
+}
+
+impl EDSSystem {
+    /// SCMaglev-style EDS
+    @pure
+    fn scmaglev() -> Self {
+        Self {
+            levitation_height: 0.10,
+            critical_speed: 30.0,       // ~100 km/h minimum
+            guideway_coil_pitch: 1.35,  // 1.35 m coil spacing
+            superconducting_magnets: SuperconductingMagnetArray::scmaglev_config()
+        }
+    }
+    
+    /// Levitation force (induced currents)
+    /// F = k · B² · v · A / ρ
+    @pure
+    fn levitation_force(&self, velocity: f64, train_mass: f64) -> f64 {
+        check velocity < self.critical_speed {
+            yield 0.0;  // Need wheel support below critical speed
+        }
+        
+        // Simplified: F increases with velocity until saturation
+        let b = self.superconducting_magnets.field_strength;
+        let k = 1e6;  // Empirical constant
+        
+        let force = k * b * b * velocity;
+        
+        // Saturates at weight
+        force.min(train_mass * 9.81)
+    }
+    
+    /// Drag force due to induced currents
+    @pure
+    fn electromagnetic_drag(&self, velocity: f64) -> f64 {
+        // F_drag ∝ v (at low speeds), ∝ √v (at high speeds)
+        let b = self.superconducting_magnets.field_strength;
+        let k_drag = 100.0;
+        
+        k_drag * b * b * velocity.sqrt()
+    }
+    
+    /// Is passively stable?
+    @pure
+    fn is_stable(&self) -> bool {
+        // EDS is inherently stable above critical speed
+        true
+    }
+}
+
+// ============================================================================
+// Linear Synchronous Motor (LSM)
+// ============================================================================
+
+/// Linear motor for propulsion
+@research_citation("IEEE Transactions on Magnetics, 2014")
+open data LinearSynchronousMotor {
+    pole_pitch: f64,            // m (wavelength)
+    synchronous_speed: f64,     // m/s
+    frequency: f64,             // Hz
+    thrust_force: f64,          // N
+    efficiency: f64             // 0-1
+}
+
+impl LinearSynchronousMotor {
+    /// SCMaglev LSM configuration
+    @pure
+    fn scmaglev_lsm() -> Self {
+        Self {
+            pole_pitch: 1.35,           // 1.35 m
+            synchronous_speed: 167.4,   // ~603 km/h
+            frequency: 123.7,           // Hz at max speed
+            thrust_force: 300000.0,     // 300 kN
+            efficiency: 0.95            // 95%
+        }
+    }
+    
+    /// Synchronous speed: v_sync = 2 · τ · f
+    /// where τ = pole pitch
+    @pure
+    @verified
+    fn calculate_synchronous_speed(&self) -> f64 {
+        2.0 * self.pole_pitch * self.frequency
+    }
+    
+    /// Mechanical power output
+    @pure
+    fn mechanical_power(&self) -> f64 {
+        self.thrust_force * self.synchronous_speed
+    }
+    
+    /// Electrical power input
+    @pure
+    fn electrical_power(&self) -> f64 {
+        self.mechanical_power() / self.efficiency
+    }
+}
+
+// ============================================================================
+// Track/Guideway Design
+// ============================================================================
+
+/// Maglev guideway specifications
+open data Guideway {
+    guideway_type: GuidewayConfiguration,
+    track_length_km: f64,
+    curve_radius_min: f64,      // m
+    max_gradient: f64,          // % slope
+    coil_spacing: f64,          // m
+    construction_cost_per_km: f64 // Million USD
+}
+
+#[derive(Clone, Copy)]
+open cases GuidewayConfiguration {
+    Elevated,       // Most common for maglev
+    AtGrade,        // Ground level
+    Tunnel,         // Underground
+    Mixed
+}
+
+impl Guideway {
+    /// Chuo Shinkansen (Tokyo-Osaka) specifications
+    @pure
+    fn chuo_shinkansen() -> Self {
+        Self {
+            guideway_type: GuidewayConfiguration::Mixed,
+            track_length_km: 438.0,     // Tokyo to Osaka
+            curve_radius_min: 8000.0,   // 8 km minimum radius
+            max_gradient: 4.0,          // 4% max grade
+            coil_spacing: 1.35,         // 1.35 m
+            construction_cost_per_km: 150.0  // ~$150M/km
+        }
+    }
+    
+    /// Maximum safe speed on curve
+    /// v_max = √(μ · g · R)
+    @pure
+    fn max_curve_speed(&self, lateral_acceleration_limit: f64) -> f64 {
+        // For maglev: a_lat typically limited to 0.7 m/s² (comfort)
+        yield (lateral_acceleration_limit * self.curve_radius_min).sqrt()
+    }
+    
+    /// Total construction cost
+    @pure
+    fn total_cost_billion_usd(&self) -> f64 {
+        self.track_length_km * self.construction_cost_per_km / 1000.0
+    }
+}
+
+// ============================================================================
+// Performance Comparison
+// ============================================================================
+
+open data TransportSystemComparison {
+    system_name: String,
+    max_speed_kmh: f64,
+    operational_speed_kmh: f64,
+    energy_efficiency: f64,     // kWh per passenger-km
+    construction_cost: f64,     // Million USD per km
+    technology: String
+}
+
+@const
+open fn transport_comparison() -> Vec<TransportSystemComparison> {
+    [
+        TransportSystemComparison {
+            system_name: "SCMaglev (Japan)".into(),
+            max_speed_kmh: 603.0,
+            operational_speed_kmh: 505.0,
+            energy_efficiency: 0.12,
+            construction_cost: 150.0,
+            technology: "Superconducting EDS".into()
+        },
+        TransportSystemComparison {
+            system_name: "Transrapid (Germany)".into(),
+            max_speed_kmh: 550.0,
+            operational_speed_kmh: 430.0,
+            energy_efficiency: 0.10,
+            construction_cost: 80.0,
+            technology: "EMS (attractive)".into()
+        },
+        TransportSystemComparison {
+            system_name: "Shinkansen N700S".into(),
+            max_speed_kmh: 360.0,
+            operational_speed_kmh: 285.0,
+            energy_efficiency: 0.06,
+            construction_cost: 40.0,
+            technology: "Steel wheel on rail".into()
+        },
+        TransportSystemComparison {
+            system_name: "TGV (France)".into(),
+            max_speed_kmh: 574.8,      // Record
+            operational_speed_kmh: 320.0,
+            energy_efficiency: 0.05,
+            construction_cost: 30.0,
+            technology: "Steel wheel on rail".into()
+        },
+        TransportSystemComparison {
+            system_name: "Hyperloop (proposed)".into(),
+            max_speed_kmh: 1200.0,     // Target
+            operational_speed_kmh: 1000.0,
+            energy_efficiency: 0.08,   // Estimated
+            construction_cost: 100.0,  // Estimated
+            technology: "Low-pressure tube + maglev".into()
+        }
+    ]
+}
+
+// ============================================================================
+// Hyperloop Concept
+// ============================================================================
+
+/// Hyperloop system (low-pressure tube + maglev)
+@research_level("experimental")
+open data HyperloopSystem {
+    tube_pressure: f64,         // Pa (100 Pa target)
+    pod_speed_kmh: f64,         // km/h (1200 km/h target)
+    tube_diameter: f64,         // m
+    levitation_system: MaglevType,
+    air_drag_coefficient: f64
+}
+
+impl HyperloopSystem {
+    @pure
+    fn elon_musk_alpha() -> Self {
+        Self {
+            tube_pressure: 100.0,       // 1/1000 atm
+            pod_speed_kmh: 1220.0,      // 760 mph
+            tube_diameter: 2.23,        // 2.23 m
+            levitation_system: MaglevType::Inductrack,
+            air_drag_coefficient: 0.01  // Very low due to low pressure
+        }
+    }
+    
+    /// Air drag force in low-pressure tube
+    /// F_drag = ½ρv²CdA
+    @pure
+    fn air_drag_force(&self, cross_sectional_area: f64) -> f64 {
+        // Density from ideal gas law: ρ = P/(RT)
+        let r_air = 287.0;  // J/(kg·K)
+        let temp = 293.0;   // K
+        let rho = self.tube_pressure / (r_air * temp);
+        
+        let v = self.pod_speed_kmh / 3.6;  // m/s
+        
+        0.5 * rho * v * v * self.air_drag_coefficient * cross_sectional_area
+    }
+    
+    /// Compare to atmospheric drag
+    @pure
+    fn drag_reduction_vs_atmospheric(&self) -> f64 {
+        let atm_pressure = 101325.0;  // Pa
+        atm_pressure / self.tube_pressure
+    }
+    
+    /// Vacuum pump power required (estimated)
+    @pure
+    fn vacuum_power_kw(&self, tube_length_km: f64, leak_rate: f64) -> f64 {
+        // Simplified: P_pump = (P_target · leak_rate · V) / η
+        let tube_area = PI * (self.tube_diameter / 2.0).powi(2);
+        let volume = tube_area * tube_length_km * 1000.0;  // m³
+        
+        let eta_pump = 0.5;  // 50% pump efficiency
+        
+        yield (self.tube_pressure * leak_rate * volume) / (eta_pump * 1000.0)
+    }
+}
+
+// ============================================================================
+// Safety & Emergency Systems
+// ============================================================================
+
+open data MaglevSafetySystem {
+    emergency_brake_distance: f64,  // m
+    backup_levitation: bool,
+    collision_avoidance: bool,
+    earthquake_detection: bool,
+    fire_suppression: bool
+}
+
+impl MaglevSafetySystem {
+    @pure
+    fn scmaglev_safety() -> Self {
+        Self {
+            emergency_brake_distance: 8000.0,  // 8 km at 500 km/h
+            backup_levitation: true,           // Wheels for low speed
+            collision_avoidance: true,
+            earthquake_detection: true,        // Critical for Japan
+            fire_suppression: true
+        }
+    }
+    
+    /// Emergency braking deceleration
+    /// Using: v² = v₀² + 2as
+    @pure
+    fn braking_deceleration(&self, initial_speed_kmh: f64) -> f64 {
+        let v0 = initial_speed_kmh / 3.6;  // m/s
+        let v = 0.0;  // Final speed
+        let s = self.emergency_brake_distance;
+        
+        // a = (v² - v₀²) / (2s)
+        yield (v * v - v0 * v0) / (2.0 * s)
+    }
+    
+    /// Braking time
+    @pure
+    fn braking_time(&self, initial_speed_kmh: f64) -> f64 {
+        let v0 = initial_speed_kmh / 3.6;
+        let a = self.braking_deceleration(initial_speed_kmh);
+        
+        -v0 / a  // t = v/a
+    }
+}
+
+// ============================================================================
+// Economic Analysis
+// ============================================================================
+
+open data MaglevEconomics {
+    construction_cost_billion: f64,
+    annual_operating_cost_million: f64,
+    annual_ridership_million: f64,
+    ticket_price_usd: f64,
+    lifespan_years: u32
+}
+
+impl MaglevEconomics {
+    /// Chuo Shinkansen economics
+    @pure
+    fn chuo_shinkansen() -> Self {
+        Self {
+            construction_cost_billion: 90.0,  // ~9 trillion yen
+            annual_operating_cost_million: 500.0,
+            annual_ridership_million: 60.0,   // Projected
+            ticket_price_usd: 100.0,          // ~11,000 yen
+            lifespan_years: 50
+        }
+    }
+    
+    /// Annual revenue
+    @pure
+    fn annual_revenue_million(&self) -> f64 {
+        self.annual_ridership_million * self.ticket_price_usd
+    }
+    
+    /// Break-even time (simplified)
+    @pure
+    fn breakeven_years(&self) -> f64 {
+        let net_annual = self.annual_revenue_million() - self.annual_operating_cost_million;
+        
+        check net_annual <= 0.0 {
+            yield f64::INFINITY;
+        }
+        
+        yield (self.construction_cost_billion * 1000.0) / net_annual
+    }
+    
+    /// ROI over lifespan
+    @pure
+    fn roi_percent(&self) -> f64 {
+        let total_revenue = self.annual_revenue_million() * (self.lifespan_years as f64);
+        let total_cost = self.construction_cost_billion * 1000.0 + 
+                        self.annual_operating_cost_million * (self.lifespan_years as f64);
+        
+        yield ((total_revenue - total_cost) / total_cost) * 100.0
+    }
+}
+
+// ============================================================================
+// Tests & Examples
+// ============================================================================
+
+#[test]
+fn test_scmaglev() {
+    let scmaglev = SCMaglevL0::new();
+    
+    println("SCMaglev L0 Series:");
+    println("  Max speed: {} km/h ({:.1} m/s)", scmaglev.max_speed_kmh, scmaglev.max_speed_ms());
+    println("  Operational: {} km/h", scmaglev.operational_speed_kmh);
+    println("  Levitation height: {:.0} cm", scmaglev.levitation_height * 100.0);
+    println("  Power: {:.0} kW ({:.1} kW/passenger)", 
+             scmaglev.power_consumption, scmaglev.power_per_passenger());
+    
+    let tokyo_osaka = 438.0;  // km
+    let time_saved = scmaglev.time_saving_vs_shinkansen(tokyo_osaka);
+    println("  Time saved vs Shinkansen (Tokyo-Osaka): {:.1} hours", time_saved);
+    
+    assert_eq!(scmaglev.max_speed_kmh, 603.0);
+}
+
+#[test]
+fn test_superconducting_magnets() {
+    let magnets = SuperconductingMagnetArray::scmaglev_config();
+    
+    println("SCMaglev Superconducting Magnets:");
+    println("  Type: NbTi");
+    println("  Field strength: {:.1} T", magnets.field_strength);
+    println("  Operating temp: {:.1} K", magnets.operating_temperature);
+    println("  Current: {:.0} A", magnets.current);
+    println("  Stored energy: {:.0} kJ", magnets.total_stored_energy() / 1000.0);
+    
+    let cooling_power = magnets.cooling_power_required(100.0, 293.0);
+    println("  Cooling power (100W load): {:.0} W", cooling_power);
+}
+
+#[test]
+fn test_eds_system() {
+    let eds = EDSSystem::scmaglev();
+    
+    let train_mass = 700000.0;  // 700 tonnes (16-car train)
+    
+    println("EDS System:");
+    println("  Levitation height: {:.0} cm", eds.levitation_height * 100.0);
+    println("  Critical speed: {:.1} km/h", eds.critical_speed * 3.6);
+    println("  Stable: {}", eds.is_stable());
+    
+    let force_at_500kmh = eds.levitation_force(500.0 / 3.6, train_mass);
+    println("  Lev force at 500 km/h: {:.0} kN", force_at_500kmh / 1000.0);
+    
+    assert(eds.is_stable());
+}
+
+#[test]
+fn test_linear_motor() {
+    let lsm = LinearSynchronousMotor::scmaglev_lsm();
+    
+    let v_sync = lsm.calculate_synchronous_speed();
+    let p_mech = lsm.mechanical_power();
+    let p_elec = lsm.electrical_power();
+    
+    println("Linear Synchronous Motor:");
+    println("  Synchronous speed: {:.1} m/s ({:.0} km/h)", v_sync, v_sync * 3.6);
+    println("  Thrust: {:.0} kN", lsm.thrust_force / 1000.0);
+    println("  Mech power: {:.1} MW", p_mech / 1e6);
+    println("  Elec power: {:.1} MW", p_elec / 1e6);
+    println("  Efficiency: {:.1}%", lsm.efficiency * 100.0);
+    
+    assert((v_sync - lsm.synchronous_speed).abs() < 0.1);
+}
+
+#[test]
+fn test_transport_comparison() {
+    let systems = transport_comparison();
+    
+    println("\nTransport System Comparison:");
+    println("{:<25} {:<12} {:<12} {:<12}", "System", "Max (km/h)", "Oper (km/h)", "Cost (M$/km)");
+    println("{}", "-".repeat(65));
+    
+    each sys in systems.iter() {
+        println("{:<25} {:<12.0} {:<12.0} {:<12.0}",
+                 sys.system_name,
+                 sys.max_speed_kmh,
+                 sys.operational_speed_kmh,
+                 sys.construction_cost);
+    }
+}
+
+#[test]
+fn test_hyperloop() {
+    let hyperloop = HyperloopSystem::elon_musk_alpha();
+    
+    let pod_area = PI * (hyperloop.tube_diameter / 2.0).powi(2) * 0.7;  // 70% of tube
+    let drag = hyperloop.air_drag_force(pod_area);
+    let reduction = hyperloop.drag_reduction_vs_atmospheric();
+    
+    println("Hyperloop Alpha:");
+    println("  Tube pressure: {:.0} Pa (1/{:.0} atm)", 
+             hyperloop.tube_pressure, reduction);
+    println("  Target speed: {} km/h", hyperloop.pod_speed_kmh);
+    println("  Air drag: {:.0} N", drag);
+    println("  Drag reduction: {:.0}x vs atmospheric", reduction);
+    
+    let vacuum_power = hyperloop.vacuum_power_kw(100.0, 0.01);
+    println("  Vacuum power (100km): {:.0} kW", vacuum_power);
+}
+
+#[test]
+fn test_economics() {
+    let econ = MaglevEconomics::chuo_shinkansen();
+    
+    println("Chuo Shinkansen Economics:");
+    println("  Construction: ${:.1}B", econ.construction_cost_billion);
+    println("  Annual revenue: ${:.0}M", econ.annual_revenue_million());
+    println("  Annual operating cost: ${:.0}M", econ.annual_operating_cost_million);
+    println("  Break-even: {:.1} years", econ.breakeven_years());
+    println("  ROI ({} years): {:.1}%", econ.lifespan_years, econ.roi_percent());
+}

@@ -1,0 +1,380 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  Nova — SOVEREIGN DATAFRAME ENGINE  v8.0                           ║
+// ║  Columnar Storage and Vectorized Query Processing                         ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::{HashMap, Vec};
+use std::data::numpy::DType;
+
+/// A Single Column of Data with native physical unit tracking
+open data Series {
+    open name:  String,
+    open dtype: DType,
+    open data:  Vec<f64>, // Unified float storage for bootstrap
+    open unit:  String,   // Physical unit (e.g. "m", "km", "s", "kg")
+}
+
+impl Series {
+    /// Creates a new Series with unit metadata
+    open fn with_unit(name: String, dtype: DType, data: Vec<f64>, unit: String) -> Series {
+        yield Series { name, dtype, data, unit };
+    }
+
+    /// Determines multiplier to convert self's unit to a base unit
+    fn get_unit_multiplier(unit: &str) -> f64 {
+        check unit == "km" { yield 1000.0; }
+        check unit == "cm" { yield 0.01; }
+        check unit == "mm" { yield 0.001; }
+        check unit == "g"  { yield 0.001; }
+        check unit == "mg" { yield 0.000001; }
+        check unit == "min" { yield 60.0; }
+        check unit == "h"   { yield 3600.0; }
+        check unit == "ms"  { yield 0.001; }
+        yield 1.0;
+    }
+
+    /// Safely add another Series with dimensional unit alignment and scaling
+    open fn add_series(&self, other: &Series) -> Series {
+        println("📊 DataFrame: Veri serileri toplanıyor (Birim Analiz Ediliyor: {} + {})...", self.unit, other.unit);
+        
+        var self_mult = Series::get_unit_multiplier(&self.unit);
+        var other_mult = Series::get_unit_multiplier(&other.unit);
+        
+        // Base units mapping (e.g., km and m both resolve to m)
+        var is_compatible = false;
+        var target_unit = self.unit.clone();
+        
+        // Match length dimensions
+        check (self.unit == "m" || self.unit == "km" || self.unit == "cm" || self.unit == "mm") &&
+              (other.unit == "m" || other.unit == "km" || other.unit == "cm" || other.unit == "mm") {
+            is_compatible = true;
+            target_unit = "m".to_string();
+        } else check (self.unit == "kg" || self.unit == "g" || self.unit == "mg") &&
+                    (other.unit == "kg" || other.unit == "g" || other.unit == "mg") {
+            is_compatible = true;
+            target_unit = "kg".to_string();
+        } else check (self.unit == "s" || self.unit == "ms" || self.unit == "min" || self.unit == "h") &&
+                    (other.unit == "s" || other.unit == "ms" || other.unit == "min" || other.unit == "h") {
+            is_compatible = true;
+            target_unit = "s".to_string();
+        } else check self.unit == other.unit {
+            is_compatible = true;
+        }
+
+        check !is_compatible {
+            println("❌ Unit Error: Uyumsuz fiziksel birimler toplanamaz: {} ve {}", self.unit, other.unit);
+            yield self.clone();
+        }
+
+        var new_data = Vec::new();
+        var i = 0;
+        let len = self.data.len();
+        while i < len && i < other.data.len() {
+            // Scale values automatically to base unit
+            let val_self = self.data[i] * self_mult;
+            let val_other = other.data[i] * other_mult;
+            new_data.push(val_self + val_other);
+            i += 1;
+        }
+
+        yield Series {
+            name:  format!("{}_plus_{}", self.name, other.name),
+            dtype: DType::F64,
+            data:  new_data,
+            unit:  target_unit,
+        };
+    }
+
+    /// Multiply two Series propagating units (e.g. kg * m/s² -> kg*m/s² [Newton])
+    open fn mul_series(&self, other: &Series) -> Series {
+        var new_data = Vec::new();
+        var i = 0;
+        let len = self.data.len();
+        while i < len && i < other.data.len() {
+            new_data.push(self.data[i] * other.data[i]);
+            i += 1;
+        }
+        
+        var out_unit = format!("{}*{}", self.unit, other.unit);
+        check self.unit == "kg" && other.unit == "m/s²" {
+            out_unit = "N".to_string(); // Newton
+        }
+        
+        yield Series {
+            name:  format!("{}_mul_{}", self.name, other.name),
+            dtype: DType::F64,
+            data:  new_data,
+            unit:  out_unit,
+        };
+    }
+
+    /// Divide two Series propagating units (e.g. m / s -> m/s [Velocity])
+    open fn div_series(&self, other: &Series) -> Series {
+        var new_data = Vec::new();
+        var i = 0;
+        let len = self.data.len();
+        while i < len && i < other.data.len() {
+            let denom = other.data[i];
+            check denom == 0.0 {
+                new_data.push(0.0);
+            } else {
+                new_data.push(self.data[i] / denom);
+            }
+            i += 1;
+        }
+        
+        var out_unit = format!("{}/{}", self.unit, other.unit);
+        
+        yield Series {
+            name:  format!("{}_div_{}", self.name, other.name),
+            dtype: DType::F64,
+            data:  new_data,
+            unit:  out_unit,
+        };
+    }
+
+    /// Element-wise greater than comparison
+    open fn gt(&self, other: f64) -> Vec<bool> {
+        var mask = Vec::new();
+        each val in self.data {
+            mask.push(val > other);
+        }
+        yield mask;
+    }
+
+    /// Element-wise less than comparison
+    open fn lt(&self, other: f64) -> Vec<bool> {
+        var mask = Vec::new();
+        each val in self.data {
+            mask.push(val < other);
+        }
+        yield mask;
+    }
+
+    /// Element-wise equal comparison
+    open fn eq_val(&self, other: f64) -> Vec<bool> {
+        var mask = Vec::new();
+        each val in self.data {
+            mask.push(val == other);
+        }
+        yield mask;
+    }
+
+    /// Calculates the rolling sum of elements
+    open fn rolling_sum(&self, window: usize) -> Series {
+        var new_data = Vec::new();
+        var i = 0;
+        let len = self.data.len();
+        
+        while i < len {
+            check i as i64 < (window as i64 - 1) {
+                new_data.push(0.0); // Padding for incomplete windows
+            } else {
+                var sum = 0.0;
+                var k = 0;
+                while k < window {
+                    sum += self.data[i - k];
+                    k += 1;
+                }
+                new_data.push(sum);
+            }
+            i += 1;
+        }
+
+        yield Series {
+            name:  format!("{}_rolling_sum", self.name),
+            dtype: DType::F64,
+            data:  new_data,
+            unit:  self.unit.clone(),
+        };
+    }
+
+    /// Calculates the rolling mean of elements
+    open fn rolling_mean(&self, window: usize) -> Series {
+        var r_sum = self.rolling_sum(window);
+        var i = 0;
+        let len = r_sum.data.len();
+        while i < len {
+            check i >= (window - 1) {
+                r_sum.data[i] = r_sum.data[i] / (window as f64);
+            }
+            i += 1;
+        }
+        r_sum.name = format!("{}_rolling_mean", self.name);
+        yield r_sum;
+    }
+
+    /// Deep clone of Series
+    open fn clone(&self) -> Series {
+        yield Series {
+            name:  self.name.clone(),
+            dtype: self.dtype,
+            data:  self.data.clone(),
+            unit:  self.unit.clone(),
+        };
+    }
+}
+
+/// The Master DataFrame Structure
+open data DataFrame {
+    open columns: HashMap<String, Series>,
+    open height:  i64,
+}
+
+impl DataFrame {
+    open fn new() -> DataFrame {
+        yield DataFrame {
+            columns: HashMap::new(),
+            height:  0,
+        };
+    }
+
+    /// Appends a new column (Series) to the DataFrame
+    open fn add_column(&var self, series: Series) {
+        check self.height > 0 && series.data.len() as i64 != self.height {
+            println("❌ DataFrame: Column length mismatch!");
+            yield;
+        }
+        self.height = series.data.len() as i64;
+        self.columns.insert(series.name.clone(), series);
+    }
+
+    /// Selects a subset of columns (Materialized view)
+    open fn select(&self, names: Vec<String>) -> DataFrame {
+        println("📊 DataFrame: Selecting {} columns...", names.len());
+        var new_df = DataFrame::new();
+        each name in names {
+            check let Some(col) = self.columns.get(&name) {
+                new_df.add_column(col.clone());
+            }
+        }
+        yield new_df;
+    }
+
+    /// High-performance filtering based on comparison
+    open fn filter(&self, col_name: String, threshold: f64) -> DataFrame {
+        println("📊 DataFrame: Filtering rows where {} > {}...", col_name, threshold);
+        check let Some(col) = self.columns.get(&col_name) {
+            let mask = col.gt(threshold);
+            yield self.filter_by_mask(mask);
+        }
+        yield self.clone();
+    }
+
+    /// Filters the DataFrame based on a boolean mask vector
+    open fn filter_by_mask(&self, mask: Vec<bool>) -> DataFrame {
+        var filtered_df = DataFrame::new();
+        
+        each (col_name, series) in &self.columns {
+            var filtered_data = Vec::new();
+            var i = 0;
+            let len = series.data.len();
+            while i < len {
+                check i < mask.len() && mask[i] {
+                    filtered_data.push(series.data[i]);
+                }
+                i += 1;
+            }
+            filtered_df.add_column(Series {
+                name:  col_name.clone(),
+                dtype: series.dtype,
+                data:  filtered_data,
+                unit:  series.unit.clone(),
+            });
+        }
+        
+        yield filtered_df;
+    }
+
+    /// Renders a highly responsive and stunning SVG Line Chart of selected columns natively!
+    open fn to_svg(&self, x_col: String, y_col: String) -> String {
+        println("📊 DataFrame: Rending SVG Chart of {} vs {}...", y_col, x_col);
+        
+        check let (Some(xc), Some(yc)) = (self.columns.get(&x_col), self.columns.get(&y_col)) {
+            let width = 600.0;
+            let height = 300.0;
+            let padding = 40.0;
+            
+            // Find boundaries
+            var min_x = 999999.0;
+            var max_x = -999999.0;
+            var min_y = 999999.0;
+            var max_y = -999999.0;
+            
+            each v in xc.data {
+                check v < min_x { min_x = v; }
+                check v > max_x { max_x = v; }
+            }
+            each v in yc.data {
+                check v < min_y { min_y = v; }
+                check v > max_y { max_y = v; }
+            }
+            
+            // Avoid division by zero
+            check min_x == max_x { max_x += 1.0; }
+            check min_y == max_y { max_y += 1.0; }
+            
+            var points_svg = String::new();
+            var line_path = String::new();
+            
+            var i = 0;
+            let len = xc.data.len();
+            while i < len && i < yc.data.len() {
+                let x_raw = xc.data[i];
+                let y_raw = yc.data[i];
+                
+                // Project coordinates into canvas space
+                let x_proj = padding + ((x_raw - min_x) / (max_x - min_x)) * (width - padding * 2.0);
+                let y_proj = (height - padding) - ((y_raw - min_y) / (max_y - min_y)) * (height - padding * 2.0);
+                
+                check i == 0 {
+                    line_path = format("M {},{}", x_proj, y_proj);
+                } else {
+                    line_path = format("{} L {},{}", line_path, x_proj, y_proj);
+                }
+                
+                // Scatter dot points
+                points_svg = format("{}<circle cx='{}' cy='{}' r='4' fill='#ff6b6b' stroke='#ffffff' stroke-width='1.5' />", points_svg, x_proj, y_proj);
+                i += 1;
+            }
+            
+            // Wrap in full professional SVG tags
+            var svg = "<svg viewBox='0 0 600 300' width='100%' height='100%' xmlns='http://www.w3.org/2000/svg' style='background:#1e1e24; border-radius:12px; padding:10px;'>".to_string();
+            // Gridlines
+            svg = format("{}<line x1='{}' y1='{}' x2='{}' y2='{}' stroke='#3e3e4a' stroke-dasharray='4' />", svg, padding, padding, width - padding, padding);
+            svg = format("{}<line x1='{}' y1='{}' x2='{}' y2='{}' stroke='#3e3e4a' stroke-dasharray='4' />", svg, padding, height - padding, width - padding, height - padding);
+            
+            // Axis lines
+            svg = format("{}<line x1='{}' y1='{}' x2='{}' y2='{}' stroke='#a0a0b0' stroke-width='2' />", svg, padding, height - padding, width - padding, height - padding);
+            svg = format("{}<line x1='{}' y1='{}' x2='{}' y2='{}' stroke='#a0a0b0' stroke-width='2' />", svg, padding, padding, padding, height - padding);
+            
+            // Graph Path
+            svg = format("{}<path d='{}' fill='none' stroke='#4dabf7' stroke-width='3' stroke-linecap='round' stroke-linejoin='round' />", svg, line_path);
+            svg = format("{}{}", svg, points_svg);
+            
+            // Labels with Unit indications
+            svg = format("{}<text x='{}' y='{}' fill='#a0a0b0' font-size='10' text-anchor='middle'>{:?} ({})</text>", svg, padding, height - padding + 15.0, min_x, xc.unit);
+            svg = format("{}<text x='{}' y='{}' fill='#a0a0b0' font-size='10' text-anchor='middle'>{:?} ({})</text>", svg, width - padding, height - padding + 15.0, max_x, xc.unit);
+            svg = format("{}<text x='{}' y='{}' fill='#a0a0b0' font-size='10' text-anchor='end'>{:?} ({})</text>", svg, padding - 5.0, height - padding, min_y, yc.unit);
+            svg = format("{}<text x='{}' y='{}' fill='#a0a0b0' font-size='10' text-anchor='end'>{:?} ({})</text>", svg, padding - 5.0, padding, max_y, yc.unit);
+            
+            svg = format("{}</svg>", svg);
+            yield svg;
+        }
+        
+        yield "<svg></svg>".to_string();
+    }
+
+    /// Deep clone of DataFrame
+    open fn clone(&self) -> DataFrame {
+        var copy = DataFrame::new();
+        each (name, col) in &self.columns {
+            copy.add_column(col.clone());
+        }
+        yield copy;
+    }
+}
+
+open fn main() {
+    println("📊  Nova Sovereign DataFrame Engine - Active");
+}

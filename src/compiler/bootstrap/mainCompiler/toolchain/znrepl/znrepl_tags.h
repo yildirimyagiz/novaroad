@@ -1,0 +1,12 @@
+#ifndef NOVA_ZNREPL_TAGS_H
+#define NOVA_ZNREPL_TAGS_H
+
+/* Value definition */
+#define NOVA_ZNREPL_VALUE_INT 0
+#define NOVA_ZNREPL_VALUE_FLOAT 1
+#define NOVA_ZNREPL_VALUE_BOOL 2
+#define NOVA_ZNREPL_VALUE_STRING 3
+#define NOVA_ZNREPL_VALUE_UNIT 4
+
+#endif
+

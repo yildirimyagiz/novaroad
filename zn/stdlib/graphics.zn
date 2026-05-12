@@ -1,0 +1,1002 @@
+// 🎨 Nova 2D Graphics Canvas — v10.0
+// 2D graphics rendering with canvas API
+// + Nova Magic: Hardware acceleration, vector graphics
+
+@module("graphics::canvas")
+@reproducible
+@export
+@inline
+
+use std::collections::{HashMap, Vec};
+use std::sync::Arc;
+use std::result::Result;
+
+// ═════════════════════════════════════════════════════════════════════════════
+// §1  CANVAS CORE TYPES
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Canvas 2D context
+open data Canvas2D {
+    width: u32,
+    height: u32,
+    buffer: Vec<Color>,
+    context: RenderContext,
+    transform_stack: Vec<Transform>,
+}
+
+/// Color representation
+open data Color {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+}
+
+impl Color {
+    open fn new(r: u8, g: u8, b: u8, a: u8) -> Color {
+        return Color { r: r, g: g, b: b, a: a };
+    }
+    
+    open fn rgb(r: u8, g: u8, b: u8) -> Color {
+        return Color::new(r, g, b, 255);
+    }
+    
+    open fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
+        return Color::new(r, g, b, a);
+    }
+    
+    open fn hex(hex: u32) -> Color {
+        return Color {
+            r: ((hex >> 24) & 0xFF) as u8,
+            g: ((hex >> 16) & 0xFF) as u8,
+            b: ((hex >> 8) & 0xFF) as u8,
+            a: (hex & 0xFF) as u8,
+        };
+    }
+    
+    open fn to_hex(&self) -> u32 {
+        return ((self.r as u32) << 24) | ((self.g as u32) << 16) | 
+               ((self.b as u32) << 8) | (self.a as u32);
+    }
+    
+    open fn to_string(&self) -> String {
+        return format!("rgba({}, {}, {}, {}, {})", self.r, self.g, self.b, self.a);
+    }
+    
+    // Predefined colors
+    pub static BLACK: Color = Color::rgb(0, 0, 0);
+    pub static WHITE: Color = Color::rgb(255, 255, 255);
+    pub static RED: Color = Color::rgb(255, 0, 0);
+    pub static GREEN: Color = Color::rgb(0, 255, 0);
+    pub static BLUE: Color = Color::rgb(0, 0, 255);
+    pub static YELLOW: Color = Color::rgb(255, 255, 0);
+    pub static CYAN: Color = Color::rgb(0, 255, 255);
+    pub static MAGENTA: Color = Color::rgb(255, 0, 255);
+    pub static TRANSPARENT: Color = Color::rgba(0, 0, 0, 0);
+}
+
+/// Point in 2D space
+open data Point {
+    x: f64,
+    y: f64,
+}
+
+impl Point {
+    open fn new(x: f64, y: f64) -> Point {
+        return Point { x: x, y: y };
+    }
+    
+    open fn distance(&self, other: &Point) -> f64 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        return (dx * dx + dy * dy).sqrt();
+    }
+    
+    open fn lerp(&self, other: &Point, t: f64) -> Point {
+        return Point::new(
+            self.x + (other.x - self.x) * t,
+            self.y + (other.y - self.y) * t
+        );
+    }
+}
+
+/// Rectangle in 2D space
+open data Rect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl Rect {
+    open fn new(x: f64, y: f64, width: f64, height: f64) -> Rect {
+        return Rect { x: x, y: y, width: width, height: height };
+    }
+    
+    open fn contains(&self, point: &Point) -> bool {
+        return point.x >= self.x && point.x <= self.x + self.width &&
+               point.y >= self.y && point.y <= self.y + self.height;
+    }
+    
+    open fn intersects(&self, other: &Rect) -> bool {
+        return !(self.x + self.width < other.x || 
+                other.x + other.width < self.x ||
+                self.y + self.height < other.y || 
+                other.y + other.height < self.y);
+    }
+    
+    open fn center(&self) -> Point {
+        return Point::new(self.x + self.width / 2.0, self.y + self.height / 2.0);
+    }
+    
+    open fn inflate(&self, amount: f64) -> Rect {
+        return Rect::new(
+            self.x - amount,
+            self.y - amount,
+            self.width + amount * 2.0,
+            self.height + amount * 2.0
+        );
+    }
+}
+
+/// 2D transform
+open data Transform {
+    matrix: [f64; 6], // [a, b, c, d, e, f] for affine transform
+}
+
+impl Transform {
+    open fn identity() -> Transform {
+        return Transform {
+            matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        };
+    }
+    
+    open fn translate(x: f64, y: f64) -> Transform {
+        return Transform {
+            matrix: [1.0, 0.0, 0.0, 1.0, x, y],
+        };
+    }
+    
+    open fn scale(sx: f64, sy: f64) -> Transform {
+        return Transform {
+            matrix: [sx, 0.0, 0.0, sy, 0.0, 0.0],
+        };
+    }
+    
+    open fn rotate(angle: f64) -> Transform {
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+        return Transform {
+            matrix: [cos_a, sin_a, -sin_a, cos_a, 0.0, 0.0],
+        };
+    }
+    
+    open fn multiply(&self, other: &Transform) -> Transform {
+        let a = self.matrix;
+        let b = other.matrix;
+        
+        return Transform {
+            matrix: [
+                a[0] * b[0] + a[2] * b[1],
+                a[1] * b[0] + a[3] * b[1],
+                a[0] * b[2] + a[2] * b[3],
+                a[1] * b[2] + a[3] * b[3],
+                a[0] * b[4] + a[2] * b[5] + a[4],
+                a[1] * b[4] + a[3] * b[5] + a[5],
+            ],
+        };
+    }
+    
+    open fn transform_point(&self, point: &Point) -> Point {
+        let x = self.matrix[0] * point.x + self.matrix[2] * point.y + self.matrix[4];
+        let y = self.matrix[1] * point.x + self.matrix[3] * point.y + self.matrix[5];
+        return Point::new(x, y);
+    }
+}
+
+/// Render context
+open data RenderContext {
+    fill_style: FillStyle,
+    stroke_style: StrokeStyle,
+    font: Font,
+    text_align: TextAlign,
+    text_baseline: TextBaseline,
+    global_alpha: f64,
+    global_composite_operation: CompositeOperation,
+    shadow_color: Color,
+    shadow_blur: f64,
+    shadow_offset_x: f64,
+    shadow_offset_y: f64,
+}
+
+/// Fill style
+open cases FillStyle {
+    Color(Color),
+    Gradient(Gradient),
+    Pattern(Pattern),
+}
+
+/// Gradient
+open data Gradient {
+    kind: GradientKind,
+    stops: Vec<GradientStop>,
+}
+
+/// Gradient kind
+open cases GradientKind {
+    Linear(Point, Point),
+    Radial(Point, f64, Point, f64),
+}
+
+/// Gradient stop
+open data GradientStop {
+    offset: f64,
+    color: Color,
+}
+
+/// Pattern
+open data Pattern {
+    image: Image,
+    repeat: Repeat,
+}
+
+/// Repeat mode
+open cases Repeat {
+    Repeat,
+    RepeatX,
+    RepeatY,
+    NoRepeat,
+}
+
+/// Stroke style
+open data StrokeStyle {
+    color: Color,
+    width: f64,
+    line_cap: LineCap,
+    line_join: LineJoin,
+    miter_limit: f64,
+    dash_pattern: Option<Vec<f64>>,
+    dash_offset: f64,
+}
+
+/// Line cap style
+open cases LineCap {
+    Butt,
+    Round,
+    Square,
+}
+
+/// Line join style
+open cases LineJoin {
+    Miter,
+    Round,
+    Bevel,
+}
+
+/// Font
+open data Font {
+    family: String,
+    size: f64,
+    style: FontStyle,
+    variant: FontVariant,
+    weight: FontWeight,
+    stretch: FontStretch,
+}
+
+/// Font style
+open cases FontStyle {
+    Normal,
+    Italic,
+    Oblique,
+}
+
+/// Font variant
+open cases FontVariant {
+    Normal,
+    SmallCaps,
+}
+
+/// Font weight
+open cases FontWeight {
+    Normal,
+    Bold,
+    Bolder,
+    Lighter,
+    Custom(u16),
+}
+
+/// Font stretch
+open cases FontStretch {
+    Normal,
+    Condensed,
+    Expanded,
+}
+
+/// Text alignment
+open cases TextAlign {
+    Left,
+    Center,
+    Right,
+    Start,
+    End,
+}
+
+/// Text baseline
+open cases TextBaseline {
+    Top,
+    Middle,
+    Bottom,
+    Alphabetic,
+    Hanging,
+    Ideographic,
+}
+
+/// Composite operation
+open cases CompositeOperation {
+    SourceOver,
+    SourceIn,
+    SourceOut,
+    SourceAtop,
+    DestinationOver,
+    DestinationIn,
+    DestinationOut,
+    DestinationAtop,
+    Lighter,
+    Copy,
+    Xor,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// §2  CANVAS IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl Canvas2D {
+    open fn new(width: u32, height: u32) -> Canvas2D {
+        let buffer_size = (width * height) as usize;
+        let mut buffer = Vec::with_capacity(buffer_size);
+        buffer.resize(buffer_size, Color::TRANSPARENT);
+        
+        return Canvas2D {
+            width: width,
+            height: height,
+            buffer: buffer,
+            context: RenderContext::default(),
+            transform_stack: Vec::new(),
+        };
+    }
+    
+    open fn clear(&mut self) {
+        for pixel in &mut self.buffer {
+            *pixel = Color::TRANSPARENT;
+        }
+    }
+    
+    open fn clear_rect(&mut self, rect: &Rect) {
+        let start_x = rect.x.max(0.0) as u32;
+        let start_y = rect.y.max(0.0) as u32;
+        let end_x = (rect.x + rect.width).min(self.width as f64) as u32;
+        let end_y = (rect.y + rect.height).min(self.height as f64) as u32;
+        
+        for y in start_y..end_y {
+            for x in start_x..end_x {
+                let index = (y * self.width + x) as usize;
+                self.buffer[index] = Color::TRANSPARENT;
+            }
+        }
+    }
+    
+    open fn fill_rect(&mut self, rect: &Rect) {
+        let start_x = rect.x.max(0.0) as u32;
+        let start_y = rect.y.max(0.0) as u32;
+        let end_x = (rect.x + rect.width).min(self.width as f64) as u32;
+        let end_y = (rect.y + rect.height).min(self.height as f64) as u32;
+        
+        let fill_color = match &self.context.fill_style {
+            FillStyle::Color(color) => *color,
+            _ => Color::BLACK, // Simplified - would handle gradients/patterns
+        };
+        
+        for y in start_y..end_y {
+            for x in start_x..end_x {
+                let index = (y * self.width + x) as usize;
+                self.buffer[index] = fill_color;
+            }
+        }
+    }
+    
+    open fn stroke_rect(&mut self, rect: &Rect) {
+        self.draw_line(&Point::new(rect.x, rect.y), &Point::new(rect.x + rect.width, rect.y));
+        self.draw_line(&Point::new(rect.x + rect.width, rect.y), &Point::new(rect.x + rect.width, rect.y + rect.height));
+        self.draw_line(&Point::new(rect.x + rect.width, rect.y + rect.height), &Point::new(rect.x, rect.y + rect.height));
+        self.draw_line(&Point::new(rect.x, rect.y + rect.height), &Point::new(rect.x, rect.y));
+    }
+    
+    open fn draw_line(&mut self, start: &Point, end: &Point) {
+        let stroke_color = match &self.context.stroke_style {
+            StrokeStyle { color, .. } => *color,
+        };
+        
+        let x0 = start.x as i32;
+        let y0 = start.y as i32;
+        let x1 = end.x as i32;
+        let y1 = end.y as i32;
+        
+        let dx = (x1 - x0).abs();
+        let dy = (y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        
+        let mut err = dx - dy;
+        
+        let mut x = x0;
+        let mut y = y0;
+        
+        while err != 0 {
+            let e2 = 2 * err;
+            if e2 > -dy {
+                err -= dy;
+                x += sx;
+            }
+            if e2 < dx {
+                err += dx;
+                y += sy;
+            }
+            
+            self.set_pixel(x as u32, y as u32, stroke_color);
+        }
+    }
+    
+    open fn draw_circle(&mut self, center: &Point, radius: f64) {
+        let stroke_color = match &self.context.stroke_style {
+            StrokeStyle { color, .. } => *color,
+        };
+        
+        let cx = center.x as i32;
+        let cy = center.y as i32;
+        let r = radius as i32;
+        
+        let mut x = r;
+        let mut y = 0;
+        let mut err = 0;
+        
+        while x >= y {
+            let plot_x = cx + x;
+            let plot_y = cy + y;
+            
+            self.set_pixel(plot_x as u32, plot_y as u32, stroke_color);
+            self.set_pixel(plot_x as u32, (cy - y) as u32, stroke_color);
+            self.set_pixel((cx - x) as u32, plot_y as u32, stroke_color);
+            self.set_pixel((cx - x) as u32, (cy - y) as u32, stroke_color);
+            self.set_pixel(plot_x as u32, (cy - y) as u32, stroke_color);
+            
+            if err <= 0 {
+                err += 2 * y + 1;
+            }
+            if err > 0 {
+                err -= 2 * x + 1;
+            }
+            
+            if err > 0 {
+                x -= 1;
+            } else {
+                y += 1;
+            }
+        }
+    }
+    
+    open fn fill_circle(&mut self, center: &Point, radius: f64) {
+        let fill_color = match &self.context.fill_style {
+            FillStyle::Color(color) => *color,
+            _ => Color::BLACK,
+        };
+        
+        let cx = center.x as i32;
+        let cy = center.y as i32;
+        let r = radius as i32;
+        
+        for y in -r..=r {
+            for x in -r..=r {
+                if x * x + y * y <= r * r {
+                    let px = (cx + x) as u32;
+                    let py = (cy + y) as u32;
+                    self.set_pixel(px, py, fill_color);
+                }
+            }
+        }
+    }
+    
+    open fn draw_image(&mut self, image: &Image, dest: &Point) {
+        let src_width = image.width;
+        let src_height = image.height;
+        
+        for y in 0..src_height {
+            for x in 0..src_width {
+                let src_index = (y * src_width + x) as usize;
+                let dest_x = (dest.x + x as f64) as u32;
+                let dest_y = (dest.y + y as f64) as u32;
+                
+                if dest_x < self.width && dest_y < self.height {
+                    let dest_index = (dest_y * self.width + dest_x) as usize;
+                    self.buffer[dest_index] = image.pixels[src_index];
+                }
+            }
+        }
+    }
+    
+    open fn draw_text(&mut self, text: &str, x: f64, y: f64) {
+        // Simplified text rendering - in real implementation would use font rendering
+        let text_color = match &self.context.stroke_style {
+            StrokeStyle { color, .. } => *color,
+        };
+        
+        let start_x = x as u32;
+        let start_y = y as u32;
+        
+        for (i, ch) in text.chars().enumerate() {
+            let char_x = start_x + (i * 8) as u32;
+            let char_y = start_y;
+            
+            // Draw simple 8x8 character
+            self.draw_char(ch, char_x, char_y, text_color);
+        }
+    }
+    
+    fn draw_char(&mut self, ch: char, x: u32, y: u32, color: Color) {
+        // Very simplified character rendering
+        for py in 0..8 {
+            for px in 0..8 {
+                let pixel_x = x + px;
+                let pixel_y = y + py;
+                
+                if pixel_x < self.width && pixel_y < self.height {
+                    let index = (pixel_y * self.width + pixel_x) as usize;
+                    // Simple pattern for characters
+                    let should_draw = (ch as u32 + px + py) % 3 == 0;
+                    self.buffer[index] = if should_draw { color } else { Color::TRANSPARENT };
+                }
+            }
+        }
+    }
+    
+    fn set_pixel(&mut self, x: u32, y: u32, color: Color) {
+        if x < self.width && y < self.height {
+            let index = (y * self.width + x) as usize;
+            self.buffer[index] = color;
+        }
+    }
+    
+    open fn get_pixel(&self, x: u32, y: u32) -> Option<Color> {
+        if x < self.width && y < self.height {
+            let index = (y * self.width + x) as usize;
+            return Some(self.buffer[index]);
+        }
+        return None;
+    }
+    
+    open fn save(&self, path: &str) -> Result<(), String> {
+        // Save canvas as image file (PNG, JPEG, etc.)
+        // In real implementation, would use image encoding library
+        return Ok(());
+    }
+    
+    open fn to_image(&self) -> Image {
+        return Image {
+            width: self.width,
+            height: self.height,
+            pixels: self.buffer.clone(),
+        };
+    }
+    
+    open fn get_width(&self) -> u32 {
+        return self.width;
+    }
+    
+    open fn get_height(&self) -> u32 {
+        return self.height;
+    }
+    
+    open fn get_size(&self) -> (u32, u32) {
+        return (self.width, self.height);
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// §3  IMAGE HANDLING
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Image data
+open data Image {
+    width: u32,
+    height: u32,
+    pixels: Vec<Color>,
+}
+
+impl Image {
+    open fn new(width: u32, height: u32) -> Image {
+        let size = (width * height) as usize;
+        let mut pixels = Vec::with_capacity(size);
+        pixels.resize(size, Color::TRANSPARENT);
+        
+        return Image {
+            width: width,
+            height: height,
+            pixels: pixels,
+        };
+    }
+    
+    open fn from_buffer(width: u32, height: u32, buffer: Vec<Color>) -> Image {
+        return Image {
+            width: width,
+            height: height,
+            pixels: buffer,
+        };
+    }
+    
+    open fn load(path: &str) -> Result<Image, String> {
+        // Load image from file (PNG, JPEG, etc.)
+        // In real implementation, would use image decoding library
+        return Ok(Image::new(100, 100));
+    }
+    
+    open fn save(&self, path: &str) -> Result<(), String> {
+        // Save image to file
+        // In real implementation, would use image encoding library
+        return Ok(());
+    }
+    
+    open fn crop(&self, x: u32, y: u32, width: u32, height: u32) -> Image {
+        let mut new_pixels = Vec::with_capacity((width * height) as usize);
+        
+        for py in y..(y + height) {
+            for px in x..(x + width) {
+                if px < self.width && py < self.height {
+                    let src_index = (py * self.width + px) as usize;
+                    new_pixels.push(self.pixels[src_index]);
+                } else {
+                    new_pixels.push(Color::TRANSPARENT);
+                }
+            }
+        }
+        
+        return Image::from_buffer(width, height, new_pixels);
+    }
+    
+    open fn resize(&self, new_width: u32, new_height: u32) -> Image {
+        let mut new_pixels = Vec::with_capacity((new_width * new_height) as usize);
+        
+        let x_ratio = self.width as f64 / new_width as f64;
+        let y_ratio = self.height as f64 / new_height as f64;
+        
+        for y in 0..new_height {
+            for x in 0..new_width {
+                let src_x = (x as f64 * x_ratio) as u32;
+                let src_y = (y as f64 * y_ratio) as u32;
+                
+                if src_x < self.width && src_y < self.height {
+                    let src_index = (src_y * self.width + src_x) as usize;
+                    new_pixels.push(self.pixels[src_index]);
+                } else {
+                    new_pixels.push(Color::TRANSPARENT);
+                }
+            }
+        }
+        
+        return Image::from_buffer(new_width, new_height, new_pixels);
+    }
+    
+    open fn flip_horizontal(&self) -> Image {
+        let mut new_pixels = Vec::with_capacity(self.pixels.len());
+        
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let src_index = (y * self.width + x) as usize;
+                let flipped_x = self.width - 1 - x;
+                let dest_index = (y * self.width + flipped_x) as usize;
+                new_pixels.push(self.pixels[src_index]);
+            }
+        }
+        
+        return Image::from_buffer(self.width, self.height, new_pixels);
+    }
+    
+    open fn flip_vertical(&self) -> Image {
+        let mut new_pixels = Vec::with_capacity(self.pixels.len());
+        
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let src_index = (y * self.width + x) as usize;
+                let flipped_y = self.height - 1 - y;
+                let dest_index = (flipped_y * self.width + x) as usize;
+                new_pixels.push(self.pixels[src_index]);
+            }
+        }
+        
+        return Image::from_buffer(self.width, self.height, new_pixels);
+    }
+    
+    open fn get_pixel(&self, x: u32, y: u32) -> Option<Color> {
+        if x < self.width && y < self.height {
+            let index = (y * self.width + x) as usize;
+            return Some(self.pixels[index]);
+        }
+        return None;
+    }
+    
+    open fn set_pixel(&mut self, x: u32, y: u32, color: Color) {
+        if x < self.width && y < self.height {
+            let index = (y * self.width + x) as usize;
+            self.pixels[index] = color;
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// §4  PATH OPERATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Path 2D
+open data Path2D {
+    commands: Vec<PathCommand>,
+    current_point: Point,
+    start_point: Point,
+}
+
+/// Path command
+open cases PathCommand {
+    MoveTo(Point),
+    LineTo(Point),
+    QuadraticCurveTo(Point, Point),
+    BezierCurveTo(Point, Point, Point),
+    ArcTo(Point, f64, f64, f64, bool),
+    ClosePath,
+}
+
+impl Path2D {
+    open fn new() -> Path2D {
+        return Path2D {
+            commands: Vec::new(),
+            current_point: Point::new(0.0, 0.0),
+            start_point: Point::new(0.0, 0.0),
+        };
+    }
+    
+    open fn move_to(&mut self, point: Point) {
+        self.commands.push(PathCommand::MoveTo(point));
+        self.current_point = point;
+        self.start_point = point;
+    }
+    
+    open fn line_to(&mut self, point: Point) {
+        self.commands.push(PathCommand::LineTo(point));
+        self.current_point = point;
+    }
+    
+    open fn quadratic_curve_to(&mut self, control: Point, end: Point) {
+        self.commands.push(PathCommand::QuadraticCurveTo(control, end));
+        self.current_point = end;
+    }
+    
+    open fn bezier_curve_to(&mut self, control1: Point, control2: Point, end: Point) {
+        self.commands.push(PathCommand::BezierCurveTo(control1, control2, end));
+        self.current_point = end;
+    }
+    
+    open fn arc_to(&mut self, center: Point, radius: f64, start_angle: f64, end_angle: f64, anticlockwise: bool) {
+        self.commands.push(PathCommand::ArcTo(center, radius, start_angle, end_angle, anticlockwise));
+        self.current_point = Point::new(
+            center.x + radius * end_angle.cos(),
+            center.y + radius * end_angle.sin()
+        );
+    }
+    
+    open fn close_path(&mut self) {
+        self.commands.push(PathCommand::ClosePath);
+        self.current_point = self.start_point;
+    }
+    
+    open fn rect(&mut self, x: f64, y: f64, width: f64, height: f64) {
+        self.move_to(Point::new(x, y));
+        self.line_to(Point::new(x + width, y));
+        self.line_to(Point::new(x + width, y + height));
+        self.line_to(Point::new(x, y + height));
+        self.close_path();
+    }
+    
+    open fn get_bounds(&self) -> Rect {
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        
+        for command in &self.commands {
+            match command {
+                PathCommand::MoveTo(p) | PathCommand::LineTo(p) => {
+                    min_x = min_x.min(p.x);
+                    min_y = min_y.min(p.y);
+                    max_x = max_x.max(p.x);
+                    max_y = max_y.max(p.y);
+                }
+                PathCommand::QuadraticCurveTo(c, e) => {
+                    min_x = min_x.min(c.x).min(e.x);
+                    min_y = min_y.min(c.y).min(e.y);
+                    max_x = max_x.max(c.x).max(e.x);
+                    max_y = max_y.max(c.y).max(e.y);
+                }
+                PathCommand::BezierCurveTo(c1, c2, e) => {
+                    min_x = min_x.min(c1.x).min(c2.x).min(e.x);
+                    min_y = min_y.min(c1.y).min(c2.y).min(e.y);
+                    max_x = max_x.max(c1.x).max(c2.x).max(e.x);
+                    max_y = max_y.max(c1.y).max(c2.y).max(e.y);
+                }
+                _ => {}
+            }
+        }
+        
+        return Rect::new(min_x, min_y, max_x - min_x, max_y - min_y);
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// §5  RENDERING ENGINE
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Rendering engine
+open data RenderEngine {
+    canvas: Canvas2D,
+    clip_rect: Option<Rect>,
+    transform: Transform,
+}
+
+impl RenderEngine {
+    open fn new(canvas: Canvas2D) -> RenderEngine {
+        return RenderEngine {
+            canvas: canvas,
+            clip_rect: None,
+            transform: Transform::identity(),
+        };
+    }
+    
+    open fn set_clip_rect(&mut self, rect: &Rect) {
+        self.clip_rect = Some(rect.clone());
+    }
+    
+    open fn reset_clip(&mut self) {
+        self.clip_rect = None;
+    }
+    
+    open fn set_transform(&mut self, transform: Transform) {
+        self.transform = transform;
+    }
+    
+    open fn transform_point(&self, point: &Point) -> Point {
+        return self.transform.transform_point(point);
+    }
+    
+    open fn transform_rect(&self, rect: &Rect) -> Rect {
+        let top_left = self.transform_point(&Point::new(rect.x, rect.y));
+        let top_right = self.transform_point(&Point::new(rect.x + rect.width, rect.y));
+        let bottom_left = self.transform_point(&Point::new(rect.x, rect.y + rect.height));
+        let bottom_right = self.transform_point(&Point::new(rect.x + rect.width, rect.y + rect.height));
+        
+        let min_x = top_left.x.min(top_right.x).min(bottom_left.x).min(bottom_right.x);
+        let min_y = top_left.y.min(top_right.y).min(bottom_left.y).min(bottom_right.y);
+        let max_x = top_left.x.max(top_right.x).max(bottom_left.x).max(bottom_right.x);
+        let max_y = top_left.y.max(top_right.y).max(bottom_left.y).max(bottom_right.y);
+        
+        return Rect::new(min_x, min_y, max_x - min_x, max_y - min_y);
+    }
+    
+    open fn is_point_clipped(&self, point: &Point) -> bool {
+        if let Some(clip_rect) = &self.clip_rect {
+            return !clip_rect.contains(point);
+        }
+        return false;
+    }
+    
+    open fn render_path(&mut self, path: &Path2D) {
+        for command in &path.commands {
+            match command {
+                PathCommand::MoveTo(p) => {
+                    // Move to transformed point
+                }
+                PathCommand::LineTo(p) => {
+                    let transformed_p = self.transform_point(p);
+                    if !self.is_point_clipped(&transformed_p) {
+                        // Draw line
+                    }
+                }
+                PathCommand::QuadraticCurveTo(c, e) => {
+                    let transformed_c = self.transform_point(c);
+                    let transformed_e = self.transform_point(e);
+                    // Draw quadratic curve
+                }
+                PathCommand::BezierCurveTo(c1, c2, e) => {
+                    let transformed_c1 = self.transform_point(c1);
+                    let transformed_c2 = self.transform_point(c2);
+                    let transformed_e = self.transform_point(e);
+                    // Draw bezier curve
+                }
+                PathCommand::ArcTo(center, radius, start_angle, end_angle, anticlockwise) => {
+                    let transformed_center = self.transform_point(center);
+                    // Draw arc
+                }
+                PathCommand::ClosePath => {
+                    // Close path
+                }
+            }
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// §6  GLOBAL INSTANCE AND HELPERS
+// ═════════════════════════════════════════════════════════════════════════
+
+/// Create canvas
+open fn create_canvas(width: u32, height: u32) -> Canvas2D {
+    return Canvas2D::new(width, height);
+}
+
+/// Create image
+open fn create_image(width: u32, height: u32) -> Image {
+    return Image::new(width, height);
+}
+
+/// Load image from file
+open fn load_image(path: &str) -> Result<Image, String> {
+    return Image::load(path);
+}
+
+/// Initialize graphics system
+open fn init_graphics() {
+    // Initialize graphics system
+}
+
+/// Default implementations
+impl Default for RenderContext {
+    fn default() -> RenderContext {
+        return RenderContext {
+            fill_style: FillStyle::Color(Color::BLACK),
+            stroke_style: StrokeStyle {
+                color: Color::BLACK,
+                width: 1.0,
+                line_cap: LineCap::Butt,
+                line_join: LineJoin::Miter,
+                miter_limit: 10.0,
+                dash_pattern: None,
+                dash_offset: 0.0,
+            },
+            font: Font {
+                family: "Arial".into(),
+                size: 12.0,
+                style: FontStyle::Normal,
+                variant: FontVariant::Normal,
+                weight: FontWeight::Normal,
+                stretch: FontStretch::Normal,
+            },
+            text_align: TextAlign::Left,
+            text_baseline: TextBaseline::Alphabetic,
+            global_alpha: 1.0,
+            global_composite_operation: CompositeOperation::SourceOver,
+            shadow_color: Color::TRANSPARENT,
+            shadow_blur: 0.0,
+            shadow_offset_x: 0.0,
+            shadow_offset_y: 0.0,
+        };
+    }
+}

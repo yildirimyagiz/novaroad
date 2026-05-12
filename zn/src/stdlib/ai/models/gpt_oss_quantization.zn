@@ -1,0 +1,509 @@
+/**
+ * Advanced Quantization for GPT-OSS
+ * INT8, FP8, and custom quantization schemes
+ */
+
+use tensor::core::{Tensor, DType};
+use tensor::triton_gpt_oss::{quantize_mxfp4};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INT8 QUANTIZATION (W8A8)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Int8Quantizer {
+    per_channel: bool,
+    symmetric: bool
+}
+
+impl Int8Quantizer {
+    fn new(per_channel: bool = true, symmetric: bool = true) -> Self {
+        Int8Quantizer { per_channel, symmetric }
+    }
+    
+    /**
+     * Quantize weights to INT8
+     * Per-channel: different scale per output channel
+     * Symmetric: [-127, 127] range
+     */
+    fn quantize_weight(self, weight: Tensor) -> (Tensor, Tensor) {
+        let [out_channels, in_channels] = weight.data;
+        
+        check self.per_channel {
+            // Per-channel quantization
+            var scales = [];
+            var quantized_channels = [];
+            
+            each i in 0..out_channels {
+                let channel = weight[i, :];
+                
+                let max_abs = channel.abs().max();
+                let scale = max_abs / 127.0;
+                
+                let quantized = (channel / scale).round().clamp(-127.0, 127.0).to_int8();
+                
+                scales.push(scale);
+                quantized_channels.push(quantized);
+            }
+            
+            yield (
+                Tensor::stack(quantized_channels, dim=0),
+                Tensor::from_vec(scales, DType::Float32)
+            );
+        } else {
+            // Per-tensor quantization
+            let max_abs = weight.abs().max();
+            let scale = max_abs / 127.0;
+            
+            let quantized = (weight / scale).round().clamp(-127.0, 127.0).to_int8();
+            
+            yield (quantized, Tensor::from_scalar(scale, DType::Float32));
+        }
+    }
+    
+    /**
+     * Quantize activations to INT8 dynamically
+     */
+    fn quantize_activation(self, activation: Tensor) -> (Tensor, Tensor) {
+        // Per-token quantization for activations
+        let [batch, seq_len, hidden] = activation.data;
+        
+        var scales = [];
+        var quantized_tokens = [];
+        
+        each i in 0..batch {
+            each j in 0..seq_len {
+                let token = activation[i, j, :];
+                
+                let max_abs = token.abs().max();
+                let scale = max_abs / 127.0;
+                
+                let quantized = (token / scale).round().clamp(-127.0, 127.0).to_int8();
+                
+                scales.push(scale);
+                quantized_tokens.push(quantized);
+            }
+        }
+        
+        let quantized = Tensor::stack(quantized_tokens, dim=0).reshape([batch, seq_len, hidden]);
+        let scales = Tensor::from_vec(scales, DType::Float32).reshape([batch, seq_len, 1]);
+        
+        yield (quantized, scales);
+    }
+    
+    /**
+     * Dequantize for computation
+     */
+    fn dequantize(self, quantized: Tensor, scale: Tensor) -> Tensor {
+        yield quantized.to_float32() * scale;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FP8 QUANTIZATION (E4M3 / E5M2)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open cases FP8Format {
+    E4M3,  // 1 sign, 4 exponent, 3 mantissa (better for weights)
+    E5M2   // 1 sign, 5 exponent, 2 mantissa (better for gradients)
+}
+
+open data FP8Quantizer {
+    format: FP8Format
+}
+
+impl FP8Quantizer {
+    fn new(format: FP8Format) -> Self {
+        FP8Quantizer { format }
+    }
+    
+    fn quantize(self, tensor: Tensor) -> (Tensor, Tensor) {
+        match self.format {
+            FP8Format::E4M3 => self.quantize_e4m3(tensor),
+            FP8Format::E5M2 => self.quantize_e5m2(tensor)
+        }
+    }
+    
+    fn quantize_e4m3(self, tensor: Tensor) -> (Tensor, Tensor) {
+        // E4M3: range [-448, 448], good for weights
+        let max_val = 448.0;
+        
+        let amax = tensor.abs().max();
+        let scale = amax / max_val;
+        
+        // Quantize to FP8 E4M3 format
+        let scaled = tensor / scale;
+        let quantized = scaled.to_fp8_e4m3();
+        
+        yield (quantized, Tensor::from_scalar(scale, DType::Float32));
+    }
+    
+    fn quantize_e5m2(self, tensor: Tensor) -> (Tensor, Tensor) {
+        // E5M2: range [-57344, 57344], good for gradients
+        let max_val = 57344.0;
+        
+        let amax = tensor.abs().max();
+        let scale = amax / max_val;
+        
+        // Quantize to FP8 E5M2 format
+        let scaled = tensor / scale;
+        let quantized = scaled.to_fp8_e5m2();
+        
+        yield (quantized, Tensor::from_scalar(scale, DType::Float32));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SMOOTHQUANT - Activation-aware Weight Quantization
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data SmoothQuant {
+    alpha: f64,
+    quantizer: Int8Quantizer
+}
+
+impl SmoothQuant {
+    fn new(alpha: f64 = 0.5) -> Self {
+        SmoothQuant {
+            alpha,
+            quantizer: Int8Quantizer::new(per_channel=true, symmetric=true)
+        }
+    }
+    
+    /**
+     * Smooth activations and weights for better quantization
+     * 
+     * Key insight: Move difficulty from activations to weights
+     * X' = X / s, W' = W * s where s is smoothing factor
+     */
+    fn calibrate(
+        self,
+        weights: Tensor,
+        activations: Vec<Tensor>
+    ) -> (Tensor, Tensor, Tensor) {
+        // Compute per-channel activation ranges
+        var act_ranges = [];
+        
+        each act in &activations {
+            let channel_max = act.abs().max(dim=[0, 1], keepdim=false);
+            act_ranges.push(channel_max);
+        }
+        
+        let act_range = Tensor::stack(act_ranges, dim=0).max(dim=0);
+        
+        // Compute per-channel weight ranges
+        let weight_range = weights.abs().max(dim=1);
+        
+        // Compute smoothing factor: s = (max_act^alpha / max_weight^(1-alpha))
+        let smoothing_factor = (act_range.pow(self.alpha) / weight_range.pow(1.0 - self.alpha));
+        
+        // Smooth weights and activations
+        let smoothed_weights = weights * smoothing_factor.unsqueeze(1);
+        
+        // Quantize smoothed weights
+        let (quantized_weights, weight_scales) = self.quantizer.quantize_weight(smoothed_weights);
+        
+        yield (quantized_weights, weight_scales, smoothing_factor);
+    }
+    
+    fn forward(
+        self,
+        activation: Tensor,
+        quantized_weight: Tensor,
+        weight_scale: Tensor,
+        smoothing_factor: Tensor
+    ) -> Tensor {
+        // Smooth activation
+        let smoothed_act = activation / smoothing_factor;
+        
+        // Quantize activation
+        let (quant_act, act_scale) = self.quantizer.quantize_activation(smoothed_act);
+        
+        // INT8 matmul
+        let output = int8_matmul(quant_act, quantized_weight);
+        
+        // Dequantize
+        let output = output.to_float32() * act_scale * weight_scale;
+        
+        yield output;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GPTQ - Post-training Quantization
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data GPTQ {
+    bits: i64,
+    group_size: i64,
+    damp_percent: f64
+}
+
+impl GPTQ {
+    fn new(bits: i64 = 4, group_size: i64 = 128, damp_percent: f64 = 0.01) -> Self {
+        GPTQ { bits, group_size, damp_percent }
+    }
+    
+    /**
+     * Optimal Brain Quantization (OBQ) for weights
+     * Minimizes reconstruction error using Hessian information
+     */
+    fn quantize_layer(
+        self,
+        weight: Tensor,
+        hessian: Tensor
+    ) -> (Tensor, Tensor) {
+        let [out_features, in_features] = weight.data;
+        let num_groups = (in_features + self.group_size - 1) / self.group_size;
+        
+        var quantized_weight = weight.clone();
+        var scales = [];
+        var zeros = [];
+        
+        // Process each group
+        each group_idx in 0..num_groups {
+            let start = group_idx * self.group_size;
+            let end = i64::min((group_idx + 1) * self.group_size, in_features);
+            
+            let w_group = weight[:, start..end];
+            let h_group = hessian[start..end, start..end];
+            
+            // Add damping for numerical stability
+            let h_inv = (h_group + Tensor::eye(end - start) * self.damp_percent * h_group.diag().mean()).inv();
+            
+            // Find optimal scale and zero point
+            let w_max = w_group.max();
+            let w_min = w_group.min();
+            
+            let qmax = 2.pow(self.bits) - 1;
+            let scale = (w_max - w_min) / qmax;
+            let zero = -w_min / scale;
+            
+            scales.push(scale);
+            zeros.push(zero);
+            
+            // Quantize with error compensation
+            each i in start..end {
+                let w = weight[:, i];
+                
+                // Quantize
+                let q = ((w / scale + zero).round()).clamp(0.0, qmax);
+                
+                // Compute error
+                let error = w - (q - zero) * scale;
+                
+                // Compensate future weights using Hessian
+                each j in (i+1)..end {
+                    weight[:, j] -= error * h_inv[i - start, j - start] / h_inv[i - start, i - start];
+                }
+                
+                quantized_weight[:, i] = q;
+            }
+        }
+        
+        let scales_tensor = Tensor::from_vec(scales, DType::Float32);
+        let zeros_tensor = Tensor::from_vec(zeros, DType::Float32);
+        
+        yield (quantized_weight, Tensor::stack([scales_tensor, zeros_tensor], dim=0));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AWQ - Activation-aware Weight Quantization
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data AWQ {
+    bits: i64,
+    group_size: i64,
+    zero_point: bool
+}
+
+impl AWQ {
+    fn new(bits: i64 = 4, group_size: i64 = 128, zero_point: bool = true) -> Self {
+        AWQ { bits, group_size, zero_point }
+    }
+    
+    /**
+     * Find optimal per-channel scaling based on activation statistics
+     */
+    fn search_scale(
+        self,
+        weights: Tensor,
+        activations: Vec<Tensor>
+    ) -> Tensor {
+        let [out_channels, in_channels] = weights.data;
+        
+        // Compute salience: how much each channel contributes
+        var salience = Tensor::zeros([in_channels]);
+        
+        each act in &activations {
+            let importance = act.abs().mean(dim=[0, 1]);
+            salience += importance;
+        }
+        
+        salience /= activations.len() as f64;
+        
+        // Grid search for best scaling factor
+        let scale_candidates = [0.0, 0.5, 1.0, 1.5, 2.0];
+        var best_scales = [];
+        
+        each out_idx in 0..out_channels {
+            let w = weights[out_idx, :];
+            var best_scale = 1.0;
+            var best_error = f64::INFINITY;
+            
+            for &alpha in &scale_candidates {
+                // Scale weights
+                let s = salience.pow(alpha);
+                let w_scaled = w * s;
+                
+                // Quantize
+                let (w_quant, _) = self.quantize_group(w_scaled);
+                let w_dequant = self.dequantize_group(w_quant, _);
+                
+                // Measure error
+                let error = (w_scaled - w_dequant / s).pow(2.0).mean();
+                
+                check error < best_error {
+                    best_error = error;
+                    best_scale = alpha;
+                }
+            }
+            
+            best_scales.push(salience.pow(best_scale));
+        }
+        
+        yield Tensor::stack(best_scales, dim=0);
+    }
+    
+    fn quantize_group(self, tensor: Tensor) -> (Tensor, (Tensor, Tensor)) {
+        let qmax = 2.0.pow(self.bits) - 1.0;
+        
+        check self.zero_point {
+            let w_max = tensor.max();
+            let w_min = tensor.min();
+            let scale = (w_max - w_min) / qmax;
+            let zero = -w_min / scale;
+            
+            let quantized = ((tensor / scale + zero).round()).clamp(0.0, qmax);
+            yield (quantized, (scale, zero));
+        } else {
+            let w_max = tensor.abs().max();
+            let scale = w_max / (qmax / 2.0);
+            
+            let quantized = (tensor / scale).round().clamp(-qmax / 2.0, qmax / 2.0);
+            yield (quantized, (scale, Tensor::zeros([1])));
+        }
+    }
+    
+    fn dequantize_group(self, quantized: Tensor, params: (Tensor, Tensor)) -> Tensor {
+        let (scale, zero) = params;
+        
+        check self.zero_point {
+            yield (quantized - zero) * scale;
+        } else {
+            yield quantized * scale;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// QUANTIZED LINEAR LAYER
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data QuantizedLinear {
+    weight: Tensor,  // Quantized weights
+    scale: Tensor,
+    zero_point: Option<Tensor>,
+    bias: Option<Tensor>,
+    bits: i64,
+    group_size: i64
+}
+
+impl QuantizedLinear {
+    fn from_float(
+        linear: Linear,
+        quantizer: impl Quantizer,
+        calibration_data: Vec<Tensor>
+    ) -> Self {
+        let (quantized_weight, scale, zero_point) = quantizer.quantize(
+            linear.weight,
+            calibration_data
+        );
+        
+        QuantizedLinear {
+            weight: quantized_weight,
+            scale,
+            zero_point: Some(zero_point),
+            bias: linear.bias,
+            bits: quantizer.bits,
+            group_size: quantizer.group_size
+        }
+    }
+    
+    fn forward(self, x: Tensor) -> Tensor {
+        // Dequantize on the fly (or use INT8 kernel)
+        let w_dequant = self.dequantize_weight();
+        
+        let output = x.matmul(w_dequant.T);
+        
+        check let Some(bias) = self.bias {
+            yield output + bias;
+        }
+        
+        yield output;
+    }
+    
+    fn forward_int8(self, x: Tensor) -> Tensor {
+        // Use INT8 kernel for maximum speed
+        let (x_quant, x_scale) = quantize_activation_int8(x);
+        
+        let output = int8_matmul(x_quant, self.weight);
+        
+        // Dequantize output
+        let output = output.to_float32() * x_scale * self.scale;
+        
+        check let Some(bias) = self.bias {
+            yield output + bias;
+        }
+        
+        yield output;
+    }
+    
+    fn dequantize_weight(self) -> Tensor {
+        check let Some(zero) = self.zero_point {
+            yield (self.weight - zero) * self.scale;
+        } else {
+            yield self.weight * self.scale;
+        }
+    }
+    
+    fn memory_size(self) -> i64 {
+        // Calculate memory footprint
+        let weight_bits = self.weight.numel() * self.bits;
+        let scale_bits = self.scale.numel() * 32;  // FP32 scales
+        let total_bits = weight_bits + scale_bits;
+        
+        yield total_bits / 8;  // bytes
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn int8_matmul(a: Tensor, b: Tensor) -> Tensor {
+    // Use Tensor Cores for INT8 matmul (Turing+)
+    @cuda_kernel
+    fn int8_matmul_kernel(a: *i8, b: *i8, c: *i32, M: i64, N: i64, K: i64) {
+        // Use IMMA (Integer Matrix Multiply and Accumulate)
+        // This is ~4x faster than FP16
+    }
+    
+    // Implementation would use cuBLAS cublasGemmEx with CUDA_R_8I
+    yield cuda_int8_gemm(a, b);
+}
+
+fn quantize_activation_int8(x: Tensor) -> (Tensor, Tensor) {
+    let quantizer = Int8Quantizer::new(per_channel=false, symmetric=true);
+    yield quantizer.quantize_activation(x);
+}

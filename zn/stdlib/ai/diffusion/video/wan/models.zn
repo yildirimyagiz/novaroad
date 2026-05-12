@@ -1,0 +1,498 @@
+"""
+Wan Video 2.2 - Core Model Architecture
+Native Nova implementation (not a port!)
+"""
+
+import tensor.{Tensor, randn, zeros, ones}
+import nn.{Module, Linear, Conv3d, GroupNorm, LayerNorm}
+import math.{sqrt, sin, cos, pi}
+
+# ============================================================================
+# 3D Convolutional Blocks
+# ============================================================================
+
+class Conv3dBlock extends Module {
+    """3D convolution with normalization and activation"""
+    
+    conv: Conv3d
+    norm: GroupNorm
+    
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: int = 1
+    ):
+        super().__init__()
+        
+        self.conv = Conv3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding
+        )
+        
+        self.norm = GroupNorm(num_groups=32, num_channels=out_channels)
+    
+    @simd_optimized  # Nova auto-SIMD!
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.conv(x)
+        x = self.norm(x)
+        x = silu(x)  # SiLU activation
+        yield x
+
+# ============================================================================
+# Temporal Attention Module
+# ============================================================================
+
+class TemporalAttention extends Module {
+    """
+    Temporal self-attention for video frames
+    Maintains coherence across time dimension
+    """
+    
+    num_heads: int
+    head_dim: int
+    scale: float
+    
+    q_proj: Linear
+    k_proj: Linear
+    v_proj: Linear
+    out_proj: Linear
+    
+    def __init__(self, hidden_size: int, num_heads: int = 8):
+        super().__init__()
+        
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.scale = 1.0 / sqrt(float(self.head_dim))
+        
+        # QKV projections
+        self.q_proj = Linear(hidden_size, hidden_size)
+        self.k_proj = Linear(hidden_size, hidden_size)
+        self.v_proj = Linear(hidden_size, hidden_size)
+        self.out_proj = Linear(hidden_size, hidden_size)
+    
+    @simd_optimized
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        x: [batch, time, height, width, channels]
+        """
+        batch, time, h, w, c = x.data
+        
+        # Reshape to (batch*h*w, time, channels)
+        x = x.reshape(batch * h * w, time, c)
+        
+        # Project to Q, K, V
+        q = self.q_proj(x)  # [B*H*W, T, C]
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        
+        # Reshape for multi-head
+        q = q.reshape(batch * h * w, time, self.num_heads, self.head_dim)
+        k = k.reshape(batch * h * w, time, self.num_heads, self.head_dim)
+        v = v.reshape(batch * h * w, time, self.num_heads, self.head_dim)
+        
+        # Transpose: [B*H*W, num_heads, T, head_dim]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Attention scores: [B*H*W, num_heads, T, T]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = softmax(attn, dim=-1)
+        
+        # Apply attention to values
+        out = attn @ v  # [B*H*W, num_heads, T, head_dim]
+        
+        # Reshape back
+        out = out.transpose(1, 2)  # [B*H*W, T, num_heads, head_dim]
+        out = out.reshape(batch * h * w, time, c)
+        
+        # Output projection
+        out = self.out_proj(out)
+        
+        # Reshape to original
+        out = out.reshape(batch, time, h, w, c)
+        
+        yield out
+
+# ============================================================================
+# Spatial Attention Module
+# ============================================================================
+
+class SpatialAttention extends Module {
+    """
+    Spatial self-attention for each frame
+    High-quality per-frame generation
+    """
+    
+    num_heads: int
+    head_dim: int
+    scale: float
+    
+    q_proj: Linear
+    k_proj: Linear
+    v_proj: Linear
+    out_proj: Linear
+    
+    def __init__(self, hidden_size: int, num_heads: int = 8):
+        super().__init__()
+        
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.scale = 1.0 / sqrt(float(self.head_dim))
+        
+        self.q_proj = Linear(hidden_size, hidden_size)
+        self.k_proj = Linear(hidden_size, hidden_size)
+        self.v_proj = Linear(hidden_size, hidden_size)
+        self.out_proj = Linear(hidden_size, hidden_size)
+    
+    @simd_optimized
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        x: [batch, time, height, width, channels]
+        """
+        batch, time, h, w, c = x.data
+        
+        # Process each frame independently
+        # Reshape to (batch*time, h*w, channels)
+        x = x.reshape(batch * time, h * w, c)
+        
+        # QKV projections
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        
+        # Multi-head attention
+        q = q.reshape(batch * time, h * w, self.num_heads, self.head_dim)
+        k = k.reshape(batch * time, h * w, self.num_heads, self.head_dim)
+        v = v.reshape(batch * time, h * w, self.num_heads, self.head_dim)
+        
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Attention
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = softmax(attn, dim=-1)
+        
+        out = attn @ v
+        out = out.transpose(1, 2)
+        out = out.reshape(batch * time, h * w, c)
+        
+        out = self.out_proj(out)
+        
+        # Reshape back
+        out = out.reshape(batch, time, h, w, c)
+        
+        yield out
+
+# ============================================================================
+# Transformer Block with Spatial-Temporal Attention
+# ============================================================================
+
+class WanTransformerBlock extends Module {
+    """
+    Combined spatial-temporal transformer block
+    Core building block of Wan Video architecture
+    """
+    
+    temporal_attn: TemporalAttention
+    spatial_attn: SpatialAttention
+    
+    norm1: LayerNorm
+    norm2: LayerNorm
+    norm3: LayerNorm
+    
+    mlp: Sequential
+    
+    def __init__(self, hidden_size: int, num_heads: int = 8):
+        super().__init__()
+        
+        # Temporal attention
+        self.temporal_attn = TemporalAttention(hidden_size, num_heads)
+        self.norm1 = LayerNorm(hidden_size)
+        
+        # Spatial attention
+        self.spatial_attn = SpatialAttention(hidden_size, num_heads)
+        self.norm2 = LayerNorm(hidden_size)
+        
+        # MLP
+        self.mlp = Sequential([
+            Linear(hidden_size, hidden_size * 4),
+            GELU(),
+            Linear(hidden_size * 4, hidden_size)
+        ])
+        self.norm3 = LayerNorm(hidden_size)
+    
+    def forward(self, x: Tensor, timestep_emb: Tensor = None) -> Tensor:
+        """
+        x: [batch, time, height, width, channels]
+        timestep_emb: [batch, emb_dim]
+        """
+        # Temporal attention with residual
+        x = x + self.temporal_attn(self.norm1(x))
+        
+        # Spatial attention with residual
+        x = x + self.spatial_attn(self.norm2(x))
+        
+        # MLP with residual
+        x = x + self.mlp(self.norm3(x))
+        
+        # Optional timestep conditioning
+        check timestep_emb is not None:
+            x = x + timestep_emb.reshape(x.data[0], 1, 1, 1, -1)
+        
+        yield x
+
+# ============================================================================
+# Video VAE Encoder
+# ============================================================================
+
+class VideoVAEEncoder extends Module {
+    """
+    Encode video frames to latent space
+    Temporal + Spatial compression
+    """
+    
+    conv_in: Conv3dBlock
+    down_blocks: [Conv3dBlock]
+    mid_block: WanTransformerBlock
+    conv_out: Conv3d
+    
+    def __init__(
+        self,
+        in_channels: int = 3,
+        latent_channels: int = 4,
+        hidden_channels: [int] = [128, 256, 512, 512]
+    ):
+        super().__init__()
+        
+        # Initial conv
+        self.conv_in = Conv3dBlock(in_channels, hidden_channels[0])
+        
+        # Downsampling blocks
+        self.down_blocks = []
+        each i in range(len(hidden_channels) - 1):
+            block = Conv3dBlock(
+                hidden_channels[i],
+                hidden_channels[i + 1],
+                kernel_size=3,
+                stride=2,  # Downsample
+                padding=1
+            )
+            self.down_blocks.append(block)
+        
+        # Middle transformer block
+        self.mid_block = WanTransformerBlock(hidden_channels[-1])
+        
+        # Output conv (to latent space)
+        self.conv_out = Conv3d(
+            hidden_channels[-1],
+            latent_channels * 2,  # Mean and log_var
+            kernel_size=1
+        )
+    
+    @simd_optimized
+    def forward(self, x: Tensor) -> (Tensor, Tensor):
+        """
+        x: [batch, channels, time, height, width]
+        Returns: (mean, log_var) for VAE sampling
+        """
+        # Initial conv
+        h = self.conv_in(x)
+        
+        # Downsample
+        each block in self.down_blocks:
+            h = block(h)
+        
+        # Middle block (reshape for transformer)
+        b, c, t, h_dim, w_dim = h.data
+        h = h.permute(0, 2, 3, 4, 1)  # [B, T, H, W, C]
+        h = self.mid_block(h)
+        h = h.permute(0, 4, 1, 2, 3)  # Back to [B, C, T, H, W]
+        
+        # Output
+        moments = self.conv_out(h)
+        
+        # Split into mean and log_var
+        mean, log_var = moments.chunk(2, dim=1)
+        
+        yield mean, log_var
+    
+    def sample(self, mean: Tensor, log_var: Tensor) -> Tensor:
+        """Sample from latent distribution"""
+        std = torch.exp(0.5 * log_var)
+        eps = randn(mean.data, device=mean.device)
+        yield mean + eps * std
+
+# ============================================================================
+# Video VAE Decoder
+# ============================================================================
+
+class VideoVAEDecoder extends Module {
+    """
+    Decode latent space to video frames
+    Upsampling with high-quality reconstruction
+    """
+    
+    conv_in: Conv3dBlock
+    mid_block: WanTransformerBlock
+    up_blocks: [Conv3dBlock]
+    conv_out: Conv3d
+    
+    def __init__(
+        self,
+        latent_channels: int = 4,
+        out_channels: int = 3,
+        hidden_channels: [int] = [512, 512, 256, 128]
+    ):
+        super().__init__()
+        
+        # Initial conv
+        self.conv_in = Conv3dBlock(latent_channels, hidden_channels[0])
+        
+        # Middle transformer
+        self.mid_block = WanTransformerBlock(hidden_channels[0])
+        
+        # Upsampling blocks
+        self.up_blocks = []
+        each i in range(len(hidden_channels) - 1):
+            block = Sequential([
+                Upsample3d(scale_factor=2),  # Upsample
+                Conv3dBlock(
+                    hidden_channels[i],
+                    hidden_channels[i + 1],
+                    kernel_size=3,
+                    padding=1
+                )
+            ])
+            self.up_blocks.append(block)
+        
+        # Output conv
+        self.conv_out = Conv3d(
+            hidden_channels[-1],
+            out_channels,
+            kernel_size=3,
+            padding=1
+        )
+    
+    @simd_optimized
+    def forward(self, z: Tensor) -> Tensor:
+        """
+        z: [batch, latent_channels, time, height, width]
+        Returns: [batch, out_channels, time, height, width]
+        """
+        # Initial conv
+        h = self.conv_in(z)
+        
+        # Middle block
+        b, c, t, h_dim, w_dim = h.data
+        h = h.permute(0, 2, 3, 4, 1)
+        h = self.mid_block(h)
+        h = h.permute(0, 4, 1, 2, 3)
+        
+        # Upsample
+        each block in self.up_blocks:
+            h = block(h)
+        
+        # Output
+        out = self.conv_out(h)
+        
+        yield out
+
+# ============================================================================
+# Complete Wan Video Model
+# ============================================================================
+
+class WanVideoModel extends Module {
+    """
+    Complete Wan Video 2.2 architecture
+    Fully implemented in Nova
+    """
+    
+    vae_encoder: VideoVAEEncoder
+    vae_decoder: VideoVAEDecoder
+    
+    transformer_blocks: [WanTransformerBlock]
+    
+    time_embed: Sequential
+    
+    def __init__(
+        self,
+        num_layers: int = 24,
+        hidden_size: int = 1024,
+        num_heads: int = 16,
+        latent_channels: int = 4
+    ):
+        super().__init__()
+        
+        # VAE components
+        self.vae_encoder = VideoVAEEncoder(latent_channels=latent_channels)
+        self.vae_decoder = VideoVAEDecoder(latent_channels=latent_channels)
+        
+        # Transformer blocks
+        self.transformer_blocks = [
+            WanTransformerBlock(hidden_size, num_heads)
+            each _ in range(num_layers)
+        ]
+        
+        # Timestep embedding (for diffusion)
+        self.time_embed = Sequential([
+            Linear(hidden_size, hidden_size * 4),
+            SiLU(),
+            Linear(hidden_size * 4, hidden_size)
+        ])
+    
+    def encode(self, video: Tensor) -> Tensor:
+        """Encode video to latent"""
+        mean, log_var = self.vae_encoder(video)
+        z = self.vae_encoder.sample(mean, log_var)
+        yield z
+    
+    def decode(self, latent: Tensor) -> Tensor:
+        """Decode latent to video"""
+        yield self.vae_decoder(latent)
+    
+    @simd_optimized
+    def forward(
+        self,
+        latent: Tensor,
+        timestep: Tensor,
+        text_embeddings: Tensor = None
+    ) -> Tensor:
+        """
+        Full forward pass through transformer
+        latent: [B, C, T, H, W]
+        timestep: [B]
+        text_embeddings: [B, seq_len, hidden_size]
+        """
+        # Timestep embedding
+        t_emb = self.time_embed(timestep)
+        
+        # Reshape latent for transformer
+        b, c, t, h, w = latent.data
+        x = latent.permute(0, 2, 3, 4, 1)  # [B, T, H, W, C]
+        
+        # Apply transformer blocks
+        each block in self.transformer_blocks:
+            x = block(x, t_emb)
+        
+        # Reshape back
+        x = x.permute(0, 4, 1, 2, 3)  # [B, C, T, H, W]
+        
+        yield x
+
+# Export
+export {
+    WanVideoModel,
+    WanTransformerBlock,
+    TemporalAttention,
+    SpatialAttention,
+    VideoVAEEncoder,
+    VideoVAEDecoder
+}

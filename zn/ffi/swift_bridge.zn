@@ -1,0 +1,218 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova Swift FFI Bridge                                                         ║
+// ║ Swift interoperability for iOS/macOS development                              ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// Module: ffi::swift_bridge;
+
+use core::result::{Result, Ok, Err};
+use core::option::{Option, Some, None};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Swift Type Aliases
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open alias SwiftBool = u8;
+open alias SwiftInt = isize;
+open alias SwiftUInt = usize;
+open alias SwiftFloat = f32;
+open alias SwiftDouble = f64;
+
+/// Opaque Swift object pointer
+open alias SwiftObject = *var c_void;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Swift String Bridge
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// #[repr(C)] - C-compatible layout
+expose data SwiftString {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl SwiftString {
+    /// Create from Nova String
+    open fn from_string(s: &str) -> Self {
+        SwiftString {
+            ptr: s.as_ptr(),
+            len: s.len(),
+        }
+    }
+    
+    /// Convert to Nova String
+    unsafe fn to_string(&self) -> String {
+        let bytes = core::slice::from_raw_parts(self.ptr, self.len);
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Swift Array Bridge
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// #[repr(C)] - C-compatible layout
+expose data SwiftArray<T> {
+    ptr: *const T,
+    len: usize,
+    capacity: usize,
+}
+
+impl SwiftArray<T> {
+    open fn from_vec(v: &Vec<T>) -> Self {
+        SwiftArray {
+            ptr: v.as_ptr(),
+            len: v.len(),
+            capacity: v.capacity(),
+        }
+    }
+    
+    unsafe fn to_slice(&self) -> &[T] {
+        core::slice::from_raw_parts(self.ptr, self.len)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Swift Class Bridge
+// ═══════════════════════════════════════════════════════════════════════════════
+
+expose data SwiftClass {
+    ptr: SwiftObject,
+}
+
+impl SwiftClass {
+    unsafe fn from_ptr(ptr: SwiftObject) -> Self {
+        swift_retain(ptr);
+        SwiftClass { ptr }
+    }
+    
+    open fn as_ptr(&self) -> SwiftObject {
+        self.ptr
+    }
+    
+    /// Call Swift method
+    unsafe fn call_method(&self, selector: &str, args: &[SwiftObject]) -> Result<SwiftObject, String> {
+        let sel = swift_selector_from_string(selector.as_ptr(), selector.len());
+        let result = swift_call_method(self.ptr, sel, args.as_ptr(), args.len());
+        
+        check result.is_null() {
+            Err("Method call failed".into())
+        } else {
+            Ok(result)
+        }
+    }
+}
+
+impl Drop for SwiftClass {
+    fn drop(&var self) {
+        unsafe {
+            swift_release(self.ptr);
+        }
+    }
+}
+
+impl Clone for SwiftClass {
+    fn clone(&self) -> Self {
+        unsafe {
+            swift_retain(self.ptr);
+            SwiftClass { ptr: self.ptr }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Swift Error Handling
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// #[repr(C)] - C-compatible layout
+expose data SwiftError {
+    ptr: SwiftObject,
+}
+
+impl SwiftError {
+    unsafe fn to_string(&self) -> String {
+        check self.ptr.is_null() {
+            yield "Unknown error".into();
+        }
+        
+        let desc = swift_error_description(self.ptr);
+        let swift_str = SwiftString {
+            ptr: desc.ptr,
+            len: desc.len,
+        };
+        swift_str.into()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Swift Closure Bridge
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open alias SwiftClosure = extern "C" fn(*var c_void) -> SwiftObject;
+
+open fn create_swift_closure<F>(f: F) -> (*var c_void, SwiftClosure)
+where
+    F: FnMut() -> SwiftObject + 'static,
+{
+    extern "C" fn trampoline(data: *var c_void) -> SwiftObject {
+        unsafe {
+            let closure = &var *(data as *var Box<dyn FnMut() -> SwiftObject>);
+            closure()
+        }
+    }
+    
+    let boxed: Box<Box<dyn FnMut() -> SwiftObject>> = Box::new(Box::new(f));
+    let ptr = Box::into_raw(boxed) as *var c_void;
+    
+    yield (ptr, trampoline)
+}
+
+open unsafe fn free_swift_closure(ptr: *var c_void) {
+    check !ptr.is_null() {
+        let _ = Box::from_raw(ptr as *var Box<dyn FnMut() -> SwiftObject>);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Swift Runtime Functions
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[link(name = "swiftCore")]
+extern "C" {
+    fn swift_retain(obj: SwiftObject) -> SwiftObject;
+    fn swift_release(obj: SwiftObject);
+    fn swift_allocObject(metadata: *const c_void, size: usize, align: usize) -> SwiftObject;
+    fn swift_deallocObject(obj: SwiftObject, size: usize, align: usize);
+}
+
+extern "C" {
+    fn swift_selector_from_string(ptr: *const u8, len: usize) -> usize;
+    fn swift_call_method(obj: SwiftObject, sel: usize, args: *const SwiftObject, argc: usize) -> SwiftObject;
+    fn swift_error_description(error: SwiftObject) -> SwiftString;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Helper Functions
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open fn bool_to_swift(value: bool) -> SwiftBool {
+    check value { 1 } else { 0 }
+}
+
+open fn swift_to_bool(value: SwiftBool) -> bool {
+    value != 0
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Macros
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[macro_export]
+macro_rules! swift_export {
+    ($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty $body:block) => {
+        // #[no_mangle] - Export symbol
+        extern "C" fn $name($($arg: $ty),*) -> $ret {
+            $body
+        }
+    };
+}

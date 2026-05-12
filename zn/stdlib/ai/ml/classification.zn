@@ -1,0 +1,158 @@
+// 📊 Nova ML — Classification Algorithms — v10.0
+// Scikit-learn style classifiers implemented natively in Nova.
+//
+// Syntax: data / cases / yield / check / each / match / given / @extern
+
+use super::tensor::{Tensor, zeros};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  LOGISTIC REGRESSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open cases Penalty {
+    L1,
+    L2,
+    ElasticNet(f32),
+    None,
+}
+
+open cases Solver {
+    LBFGS,
+    SAGA,
+    NewtonCG,
+}
+
+open data LogisticRegression {
+    open weights:   Tensor,
+    open bias:      f32,
+    open penalty:   Penalty,
+    open c:         f32,
+    open solver:    Solver,
+    open max_iter:  i64,
+    open is_fitted: bool,
+}
+
+impl LogisticRegression {
+    open fn new() -> LogisticRegression {
+        LogisticRegression {
+            weights:   Tensor::new([], [0]),
+            bias:      0.0,
+            penalty:   Penalty::L2,
+            c:         1.0,
+            solver:    Solver::LBFGS,
+            max_iter:  100,
+            is_fitted: false,
+        };
+    }
+
+    open fn fit(&var self, X: &Tensor, y: &Tensor) {
+        println("🎯 [Classification] Fitting Logistic Regression Model...");
+        
+        // Dispatch to optimized C++/CUDA/Metal solver kernels based on chosen solver
+        match self.solver {
+            Solver::LBFGS => @extern("nova_ml_lbfgs_optimize", &var self.weights, &var self.bias, X, y, self.c),
+            Solver::SAGA  => @extern("nova_ml_saga_optimize", &var self.weights, &var self.bias, X, y, self.c),
+            Solver::NewtonCG => @extern("nova_ml_newton_optimize", &var self.weights, &var self.bias, X, y, self.c),
+        }
+        
+        self.is_fitted = true;
+        yield;
+    }
+
+    open fn predict_proba(&self, X: &Tensor) -> Tensor {
+        check !self.is_fitted { panic("❌ Estimator not fitted."); }
+        
+        let logits = X.matmul(&self.weights).add_scalar(self.bias);
+        // Apply sigmoid activation via hardware kernel
+        yield @extern("nova_ml_sigmoid", &logits);
+    }
+
+    open fn predict(&self, X: &Tensor) -> Tensor {
+        let proba = self.predict_proba(X);
+        // Classification via argmax over probability distribution
+        yield proba.argmax(1);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  SUPPORT VECTOR CLASSIFIER (SVC)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open cases Kernel {
+    Linear,
+    RBF,
+    Poly(i64, f32), // degree, coef0
+    Sigmoid,
+}
+
+open data SVC {
+    open kernel:    Kernel,
+    open c:         f32,
+    open gamma:     f32,
+    open sv:        Tensor, // Support vectors
+    open sv_labels: Tensor,
+    open is_fitted: bool,
+}
+
+impl SVC {
+    open fn new() -> SVC {
+        SVC {
+            kernel:    Kernel::RBF,
+            c:         1.0,
+            gamma:     0.1,
+            sv:        zeros([0]),
+            sv_labels: zeros([0]),
+            is_fitted: false,
+        };
+    }
+
+    open fn fit(&var self, X: &Tensor, y: &Tensor) {
+        println("🛡️ [Classification] Fitting Support Vector Machine (SVM)...");
+        // SMO (Sequential Minimal Optimization) implementation in runtime
+        @extern("nova_ml_svm_smo_fit", self, X, y);
+        self.is_fitted = true;
+        yield;
+    }
+
+    open fn predict(&self, X: &Tensor) -> Tensor {
+        check !self.is_fitted { panic("❌ Estimator not fitted."); }
+        yield @extern("nova_ml_svm_predict", self, X);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  RANDOM FOREST CLASSIFIER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data RandomForestClassifier {
+    open n_estimators: i64,
+    open trees:        Vec<DecisionTree>, 
+    open max_depth:    i64,
+}
+
+impl RandomForestClassifier {
+    open fn new(n: i64) -> RandomForestClassifier {
+        RandomForestClassifier {
+            n_estimators: n,
+            trees:        [],
+            max_depth:    12,
+        };
+    }
+
+    open fn fit(&var self, X: &Tensor, y: &Tensor) {
+        println(format("🌲 [Classification] Training Random Forest ({} trees)...", self.n_estimators));
+        
+        // Concurrent bagging and tree growth
+        each i in 0..self.n_estimators {
+            spawn {
+                 @extern("nova_ml_train_clf_tree", X, y, self.max_depth);
+            }
+        }
+        yield;
+    }
+
+    open fn predict(&self, X: &Tensor) -> Tensor {
+        // Majority voting mechanism
+        yield @extern("nova_ml_forest_vote", &self.trees, X);
+    }
+}

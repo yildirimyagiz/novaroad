@@ -1,0 +1,699 @@
+// Nova Integration
+// Complete ML lifecycle management: experiments, models, deployments
+// Tracking, registry, and serving capabilities
+
+@module("ai::mlflow::core")
+@reproducible
+@export
+
+use std::collections::{HashMap, Vec};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// MLflow Client
+open data MlflowClient {
+    tracking_uri: String,
+    registry_uri: Option<String>,
+    http_client: reqwest::Client,
+}
+
+impl MlflowClient {
+    /// Create MLflow client
+    fn new(tracking_uri: &str) -> Self {
+        MlflowClient {
+            tracking_uri: tracking_uri.into(),
+            registry_uri: None,
+            http_client: reqwest::Client::new(),
+        }
+    }
+
+    /// Set registry URI
+    fn set_registry_uri(&var self, uri: &str) {
+        self.registry_uri = Some(uri.into());
+    }
+
+    /// Start run
+    fn start_run(&self, experiment_id: Option<&str>, run_name: Option<&str>) -> Result<ActiveRun, String> {
+        let run_id = generate_run_id();
+        let experiment_id = experiment_id.unwrap_or("0"); // Default experiment
+
+        println("Starting MLflow run: {}", run_id);
+
+        Ok(ActiveRun {
+            run_id: run_id.into(),
+            experiment_id: experiment_id.into(),
+            run_name: run_name.map(|s| s.into()),
+            start_time: SystemTime::now(),
+            status: RunStatus::Running,
+            tags: HashMap::new(),
+            params: HashMap::new(),
+            metrics: HashMap::new(),
+            artifacts: [],
+        })
+    }
+
+    /// End run
+    fn end_run(&self, run: &var ActiveRun) {
+        run.end_time = Some(SystemTime::now());
+        run.status = RunStatus::Finished;
+        println("Ended MLflow run: {}", run.run_id);
+    }
+
+    /// Log parameter
+    fn log_param(&self, run: &var ActiveRun, key: &str, value: &str) {
+        run.params.insert(key.into(), value.into());
+        println("Logged parameter: {} = {}", key, value);
+    }
+
+    /// Log metric
+    fn log_metric(&self, run: &var ActiveRun, key: &str, value: f64, step: Option<i32>) {
+        let metric_key = format("{}_{}", key, step.unwrap_or(0));
+        run.metrics.insert(metric_key, value);
+        println("Logged metric: {} = {} (step: {:?})", key, value, step);
+    }
+
+    /// Log artifact
+    fn log_artifact(&self, run: &var ActiveRun, local_path: &str, artifact_path: Option<&str>) {
+        run.artifacts.push(Artifact {
+            local_path: local_path.into(),
+            artifact_path: artifact_path.map(|s| s.into()),
+            uploaded: false,
+        });
+        println("Logged artifact: {}", local_path);
+    }
+
+    /// Set tag
+    fn set_tag(&self, run: &var ActiveRun, key: &str, value: &str) {
+        run.tags.insert(key.into(), value.into());
+        println("Set tag: {} = {}", key, value);
+    }
+
+    /// Get experiment by name
+    fn get_experiment_by_name(&self, name: &str) -> Result<Experiment, String> {
+        // In practice, would query MLflow API
+        Ok(Experiment {
+            experiment_id: "1".into(),
+            name: name.into(),
+            artifact_location: format("{}/experiments/1", self.tracking_uri),
+            lifecycle_stage: LifecycleStage::Active,
+        })
+    }
+
+    /// Create experiment
+    fn create_experiment(&self, name: &str, artifact_location: Option<&str>) -> Result<String, String> {
+        let experiment_id = generate_experiment_id();
+        println("Created experiment: {} ({})", name, experiment_id);
+        Ok(experiment_id)
+    }
+
+    /// List experiments
+    fn list_experiments(&self) -> Result<Vec<Experiment>, String> {
+        // Mock experiments
+        Ok([
+            Experiment {
+                experiment_id: "0".into(),
+                name: "Default".into(),
+                artifact_location: format("{}/experiments/0", self.tracking_uri),
+                lifecycle_stage: LifecycleStage::Active,
+            }
+        ])
+    }
+
+    /// Search runs
+    fn search_runs(&self, experiment_ids: Vec<&str>, filter_string: Option<&str>, order_by: Option<Vec<&str>>) -> Result<Vec<Run>, String> {
+        // Mock search results
+        Ok([
+            Run {
+                run_id: "run_1".into(),
+                experiment_id: experiment_ids[0].into(),
+                status: RunStatus::Finished,
+                start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+                end_time: Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64),
+                tags: HashMap::new(),
+                params: [("model_type".into(), "random_forest".into())].iter().cloned().collect(),
+                metrics: [("accuracy".into(), 0.85)].iter().cloned().collect(),
+            }
+        ])
+    }
+}
+
+/// Active Run
+open data ActiveRun {
+    run_id: String,
+    experiment_id: String,
+    run_name: Option<String>,
+    start_time: SystemTime,
+    end_time: Option<SystemTime>,
+    status: RunStatus,
+    tags: HashMap<String, String>,
+    params: HashMap<String, String>,
+    metrics: HashMap<String, f64>,
+    artifacts: Vec<Artifact>,
+}
+
+impl ActiveRun {
+    /// Log parameter
+    fn log_param(&var self, key: &str, value: &str) {
+        self.params.insert(key.into(), value.into());
+    }
+
+    /// Log metric
+    fn log_metric(&var self, key: &str, value: f64, step: Option<i32>) {
+        let metric_key = format("{}_{}", key, step.unwrap_or(0));
+        self.metrics.insert(metric_key, value);
+    }
+
+    /// Set tag
+    fn set_tag(&var self, key: &str, value: &str) {
+        self.tags.insert(key.into(), value.into());
+    }
+}
+
+/// Run Status
+#[derive(Clone)]
+open cases RunStatus {
+    Running,
+    Scheduled,
+    Finished,
+    Failed,
+    Killed,
+}
+
+/// Artifact
+#[derive(Clone)]
+open data Artifact {
+    local_path: String,
+    artifact_path: Option<String>,
+    uploaded: bool,
+}
+
+/// Experiment
+#[derive(Clone)]
+open data Experiment {
+    experiment_id: String,
+    name: String,
+    artifact_location: String,
+    lifecycle_stage: LifecycleStage,
+}
+
+/// Lifecycle Stage
+#[derive(Clone)]
+open cases LifecycleStage {
+    Active,
+    Deleted,
+}
+
+/// Run
+#[derive(Clone)]
+open data Run {
+    run_id: String,
+    experiment_id: String,
+    status: RunStatus,
+    start_time: i64,
+    end_time: Option<i64>,
+    tags: HashMap<String, String>,
+    params: HashMap<String, String>,
+    metrics: HashMap<String, f64>,
+}
+
+/// Model Registry
+open data ModelRegistry {
+    client: MlflowClient,
+}
+
+impl ModelRegistry {
+    fn new(client: MlflowClient) -> Self {
+        ModelRegistry { client }
+    }
+
+    /// Register model
+    fn register_model(&self, name: &str, model_uri: &str) -> Result<RegisteredModel, String> {
+        println("Registering model: {} from {}", name, model_uri);
+
+        Ok(RegisteredModel {
+            name: name.into(),
+            creation_timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+            last_updated_timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+            description: None,
+            latest_versions: [],
+        })
+    }
+
+    /// Create model version
+    fn create_model_version(&self, name: &str, source: &str, run_id: Option<&str>) -> Result<ModelVersion, String> {
+        println("Creating model version for: {}", name);
+
+        Ok(ModelVersion {
+            name: name.into(),
+            version: "1".into(),
+            creation_timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+            last_updated_timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+            description: None,
+            user_id: "nova_user".into(),
+            current_stage: ModelStage::None,
+            source: source.into(),
+            run_id: run_id.map(|s| s.into()),
+            status: ModelVersionStatus::Ready,
+            status_message: None,
+        })
+    }
+
+    /// Transition model version stage
+    fn transition_model_version_stage(&self, name: &str, version: &str, stage: ModelStage) -> Result<(), String> {
+        println("Transitioning model {} version {} to stage {:?}", name, version, stage);
+        Ok(())
+    }
+
+    /// Get registered model
+    fn get_registered_model(&self, name: &str) -> Result<RegisteredModel, String> {
+        // Mock model retrieval
+        Ok(RegisteredModel {
+            name: name.into(),
+            creation_timestamp: 0,
+            last_updated_timestamp: 0,
+            description: Some("Mock registered model".into()),
+            latest_versions: [],
+        })
+    }
+
+    /// List registered models
+    fn list_registered_models(&self) -> Result<Vec<RegisteredModel>, String> {
+        // Mock model list
+        Ok([
+            RegisteredModel {
+                name: "sentiment_classifier".into(),
+                creation_timestamp: 0,
+                last_updated_timestamp: 0,
+                description: Some("Sentiment analysis model".into()),
+                latest_versions: [],
+            }
+        ])
+    }
+}
+
+/// Registered Model
+#[derive(Clone)]
+open data RegisteredModel {
+    name: String,
+    creation_timestamp: i64,
+    last_updated_timestamp: i64,
+    description: Option<String>,
+    latest_versions: Vec<ModelVersion>,
+}
+
+/// Model Version
+#[derive(Clone)]
+open data ModelVersion {
+    name: String,
+    version: String,
+    creation_timestamp: i64,
+    last_updated_timestamp: i64,
+    description: Option<String>,
+    user_id: String,
+    current_stage: ModelStage,
+    source: String,
+    run_id: Option<String>,
+    status: ModelVersionStatus,
+    status_message: Option<String>,
+}
+
+/// Model Stage
+#[derive(Clone)]
+open cases ModelStage {
+    None,
+    Staging,
+    Production,
+    Archived,
+}
+
+/// Model Version Status
+#[derive(Clone)]
+open cases ModelVersionStatus {
+    PendingRegistration,
+    FailedRegistration,
+    Ready,
+}
+
+/// Model Serving
+open data ModelServing {
+    registry: ModelRegistry,
+    served_models: HashMap<String, ServedModel>,
+}
+
+impl ModelServing {
+    fn new(registry: ModelRegistry) -> Self {
+        ModelServing {
+            registry,
+            served_models: HashMap::new(),
+        }
+    }
+
+    /// Serve model
+    fn serve_model(&var self, model_name: &str, model_version: &str, port: u16) -> Result<(), String> {
+        println("Serving model {} version {} on port {}", model_name, model_version, port);
+
+        self.served_models.insert(
+            format("{}:{}", model_name, port),
+            ServedModel {
+                model_name: model_name.into(),
+                model_version: model_version.into(),
+                port,
+                status: ServingStatus::Running,
+                request_count: 0,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Stop serving model
+    fn stop_serving(&var self, model_name: &str, port: u16) -> Result<(), String> {
+        let key = format("{}:{}", model_name, port);
+        self.served_models.remove(&key);
+        println("Stopped serving model {} on port {}", model_name, port);
+        Ok(())
+    }
+
+    /// Get serving status
+    fn get_serving_status(&self, model_name: &str, port: u16) -> Option<&ServedModel> {
+        let key = format("{}:{}", model_name, port);
+        self.served_models.get(&key)
+    }
+
+    /// Predict with served model
+    fn predict(&self, model_name: &str, port: u16, input: Vec<f64>) -> Result<Vec<f64>, String> {
+        let key = format("{}:{}", model_name, port);
+        check let Some(served_model) = self.served_models.get_mut(&key) {
+            served_model.request_count += 1;
+            // Mock prediction
+            Ok([0.8; 10])
+        } else {
+            Err(format("Model {} not served on port {}", model_name, port))
+        }
+    }
+}
+
+/// Served Model
+#[derive(Clone)]
+open data ServedModel {
+    model_name: String,
+    model_version: String,
+    port: u16,
+    status: ServingStatus,
+    request_count: u64,
+}
+
+/// Serving Status
+#[derive(Clone)]
+open cases ServingStatus {
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+/// Experiment Tracking Helper
+open data ExperimentTracker {
+    client: MlflowClient,
+    current_run: Option<ActiveRun>,
+    auto_log: bool,
+}
+
+impl ExperimentTracker {
+    fn new(tracking_uri: &str) -> Self {
+        ExperimentTracker {
+            client: MlflowClient::new(tracking_uri),
+            current_run: None,
+            auto_log: true,
+        }
+    }
+
+    /// Start experiment run
+    fn start_run(&var self, experiment_name: Option<&str>, run_name: Option<&str>) -> Result<(), String> {
+        let experiment_id = check let Some(exp_name) = experiment_name {
+            let exp = self.client.get_experiment_by_name(exp_name)?;
+            Some(exp.experiment_id.as_str())
+        } else {
+            None
+        };
+
+        self.current_run = Some(self.client.start_run(experiment_id, run_name)?);
+        Ok(())
+    }
+
+    /// End current run
+    fn end_run(&var self) {
+        check let Some(ref var run) = self.current_run {
+            self.client.end_run(run);
+        }
+        self.current_run = None;
+    }
+
+    /// Log hyperparameters
+    fn log_params(&var self, params: HashMap<&str, &str>) {
+        check let Some(ref var run) = self.current_run {
+            each entry in params  { let (key, value) = entry;
+                self.client.log_param(run, key, value);
+            }
+        }
+    }
+
+    /// Log metrics
+    fn log_metrics(&var self, metrics: HashMap<&str, f64>, step: Option<i32>) {
+        check let Some(ref var run) = self.current_run {
+            each entry in metrics  { let (key, value) = entry;
+                self.client.log_metric(run, key, value, step);
+            }
+        }
+    }
+
+    /// Log model
+    fn log_model(&var self, model: &dyn ModelArtifact, artifact_path: &str) -> Result<(), String> {
+        check let Some(ref var run) = self.current_run {
+            // Save model artifact
+            let model_path = format("{}/model", artifact_path);
+            model.save(&model_path)?;
+
+            // Log as artifact
+            self.client.log_artifact(run, &model_path, Some(artifact_path));
+
+            // Register in model registry
+            let registry = ModelRegistry::new(self.client.clone());
+            registry.register_model(&format("{}_model", run.run_id), &model_path)?;
+        }
+        Ok(())
+    }
+
+    /// Auto-log framework metrics
+    fn auto_log_framework(&var self, framework: &str) {
+        check !self.auto_log {
+            yield;
+        }
+
+        match framework {
+            "pytorch_nova" => {
+                // Would integrate with nova's logging
+                self.log_params([("framework", "pytorch_nova")].iter().cloned().collect());
+            },
+            "transformers" => {
+                // Would integrate with Transformers logging
+                self.log_params([("framework", "transformers")].iter().cloned().collect());
+            },
+            _ => {}
+        }
+    }
+}
+
+/// Model Artifact Trait
+open rules ModelArtifact {
+    fn save(&self, path: &str) -> Result<(), String>;
+    fn load(path: &str) -> Result<Self, String> where Self: Sized;
+    fn predict(&self, input: Vec<f64>) -> Vec<f64>;
+}
+
+/// MLflow UI Integration
+open data MLflowUI {
+    client: MlflowClient,
+    port: u16,
+}
+
+impl MLflowUI {
+    fn new(client: MlflowClient, port: u16) -> Self {
+        MLflowUI { client, port }
+    }
+
+    /// Start MLflow UI server
+    fn start_ui(&self) -> Result<(), String> {
+        println("Starting MLflow UI on port {}", self.port);
+        // In practice, would start the MLflow UI server
+        Ok(())
+    }
+
+    /// Get UI URL
+    fn get_ui_url(&self) -> String {
+        format("http://localhost:{}", self.port)
+    }
+}
+
+/// Project Structure for MLflow
+open data MLflowProject {
+    name: String,
+    entry_point: String,
+    parameters: HashMap<String, Parameter>,
+    environment: Environment,
+}
+
+#[derive(Clone)]
+open data Parameter {
+    param_type: String,
+    default: String,
+    description: Option<String>,
+}
+
+#[derive(Clone)]
+open data Environment {
+    python_version: String,
+    dependencies: Vec<String>,
+    channels: Vec<String>,
+}
+
+impl MLflowProject {
+    fn new(name: &str) -> Self {
+        MLflowProject {
+            name: name.into(),
+            entry_point: "train.py".into(),
+            parameters: HashMap::new(),
+            environment: Environment {
+                python_version: "3.8".into(),
+                dependencies: ["mlflow".into(), "pandas".into()],
+                channels: ["conda-forge".into()],
+            },
+        }
+    }
+
+    /// Run project
+    fn run(&self, parameters: HashMap<String, String>) -> Result<Run, String> {
+        println("Running MLflow project: {}", self.name);
+        // In practice, would execute the project with given parameters
+        Ok(Run {
+            run_id: generate_run_id(),
+            experiment_id: "1".into(),
+            status: RunStatus::Finished,
+            start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+            end_time: Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64),
+            tags: HashMap::new(),
+            params: parameters,
+            metrics: HashMap::new(),
+        })
+    }
+}
+
+/// High-level AutoML with MLflow Integration
+open data AutoMLWithTracking {
+    automl: crate::automl::lightweight::LightAutoML, // Reference to LightAutoML
+    tracker: ExperimentTracker,
+    registry: ModelRegistry,
+}
+
+impl AutoMLWithTracking {
+    fn new(automl: crate::automl::lightweight::LightAutoML, tracking_uri: &str) -> Self {
+        AutoMLWithTracking {
+            automl,
+            tracker: ExperimentTracker::new(tracking_uri),
+            registry: ModelRegistry::new(MlflowClient::new(tracking_uri)),
+        }
+    }
+
+    /// Train with full experiment tracking
+    async fn fit_with_tracking(&var self, train_data: &crate::automl::lightweight::TabularDataset, roles: &crate::automl::lightweight::DataRoles) -> Result<crate::automl::lightweight::LightAutoMLModel, String> {
+        // Start MLflow run
+        self.tracker.start_run(Some("automl_experiment"), Some("lightweight_automl"))?;
+
+        // Log hyperparameters
+        let params = [
+            ("preset", self.automl.presets.as_str()),
+            ("time_limit", &self.automl.time_limit.as_secs().into()),
+            ("cpu_limit", &self.automl.cpu_limit.into()),
+        ].iter().cloned().collect();
+        self.tracker.log_params(params);
+
+        // Train model
+        let model = self.automl.fit(train_data, roles)?;
+
+        // Log metrics
+        let metrics = [
+            ("accuracy", model.metrics.accuracy.unwrap_or(0.0)),
+            ("precision", model.metrics.precision.unwrap_or(0.0)),
+            ("recall", model.metrics.recall.unwrap_or(0.0)),
+            ("training_time", model.training_time.as_secs_f64()),
+        ].iter().cloned().collect();
+        self.tracker.log_metrics(metrics, None);
+
+        // Log feature importance
+        self.tracker.log_metrics(model.feature_importance.clone().into_iter().map(|(k, v)| (k, v)).collect(), None);
+
+        // Register model
+        check let Some(ref var run) = self.tracker.current_run {
+            let model_uri = format("runs:/{}/model", run.run_id);
+            self.registry.register_model("automl_model", &model_uri)?;
+        }
+
+        // End run
+        self.tracker.end_run();
+
+        Ok(model)
+    }
+}
+
+// Utility functions
+fn generate_run_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    format("run_{}", time)
+}
+
+fn generate_experiment_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    format("exp_{}", time)
+}
+
+/// Example usage
+open fn example_automl_with_mlflow() {
+    // Create MLflow client
+    let client = MlflowClient::new("http://localhost:5000");
+
+    // Create experiment
+    let experiment_id = client.create_experiment("nova_automl", None).unwrap();
+
+    // Start run
+    var run = client.start_run(Some(&experiment_id), Some("automl_training")).unwrap();
+
+    // Log parameters
+    client.log_param(&var run, "model_type", "lightweight_automl");
+    client.log_param(&var run, "preset", "medium_quality");
+
+    // Log metrics during training
+    each epoch in 1..=10 {
+        let accuracy = 0.5 + (epoch as f64 * 0.04); // Mock improving accuracy
+        client.log_metric(&var run, "accuracy", accuracy, Some(epoch));
+        client.log_metric(&var run, "loss", 1.0 - accuracy, Some(epoch));
+    }
+
+    // Log final metrics
+    client.log_metric(&var run, "final_accuracy", 0.85, None);
+    client.log_metric(&var run, "training_time", 300.0, None);
+
+    // Log model artifact
+    client.log_artifact(&var run, "./model.pkl", Some("model"));
+
+    // Register model
+    let registry = ModelRegistry::new(client);
+    let registered_model = registry.register_model("my_automl_model", "runs:/model").unwrap();
+    registry.create_model_version("my_automl_model", "runs:/model", Some(&run.run_id)).unwrap();
+
+    // End run
+    client.end_run(&var run);
+
+    println("AutoML training completed and logged to MLflow!");
+}

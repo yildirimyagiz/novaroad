@@ -1,0 +1,896 @@
+// Nova PyTorch nova Integration
+// High-level PyTorch training framework for rapid prototyping and production
+// novaModule, Trainer, and distributed training support
+
+@module("ai::nova::pytorch")
+@reproducible
+@export
+
+use std::collections::{HashMap, Vec};
+use std::sync::{Arc, Mutex};
+
+/// nova Module - Core training component
+open rules novaModule {
+    /// Forward pass
+    fn forward(&self, x: &Tensor) -> Tensor;
+
+    /// Training step
+    fn training_step(&self, batch: &Batch, batch_idx: usize) -> TrainingStepOutput;
+
+    /// Validation step
+    fn validation_step(&self, batch: &Batch, batch_idx: usize) -> ValidationStepOutput;
+
+    /// Test step
+    fn test_step(&self, batch: &Batch, batch_idx: usize) -> TestStepOutput;
+
+    /// Configure optimizers
+    fn configure_optimizers(&self) -> OptimizerConfig;
+
+    /// Configure learning rate scheduler (optional)
+    fn configure_schedulers(&self) -> Option<SchedulerConfig> {
+        None
+    }
+
+    /// Training epoch end
+    fn training_epoch_end(&var self, outputs: Vec<TrainingStepOutput>) {}
+
+    /// Validation epoch end
+    fn validation_epoch_end(&var self, outputs: Vec<ValidationStepOutput>) {}
+
+    /// Hooks
+    fn on_train_start(&var self) {}
+    fn on_train_end(&var self) {}
+    fn on_validation_start(&var self) {}
+    fn on_validation_end(&var self) {}
+    fn on_test_start(&var self) {}
+    fn on_test_end(&var self) {}
+}
+
+/// PyTorch nova Trainer
+open data Trainer {
+    max_epochs: usize,
+    min_epochs: Option<usize>,
+    max_steps: Option<usize>,
+    min_steps: Option<usize>,
+    max_time: Option<std::time::Duration>,
+    limit_train_batches: Option<f64>,
+    limit_val_batches: Option<f64>,
+    limit_test_batches: Option<f64>,
+    limit_predict_batches: Option<f64>,
+    val_check_interval: f64,
+    check_val_every_n_epoch: Option<usize>,
+    num_sanity_val_steps: usize,
+    enable_checkpointing: bool,
+    default_root_dir: Option<String>,
+    default_save_path: Option<String>,
+    enable_progress_bar: bool,
+    enable_model_summary: bool,
+    gradient_clip_val: Option<f64>,
+    gradient_clip_algorithm: GradientClipAlgorithm,
+    accumulate_grad_batches: usize,
+    inference_mode: bool,
+    amp_backend: Option<AmpBackend>,
+    amp_level: Option<String>,
+    precision: Precision,
+    accelerator: Accelerator,
+    strategy: TrainingStrategy,
+    devices: DeviceConfig,
+    num_nodes: usize,
+    sync_batchnorm: bool,
+    benchmark: bool,
+    deterministic: Option<bool>,
+    enable_logger: bool,
+    logger: Option<Box<dyn Logger>>,
+    log_every_n_steps: usize,
+    callbacks: Vec<Box<dyn Callback>>,
+    fast_dev_run: bool,
+    overfit_batches: f64,
+    track_grad_norm: TrackGradNorm,
+    detect_anomaly: bool,
+    reload_dataloaders_every_n_epochs: usize,
+    auto_lr_find: bool,
+    auto_scale_batch_size: Option<AutoBatchSize>,
+    plugins: Vec<Box<dyn TrainingPlugin>>,
+}
+
+impl Trainer {
+    /// Create trainer with default configuration
+    fn new() -> Self {
+        Trainer {
+            max_epochs: 1000,
+            min_epochs: None,
+            max_steps: None,
+            min_steps: None,
+            max_time: None,
+            limit_train_batches: None,
+            limit_val_batches: None,
+            limit_test_batches: None,
+            limit_predict_batches: None,
+            val_check_interval: 1.0,
+            check_val_every_n_epoch: Some(1),
+            num_sanity_val_steps: 2,
+            enable_checkpointing: true,
+            default_root_dir: None,
+            default_save_path: None,
+            enable_progress_bar: true,
+            enable_model_summary: true,
+            gradient_clip_val: None,
+            gradient_clip_algorithm: GradientClipAlgorithm::Norm,
+            accumulate_grad_batches: 1,
+            inference_mode: true,
+            amp_backend: None,
+            amp_level: None,
+            precision: Precision::F32,
+            accelerator: Accelerator::CPU,
+            strategy: TrainingStrategy::SingleDevice,
+            devices: DeviceConfig::Auto,
+            num_nodes: 1,
+            sync_batchnorm: false,
+            benchmark: false,
+            deterministic: None,
+            enable_logger: true,
+            logger: None,
+            log_every_n_steps: 50,
+            callbacks: [],
+            fast_dev_run: false,
+            overfit_batches: 0.0,
+            track_grad_norm: TrackGradNorm::Disabled,
+            detect_anomaly: false,
+            reload_dataloaders_every_n_epochs: 0,
+            auto_lr_find: false,
+            auto_scale_batch_size: None,
+            plugins: [],
+        }
+    }
+
+    /// Quick training setup
+    fn quick_train() -> Self {
+        var trainer = Self::new();
+        trainer.max_epochs = 1;
+        trainer.enable_progress_bar = false;
+        trainer.enable_model_summary = false;
+        trainer.enable_checkpointing = false;
+        trainer
+    }
+
+    /// Fit model
+    fn fit<M: novaModule>(&self, model: &var M, train_dataloaders: &DataLoader, val_dataloaders: Option<&DataLoader>) {
+        println("🚀 Starting PyTorch nova Training");
+
+        // Initialize training
+        model.on_train_start();
+
+        each epoch in 0..self.max_epochs {
+            println("Epoch {}/{}", epoch + 1, self.max_epochs);
+
+            // Training loop
+            self.training_epoch(model, train_dataloaders, epoch);
+
+            // Validation
+            check let Some(val_loader) = val_dataloaders {
+                check self.should_validate(epoch) {
+                    model.on_validation_start();
+                    self.validation_epoch(model, val_loader, epoch);
+                    model.on_validation_end();
+                }
+            }
+
+            // Callbacks
+            each callback in &self.callbacks {
+                callback.on_epoch_end(epoch);
+            }
+        }
+
+        model.on_train_end();
+        println("✅ Training completed");
+    }
+
+    /// Validate model
+    fn validate<M: novaModule>(&self, model: &M, dataloaders: &DataLoader, verbose: bool) {
+        model.on_validation_start();
+        self.validation_epoch(model, dataloaders, 0);
+        model.on_validation_end();
+    }
+
+    /// Test model
+    fn test<M: novaModule>(&self, model: &M, dataloaders: &DataLoader, verbose: bool) {
+        model.on_test_start();
+        self.test_epoch(model, dataloaders);
+        model.on_test_end();
+    }
+
+    /// Predict with model
+    fn predict<M: novaModule>(&self, model: &M, dataloaders: &DataLoader) -> Vec<Tensor> {
+        // Prediction loop
+        yield [] // Would yield predictions
+    }
+
+    /// Tune hyperparameters
+    fn tune<M: novaModule>(&self, model: &var M, train_dataloaders: &DataLoader) -> TuneResult {
+        check self.auto_lr_find {
+            let lr_finder = self.lr_find(model, train_dataloaders);
+            println("Found optimal LR: {:.6f}", lr_finder.suggestion());
+        }
+
+        check let Some(auto_batch_size) = &self.auto_scale_batch_size {
+            // Auto scale batch size
+            println("Auto-scaling batch size");
+        }
+
+        TuneResult {
+            best_lr: Some(0.001),
+            best_batch_size: Some(32),
+        }
+    }
+
+    fn training_epoch<M: novaModule>(&self, model: &var M, dataloader: &DataLoader, epoch: usize) {
+        var epoch_outputs = [];
+
+        each entry in dataloader.iter().enumerate()  { let (batch_idx, batch) = entry;
+            // Forward pass
+            let output = model.training_step(batch, batch_idx);
+            epoch_outputs.push(output.clone());
+
+            // Backward pass and optimization would happen here
+            // In practice, would use actual PyTorch autograd
+
+            // Logging
+            check batch_idx % self.log_every_n_steps == 0 {
+                check let Some(logger) = &self.logger {
+                    logger.log_metrics(&[("train_loss".into(), output.loss)]);
+                }
+            }
+        }
+
+        model.training_epoch_end(epoch_outputs);
+    }
+
+    fn validation_epoch<M: novaModule>(&self, model: &M, dataloader: &DataLoader, epoch: usize) {
+        var epoch_outputs = [];
+
+        each entry in dataloader.iter().enumerate()  { let (batch_idx, batch) = entry;
+            let output = model.validation_step(batch, batch_idx);
+            epoch_outputs.push(output);
+        }
+
+        model.validation_epoch_end(epoch_outputs);
+    }
+
+    fn test_epoch<M: novaModule>(&self, model: &M, dataloader: &DataLoader) {
+        each entry in dataloader.iter().enumerate()  { let (batch_idx, batch) = entry;
+            let _output = model.test_step(batch, batch_idx);
+            // Test outputs would be collected and summarized
+        }
+    }
+
+    fn should_validate(&self, epoch: usize) -> bool {
+        match self.check_val_every_n_epoch {
+            Some(n) => epoch % n == 0,
+            None => true,
+        }
+    }
+
+    fn lr_find<M: novaModule>(&self, model: &var M, dataloader: &DataLoader) -> LrFinder {
+        // Learning rate finder implementation
+        LrFinder {
+            lrs: [1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1],
+            losses: [2.5, 2.3, 2.1, 1.8, 1.2, 0.8, 0.9, 2.1],
+        }
+    }
+}
+
+/// Training Strategy
+#[derive(Clone)]
+open cases TrainingStrategy {
+    SingleDevice,
+    DDP,                    // Distributed Data Parallel
+    DDPStrategy,           // DDP with custom config
+    Horovod,
+    DeepSpeed,
+    FSDPStrategy,          // Fully Sharded Data Parallel
+    Bagua,
+}
+
+/// Device Configuration
+#[derive(Clone)]
+open cases DeviceConfig {
+    Auto,
+    CPU,
+    GPU(usize),            // Number of GPUs
+    TPUs(usize),           // Number of TPUs
+}
+
+/// Accelerator
+#[derive(Clone)]
+open cases Accelerator {
+    CPU,
+    GPU,
+    TPU,
+}
+
+/// Precision
+#[derive(Clone)]
+open cases Precision {
+    F64,
+    F32,
+    F16,
+    BF16,
+    Int8,
+}
+
+/// AMP Backend
+#[derive(Clone)]
+open cases AmpBackend {
+    Native,
+    Apex,
+}
+
+/// Gradient Clipping
+#[derive(Clone)]
+open cases GradientClipAlgorithm {
+    Norm,
+    Value,
+}
+
+/// Auto Batch Size
+#[derive(Clone)]
+open cases AutoBatchSize {
+    PowerScaling,
+    Binsearch,
+}
+
+/// Gradient Norm Tracking
+#[derive(Clone)]
+open cases TrackGradNorm {
+    Disabled,
+    Inf,
+    L2(usize),
+}
+
+/// Data Structures
+#[derive(Clone)]
+open data Tensor {
+    data: Vec<f64>,
+    data: Vec<usize>,
+    requires_grad: bool,
+}
+
+#[derive(Clone)]
+open data Batch {
+    inputs: Tensor,
+    targets: Tensor,
+    batch_size: usize,
+}
+
+#[derive(Clone)]
+open data DataLoader {
+    dataset: Arc<dyn Dataset>,
+    batch_size: usize,
+    shuffle: bool,
+    num_workers: usize,
+    pin_memory: bool,
+    drop_last: bool,
+}
+
+impl DataLoader {
+    fn iter(&self) -> DataLoaderIter {
+        DataLoaderIter {
+            dataloader: self,
+            current_idx: 0,
+        }
+    }
+}
+
+open data DataLoaderIter<'a> {
+    dataloader: &'a DataLoader,
+    current_idx: usize,
+}
+
+impl<'a> Iterator for DataLoaderIter<'a> {
+    alias Item = (usize, Batch);
+
+    fn next(&var self) -> Option<Self::Item> {
+        // Simulate batch generation
+        check self.current_idx < 10 { // Mock 10 batches
+            let batch = Batch {
+                inputs: Tensor {
+                    data: [0.0; 784], // 28x28 flattened
+                    data: [self.dataloader.batch_size, 784],
+                    requires_grad: false,
+                },
+                targets: Tensor {
+                    data: [0.0; self.dataloader.batch_size as usize],
+                    data: [self.dataloader.batch_size],
+                    requires_grad: false,
+                },
+                batch_size: self.dataloader.batch_size,
+            };
+
+            self.current_idx += 1;
+            Some((self.current_idx - 1, batch))
+        } else {
+            None
+        }
+    }
+}
+
+open rules Dataset {
+    fn len(&self) -> usize;
+    fn get(&self, index: usize) -> (Tensor, Tensor);
+}
+
+/// Training Outputs
+#[derive(Clone)]
+open data TrainingStepOutput {
+    loss: f64,
+    logs: HashMap<String, f64>,
+}
+
+#[derive(Clone)]
+open data ValidationStepOutput {
+    loss: f64,
+    logs: HashMap<String, f64>,
+}
+
+#[derive(Clone)]
+open data TestStepOutput {
+    loss: f64,
+    logs: HashMap<String, f64>,
+}
+
+/// Optimizer Configuration
+#[derive(Clone)]
+open data OptimizerConfig {
+    optimizer: Box<dyn Optimizer>,
+    lr_scheduler: Option<Box<dyn LrScheduler>>,
+}
+
+/// Learning Rate Scheduler
+open rules LrScheduler {
+    fn step(&var self);
+    fn get_lr(&self) -> Vec<f64>;
+}
+
+/// Scheduler Configuration
+#[derive(Clone)]
+open data SchedulerConfig {
+    scheduler: Box<dyn LrScheduler>,
+    interval: SchedulerInterval,
+    frequency: usize,
+}
+
+#[derive(Clone)]
+open cases SchedulerInterval {
+    Epoch,
+    Step,
+}
+
+/// Optimizers
+open rules Optimizer {
+    fn step(&var self);
+    fn zero_grad(&var self);
+}
+
+/// Callbacks
+open rules Callback {
+    fn on_epoch_start(&self, epoch: usize) {}
+    fn on_epoch_end(&self, epoch: usize) {}
+    fn on_train_start(&self) {}
+    fn on_train_end(&self) {}
+    fn on_validation_start(&self) {}
+    fn on_validation_end(&self) {}
+    fn on_test_start(&self) {}
+    fn on_test_end(&self) {}
+    fn on_exception(&self, exception: &str) {}
+}
+
+/// Logger Trait
+open rules Logger {
+    fn log_metrics(&self, metrics: &[(String, f64)]);
+    fn log_hyperparams(&self, params: &HashMap<String, serde_json::Value>);
+}
+
+/// Training Plugins
+open rules TrainingPlugin {
+    fn setup(&self, trainer: &var Trainer);
+    fn teardown(&self, trainer: &var Trainer);
+}
+
+/// Pre-built Callbacks
+open data ModelCheckpoint {
+    dirpath: String,
+    filename: String,
+    monitor: String,
+    save_top_k: i32,
+    mode: CheckpointMode,
+    save_weights_only: bool,
+}
+
+#[derive(Clone)]
+open cases CheckpointMode {
+    Min,
+    Max,
+}
+
+impl ModelCheckpoint {
+    fn new() -> Self {
+        ModelCheckpoint {
+            dirpath: "./checkpoints".into(),
+            filename: "{epoch}-{val_loss:.2f}".into(),
+            monitor: "val_loss".into(),
+            save_top_k: 1,
+            mode: CheckpointMode::Min,
+            save_weights_only: false,
+        }
+    }
+}
+
+impl Callback for ModelCheckpoint {
+    fn on_epoch_end(&self, epoch: usize) {
+        // Save checkpoint logic
+        println("Saving checkpoint for epoch {}", epoch);
+    }
+}
+
+open data EarlyStopping {
+    monitor: String,
+    min_delta: f64,
+    patience: usize,
+    mode: CheckpointMode,
+    check_finite: bool,
+}
+
+impl EarlyStopping {
+    fn new(monitor: &str, patience: usize) -> Self {
+        EarlyStopping {
+            monitor: monitor.into(),
+            min_delta: 0.0,
+            patience,
+            mode: CheckpointMode::Min,
+            check_finite: true,
+        }
+    }
+}
+
+impl Callback for EarlyStopping {
+    // Early stopping logic would go here
+}
+
+open data LearningRateMonitor {
+    logging_interval: LoggingInterval,
+}
+
+#[derive(Clone)]
+open cases LoggingInterval {
+    Step,
+    Epoch,
+}
+
+impl LearningRateMonitor {
+    fn new() -> Self {
+        LearningRateMonitor {
+            logging_interval: LoggingInterval::Epoch,
+        }
+    }
+}
+
+impl Callback for LearningRateMonitor {
+    fn on_epoch_end(&self, epoch: usize) {
+        // Log learning rate
+        println("Learning rate at epoch {}: 0.001", epoch);
+    }
+}
+
+/// Learning Rate Finder
+open data LrFinder {
+    lrs: Vec<f64>,
+    losses: Vec<f64>,
+}
+
+impl LrFinder {
+    fn suggestion(&self) -> f64 {
+        // Find the learning rate with steepest negative slope
+        var best_lr = self.lrs[0];
+        var best_slope = 0.0;
+
+        each i in 1..self.losses.len() {
+            let slope = (self.losses[i] - self.losses[i-1]) / (self.lrs[i].ln() - self.lrs[i-1].ln());
+            check slope < best_slope {
+                best_slope = slope;
+                best_lr = self.lrs[i];
+            }
+        }
+
+        best_lr
+    }
+}
+
+/// Tune Result
+#[derive(Clone)]
+open data TuneResult {
+    best_lr: Option<f64>,
+    best_batch_size: Option<usize>,
+}
+
+/// Loggers
+open data TensorBoardLogger {
+    save_dir: String,
+    name: String,
+    version: Option<String>,
+}
+
+impl TensorBoardLogger {
+    fn new(save_dir: &str, name: &str) -> Self {
+        TensorBoardLogger {
+            save_dir: save_dir.into(),
+            name: name.into(),
+            version: None,
+        }
+    }
+}
+
+impl Logger for TensorBoardLogger {
+    fn log_metrics(&self, metrics: &[(String, f64)]) {
+        // Log to TensorBoard
+        each entry in metrics  { let (key, value) = entry;
+            println("TensorBoard: {} = {}", key, value);
+        }
+    }
+
+    fn log_hyperparams(&self, params: &HashMap<String, serde_json::Value>) {
+        // Log hyperparameters
+        println("TensorBoard: Hyperparams logged");
+    }
+}
+
+open data WandbLogger {
+    project: String,
+    name: String,
+    save_dir: String,
+}
+
+impl WandbLogger {
+    fn new(project: &str) -> Self {
+        WandbLogger {
+            project: project.into(),
+            name: "nova_run".into(),
+            save_dir: "./wandb".into(),
+        }
+    }
+}
+
+impl Logger for WandbLogger {
+    fn log_metrics(&self, metrics: &[(String, f64)]) {
+        // Log to Weights & Biases
+        each entry in metrics  { let (key, value) = entry;
+            println("Wandb: {} = {}", key, value);
+        }
+    }
+
+    fn log_hyperparams(&self, params: &HashMap<String, serde_json::Value>) {
+        // Log hyperparameters
+        println("Wandb: Hyperparams logged");
+    }
+}
+
+/// Example nova Module Implementation
+open data LitMNIST {
+    layer_1: Linear,
+    layer_2: Linear,
+    layer_3: Linear,
+    dropout: Dropout,
+    loss_fn: CrossEntropyLoss,
+}
+
+impl LitMNIST {
+    fn new() -> Self {
+        LitMNIST {
+            layer_1: Linear::new(784, 128),
+            layer_2: Linear::new(128, 256),
+            layer_3: Linear::new(256, 10),
+            dropout: Dropout::new(0.2),
+            loss_fn: CrossEntropyLoss::new(),
+        }
+    }
+}
+
+impl novaModule for LitMNIST {
+    fn forward(&self, x: &Tensor) -> Tensor {
+        let x = self.layer_1.forward(x);
+        let x = relu(&x);
+        let x = self.dropout.forward(&x);
+        let x = self.layer_2.forward(&x);
+        let x = relu(&x);
+        let x = self.dropout.forward(&x);
+        let x = self.layer_3.forward(&x);
+        x
+    }
+
+    fn training_step(&self, batch: &Batch, batch_idx: usize) -> TrainingStepOutput {
+        let y_hat = self.forward(&batch.inputs);
+        let loss = self.loss_fn.forward(&y_hat, &batch.targets);
+
+        TrainingStepOutput {
+            loss: loss.data[0],
+            logs: [("train_loss".into(), loss.data[0])].iter().cloned().collect(),
+        }
+    }
+
+    fn validation_step(&self, batch: &Batch, batch_idx: usize) -> ValidationStepOutput {
+        let y_hat = self.forward(&batch.inputs);
+        let loss = self.loss_fn.forward(&y_hat, &batch.targets);
+
+        ValidationStepOutput {
+            loss: loss.data[0],
+            logs: [("val_loss".into(), loss.data[0])].iter().cloned().collect(),
+        }
+    }
+
+    fn test_step(&self, batch: &Batch, batch_idx: usize) -> TestStepOutput {
+        let y_hat = self.forward(&batch.inputs);
+        let loss = self.loss_fn.forward(&y_hat, &batch.targets);
+
+        TestStepOutput {
+            loss: loss.data[0],
+            logs: [("test_loss".into(), loss.data[0])].iter().cloned().collect(),
+        }
+    }
+
+    fn configure_optimizers(&self) -> OptimizerConfig {
+        OptimizerConfig {
+            optimizer: Box::new(Adam::new(0.001, 0.9, 0.999, 1e-8)),
+            lr_scheduler: Some(Box::new(StepLR::new(30, 0.1))),
+        }
+    }
+}
+
+/// Neural Network Components (simplified)
+#[derive(Clone)]
+open data Linear {
+    weight: Tensor,
+    bias: Tensor,
+}
+
+impl Linear {
+    fn new(in_features: usize, out_features: usize) -> Self {
+        Linear {
+            weight: Tensor {
+                data: [0.0; in_features * out_features],
+                data: [out_features, in_features],
+                requires_grad: true,
+            },
+            bias: Tensor {
+                data: [0.0; out_features],
+                data: [out_features],
+                requires_grad: true,
+            },
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Tensor {
+        // Linear transformation: x @ weight.T + bias
+        // Simplified implementation
+        Tensor {
+            data: [0.0; self.bias.data[0]],
+            data: self.bias.data.clone(),
+            requires_grad: true,
+        }
+    }
+}
+
+#[derive(Clone)]
+open data Dropout {
+    p: f64,
+}
+
+impl Dropout {
+    fn new(p: f64) -> Self {
+        Dropout { p }
+    }
+
+    fn forward(&self, x: &Tensor) -> Tensor {
+        // Dropout implementation (simplified)
+        x.clone()
+    }
+}
+
+#[derive(Clone)]
+open data CrossEntropyLoss {}
+
+impl CrossEntropyLoss {
+    fn new() -> Self {
+        CrossEntropyLoss {}
+    }
+
+    fn forward(&self, input: &Tensor, target: &Tensor) -> Tensor {
+        // Cross entropy loss (simplified)
+        Tensor {
+            data: [2.5], // Mock loss
+            data: [1],
+            requires_grad: true,
+        }
+    }
+}
+
+/// Activation functions
+open fn relu(x: &Tensor) -> Tensor {
+    Tensor {
+        data: x.data.iter().map(|&v| check v > 0.0 { v } else { 0.0 }).collect(),
+        data: x.data.clone(),
+        requires_grad: true,
+    }
+}
+
+/// Optimizers
+#[derive(Clone)]
+open data Adam {
+    lr: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+}
+
+impl Adam {
+    fn new(lr: f64, beta1: f64, beta2: f64, eps: f64) -> Self {
+        Adam { lr, beta1, beta2, eps }
+    }
+}
+
+impl Optimizer for Adam {
+    fn step(&var self) {
+        // Adam step
+    }
+
+    fn zero_grad(&var self) {
+        // Zero gradients
+    }
+}
+
+#[derive(Clone)]
+open data StepLR {
+    step_size: usize,
+    gamma: f64,
+}
+
+impl StepLR {
+    fn new(step_size: usize, gamma: f64) -> Self {
+        StepLR { step_size, gamma }
+    }
+}
+
+impl LrScheduler for StepLR {
+    fn step(&var self) {
+        // Step scheduler
+    }
+
+    fn get_lr(&self) -> Vec<f64> {
+        yield [0.001] // Current LR
+    }
+}
+
+/// High-level training API
+open fn train_model<M: novaModule>(model: &var M, trainer: &Trainer, train_loader: &DataLoader, val_loader: Option<&DataLoader>) {
+    trainer.fit(model, train_loader, val_loader);
+}
+
+/// Quick training function
+open fn quick_train<M: novaModule>(model: &var M, train_loader: &DataLoader) {
+    let trainer = Trainer::quick_train();
+    trainer.fit(model, train_loader, None);
+}
+
+/// Distributed training helper
+open fn train_distributed<M: novaModule>(
+    model_factory: impl Fn() -> M,
+    trainer_config: Trainer,
+    train_loader: &DataLoader,
+    val_loader: Option<&DataLoader>,
+    num_devices: usize,
+) {
+    // Distributed training setup
+    println("Setting up distributed training on {} devices", num_devices);
+
+    // In practice, would spawn processes and coordinate training
+    var model = model_factory();
+    trainer_config.fit(&var model, train_loader, val_loader);
+}

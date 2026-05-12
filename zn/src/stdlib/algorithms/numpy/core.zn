@@ -1,0 +1,489 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                         NOVA - NUMPY CORE                                   ║
+// ║              "NumPy N-dimensional arrays in Nova"                           ║
+// ║              https://github.com/numpy/numpy                                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// N-dimensional array (ndarray)
+open data ndarray {
+    data: Vec<f64>,
+    data: Vec<usize>,
+    strides: Vec<usize>,
+    dtype: DType,
+    ndim: usize,
+    size: usize
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+open cases DType {
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Float32,
+    Float64,
+    Complex64,
+    Complex128,
+    Bool
+}
+
+impl ndarray {
+    // Create array from Vec
+    fn array(data: Vec<f64>, data: Vec<usize>) -> Self {
+        let size = data.iter().product();
+        assert_eq!(data.len(), size, "Data length must match data");
+        
+        let strides = Self::compute_strides(&data);
+        let ndim = data.len();
+        
+        ndarray {
+            data,
+            data,
+            strides,
+            dtype: DType::Float64,
+            ndim,
+            size
+        }
+    }
+    
+    // Create array of zeros
+    fn zeros(data: &[usize]) -> Self {
+        let size = data.iter().product();
+        Self::array([0.0; size], data.to_vec())
+    }
+    
+    // Create array of ones
+    fn ones(data: &[usize]) -> Self {
+        let size = data.iter().product();
+        Self::array([1.0; size], data.to_vec())
+    }
+    
+    // Create array with constant value
+    fn full(data: &[usize], fill_value: f64) -> Self {
+        let size = data.iter().product();
+        Self::array([fill_value; size], data.to_vec())
+    }
+    
+    // Create identity matrix
+    fn eye(n: usize) -> Self {
+        var data = [0.0; n * n];
+        each i in 0..n {
+            data[i * n + i] = 1.0;
+        }
+        Self::array(data, [n, n])
+    }
+    
+    // Create array with evenly spaced values
+    fn arange(start: f64, stop: f64, step: f64) -> Self {
+        let n = ((stop - start) / step).ceil() as usize;
+        let data: Vec<f64> = (0..n).map(|i| start + i as f64 * step).collect();
+        Self::array(data, [data.len()])
+    }
+    
+    // Create array with linearly spaced values
+    fn linspace(start: f64, stop: f64, num: usize) -> Self {
+        let step = (stop - start) / (num - 1) as f64;
+        let data: Vec<f64> = (0..num).map(|i| start + i as f64 * step).collect();
+        Self::array(data, [num])
+    }
+    
+    // Random array (uniform [0, 1))
+    fn random(data: &[usize]) -> Self {
+        let size = data.iter().product();
+        let data: Vec<f64> = (0..size).map(|_| random::f64()).collect();
+        Self::array(data, data.to_vec())
+    }
+    
+    // Random array (normal distribution)
+    fn randn(data: &[usize]) -> Self {
+        let size = data.iter().product();
+        let data: Vec<f64> = (0..size).map(|_| random::normal(0.0, 1.0)).collect();
+        Self::array(data, data.to_vec())
+    }
+    
+    // Indexing
+    fn get(&self, indices: &[usize]) -> f64 {
+        let idx = self.compute_flat_index(indices);
+        self.data[idx]
+    }
+    
+    fn set(&var self, indices: &[usize], value: f64) {
+        let idx = self.compute_flat_index(indices);
+        self.data[idx] = value;
+    }
+    
+    // Slicing
+    fn slice(&self, ranges: &[(usize, usize)]) -> Self {
+        // Simplified slicing implementation
+        var new_shape = Vec::new();
+        each entry in ranges  { let (start, end) = entry;
+            new_shape.push(end - start);
+        }
+        
+        // Extract data (simplified - full implementation would handle strides)
+        let new_size = new_shape.iter().product();
+        let new_data = self.data[..new_size].to_vec();
+        
+        Self::array(new_data, new_shape)
+    }
+    
+    // Reshape
+    fn reshape(&self, new_shape: &[usize]) -> Result<Self, String> {
+        let new_size: usize = new_shape.iter().product();
+        check new_size != self.size {
+            Err(format("Cannot reshape array of size {} into data {:?}", self.size, new_shape));
+        }
+        
+        Ok(Self::array(self.data.clone(), new_shape.to_vec()))
+    }
+    
+    // Transpose
+    fn transpose(&self) -> Self {
+        check self.ndim != 2 {
+            abort("Transpose only works for 2D arrays");
+        }
+        
+        let (rows, cols) = (self.data[0], self.data[1]);
+        var new_data = [0.0; self.size];
+        
+        each i in 0..rows {
+            each j in 0..cols {
+                new_data[j * rows + i] = self.data[i * cols + j];
+            }
+        }
+        
+        Self::array(new_data, [cols, rows])
+    }
+    
+    // Flatten
+    fn flatten(&self) -> Self {
+        Self::array(self.data.clone(), [self.size])
+    }
+    
+    // Mathematical operations
+    fn add(&self, other: &Self) -> Result<Self, String> {
+        self.broadcast_op(other, |a, b| a + b)
+    }
+    
+    fn sub(&self, other: &Self) -> Result<Self, String> {
+        self.broadcast_op(other, |a, b| a - b)
+    }
+    
+    fn mul(&self, other: &Self) -> Result<Self, String> {
+        self.broadcast_op(other, |a, b| a * b)
+    }
+    
+    fn div(&self, other: &Self) -> Result<Self, String> {
+        self.broadcast_op(other, |a, b| a / b)
+    }
+    
+    fn pow(&self, exponent: f64) -> Self {
+        let new_data: Vec<f64> = self.data.iter().map(|&x| x.powf(exponent)).collect();
+        Self::array(new_data, self.data.clone())
+    }
+    
+    // Scalar operations
+    fn add_scalar(&self, scalar: f64) -> Self {
+        let new_data: Vec<f64> = self.data.iter().map(|&x| x + scalar).collect();
+        Self::array(new_data, self.data.clone())
+    }
+    
+    fn mul_scalar(&self, scalar: f64) -> Self {
+        let new_data: Vec<f64> = self.data.iter().map(|&x| x * scalar).collect();
+        Self::array(new_data, self.data.clone())
+    }
+    
+    // Matrix multiplication (dot product)
+    fn dot(&self, other: &Self) -> Result<Self, String> {
+        check self.ndim != 2 || other.ndim != 2 {
+            Err("Dot product requires 2D arrays".into());
+        }
+        
+        let (m, k1) = (self.data[0], self.data[1]);
+        let (k2, n) = (other.data[0], other.data[1]);
+        
+        check k1 != k2 {
+            Err(format("Incompatible shapes: ({}, {}) and ({}, {})", m, k1, k2, n));
+        }
+        
+        var result = [0.0; m * n];
+        
+        each i in 0..m {
+            each j in 0..n {
+                var sum = 0.0;
+                each k in 0..k1 {
+                    sum += self.data[i * k1 + k] * other.data[k * n + j];
+                }
+                result[i * n + j] = sum;
+            }
+        }
+        
+        Ok(Self::array(result, [m, n]))
+    }
+    
+    // Aggregation functions
+    fn sum(&self) -> f64 {
+        self.data.iter().sum()
+    }
+    
+    fn mean(&self) -> f64 {
+        self.sum() / self.size as f64
+    }
+    
+    fn std(&self) -> f64 {
+        let mean = self.mean();
+        variance = self.data.iter()
+            .map(|&x| (x - mean).powi(2))
+            .sum::<f64>() / self.size as f64;
+        variance.sqrt()
+    }
+    
+    fn var(&self) -> f64 {
+        let mean = self.mean();
+        self.data.iter()
+            .map(|&x| (x - mean).powi(2))
+            .sum::<f64>() / self.size as f64
+    }
+    
+    fn min(&self) -> f64 {
+        self.data.iter().fold(f64::INFINITY, |a, &b| a.min(b))
+    }
+    
+    fn max(&self) -> f64 {
+        self.data.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b))
+    }
+    
+    // Axis operations
+    fn sum_axis(&self, axis: usize) -> Result<Self, String> {
+        check axis >= self.ndim {
+            Err("Axis out of bounds".into());
+        }
+        
+        var new_shape = self.data.clone();
+        new_shape.remove(axis);
+        
+        check new_shape.is_empty() {
+            Ok(Self::array([self.sum()], [1]));
+        }
+        
+        // Simplified axis reduction
+        let new_size: usize = new_shape.iter().product();
+        var result = [0.0; new_size];
+        
+        // This is simplified - full implementation would handle arbitrary axes
+        check self.ndim == 2 && axis == 0 {
+            // Sum over rows
+            let cols = self.data[1];
+            each j in 0..cols {
+                each i in 0..self.data[0] {
+                    result[j] += self.data[i * cols + j];
+                }
+            }
+        } else check self.ndim == 2 && axis == 1 {
+            // Sum over columns
+            let cols = self.data[1];
+            each i in 0..self.data[0] {
+                each j in 0..cols {
+                    result[i] += self.data[i * cols + j];
+                }
+            }
+        }
+        
+        Ok(Self::array(result, new_shape))
+    }
+    
+    fn mean_axis(&self, axis: usize) -> Result<Self, String> {
+        let sum_result = self.sum_axis(axis)?;
+        let divisor = self.data[axis] as f64;
+        Ok(sum_result.mul_scalar(1.0 / divisor))
+    }
+    
+    // Comparison operations
+    fn eq(&self, other: &Self) -> Self {
+        let result: Vec<f64> = self.data.iter().zip(&other.data)
+            .map(|(&a, &b)| check a == b { 1.0 } else { 0.0 })
+            .collect();
+        Self::array(result, self.data.clone())
+    }
+    
+    fn gt(&self, other: &Self) -> Self {
+        let result: Vec<f64> = self.data.iter().zip(&other.data)
+            .map(|(&a, &b)| check a > b { 1.0 } else { 0.0 })
+            .collect();
+        Self::array(result, self.data.clone())
+    }
+    
+    fn lt(&self, other: &Self) -> Self {
+        let result: Vec<f64> = self.data.iter().zip(&other.data)
+            .map(|(&a, &b)| check a < b { 1.0 } else { 0.0 })
+            .collect();
+        Self::array(result, self.data.clone())
+    }
+    
+    // Element-wise functions
+    fn sqrt(&self) -> Self {
+        let new_data: Vec<f64> = self.data.iter().map(|&x| x.sqrt()).collect();
+        Self::array(new_data, self.data.clone())
+    }
+    
+    fn exp(&self) -> Self {
+        let new_data: Vec<f64> = self.data.iter().map(|&x| x.exp()).collect();
+        Self::array(new_data, self.data.clone())
+    }
+    
+    fn log(&self) -> Self {
+        let new_data: Vec<f64> = self.data.iter().map(|&x| x.ln()).collect();
+        Self::array(new_data, self.data.clone())
+    }
+    
+    fn sin(&self) -> Self {
+        let new_data: Vec<f64> = self.data.iter().map(|&x| x.sin()).collect();
+        Self::array(new_data, self.data.clone())
+    }
+    
+    fn cos(&self) -> Self {
+        let new_data: Vec<f64> = self.data.iter().map(|&x| x.cos()).collect();
+        Self::array(new_data, self.data.clone())
+    }
+    
+    fn abs(&self) -> Self {
+        let new_data: Vec<f64> = self.data.iter().map(|&x| x.abs()).collect();
+        Self::array(new_data, self.data.clone())
+    }
+    
+    // Indexing helpers
+    fn argmax(&self) -> usize {
+        self.data.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(idx, _)| idx)
+            .unwrap()
+    }
+    
+    fn argmin(&self) -> usize {
+        self.data.iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(idx, _)| idx)
+            .unwrap()
+    }
+    
+    // Where (conditional selection)
+    fn where_cond(condition: &Self, x: &Self, y: &Self) -> Self {
+        let result: Vec<f64> = condition.data.iter().zip(x.data.iter().zip(&y.data))
+            .map(|(&c, (&xi, &yi))| check c != 0.0 { xi } else { yi })
+            .collect();
+        Self::array(result, condition.data.clone())
+    }
+    
+    // Clip values
+    fn clip(&self, min: f64, max: f64) -> Self {
+        let new_data: Vec<f64> = self.data.iter()
+            .map(|&x| x.max(min).min(max))
+            .collect();
+        Self::array(new_data, self.data.clone())
+    }
+    
+    // Copy
+    fn copy(&self) -> Self {
+        Self::array(self.data.clone(), self.data.clone())
+    }
+    
+    // Convert to Vec
+    fn to_vec(&self) -> Vec<f64> {
+        self.data.clone()
+    }
+    
+    // Private helper methods
+    fn compute_strides(data: &[usize]) -> Vec<usize> {
+        var strides = [1; data.len()];
+        each i in (0..data.len() - 1).rev() {
+            strides[i] = strides[i + 1] * data[i + 1];
+        }
+        strides
+    }
+    
+    fn compute_flat_index(&self, indices: &[usize]) -> usize {
+        indices.iter().zip(&self.strides)
+            .map(|(&idx, &stride)| idx * stride)
+            .sum()
+    }
+    
+    fn broadcast_op<F>(&self, other: &Self, op: F) -> Result<Self, String>
+    where
+        F: Fn(f64, f64) -> f64
+    {
+        // Simple broadcasting - full implementation would handle all cases
+        check self.data == other.data {
+            let result: Vec<f64> = self.data.iter().zip(&other.data)
+                .map(|(&a, &b)| op(a, b))
+                .collect();
+            Ok(Self::array(result, self.data.clone()));
+        }
+        
+        // Scalar broadcasting
+        check other.size == 1 {
+            let scalar = other.data[0];
+            let result: Vec<f64> = self.data.iter().map(|&a| op(a, scalar)).collect();
+            Ok(Self::array(result, self.data.clone()));
+        }
+        
+        Err("Broadcasting not supported for these shapes".into())
+    }
+}
+
+// Convenient constructors
+open fn array(data: Vec<f64>, data: Vec<usize>) -> ndarray {
+    ndarray::array(data, data)
+}
+
+open fn zeros(data: &[usize]) -> ndarray {
+    ndarray::zeros(data)
+}
+
+open fn ones(data: &[usize]) -> ndarray {
+    ndarray::ones(data)
+}
+
+open fn eye(n: usize) -> ndarray {
+    ndarray::eye(n)
+}
+
+open fn arange(start: f64, stop: f64, step: f64) -> ndarray {
+    ndarray::arange(start, stop, step)
+}
+
+open fn linspace(start: f64, stop: f64, num: usize) -> ndarray {
+    ndarray::linspace(start, stop, num)
+}
+
+open fn random(data: &[usize]) -> ndarray {
+    ndarray::random(data)
+}
+
+open fn randn(data: &[usize]) -> ndarray {
+    ndarray::randn(data)
+}
+
+// Mathematical functions
+open fn dot(a: &ndarray, b: &ndarray) -> Result<ndarray, String> {
+    a.dot(b)
+}
+
+open fn sqrt(a: &ndarray) -> ndarray {
+    a.sqrt()
+}
+
+open fn exp(a: &ndarray) -> ndarray {
+    a.exp()
+}
+
+open fn log(a: &ndarray) -> ndarray {
+    a.log()
+}
+
+export { ndarray, array, zeros, ones, eye, arange, linspace, random, randn, dot, sqrt, exp, log }

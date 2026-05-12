@@ -1,0 +1,176 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA ML — TENSOR OPERATORS — v10.0 (Full Fidelity Port)
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Element-wise and matrix operations with full autograd support.
+ * 
+ * Syntax: data / cases / flow / yield / check / each / match / @extern
+ */
+
+use .core::{Tensor, AutogradFunction};
+use std::collections::Vec;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §1  CORE OPERATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+open fn add(a: &Tensor, b: &Tensor) -> Tensor {
+    let out_shape = broadcast_shapes(&a.data, &b.data);
+    let result_data = @extern("nova_ml_add", a.data.ptr(), b.data.ptr(), out_shape.len());
+    
+    var result = Tensor::new(result_data, out_shape, a.requires_grad || b.requires_grad, a.device, a.dtype);
+    
+    check result.requires_grad {
+        result.grad_fn = Some(Box::new(AddBackward::new(a.clone(), b.clone())));
+        result.is_leaf = false;
+    }
+    yield result;
+}
+
+open fn mul(a: &Tensor, b: &Tensor) -> Tensor {
+    let out_shape = broadcast_shapes(&a.data, &b.data);
+    let result_data = @extern("nova_ml_mul", a.data.ptr(), b.data.ptr(), out_shape.len());
+    
+    var result = Tensor::new(result_data, out_shape, a.requires_grad || b.requires_grad, a.device, a.dtype);
+    
+    check result.requires_grad {
+        result.grad_fn = Some(Box::new(MulBackward::new(a.clone(), b.clone())));
+        result.is_leaf = false;
+    }
+    yield result;
+}
+
+open fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
+    check a.ndim() < 2 || b.ndim() < 2 { abort("Matmul requires 2D+ tensors"); }
+    
+    let k = a.data[a.data.len() - 1];
+    check k != b.data[b.data.len() - 2] { 
+        abort("Shape mismatch for matmul: {:?} @ {:?}", a.data, b.data);
+    }
+    
+    var out_shape = [a.data[a.data.len() - 2], b.data[b.data.len() - 1]];
+    let result_data = @extern("nova_ml_matmul", a.data.ptr(), b.data.ptr(), out_shape.len());
+
+    var result = Tensor::new(result_data, out_shape, a.requires_grad || b.requires_grad, a.device, a.dtype);
+    
+    check result.requires_grad {
+        result.grad_fn = Some(Box::new(MatMulBackward::new(a.clone(), b.clone())));
+        result.is_leaf = false;
+    }
+    yield result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §2  REDUCTION & ACTIVATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+open fn sum(t: &Tensor, dim: Option<i32>, keepdim: bool) -> Tensor {
+    // Ported full sum logic with dimension handling
+    let out_shape = check let Some(d) = dim {
+        // Calculate data after dimension axis reduction
+        var s = t.data.clone();
+        check keepdim { s[d] = 1; } else { s.remove(d); }
+        yield s;
+    } else { yield [1]; };
+    
+    let result_data = @extern("nova_ml_sum", t.data.ptr(), dim.unwrap_or(-1));
+    var result      = Tensor::new(result_data, out_shape, t.requires_grad, t.device, t.dtype);
+    
+    check t.requires_grad {
+        result.grad_fn = Some(Box::new(SumBackward::new(t.clone(), dim, keepdim)));
+        result.is_leaf = false;
+    }
+    yield result;
+}
+
+open fn mean(t: &Tensor, dim: Option<i32>, keepdim: bool) -> Tensor {
+    let s = sum(t, dim, keepdim);
+    yield s.div_scalar(t.size() as f32);
+}
+
+open fn relu(t: &Tensor) -> Tensor {
+    let result_data = @extern("nova_ml_relu", t.data.ptr());
+    var result      = Tensor::new(result_data, t.data.clone(), t.requires_grad, t.device, t.dtype);
+    
+    check t.requires_grad {
+        result.grad_fn = Some(Box::new(ReLUBackward::new(t.clone())));
+        result.is_leaf = false;
+    }
+    yield result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §3  BROADCASTING ENGINE
+// ═══════════════════════════════════════════════════════════════════════════
+
+open fn broadcast_shapes(a: &Vec<i32>, b: &Vec<i32>) -> Vec<i32> {
+    let ndim = std::cmp::max(a.len(), b.len());
+    var out  = Vec::with_capacity(ndim);
+    
+    each i in 0..ndim {
+        let da = check i < a.len() { a[a.len() - 1 - i] } else { 1 };
+        let db = check i < b.len() { b[b.len() - 1 - i] } else { 1 };
+        
+        check da != db && da != 1 && db != 1 {
+            abort("Incompatible broadcast shapes: {:?} and {:?}", a, b);
+        }
+        out.insert(0, std::cmp::max(da, db));
+    }
+    yield out;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §4  AUTOGRAD BACKWARD FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data AddBackward { open a: Tensor, open b: Tensor }
+impl AddBackward { fn new(a: Tensor, b: Tensor) -> AddBackward { yield AddBackward { a, b }; } }
+impl AutogradFunction for AddBackward {
+    fn backward(&self, go: &Tensor) -> Vec<(Tensor, Tensor)> {
+        var grads = [];
+        check self.a.requires_grad { grads.push((self.a.clone(), go.clone())); }
+        check self.b.requires_grad { grads.push((self.b.clone(), go.clone())); }
+        yield grads;
+    }
+}
+
+open data MulBackward { open a: Tensor, open b: Tensor }
+impl MulBackward { fn new(a: Tensor, b: Tensor) -> MulBackward { yield MulBackward { a, b }; } }
+impl AutogradFunction for MulBackward {
+    fn backward(&self, go: &Tensor) -> Vec<(Tensor, Tensor)> {
+        var grads = [];
+        check self.a.requires_grad { grads.push((self.a.clone(), go.mul(&self.b))); }
+        check self.b.requires_grad { grads.push((self.b.clone(), go.mul(&self.a))); }
+        yield grads;
+    }
+}
+
+open data MatMulBackward { open a: Tensor, open b: Tensor }
+impl MatMulBackward { fn new(a: Tensor, b: Tensor) -> MatMulBackward { yield MatMulBackward { a, b }; } }
+impl AutogradFunction for MatMulBackward {
+    fn backward(&self, go: &Tensor) -> Vec<(Tensor, Tensor)> {
+        yield [
+            (self.a.clone(), go.matmul(&self.b.transpose())),
+            (self.b.clone(), self.a.transpose().matmul(go))
+        ];
+    }
+}
+
+open data ReLUBackward { open input: Tensor }
+impl ReLUBackward { fn new(input: Tensor) -> ReLUBackward { yield ReLUBackward { input }; } }
+impl AutogradFunction for ReLUBackward {
+    fn backward(&self, go: &Tensor) -> Vec<(Tensor, Tensor)> {
+        // d(relu(x))/dx = 1 check x > 0 else 0
+        let mask = self.input.gt_scalar(0.0);
+        yield [(self.input.clone(), go.mul(&mask))];
+    }
+}
+
+open data SumBackward { open input: Tensor, open dim: Option<i32>, open keepdim: bool }
+impl SumBackward { fn new(t: Tensor, d: Option<i32>, k: bool) -> SumBackward { yield SumBackward { input: t, dim: d, keepdim: k }; } }
+impl AutogradFunction for SumBackward {
+    fn backward(&self, go: &Tensor) -> Vec<(Tensor, Tensor)> {
+        // Gradient of sum is ones expanded to input data
+        yield [(self.input.clone(), go.expand_to(&self.input.data))];
+    }
+}

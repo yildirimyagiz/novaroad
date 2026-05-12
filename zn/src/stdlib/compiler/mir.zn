@@ -1,0 +1,307 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA MIR LOWERING - HIR to MIR Transformation
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Inspired by rustc_mir: Lower HIR to MIR (SSA-based IR)
+ */
+
+use std::collections::HashMap;
+use hir::*;
+use ir::*;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MIR LOWERING
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data MirLowerer {
+    next_value_id: usize,
+    next_block_id: usize,
+}
+
+impl MirLowerer {
+    fn new() -> Self {
+        Self {
+            next_value_id: 0,
+            next_block_id: 0,
+        }
+    }
+
+    fn lower_program(&var self, hir_program: &HirProgram) -> Module {
+        var module = Module::new("main".into());
+
+        each item in &hir_program.items {
+            match item {
+                HirItem::Fn(hir_fn) => {
+                    let func = self.lower_fn(hir_fn);
+                    module.add_function(func);
+                }
+                _ => {} // Other items handled separately
+            }
+        }
+
+        module
+    }
+
+    fn lower_fn(&var self, hir_fn: &HirFn) -> Function {
+        var func = Function::new(
+            hir_fn.name.0.clone(),
+            hir_fn.params.iter().map(|p| (p.name.0.clone(), self.lower_ty(&p.ty))).collect(),
+            self.lower_ty(&hir_fn.return_ty)
+        );
+
+        // Create entry block
+        let entry = func.entry_block;
+
+        // Lower body
+        self.lower_expr(&hir_fn.body.value, &var func, entry);
+
+        func
+    }
+
+    fn lower_expr(&var self, expr: &HirExpr, func: &var Function, block: BlockId) -> ValueId {
+        match expr {
+            HirExpr::Lit(lit) => {
+                let const_val = match lit {
+                    HirLit::Int(i) => ConstValue::I64(*i),
+                    HirLit::Float(f) => ConstValue::F64(*f),
+                    HirLit::Bool(b) => ConstValue::Bool(*b),
+                    HirLit::String(s) => ConstValue::Bool(true), // Placeholder
+                };
+                let ty = self.infer_lit_ty(lit);
+                func.add_value(ty, Instruction::Const(const_val), block)
+            },
+            HirExpr::Var(name) => {
+                // Variable reference - in MIR this becomes a phi or parameter
+                // For now, treat as constant (simplified)
+                let ty = Type::I32; // Placeholder
+                func.add_value(ty, Instruction::Const(ConstValue::I64(0)), block)
+            },
+            HirExpr::Binary(bin_expr) => {
+                let lhs = self.lower_expr(&bin_expr.lhs, func, block);
+                let rhs = self.lower_expr(&bin_expr.rhs, func, block);
+                let op = self.lower_binop(&bin_expr.op);
+                let ty = self.infer_binop_ty(&bin_expr.op);
+                func.add_value(ty, op(lhs, rhs), block)
+            },
+            HirExpr::Unary(un_expr) => {
+                let expr_val = self.lower_expr(&un_expr.expr, func, block);
+                let op = self.lower_unop(&un_expr.op);
+                let ty = Type::I32; // Placeholder
+                func.add_value(ty, op(expr_val), block)
+            },
+            HirExpr::Call(call_expr) => {
+                let func_val = self.lower_expr(&call_expr.func, func, block);
+                let args = call_expr.args.iter()
+                    .map(|arg| self.lower_expr(arg, func, block))
+                    .collect();
+                let ty = Type::I32; // Placeholder for yield alias
+                func.add_value(ty, Instruction::Call("unknown".into(), args), block)
+            },
+            HirExpr::If(if_expr) => {
+                // Lower to CFG with branches
+                let cond_val = self.lower_expr(&if_expr.cond, func, block);
+
+                // Create then and else blocks
+                let then_block = self.fresh_block_id();
+                let else_block = self.fresh_block_id();
+                let merge_block = self.fresh_block_id();
+
+                // Add blocks to function
+                func.blocks.insert(then_block, BasicBlock {
+                    id: then_block,
+                    instructions: Vec::new(),
+                    terminator: Terminator::Jump(merge_block),
+                    predecessors: [block],
+                    successors: [merge_block],
+                });
+
+                func.blocks.insert(else_block, BasicBlock {
+                    id: else_block,
+                    instructions: Vec::new(),
+                    terminator: Terminator::Jump(merge_block),
+                    predecessors: [block],
+                    successors: [merge_block],
+                });
+
+                func.blocks.insert(merge_block, BasicBlock {
+                    id: merge_block,
+                    instructions: Vec::new(),
+                    terminator: Terminator::Unreachable,
+                    predecessors: [then_block, else_block],
+                    successors: Vec::new(),
+                });
+
+                // Set current block terminator
+                check let Some(current_block) = func.blocks.get_mut(&block) {
+                    current_block.terminator = Terminator::Branch(cond_val, then_block, else_block);
+                    current_block.successors = [then_block, else_block];
+                }
+
+                // Lower then and else bodies
+                let then_val = self.lower_expr(&if_expr.then.expr.as_ref().unwrap(), func, then_block);
+                let else_val = check let Some(else_expr) = &if_expr.else_ {
+                    self.lower_expr(else_expr, func, else_block)
+                } else {
+                    // Unit value
+                    func.add_value(Type::Void, Instruction::Const(ConstValue::Bool(true)), else_block)
+                };
+
+                // Phi node in merge
+                let phi = [
+                    (then_val, then_block),
+                    (else_val, else_block),
+                ];
+                let ty = Type::I32; // Placeholder
+                func.add_value(ty, Instruction::Phi(phi), merge_block)
+            },
+            HirExpr::Block(block_expr) => {
+                var current_block = block;
+                each stmt in &block_expr.stmts {
+                    match stmt {
+                        HirStmt::Let(let_stmt) => {
+                            check let Some(init) = &let_stmt.init {
+                                let val = self.lower_expr(init, func, current_block);
+                                // Bind to pattern (simplified)
+                            }
+                        },
+                        HirStmt::Expr(expr) => {
+                            self.lower_expr(expr, func, current_block);
+                        },
+                        HirStmt::Semi(expr) => {
+                            self.lower_expr(expr, func, current_block);
+                        },
+                    }
+                }
+
+                check let Some(expr) = &block_expr.expr {
+                    self.lower_expr(expr, func, current_block)
+                } else {
+                    func.add_value(Type::Void, Instruction::Const(ConstValue::Bool(true)), current_block)
+                }
+            },
+            _ => {
+                // Placeholder for other expressions
+                let ty = Type::I32;
+                func.add_value(ty, Instruction::Const(ConstValue::I64(0)), block)
+            }
+        }
+    }
+
+    fn lower_ty(&var self, ty: &HirTy) -> Type {
+        match ty {
+            HirTy::Bool => Type::Bool,
+            HirTy::Int => Type::I64,
+            HirTy::Float => Type::F64,
+            HirTy::String => Type::Ptr(Box::new(Type::U8)), // Simplified
+            _ => Type::I32, // Placeholder
+        }
+    }
+
+    fn infer_lit_ty(&var self, lit: &HirLit) -> Type {
+        match lit {
+            HirLit::Int(_) => Type::I64,
+            HirLit::Float(_) => Type::F64,
+            HirLit::Bool(_) => Type::Bool,
+            HirLit::String(_) => Type::Ptr(Box::new(Type::U8)),
+        }
+    }
+
+    fn infer_binop_ty(&var self, op: &HirBinOp) -> Type {
+        match op {
+            HirBinOp::Eq | HirBinOp::Ne | HirBinOp::Lt | HirBinOp::Le | HirBinOp::Gt | HirBinOp::Ge | HirBinOp::And | HirBinOp::Or => Type::Bool,
+            _ => Type::I64, // Arithmetic ops
+        }
+    }
+
+    fn lower_binop(&var self, op: &HirBinOp) -> fn(ValueId, ValueId) -> Instruction {
+        match op {
+            HirBinOp::Add => |a, b| Instruction::Add(a, b),
+            HirBinOp::Sub => |a, b| Instruction::Sub(a, b),
+            HirBinOp::Mul => |a, b| Instruction::Mul(a, b),
+            HirBinOp::Div => |a, b| Instruction::Div(a, b),
+            HirBinOp::Mod => |a, b| Instruction::Mod(a, b),
+            HirBinOp::Eq => |a, b| Instruction::Eq(a, b),
+            HirBinOp::Ne => |a, b| Instruction::Ne(a, b),
+            HirBinOp::Lt => |a, b| Instruction::Lt(a, b),
+            HirBinOp::Le => |a, b| Instruction::Le(a, b),
+            HirBinOp::Gt => |a, b| Instruction::Gt(a, b),
+            HirBinOp::Ge => |a, b| Instruction::Ge(a, b),
+            HirBinOp::And => |a, b| Instruction::And(a, b),
+            HirBinOp::Or => |a, b| Instruction::Or(a, b),
+        }
+    }
+
+    fn lower_unop(&var self, op: &HirUnOp) -> fn(ValueId) -> Instruction {
+        match op {
+            HirUnOp::Not => |a| Instruction::Not(a), // Assuming Not exists
+            HirUnOp::Neg => |a| Instruction::Neg(a), // Assuming Neg exists
+        }
+    }
+
+    fn fresh_block_id(&var self) -> BlockId {
+        let id = self.next_block_id;
+        self.next_block_id += 1;
+        BlockId(id + 1) // +1 because entry is 0
+    }
+}
+
+// test module
+space tests {
+    use super::*;
+    use hir::*;
+
+    // test
+    fn test_mir_lowerer_initialization() {
+        let lowerer = MirLowerer::new();
+        assert_eq!(lowerer.next_value_id, 0);
+        assert_eq!(lowerer.next_block_id, 0);
+    }
+
+    // test
+    fn test_lower_ty() {
+        let lowerer = MirLowerer::new();
+        assert_eq!(lowerer.lower_ty(&HirTy::Bool), Type::Bool);
+        assert_eq!(lowerer.lower_ty(&HirTy::Int), Type::I64);
+        assert_eq!(lowerer.lower_ty(&HirTy::Float), Type::F64);
+    }
+
+    // test
+    fn test_infer_lit_ty() {
+        let lowerer = MirLowerer::new();
+        assert_eq!(lowerer.infer_lit_ty(&HirLit::Int(42)), Type::I64);
+        assert_eq!(lowerer.infer_lit_ty(&HirLit::Bool(true)), Type::Bool);
+        assert_eq!(lowerer.infer_lit_ty(&HirLit::String("test".into())), Type::Ptr(Box::new(Type::U8)));
+    }
+
+    // test
+    fn test_infer_binop_ty() {
+        let lowerer = MirLowerer::new();
+        assert_eq!(lowerer.infer_binop_ty(&HirBinOp::Add), Type::I64);
+        assert_eq!(lowerer.infer_binop_ty(&HirBinOp::Eq), Type::Bool);
+        assert_eq!(lowerer.infer_binop_ty(&HirBinOp::And), Type::Bool);
+    }
+
+    // test
+    fn test_fresh_block_id() {
+        var lowerer = MirLowerer::new();
+        assert_eq!(lowerer.fresh_block_id(), BlockId(1));
+        assert_eq!(lowerer.fresh_block_id(), BlockId(2));
+        assert_eq!(lowerer.next_block_id, 2);
+    }
+
+    // test
+    fn test_lower_binop() {
+        let lowerer = MirLowerer::new();
+        let add_fn = lowerer.lower_binop(&HirBinOp::Add);
+        let val1 = ValueId(1);
+        let val2 = ValueId(2);
+        let inst = add_fn(val1, val2);
+        match inst {
+            Instruction::Add(a, b) => {
+                assert_eq!(a, val1);
+                assert_eq!(b, val2);
+            }
+            _ => abort("expected Add instruction"),
+        }
+    }
+}

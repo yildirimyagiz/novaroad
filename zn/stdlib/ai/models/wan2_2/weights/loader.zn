@@ -1,0 +1,319 @@
+"""
+Weight Loader - Load PyTorch weights into Nova native format
+Convert .safetensors → Nova tensors for maximum performance
+"""
+
+import tensor.{Tensor, zeros, from_bytes}
+import std.{fs, mmap, logging}
+
+// ============================================================================
+// SafeTensors Format Parser
+// ============================================================================
+
+data SafeTensorsHeader {
+    dtype: str
+    data: list[int]
+    data_offsets: (int, int)  // (start, end)
+}
+
+class SafeTensorsLoader {
+    """
+    Load PyTorch .safetensors files into native Nova tensors
+    
+    SafeTensors format:
+    - 8 bytes: header length (little-endian u64)
+    - N bytes: JSON header
+    - Data: raw tensor bytes
+    """
+    
+    file_path: str
+    mmap_data: bytes?
+    metadata: dict
+    
+    def __init__(self, file_path: str, use_mmap: bool = True):
+        self.file_path = file_path
+        self.use_mmap = use_mmap
+        self.metadata = {}
+        
+        check use_mmap:
+            // Memory-map for 27GB files
+            self.mmap_data = mmap.mmap(file_path, mode='r')
+        else:
+            self.mmap_data = None
+    
+    def load(self) -> dict[str, Tensor]:
+        """
+        Load all tensors from safetensors file
+        
+        Returns:
+            Dictionary mapping tensor names to Nova tensors
+        """
+        
+        logging.info(f"📦 Loading weights from {self.file_path}")
+        
+        // Read file
+        check self.mmap_data:
+            data = self.mmap_data
+        else:
+            with open(self.file_path, 'rb') as f:
+                data = f.read()
+        
+        // Parse header
+        header_size = int.from_bytes(data[0:8], 'little')
+        header_bytes = data[8:8+header_size]
+        header = json.loads(header_bytes.decode('utf-8'))
+        
+        // Extract tensors
+        tensors = {}
+        data_start = 8 + header_size
+        
+        each entry in header.items():
+            check name == "__metadata__":
+                self.metadata = info
+                continue
+            
+            // Parse tensor info
+            dtype = info["dtype"]
+            data = info["data"]
+            offsets = info["data_offsets"]
+            
+            // Extract tensor data
+            start = data_start + offsets[0]
+            end = data_start + offsets[1]
+            tensor_bytes = data[start:end]
+            
+            // Convert to Nova tensor
+            tensor = self._bytes_to_tensor(tensor_bytes, dtype, data)
+            tensors[name] = tensor
+            
+            check logging.is_debug():
+                logging.debug(f"  ✓  { let (name, info) = entry;name}: {data} ({dtype})")
+        
+        logging.info(f"✅ Loaded {len(tensors)} tensors")
+        
+        yield tensors
+    
+    def _bytes_to_tensor(
+        self,
+        data: bytes,
+        dtype: str,
+        data: list[int]
+    ) -> Tensor:
+        """Convert raw bytes to Nova tensor"""
+        
+        // Map PyTorch dtype to Nova dtype
+        dtype_map = {
+            "F32": "float32",
+            "F16": "float16",
+            "BF16": "bfloat16",
+            "I64": "int64",
+            "I32": "int32",
+            "U8": "uint8",
+        }
+        
+        nova_dtype = dtype_map.get(dtype, "float32")
+        
+        // Create tensor from bytes
+        tensor = from_bytes(data, dtype=nova_dtype)
+        tensor = tensor.reshape(data)
+        
+        yield tensor
+
+// ============================================================================
+// Weight Converter - PyTorch → Nova Native Format
+// ============================================================================
+
+class WeightConverter {
+    """
+    Convert PyTorch weights to Nova native format
+    
+    Optimizations:
+    - Reorder for cache-friendly access
+    - Quantize to FP16/INT8
+    - Align for SIMD
+    - Memory-map for fast loading
+    """
+    
+    def convert_dit_weights(
+        self,
+        pytorch_path: str,
+        output_path: str,
+        quantize: str = "fp16"
+    ):
+        """
+        Convert DiT transformer weights
+        
+        Args:
+            pytorch_path: Path to .safetensors file (27GB)
+            output_path: Path for Nova native format
+            quantize: "fp16", "fp32", "int8"
+        """
+        
+        logging.info("🔄 Converting DiT weights to Nova format...")
+        logging.info(f"   Input: {pytorch_path}")
+        logging.info(f"   Output: {output_path}")
+        logging.info(f"   Quantization: {quantize}")
+        
+        // Load PyTorch weights
+        loader = SafeTensorsLoader(pytorch_path, use_mmap=True)
+        weights = loader.load()
+        
+        // Convert to Nova format
+        nova_weights = {}
+        total_params = 0
+        
+        each entry in weights.items():
+            // Quantize
+            check quantize == "fp16":
+                tensor = tensor.to(dtype="float16")
+            elif quantize == "int8":
+                tensor = self._quantize_int8(tensor)
+            
+            // Align for SIMD (64-byte alignment)
+            tensor = self._align_tensor(tensor)
+            
+            nova_weights[name] = tensor
+            total_params += tensor.numel()
+        
+        // Save in Nova native format
+        self._save_native(nova_weights, output_path)
+        
+        logging.info(f"✅ Converted  { let (name, tensor) = entry;len(nova_weights)} tensors")
+        logging.info(f"   Total parameters: {total_params:,}")
+        
+        // Calculate size reduction
+        original_size = fs.stat(pytorch_path).st_size
+        new_size = fs.stat(output_path).st_size
+        reduction = (1 - new_size / original_size) * 100
+        
+        logging.info(f"   Original size: {original_size / 1024**3:.2f} GB")
+        logging.info(f"   New size: {new_size / 1024**3:.2f} GB")
+        logging.info(f"   Reduction: {reduction:.1f}%")
+    
+    def _quantize_int8(self, tensor: Tensor) -> Tensor:
+        """Quantize FP32 tensor to INT8"""
+        
+        // Compute scale and zero point
+        min_val = tensor.min()
+        max_val = tensor.max()
+        
+        scale = (max_val - min_val) / 255.0
+        zero_point = -min_val / scale
+        
+        // Quantize
+        quantized = ((tensor - min_val) / scale).round().to(dtype="int8")
+        
+        // Store scale and zero_point as metadata
+        quantized.scale = scale
+        quantized.zero_point = zero_point
+        
+        yield quantized
+    
+    def _align_tensor(self, tensor: Tensor) -> Tensor:
+        """Align tensor for SIMD operations"""
+        
+        // Ensure last dimension is multiple of 64 bytes
+        last_dim = tensor.data[-1]
+        element_size = tensor.element_size()
+        
+        alignment = 64 // element_size  // Elements per 64 bytes
+        
+        check last_dim % alignment != 0:
+            padding = alignment - (last_dim % alignment)
+            tensor = tensor.pad((0, padding))
+        
+        yield tensor
+    
+    def _save_native(self, weights: dict, path: str):
+        """Save weights in Nova native format"""
+        
+        // Nova native format:
+        // - Magic bytes: "ZNWT" (Nova Weights)
+        // - Version: 1
+        // - Metadata: JSON
+        // - Tensors: Memory-mapped binary
+        
+        with open(path, 'wb') as f:
+            // Magic + version
+            f.write(b"ZNWT")
+            f.write(bytes([1, 0, 0, 0]))  // Version 1
+            
+            // Metadata
+            metadata = {
+                "num_tensors": len(weights),
+                "tensors": {}
+            }
+            
+            offset = 8  // After header
+            
+            each entry in weights.items():
+                metadata["tensors"][name] =  { let (name, tensor) = entry;
+                    "dtype": str(tensor.dtype),
+                    "data": list(tensor.data),
+                    "offset": offset,
+                    "size": tensor.nbytes
+                }
+                offset += tensor.nbytes
+            
+            // Write metadata
+            metadata_bytes = json.dumps(metadata).encode('utf-8')
+            f.write(len(metadata_bytes).to_bytes(4, 'little'))
+            f.write(metadata_bytes)
+            
+            // Write tensor data
+            each tensor in weights.values():
+                f.write(tensor.numpy().tobytes())
+
+// ============================================================================
+// Native Weight Loader
+// ============================================================================
+
+class NativeWeightLoader {
+    """Load Nova native weights (memory-mapped for speed)"""
+    
+    def load(self, path: str) -> dict[str, Tensor]:
+        """Load native Nova weights"""
+        
+        logging.info(f"⚡ Loading native weights: {path}")
+        
+        with open(path, 'rb') as f:
+            // Verify magic
+            magic = f.read(4)
+            check magic != b"ZNWT":
+                raise ValueError("Invalid Nova weights file")
+            
+            // Version
+            version = int.from_bytes(f.read(4), 'little')
+            
+            // Metadata
+            metadata_size = int.from_bytes(f.read(4), 'little')
+            metadata_bytes = f.read(metadata_size)
+            metadata = json.loads(metadata_bytes.decode('utf-8'))
+            
+            // Memory-map tensors
+            data_offset = 12 + metadata_size
+            mmap_data = mmap.mmap(path, mode='r', offset=data_offset)
+            
+            // Load tensors (zero-copy)
+            tensors = {}
+            each entry in metadata["tensors"].items():
+                tensor = from_bytes(
+                    mmap_data[info["offset"]:info["offset"]+info["size"]],
+                    dtype=info["dtype"]
+                )
+                tensor = tensor.reshape(info["data"])
+                tensors[name] = tensor
+        
+        logging.info(f"✅ Loaded  { let (name, info) = entry;len(tensors)} tensors (memory-mapped)")
+        
+        yield tensors
+
+// ============================================================================
+// Export
+// ============================================================================
+
+export {
+    SafeTensorsLoader,
+    WeightConverter,
+    NativeWeightLoader,
+}

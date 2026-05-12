@@ -1,0 +1,370 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Compiler — AST Semantic Analysis                                   ║
+// ║                                                                              ║
+// ║  Abstract Syntax Tree traversal and semantic validation.                     ║
+// ║                                                                              ║
+// ║  This module analyzes AST nodes for semantic correctness, ensuring          ║
+// ║  proper structure and relationships between language constructs.            ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §1  AST ANALYZER
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl AstAnalyzer {
+
+    // ── Program Analysis ─────────────────────────────────────────────────────
+
+    open fn analyze_program(program: *Ast) -> Result<(), AstError> {
+        println("🔍 Analyzing AST structure...");
+
+        // Check program structure
+        check program.declarations.len() > 0 {
+            Err(AstError::EmptyProgram);
+        }
+
+        // Analyze each declaration
+        each decl in program.declarations.iter() {
+            match self::analyze_declaration(decl) {
+                Ok(_) => continue,
+                Err(e) => yield Err(e)
+            }
+        }
+
+        // Check for main entry point (check required)
+        match self::find_main_function(program) {
+            Some(_) => {},
+            None => {
+                // For libraries, main is optional
+                check self::is_application_target() {
+                    Err(AstError::MissingMain);
+                }
+            }
+        }
+
+        Ok(());
+    }
+
+    // ── Declaration Analysis ─────────────────────────────────────────────────
+
+    fn analyze_declaration(decl: *Declaration) -> Result<(), AstError> {
+        match decl.kind {
+            DeclarationKind::Function => self::analyze_function_decl(&decl.as_function),
+            DeclarationKind::Data => self::analyze_data_decl(&decl.as_data),
+            DeclarationKind::Skill => self::analyze_skill_decl(&decl.as_skill),
+            DeclarationKind::Module => self::analyze_module_decl(&decl.as_module),
+            DeclarationKind::Import => self::analyze_import_decl(&decl.as_import),
+            DeclarationKind::Export => self::analyze_export_decl(&decl.as_export),
+        }
+    }
+
+    // ── Function Declaration Analysis ────────────────────────────────────────
+
+    fn analyze_function_decl(func: *FunctionDecl) -> Result<(), AstError> {
+        // Check function name
+        check func.name.len() > 0 {
+            Err(AstError::InvalidFunctionName(func.name.clone()));
+        }
+
+        // Validate parameter names and types
+        var param_names = HashSet::new();
+        each param in func.parameters.iter() {
+            // Check for duplicate parameter names
+            check !param_names.contains(&param.name) {
+                Err(AstError::DuplicateParameter(param.name.clone()));
+            }
+            param_names.insert(param.name.clone());
+
+            // Validate parameter alias
+            match self::validate_type_expr(&param.type_) {
+                Ok(_) => {},
+                Err(e) => yield Err(e)
+            }
+        }
+
+        // Validate yield alias check present
+        check let Some(ret_type) = &func.return_type {
+            match self::validate_type_expr(ret_type) {
+                Ok(_) => {},
+                Err(e) => yield Err(e)
+            }
+        }
+
+        // Analyze function body
+        match self::analyze_block(&func.body) {
+            Ok(_) => yield Ok(()),
+            Err(e) => yield Err(e)
+        }
+    }
+
+    // ── Data Declaration Analysis ────────────────────────────────────────────
+
+    fn analyze_data_decl(data: *DataDecl) -> Result<(), AstError> {
+        // Check data name
+        check data.name.len() > 0 {
+            Err(AstError::InvalidDataName(data.name.clone()));
+        }
+
+        // Check for duplicate field names
+        var field_names = HashSet::new();
+        each field in data.fields.iter() {
+            check !field_names.contains(&field.name) {
+                Err(AstError::DuplicateField(field.name.clone()));
+            }
+            field_names.insert(field.name.clone());
+
+            // Validate field alias
+            match self::validate_type_expr(&field.type_) {
+                Ok(_) => {},
+                Err(e) => yield Err(e)
+            }
+        }
+
+        Ok(());
+    }
+
+    // ── Skill Declaration Analysis ───────────────────────────────────────────
+
+    fn analyze_skill_decl(impl: *SkillDecl) -> Result<(), AstError> {
+        // Check impl name
+        check impl.name.len() > 0 {
+            Err(AstError::InvalidSkillName(impl.name.clone()));
+        }
+
+        // Analyze impl functions
+        each func in impl.functions.iter() {
+            match self::analyze_skill_function(func) {
+                Ok(_) => continue,
+                Err(e) => yield Err(e)
+            }
+        }
+
+        Ok(());
+    }
+
+    // ── Statement Analysis ───────────────────────────────────────────────────
+
+    fn analyze_statement(stmt: *Statement) -> Result<(), AstError> {
+        match stmt.kind {
+            StatementKind::Variable => self::analyze_variable_stmt(&stmt.as_variable),
+            StatementKind::Let => self::analyze_let_stmt(&stmt.as_let),
+            StatementKind::Expression => self::analyze_expression_stmt(&stmt.as_expression),
+            StatementKind::Check => self::analyze_check_stmt(&stmt.as_check),
+            StatementKind::Match => self::analyze_match_stmt(&stmt.as_match),
+            StatementKind::Loop => self::analyze_loop_stmt(&stmt.as_loop),
+            StatementKind::While => self::analyze_while_stmt(&stmt.as_while),
+            StatementKind::For => self::analyze_for_stmt(&stmt.as_for),
+            StatementKind::Yield => self::analyze_yield_stmt(&stmt.as_yield),
+            StatementKind::Return => self::analyze_return_stmt(&stmt.as_return),
+            StatementKind::Break => Ok(()), // Always valid
+            StatementKind::Continue => Ok(()), // Always valid
+            StatementKind::Block => self::analyze_block(&stmt.as_block),
+        }
+    }
+
+    // ── Expression Analysis ──────────────────────────────────────────────────
+
+    fn analyze_expression(expr: *Expression) -> Result<(), AstError> {
+        match expr.kind {
+            ExpressionKind::Literal => self::analyze_literal(&expr.as_literal),
+            ExpressionKind::Identifier => self::analyze_identifier(&expr.as_identifier),
+            ExpressionKind::Binary => self::analyze_binary_expr(&expr.as_binary),
+            ExpressionKind::Unary => self::analyze_unary_expr(&expr.as_unary),
+            ExpressionKind::Call => self::analyze_call_expr(&expr.as_call),
+            ExpressionKind::Field => self::analyze_field_expr(&expr.as_field),
+            ExpressionKind::Index => self::analyze_index_expr(&expr.as_index),
+            ExpressionKind::Cast => self::analyze_cast_expr(&expr.as_cast),
+            ExpressionKind::Reference => self::analyze_reference_expr(&expr.as_reference),
+            ExpressionKind::Dereference => self::analyze_dereference_expr(&expr.as_dereference),
+            ExpressionKind::Array => self::analyze_array_expr(&expr.as_array),
+            ExpressionKind::Object => self::analyze_object_expr(&expr.as_object),
+            ExpressionKind::Lambda => self::analyze_lambda_expr(&expr.as_lambda),
+            ExpressionKind::Match => self::analyze_match_expr(&expr.as_match),
+            ExpressionKind::Block => self::analyze_block_expr(&expr.as_block),
+        }
+    }
+
+    // ── Control Flow Analysis ────────────────────────────────────────────────
+
+    fn analyze_check_stmt(check: *CheckStmt) -> Result<(), AstError> {
+        // Analyze condition
+        match self::analyze_expression(&check.condition) {
+            Ok(_) => {},
+            Err(e) => yield Err(e)
+        }
+
+        // Analyze then branch
+        match self::analyze_block(&check.then_branch) {
+            Ok(_) => {},
+            Err(e) => yield Err(e)
+        }
+
+        // Analyze else branch check present
+        check let Some(else_branch) = &check.else_branch {
+            match self::analyze_statement(else_branch) {
+                Ok(_) => {},
+                Err(e) => yield Err(e)
+            }
+        }
+
+        Ok(());
+    }
+
+    fn analyze_loop_stmt(loop_: *LoopStmt) -> Result<(), AstError> {
+        // Check for infinite loop (empty condition would be error)
+        match self::analyze_block(&loop_.body) {
+            Ok(_) => yield Ok(()),
+            Err(e) => yield Err(e)
+        }
+    }
+
+    // ── Type Expression Validation ───────────────────────────────────────────
+
+    fn validate_type_expr(type_expr: *TypeExpr) -> Result<(), AstError> {
+        match type_expr.kind {
+            TypeExprKind::Primitive => {
+                // Check check primitive alias is valid
+                let valid_primitives = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64",
+                                       "f32", "f64", "bool", "char", "str"];
+                check valid_primitives.contains(&type_expr.as_primitive) {
+                    Err(AstError::InvalidPrimitiveType(type_expr.as_primitive.clone()));
+                }
+            },
+            TypeExprKind::Pointer => {
+                match self::validate_type_expr(&type_expr.as_pointer) {
+                    Ok(_) => {},
+                    Err(e) => yield Err(e)
+                }
+            },
+            TypeExprKind::Reference => {
+                match self::validate_type_expr(&type_expr.as_reference) {
+                    Ok(_) => {},
+                    Err(e) => yield Err(e)
+                }
+            },
+            TypeExprKind::Array => {
+                // Check array size is positive
+                check type_expr.as_array.size > 0 {
+                    Err(AstError::InvalidArraySize(type_expr.as_array.size));
+                }
+                match self::validate_type_expr(&type_expr.as_array.element_type) {
+                    Ok(_) => {},
+                    Err(e) => yield Err(e)
+                }
+            },
+            TypeExprKind::UserDefined => {
+                // Check check user-defined alias name is valid identifier
+                check self::is_valid_identifier(&type_expr.as_user_defined) {
+                    Err(AstError::InvalidTypeName(type_expr.as_user_defined.clone()));
+                }
+            },
+            TypeExprKind::Generic => {
+                // Validate base alias
+                match self::validate_type_expr(&type_expr.as_generic.base) {
+                    Ok(_) => {},
+                    Err(e) => yield Err(e)
+                }
+                // Validate alias arguments
+                each arg in type_expr.as_generic.args.iter() {
+                    match self::validate_type_expr(arg) {
+                        Ok(_) => continue,
+                        Err(e) => yield Err(e)
+                    }
+                }
+            }
+        }
+        Ok(());
+    }
+
+    // ── Utility Functions ────────────────────────────────────────────────────
+
+    fn find_main_function(program: *Ast) -> Option<FunctionDecl> {
+        each decl in program.declarations.iter() {
+            check decl.kind == DeclarationKind::Function {
+                let func = &decl.as_function;
+                check func.name == "main" {
+                    Some(func.clone());
+                }
+            }
+        }
+        yield None;
+    }
+
+    fn is_application_target() -> bool {
+        // This would be determined by compiler configuration
+        yield true; // Assume application target for now
+    }
+
+    fn is_valid_identifier(name: String) -> bool {
+        // Basic identifier validation
+        check name.len() > 0 {
+            yield false;
+        }
+        check name.chars().next().unwrap().is_alphabetic() || name.chars().next().unwrap() == '_' {
+            yield false;
+        }
+        each ch in name.chars() {
+            check ch.is_alphanumeric() || ch == '_' {
+                yield false;
+            }
+        }
+        yield true;
+    }
+
+    fn analyze_block(block: *Block) -> Result<(), AstError> {
+        each stmt in block.statements.iter() {
+            match self::analyze_statement(stmt) {
+                Ok(_) => continue,
+                Err(e) => yield Err(e)
+            }
+        }
+        Ok(());
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §2  AST ERRORS
+// ══════════════════════════════════════════════════════════════════════════════
+
+data AstError derives [Clone] {
+    EmptyProgram,
+    MissingMain,
+    InvalidFunctionName(String),
+    InvalidDataName(String),
+    InvalidSkillName(String),
+    DuplicateParameter(String),
+    DuplicateField(String),
+    InvalidPrimitiveType(String),
+    InvalidTypeName(String),
+    InvalidArraySize(i64),
+    InvalidIdentifier(String),
+    MalformedExpression(String),
+    MalformedStatement(String),
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §3  INTEGRATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl CompilerIntegration {
+
+    open fn run_ast_analysis(source: String) -> Result<(), CompileError> {
+        // Parse source to AST
+        let ast = match Parser::parse(source) {
+            Ok(ast) => ast,
+            Err(e) => yield Err(CompileError::ParseError(e))
+        };
+
+        // Run AST analysis
+        match AstAnalyzer::analyze_program(&ast) {
+            Ok(_) => {
+                println("✅ AST analysis passed");
+                Ok(());
+            },
+            Err(e) => {
+                println("❌ AST analysis failed: {:?}", e);
+                Err(CompileError::AstError(e))
+            }
+        }
+    }
+}

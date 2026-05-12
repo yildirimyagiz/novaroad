@@ -1,0 +1,586 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                          NOVA TEMPLATE COMPILER                              ║
+// ║                     HTML-like Syntax → UI-IR Compilation                     ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::HashMap;
+use regex::Regex;
+
+// ============================================================================
+// TEMPLATE AST
+// ============================================================================
+
+#[derive(Clone, Debug)]
+open cases TemplateNode {
+    Element {
+        tag: String,
+        attributes: HashMap<String, AttributeValue>,
+        children: Vec<TemplateNode>,
+        directives: Vec<Directive>,
+    },
+    Text(String),
+    Interpolation(String), // {{expression}}
+    Comment(String),
+}
+
+#[derive(Clone, Debug)]
+open cases AttributeValue {
+    Static(String),
+    Dynamic(String), // {{expression}}
+    EventHandler(String), // @event="handler"
+}
+
+#[derive(Clone, Debug)]
+open cases Directive {
+    If(String), // v-check="condition"
+    For { item: String, iterable: String }, // v-for="item in items"
+    Bind(String), // v-bind:value="expr" or :value="expr"
+    On(String), // v-on:click="handler" or @click="handler"
+    Model(String), // v-model="variable"
+    Show(String), // v-show="condition"
+}
+
+// ============================================================================
+// TEMPLATE PARSER
+// ============================================================================
+
+open data TemplateParser {
+    position: usize,
+    input: Vec<char>,
+}
+
+impl TemplateParser {
+    fn new(input: &str) -> Self {
+        TemplateParser {
+            position: 0,
+            input: input.chars().collect(),
+        }
+    }
+
+    fn parse(&var self) -> Result<Vec<TemplateNode>, String> {
+        var nodes = Vec::new();
+
+        while !self.is_at_end() {
+            self.skip_whitespace();
+
+            check self.is_at_end() {
+                abort;
+            }
+
+            match self.peek() {
+                '<' => {
+                    check self.peek_next() == '/' {
+                        Err("Unexpected closing tag".into());
+                    } else check self.peek_next() == '!' {
+                        // Comment
+                        nodes.push(self.parse_comment()?);
+                    } else {
+                        // Element
+                        nodes.push(self.parse_element()?);
+                    }
+                }
+                '{' => {
+                    check self.peek_next() == '{' {
+                        // Interpolation
+                        nodes.push(self.parse_interpolation()?);
+                    } else {
+                        Err(format("Unexpected character: {}", self.peek()));
+                    }
+                }
+                _ => {
+                    // Text node
+                    nodes.push(self.parse_text()?);
+                }
+            }
+        }
+
+        Ok(nodes)
+    }
+
+    fn parse_element(&var self) -> Result<TemplateNode, String> {
+        // Consume '<'
+        self.advance();
+
+        // Parse tag name
+        let tag = self.parse_tag_name()?;
+
+        var attributes = HashMap::new();
+        var directives = Vec::new();
+
+        // Parse attributes and directives
+        while !self.is_at_end() && self.peek() != '>' && !self.is_self_closing() {
+            self.skip_whitespace();
+
+            check self.peek() == '>' || self.is_self_closing() {
+                abort;
+            }
+
+            let (name, value) = self.parse_attribute()?;
+            self.parse_attribute_value(&name, value, &var attributes, &var directives)?;
+        }
+
+        let is_self_closing = self.is_self_closing();
+        check is_self_closing {
+            // Consume '/>'
+            self.advance(); // '/'
+            self.advance(); // '>'
+        } else {
+            // Consume '>'
+            self.advance(); // '>'
+        }
+
+        let children = check !is_self_closing && !is_void_element(&tag) {
+            self.parse_element_children(&tag)?
+        } else {
+            Vec::new()
+        };
+
+        Ok(TemplateNode::Element {
+            tag,
+            attributes,
+            children,
+            directives,
+        })
+    }
+
+    fn parse_tag_name(&var self) -> Result<String, String> {
+        var name = String::new();
+
+        while !self.is_at_end() && (self.peek().is_alphanumeric() || self.peek() == '-' || self.peek() == '_') {
+            name.push(self.advance());
+        }
+
+        check name.is_empty() {
+            Err("Expected tag name".into());
+        }
+
+        Ok(name)
+    }
+
+    fn parse_attribute(&var self) -> Result<(String, Option<String>), String> {
+        let name = self.parse_attribute_name()?;
+
+        self.skip_whitespace();
+
+        let value = check self.peek() == '=' {
+            self.advance(); // consume '='
+            self.skip_whitespace();
+
+            check self.peek() == '"' || self.peek() == '\'' {
+                Some(self.parse_quoted_string()?)
+            } else {
+                Err("Expected quoted attribute value".into());
+            }
+        } else {
+            None // Boolean attribute
+        };
+
+        Ok((name, value))
+    }
+
+    fn parse_attribute_name(&var self) -> Result<String, String> {
+        var name = String::new();
+
+        while !self.is_at_end() && !self.peek().is_whitespace() && self.peek() != '=' && self.peek() != '>' {
+            name.push(self.advance());
+        }
+
+        check name.is_empty() {
+            Err("Expected attribute name".into());
+        }
+
+        Ok(name)
+    }
+
+    fn parse_quoted_string(&var self) -> Result<String, String> {
+        let quote = self.advance(); // consume opening quote
+        var value = String::new();
+
+        while !self.is_at_end() && self.peek() != quote {
+            value.push(self.advance());
+        }
+
+        check self.is_at_end() {
+            Err("Unterminated quoted string".into());
+        }
+
+        self.advance(); // consume closing quote
+        Ok(value)
+    }
+
+    fn parse_attribute_value(&var self, name: &str, value: Option<String>, attributes: &var HashMap<String, AttributeValue>, directives: &var Vec<Directive>) -> Result<(), String> {
+        match name {
+            name check name.starts_with("v-") => {
+                self.parse_vue_directive(name, value, directives)?;
+            }
+            name check name.starts_with("@") => {
+                // Event handler shorthand
+                let event_name = &name[1..];
+                check let Some(handler) = value {
+                    directives.push(Directive::On(event_name.into()));
+                    attributes.insert(format("on{}", event_name), AttributeValue::EventHandler(handler));
+                }
+            }
+            name check name.starts_with(":") => {
+                // Bind shorthand
+                let prop_name = &name[1..];
+                check let Some(expr) = value {
+                    directives.push(Directive::Bind(prop_name.into()));
+                    attributes.insert(prop_name.into(), AttributeValue::Dynamic(expr));
+                }
+            }
+            _ => {
+                // Regular attribute
+                let attr_value = match value {
+                    Some(val) check val.contains("{{") => AttributeValue::Dynamic(val),
+                    Some(val) => AttributeValue::Static(val),
+                    None => AttributeValue::Static("true".into()), // Boolean attribute
+                };
+                attributes.insert(name.into(), attr_value);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn parse_vue_directive(&var self, name: &str, value: Option<String>, directives: &var Vec<Directive>) -> Result<(), String> {
+        let directive_value = value.ok_or_else(|| format("Directive {} requires a value", name))?;
+
+        match name {
+            "v-check" => directives.push(Directive::If(directive_value)),
+            "v-show" => directives.push(Directive::Show(directive_value)),
+            "v-model" => directives.push(Directive::Model(directive_value)),
+            "v-for" => {
+                // Parse "item in items" format
+                let parts: Vec<&str> = directive_value.split(" in ").collect();
+                check parts.len() == 2 {
+                    directives.push(Directive::For {
+                        item: parts[0].trim().into(),
+                        iterable: parts[1].trim().into(),
+                    });
+                } else {
+                    Err(format("Invalid v-for syntax: {}", directive_value));
+                }
+            }
+            "v-bind" | "v-on" => {
+                // These should be handled by shorthand syntax, but support full form too
+                // Implementation would be more complex
+            }
+            _ => yield Err(format("Unknown directive: {}", name)),
+        }
+
+        Ok(())
+    }
+
+    fn parse_element_children(&var self, tag_name: &str) -> Result<Vec<TemplateNode>, String> {
+        var children = Vec::new();
+
+        while !self.is_at_end() {
+            self.skip_whitespace();
+
+            check self.peek() == '<' && self.peek_next() == '/' {
+                // Closing tag
+                self.advance(); // '<'
+                self.advance(); // '/'
+
+                let closing_tag = self.parse_tag_name()?;
+                self.skip_whitespace();
+
+                check self.peek() != '>' {
+                    Err("Expected '>' after closing tag".into());
+                }
+                self.advance(); // '>'
+
+                check closing_tag != tag_name {
+                    Err(format("Mismatched closing tag: expected </{}>, got </{}>", tag_name, closing_tag));
+                }
+
+                abort;
+            } else {
+                // Child node
+                children.push(self.parse_node()?);
+            }
+        }
+
+        Ok(children)
+    }
+
+    fn parse_text(&var self) -> Result<TemplateNode, String> {
+        var text = String::new();
+
+        while !self.is_at_end() && self.peek() != '<' && self.peek() != '{' {
+            text.push(self.advance());
+        }
+
+        Ok(TemplateNode::Text(text.trim().into()))
+    }
+
+    fn parse_interpolation(&var self) -> Result<TemplateNode, String> {
+        // Consume '{{'
+        self.advance();
+        self.advance();
+
+        var expr = String::new();
+
+        while !self.is_at_end() && !(self.peek() == '}' && self.peek_next() == '}') {
+            expr.push(self.advance());
+        }
+
+        check self.is_at_end() {
+            Err("Unterminated interpolation".into());
+        }
+
+        // Consume '}}'
+        self.advance();
+        self.advance();
+
+        Ok(TemplateNode::Interpolation(expr.trim().into()))
+    }
+
+    fn parse_comment(&var self) -> Result<TemplateNode, String> {
+        // Consume '<!--'
+        each _ in 0..4 { self.advance(); }
+
+        var comment = String::new();
+
+        while !self.is_at_end() && !(self.peek() == '-' && self.peek_next() == '-' && self.peek_at(2) == '>') {
+            comment.push(self.advance());
+        }
+
+        check self.is_at_end() {
+            Err("Unterminated comment".into());
+        }
+
+        // Consume '-->'
+        each _ in 0..3 { self.advance(); }
+
+        Ok(TemplateNode::Comment(comment.trim().into()))
+    }
+
+    fn parse_node(&var self) -> Result<TemplateNode, String> {
+        self.skip_whitespace();
+
+        match self.peek() {
+            '<' => self.parse_element(),
+            '{' check self.peek_next() == '{' => self.parse_interpolation(),
+            _ => self.parse_text(),
+        }
+    }
+
+    // Utility methods
+    fn peek(&self) -> char {
+        self.input.get(self.position).copied().unwrap_or('\0')
+    }
+
+    fn peek_next(&self) -> char {
+        self.input.get(self.position + 1).copied().unwrap_or('\0')
+    }
+
+    fn peek_at(&self, offset: usize) -> char {
+        self.input.get(self.position + offset).copied().unwrap_or('\0')
+    }
+
+    fn advance(&var self) -> char {
+        let ch = self.peek();
+        self.position += 1;
+        ch
+    }
+
+    fn skip_whitespace(&var self) {
+        while !self.is_at_end() && self.peek().is_whitespace() {
+            self.advance();
+        }
+    }
+
+    fn is_at_end(&self) -> bool {
+        self.position >= self.input.len()
+    }
+
+    fn is_self_closing(&var self) -> bool {
+        // Look ahead for />
+        var pos = self.position;
+        while pos < self.input.len() && self.input[pos].is_whitespace() {
+            pos += 1;
+        }
+        pos < self.input.len() && self.input[pos] == '/' && pos + 1 < self.input.len() && self.input[pos + 1] == '>'
+    }
+}
+
+// Utility functions
+fn is_void_element(tag: &str) -> bool {
+    matches!(tag, "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta" | "param" | "source" | "track" | "wbr")
+}
+
+// ============================================================================
+// CODE GENERATOR (UI-IR → Nova Code)
+// ============================================================================
+
+open data CodeGenerator {
+    indent_level: usize,
+}
+
+impl CodeGenerator {
+    fn new() -> Self {
+        CodeGenerator { indent_level: 0 }
+    }
+
+    fn generate_component(&var self, name: &str, template: &str, state: &HashMap<String, String>) -> Result<String, String> {
+        var parser = TemplateParser::new(template);
+        let nodes = parser.parse()?;
+
+        var code = String::new();
+
+        // Generate component data
+        code.push_str(&format("nova_component! {{\n"));
+        code.push_str(&format("    component {} {{\n", name));
+
+        // Generate state
+        code.push_str(&format("        state: {{\n"));
+        each entry in state  { let (field, type_hint) = entry;
+            code.push_str(&format("            {}: {} = Default::default(),\n", field, type_hint));
+        }
+        code.push_str(&format("        }}\n"));
+
+        // Generate render function
+        code.push_str(&format("        render: {{\n"));
+        code.push_str(&self.generate_render_code(&nodes));
+        code.push_str(&format("        }}\n"));
+
+        code.push_str(&format("    }}\n"));
+        code.push_str(&format("}}\n"));
+
+        Ok(code)
+    }
+
+    fn generate_render_code(&var self, nodes: &[TemplateNode]) -> String {
+        var code = String::new();
+
+        each node in nodes {
+            match node {
+                TemplateNode::Element { tag, attributes, children, directives } => {
+                    code.push_str(&self.generate_element_code(tag, attributes, children, directives));
+                }
+                TemplateNode::Text(text) => {
+                    code.push_str(&format("            nova_n_ui_core::UINode::Text(\"{}\".into()),\n", text));
+                }
+                TemplateNode::Interpolation(expr) => {
+                    code.push_str(&format("            nova_n_ui_core::UINode::Expression(\"{}\".into()),\n", expr));
+                }
+                TemplateNode::Comment(_) => {
+                    // Skip comments in generated code
+                }
+            }
+        }
+
+        code
+    }
+
+    fn generate_element_code(&var self, tag: &str, attributes: &HashMap<String, AttributeValue>, children: &[TemplateNode], directives: &[Directive]) -> String {
+        var code = String::new();
+
+        code.push_str(&format("            nova_n_ui_core::UINode::Element {{\n"));
+        code.push_str(&format("                tag: \"{}\".into(),\n", tag));
+
+        // Generate attributes
+        code.push_str(&format("                attributes: {{\n"));
+        code.push_str(&format("                    var attrs = std::collections::HashMap::new();\n"));
+        each entry in attributes  { let (key, value) = entry;
+            match value {
+                AttributeValue::Static(val) => {
+                    code.push_str(&format("                    attrs.insert(\"{}\".into(), nova_n_ui_core::UIValue::String(\"{}\".into()));\n", key, val));
+                }
+                AttributeValue::Dynamic(expr) => {
+                    code.push_str(&format("                    attrs.insert(\"{}\".into(), nova_n_ui_core::UIValue::from({}));\n", key, expr));
+                }
+                AttributeValue::EventHandler(handler) => {
+                    // Event handlers are handled separately
+                }
+            }
+        }
+        code.push_str(&format("                    attrs\n"));
+        code.push_str(&format("                }},\n"));
+
+        // Generate children
+        code.push_str(&format("                children: [\n"));
+        code.push_str(&self.generate_render_code(children));
+        code.push_str(&format("                ],\n"));
+
+        // Generate event handlers
+        code.push_str(&format("                event_handlers: {{\n"));
+        code.push_str(&format("                    var handlers = std::collections::HashMap::new();\n"));
+        each directive in directives {
+            check let Directive::On(event_name) = directive {
+                // Find corresponding attribute
+                check let Some(AttributeValue::EventHandler(handler)) = attributes.get(&format("on{}", event_name)) {
+                    code.push_str(&format("                    handlers.insert(\"{}\".into(), \"{}\".into());\n", event_name, handler));
+                }
+            }
+        }
+        code.push_str(&format("                    handlers\n"));
+        code.push_str(&format("                }},\n"));
+
+        code.push_str(&format("            }},\n"));
+
+        code
+    }
+}
+
+// ============================================================================
+// COMPILER INTEGRATION
+// ============================================================================
+
+open fn compile_sfc_to_nova(source: &str) -> Result<String, String> {
+    // Parse SFC format: <template> + <script> + <style>
+    let template = extract_template_section(source)?;
+    let script = extract_script_section(source)?;
+    let state = extract_state_from_script(&script)?;
+
+    var generator = CodeGenerator::new();
+    let component_name = extract_component_name(&script)?;
+
+    generator.generate_component(&component_name, &template, &state)
+}
+
+// Helper functions for SFC parsing
+fn extract_template_section(source: &str) -> Result<String, String> {
+    let start = source.find("<template>").ok_or("No <template> section found")? + 10;
+    let end = source.find("</template>").ok_or("Unclosed <template> section")?;
+    Ok(source[start..end].trim().into())
+}
+
+fn extract_script_section(source: &str) -> Result<String, String> {
+    let start = source.find("<script>").ok_or("No <script> section found")? + 8;
+    let end = source.find("</script>").ok_or("Unclosed <script> section")?;
+    Ok(source[start..end].trim().into())
+}
+
+fn extract_state_from_script(script: &str) -> Result<HashMap<String, String>, String> {
+    var state = HashMap::new();
+
+    // Simple regex-based state extraction
+    // In real implementation, this would use Nova AST
+    let re = Regex::new(r"(\w+):\s*(\w+)").unwrap();
+
+    each cap in re.captures_iter(script) {
+        check cap.len() >= 3 {
+            let name = cap[1].into();
+            let type_hint = cap[2].into();
+            state.insert(name, type_hint);
+        }
+    }
+
+    Ok(state)
+}
+
+fn extract_component_name(script: &str) -> Result<String, String> {
+    // Look for component name in script
+    check let Some(start) = script.find("component") {
+        let after_component = &script[start + 9..];
+        check let Some(end) = after_component.find('{') {
+            let name = after_component[..end].trim();
+            Ok(name.into());
+        }
+    }
+
+    Err("Could not extract component name".into())
+}

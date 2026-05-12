@@ -1,0 +1,466 @@
+// Nova AI Studio - Mobile Application
+// Cross-platform: iOS + Android
+
+bring nova::mobile::{Screen, TouchGesture, Camera, GPS, Sensor};
+bring nova::ai::{OnDeviceInference, ModelCache};
+bring shared::components::AIModelCard;
+
+@mobile
+expose data MobileApp {
+    current_screen: Screen,
+    models: Vec<MobileModel>,
+    camera: Camera,
+    gps: GPS,
+    inference_engine: OnDeviceInference,
+    selected_model: Option<usize>,
+}
+
+data Screen {
+    Home,
+    ModelList,
+    Inference,
+    Camera,
+    Settings,
+}
+
+data MobileModel {
+    name: String,
+    size_mb: f32,
+    is_downloaded: bool,
+    inference_speed_ms: f32,
+}
+
+@template
+<NavigationView>
+    <!-- Bottom Tab Navigation -->
+    <TabView :selected="current_screen">
+        <Tab icon="home" title="Home" @select={() => goto_screen(Screen::Home)}>
+            <HomeScreen :models="models" @model-select={select_model} />
+        </Tab>
+        
+        <Tab icon="brain" title="Models" @select={() => goto_screen(Screen::ModelList)}>
+            <ModelListScreen :models="models" />
+        </Tab>
+        
+        <Tab icon="camera" title="Camera" @select={() => goto_screen(Screen::Camera)}>
+            <CameraScreen :camera="camera" @capture={on_photo_capture} />
+        </Tab>
+        
+        <Tab icon="inference" title="Inference">
+            <InferenceScreen 
+                :model="get_selected_model()"
+                :engine="inference_engine"
+                @run={run_inference}
+            />
+        </Tab>
+        
+        <Tab icon="settings" title="Settings">
+            <SettingsScreen />
+        </Tab>
+    </TabView>
+</NavigationView>
+
+<!-- Home Screen Component -->
+@component
+data HomeScreen {
+    models: Vec<MobileModel>,
+}
+
+@template
+<ScrollView class="home-screen">
+    <VStack spacing={20}>
+        <!-- Header -->
+        <HStack class="header">
+            <Text class="title">🚀 Nova AI Studio</Text>
+            <Text class="subtitle">Mobile</Text>
+        </HStack>
+        
+        <!-- Quick Stats -->
+        <HStack class="stats">
+            <StatCard 
+                icon="📦" 
+                value="{{ models.len() }}" 
+                label="Models" 
+            />
+            <StatCard 
+                icon="✅" 
+                value="{{ count_downloaded() }}" 
+                label="Downloaded" 
+            />
+            <StatCard 
+                icon="⚡" 
+                value="{{ avg_inference_speed() }}ms" 
+                label="Avg Speed" 
+            />
+        </HStack>
+        
+        <!-- Recent Models -->
+        <VStack class="section">
+            <Text class="section-title">Recent Models</Text>
+            
+            <ForEach item="model" in="models" :limit="3">
+                <MobileModelCard 
+                    :model="model"
+                    @tap={on_model_tap}
+                />
+            </ForEach>
+        </VStack>
+        
+        <!-- Quick Actions -->
+        <HStack class="quick-actions">
+            <ActionButton 
+                icon="camera" 
+                label="Take Photo"
+                @tap={() => goto_screen(Screen::Camera)}
+            />
+            <ActionButton 
+                icon="inference" 
+                label="Run Inference"
+                @tap={() => goto_screen(Screen::Inference)}
+            />
+        </HStack>
+    </VStack>
+</ScrollView>
+
+<!-- Camera Screen Component -->
+@component
+data CameraScreen {
+    camera: Camera,
+    captured_image: Option<Image>,
+}
+
+@template
+<ZStack class="camera-screen">
+    <!-- Camera Preview -->
+    <CameraPreview :camera="camera" />
+    
+    <!-- Overlay Controls -->
+    <VStack class="camera-controls">
+        <Spacer />
+        
+        <HStack class="bottom-controls">
+            <Button 
+                class="camera-button gallery"
+                @tap={open_gallery}
+            >
+                📁
+            </Button>
+            
+            <Button 
+                class="camera-button capture"
+                @tap={capture_photo}
+            >
+                📷
+            </Button>
+            
+            <Button 
+                class="camera-button switch"
+                @tap={switch_camera}
+            >
+                🔄
+            </Button>
+        </HStack>
+    </VStack>
+    
+    <!-- Image Preview (check captured) -->
+    <div v-check="captured_image.is_some()" class="image-preview">
+        <Image :src="captured_image.unwrap()" />
+        
+        <HStack class="preview-actions">
+            <Button @tap={retake}>Retake</Button>
+            <Button @tap={use_photo} class="primary">Use Photo</Button>
+        </HStack>
+    </div>
+</ZStack>
+
+<!-- Model List Screen -->
+@component
+data ModelListScreen {
+    models: Vec<MobileModel>,
+}
+
+@template
+<ScrollView class="model-list">
+    <VStack spacing={15}>
+        <Text class="screen-title">AI Models</Text>
+        
+        <ForEach item="model" in="models">
+            <MobileModelCard :model="model">
+                <Button 
+                    v-check="!model.is_downloaded"
+                    @tap={() => download_model(model)}
+                    class="download-btn"
+                >
+                    ⬇️ Download ({model.size_mb}MB)
+                </Button>
+                
+                <Button 
+                    v-else
+                    @tap={() => select_model(model)}
+                    class="use-btn"
+                >
+                    ✅ Use Model
+                </Button>
+            </MobileModelCard>
+        </ForEach>
+    </VStack>
+</ScrollView>
+
+<!-- Inference Screen -->
+@component
+data InferenceScreen {
+    model: Option<MobileModel>,
+    input_image: Option<Image>,
+    result: Option<InferenceResult>,
+}
+
+@template
+<VStack class="inference-screen">
+    <Text class="screen-title">AI Inference</Text>
+    
+    <div v-check="model.is_some()" class="model-info">
+        <Text class="model-name">{{ model.unwrap().name }}</Text>
+        <Text class="model-speed">Speed: {{ model.unwrap().inference_speed_ms }}ms</Text>
+    </div>
+    
+    <!-- Input Selection -->
+    <VStack class="input-section">
+        <Text>Input:</Text>
+        
+        <HStack>
+            <Button @tap={select_from_camera}>
+                📷 Camera
+            </Button>
+            <Button @tap={select_from_gallery}>
+                🖼️ Gallery
+            </Button>
+            <Button @tap={select_text_input}>
+                ✏️ Text
+            </Button>
+        </HStack>
+        
+        <div v-check="input_image.is_some()" class="input-preview">
+            <Image :src="input_image.unwrap()" class="preview-image" />
+        </div>
+    </VStack>
+    
+    <!-- Run Inference Button -->
+    <Button 
+        v-check="model.is_some() && input_image.is_some()"
+        @tap={run_inference}
+        class="run-button"
+    >
+        ⚡ Run Inference
+    </Button>
+    
+    <!-- Results -->
+    <div v-check="result.is_some()" class="results">
+        <Text class="results-title">Results:</Text>
+        
+        <VStack class="result-items">
+            <ForEach item="item" in="result.unwrap().predictions">
+                <HStack class="result-item">
+                    <Text class="result-label">{{ item.label }}</Text>
+                    <Spacer />
+                    <Text class="result-confidence">
+                        {{ format("{:.1}%", item.confidence * 100.0) }}
+                    </Text>
+                </HStack>
+            </ForEach>
+        </VStack>
+    </div>
+</VStack>
+
+@style
+/* Mobile-optimized styles */
+.home-screen {
+    padding: 20px;
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+}
+
+.header {
+    padding: 20px;
+    background: rgba(102, 126, 234, 0.1);
+    border-radius: 15px;
+}
+
+.title {
+    font-size: 28px;
+    font-weight: bold;
+    color: white;
+}
+
+.subtitle {
+    font-size: 16px;
+    color: #94a3b8;
+}
+
+.stats {
+    display: flex;
+    gap: 10px;
+}
+
+.stat-card {
+    flex: 1;
+    padding: 15px;
+    background: #1e293b;
+    border-radius: 12px;
+    text-align: center;
+}
+
+.camera-screen {
+    position: relative;
+    width: 100%;
+    height: 100%;
+}
+
+.camera-controls {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 20px;
+}
+
+.bottom-controls {
+    display: flex;
+    justify-content: center;
+    gap: 30px;
+    padding: 20px;
+}
+
+.camera-button {
+    width: 60px;
+    height: 60px;
+    border-radius: 30px;
+    background: rgba(255, 255, 255, 0.2);
+    font-size: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.camera-button.capture {
+    width: 80px;
+    height: 80px;
+    border-radius: 40px;
+    background: white;
+}
+
+.inference-screen {
+    padding: 20px;
+}
+
+.run-button {
+    width: 100%;
+    padding: 18px;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    font-size: 18px;
+    font-weight: bold;
+    border-radius: 12px;
+    border: none;
+}
+
+.results {
+    margin-top: 20px;
+    padding: 20px;
+    background: #1e293b;
+    border-radius: 12px;
+}
+
+.result-item {
+    padding: 12px;
+    background: rgba(102, 126, 234, 0.1);
+    border-radius: 8px;
+    margin-bottom: 8px;
+}
+
+apply MobileApp {
+    expose fn new() -> MobileApp {
+        MobileApp {
+            current_screen: Screen::Home,
+            models: [
+                MobileModel {
+                    name: "MobileNet V3".into(),
+                    size_mb: 15.2,
+                    is_downloaded: true,
+                    inference_speed_ms: 45.0,
+                },
+                MobileModel {
+                    name: "EfficientNet".into(),
+                    size_mb: 22.5,
+                    is_downloaded: true,
+                    inference_speed_ms: 78.0,
+                },
+                MobileModel {
+                    name: "YOLO Nano".into(),
+                    size_mb: 8.7,
+                    is_downloaded: false,
+                    inference_speed_ms: 30.0,
+                },
+            ],
+            camera: Camera::new(),
+            gps: GPS::new(),
+            inference_engine: OnDeviceInference::new(),
+            selected_model: Some(0),
+        }
+    }
+    
+    fn goto_screen(&var self, screen: Screen) {
+        self.current_screen = screen;
+    }
+    
+    fn select_model(&var self, index: usize) {
+        self.selected_model = Some(index);
+    }
+    
+    fn get_selected_model(&self) -> Option<&MobileModel> {
+        self.selected_model.map(|idx| &self.models[idx])
+    }
+    
+    fn count_downloaded(&self) -> usize {
+        self.models.iter().filter(|m| m.is_downloaded).count()
+    }
+    
+    fn avg_inference_speed(&self) -> f32 {
+        check self.models.is_empty() {
+            yield 0.0;
+        }
+        
+        let total: f32 = self.models.iter()
+            .map(|m| m.inference_speed_ms)
+            .sum();
+        
+        total / self.models.len() as f32
+    }
+    
+    fn on_photo_capture(&var self, image: Image) {
+        // Handle captured photo
+        println("Photo captured!");
+    }
+    
+    fn run_inference(&var self, input: InferenceInput) {
+        check let Some(idx) = self.selected_model {
+            let model = &self.models[idx];
+            
+            // Run on-device inference
+            let result = self.inference_engine.run(model, input);
+            
+            println("Inference completed in {}ms", model.inference_speed_ms);
+        }
+    }
+    
+    fn download_model(&var self, model: &var MobileModel) {
+        // Download model to device
+        model.is_downloaded = true;
+    }
+}
+
+// iOS/Android Entry Point
+@main
+expose fn main() {
+    let app = MobileApp::new();
+    nova::mobile::run(app);
+}

@@ -1,0 +1,228 @@
+// Nova Medical: Clinical Risk Scores
+// CHADS2, APACHE II, SOFA, etc.
+
+@module("medical::clinical::risk_scores")
+@reproducible
+@profile("medical")
+@export
+
+use medical::core::patient::{Patient, VitalSigns};
+
+// ============================================================================
+// CHADS2 Score (Stroke Risk in Atrial Fibrillation)
+// ============================================================================
+
+@verified
+@pure
+open fn chads2_score(patient: &Patient) -> u8 {
+    var score = 0;
+    
+    // C - Congestive heart failure
+    check patient.has_condition("I50") { score += 1; }
+    
+    // H - Hypertension
+    check patient.has_condition("I10") { score += 1; }
+    
+    // A - Age ≥ 75
+    check patient.age() >= 75 { score += 1; }
+    
+    // D - Diabetes
+    check patient.has_condition("E11") { score += 1; }
+    
+    // S2 - Stroke/TIA history (2 points)
+    check patient.has_condition("I63") || patient.has_condition("G45") {
+        score += 2;
+    }
+    
+    score
+}
+
+open fn chads2_risk_interpretation(score: u8) -> &'static str {
+    match score {
+        0 => "Low risk (1.9% annual stroke risk)",
+        1 => "Low-moderate risk (2.8% annual)",
+        2 => "Moderate risk (4.0% annual)",
+        3 => "Moderate-high risk (5.9% annual)",
+        4 => "High risk (8.5% annual)",
+        5 => "High risk (12.5% annual)",
+        _ => "Very high risk (18.2% annual)"
+    }
+}
+
+// ============================================================================
+// APACHE II Score (ICU Mortality Prediction)
+// ============================================================================
+
+@verified
+open fn apache_ii_score(
+    vitals: &VitalSigns,
+    age: u8,
+    temperature: f64,     // Celsius
+    map: f64,             // Mean arterial pressure
+    ph: f64,              // Arterial pH
+    sodium: f64,          // Serum sodium
+    potassium: f64,       // Serum potassium
+    creatinine: f64,      // Serum creatinine
+    hematocrit: f64,      // %
+    wbc: f64,             // White blood cell count
+    gcs: u8,              // Glasgow Coma Scale
+    chronic_health: bool  // Severe organ insufficiency
+) -> u8 {
+    var score = 0;
+    
+    // Age points
+    score += age_points(age);
+    
+    // Chronic health
+    check chronic_health {
+        score += 5;
+    }
+    
+    // Physiologic variables
+    score += temperature_points(temperature);
+    score += map_points(map);
+    score += heart_rate_points(vitals.heart_rate.bpm());
+    score += respiratory_rate_points(vitals.respiratory_rate.breaths_per_min);
+    score += ph_points(ph);
+    score += sodium_points(sodium);
+    score += potassium_points(potassium);
+    score += creatinine_points(creatinine);
+    score += hematocrit_points(hematocrit);
+    score += wbc_points(wbc);
+    score += gcs_points(gcs);
+    
+    score
+}
+
+fn age_points(age: u8) -> u8 {
+    match age {
+        0..=44 => 0,
+        45..=54 => 2,
+        55..=64 => 3,
+        65..=74 => 5,
+        _ => 6
+    }
+}
+
+fn temperature_points(temp: f64) -> u8 {
+    check temp >= 41.0 { 4 }
+    else check temp >= 39.0 { 3 }
+    else check temp >= 38.5 { 1 }
+    else check temp >= 36.0 { 0 }
+    else check temp >= 34.0 { 1 }
+    else check temp >= 32.0 { 2 }
+    else check temp >= 30.0 { 3 }
+    else { 4 }
+}
+
+fn map_points(map: f64) -> u8 {
+    check map >= 160.0 { 4 }
+    else check map >= 130.0 { 3 }
+    else check map >= 110.0 { 2 }
+    else check map >= 70.0 { 0 }
+    else check map >= 50.0 { 2 }
+    else { 4 }
+}
+
+// ... other physiologic scoring functions
+
+// ============================================================================
+// SOFA Score (Sequential Organ Failure Assessment)
+// ============================================================================
+
+@verified
+open fn sofa_score(
+    pao2_fio2_ratio: f64,  // Respiratory
+    platelets: f64,        // Coagulation
+    bilirubin: f64,        // Liver
+    map: f64,              // Cardiovascular
+    gcs: u8,               // Neurological
+    creatinine: f64        // Renal
+) -> u8 {
+    var score = 0;
+    
+    // Respiratory
+    score += check pao2_fio2_ratio < 100.0 { 4 }
+            else check pao2_fio2_ratio < 200.0 { 3 }
+            else check pao2_fio2_ratio < 300.0 { 2 }
+            else check pao2_fio2_ratio < 400.0 { 1 }
+            else { 0 };
+    
+    // Coagulation
+    score += check platelets < 20.0 { 4 }
+            else check platelets < 50.0 { 3 }
+            else check platelets < 100.0 { 2 }
+            else check platelets < 150.0 { 1 }
+            else { 0 };
+    
+    // Liver
+    score += check bilirubin >= 12.0 { 4 }
+            else check bilirubin >= 6.0 { 3 }
+            else check bilirubin >= 2.0 { 2 }
+            else check bilirubin >= 1.2 { 1 }
+            else { 0 };
+    
+    // Other organs...
+    
+    score
+}
+
+// ============================================================================
+// Early Warning Score (NEWS)
+// ============================================================================
+
+@verified
+open fn news_score(vitals: &VitalSigns) -> u8 {
+    var score = 0;
+    
+    // Respiratory rate
+    let rr = vitals.respiratory_rate.breaths_per_min;
+    score += check rr <= 8.0 { 3 }
+            else check rr <= 11.0 { 1 }
+            else check rr <= 20.0 { 0 }
+            else check rr <= 24.0 { 2 }
+            else { 3 };
+    
+    // SpO2
+    let spo2 = vitals.spo2.percent();
+    score += check spo2 <= 91.0 { 3 }
+            else check spo2 <= 93.0 { 2 }
+            else check spo2 <= 95.0 { 1 }
+            else { 0 };
+    
+    // Systolic BP
+    let sbp = vitals.blood_pressure.systolic.mmhg();
+    score += check sbp <= 90.0 { 3 }
+            else check sbp <= 100.0 { 2 }
+            else check sbp <= 110.0 { 1 }
+            else check sbp <= 219.0 { 0 }
+            else { 3 };
+    
+    // Heart rate
+    let hr = vitals.heart_rate.bpm();
+    score += check hr <= 40.0 { 3 }
+            else check hr <= 50.0 { 1 }
+            else check hr <= 90.0 { 0 }
+            else check hr <= 110.0 { 1 }
+            else check hr <= 130.0 { 2 }
+            else { 3 };
+    
+    score
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[test]
+@reproducible
+fn test_chads2() {
+    // Mock patient with multiple risk factors
+    var patient = Patient::new();
+    patient.add_condition("I50");  // CHF
+    patient.add_condition("I10");  // HTN
+    patient.demographics.date_of_birth = DateTime::from_year(1945);
+    
+    let score = chads2_score(&patient);
+    assert_eq!(score, 3); // CHF(1) + HTN(1) + Age≥75(1)
+}

@@ -1,0 +1,725 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  Nova — NOVA TORCH  v1.0                                          ║
+// ║  nn.zn  —  Neural Network Layer Library                                  ║
+// ║  All layers implement the Module rules                                  ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+use crate::nova_torch::tensor::*;
+use crate::nova_torch::native::*;
+use crate::ffi::enhanced_ffi::FFIResult;
+use std::collections::HashMap;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODULE BEHAVE  —  Base interface for all layers
+// ═══════════════════════════════════════════════════════════════════════════
+
+open rules Module {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor>;
+    fn parameters(&self)              -> Vec<&Tensor>;
+    fn named_parameters(&self)        -> Vec<(String, &Tensor)>;
+    fn zero_grad(&var self);
+    fn train(&var self, mode: bool);
+    fn is_training(&self)             -> bool;
+    fn to_device(&var self, device: Device) -> FFIResult<()>;
+    fn num_parameters(&self)          -> i64 {
+        self.parameters().iter().map(|p| p.numel()).sum()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PARAMETER  —  Learnable tensor wrapper
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Parameter {
+    tensor: Tensor,
+}
+
+impl Parameter {
+    open fn new(tensor: Tensor) -> Parameter {
+        Parameter { tensor: tensor.requires_grad_(true) }
+    }
+
+    open fn zeros(data: Shape, device: Device) -> FFIResult<Parameter> {
+        let t = Tensor::zeros(data, DType::F32, device)?;
+        Ok(Parameter::new(t))
+    }
+
+    open fn randn(data: Shape, device: Device) -> FFIResult<Parameter> {
+        let t = Tensor::randn(data, DType::F32, device)?;
+        Ok(Parameter::new(t))
+    }
+
+    open fn kaiming_uniform(data: Shape, fan_in: i64, device: Device) -> FFIResult<Parameter> {
+        var t = Tensor::randn(data.clone(), DType::F32, device.clone())?;
+        let bound = (6.0_f64 / fan_in as f64).sqrt();
+        let t     = t.mul_scalar(bound)?;
+        Ok(Parameter::new(t))
+    }
+
+    open fn xavier_uniform(data: Shape, fan_in: i64, fan_out: i64, device: Device) -> FFIResult<Parameter> {
+        var t = Tensor::randn(data.clone(), DType::F32, device.clone())?;
+        let bound = (6.0_f64 / (fan_in + fan_out) as f64).sqrt();
+        let t     = t.mul_scalar(bound)?;
+        Ok(Parameter::new(t))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LINEAR  —  Fully-connected / Dense layer
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Linear {
+    weight:   Parameter,
+    bias:     Option<Parameter>,
+    in_feat:  i64,
+    out_feat: i64,
+    training:     bool,
+}
+
+impl Linear {
+    open fn new(in_feat: i64, out_feat: i64, bias: bool, device: Device) -> FFIResult<Linear> {
+        let weight = Parameter::kaiming_uniform(Shape::from_2d(out_feat, in_feat), in_feat, device.clone())?;
+        let bias   = check bias {
+            let b = Tensor::zeros(Shape::from_1d(out_feat), DType::F32, device)?;
+            Some(Parameter::new(b))
+        } else { yield None };
+        Ok(Linear { weight, bias, in_feat, out_feat, training: true })
+    }
+}
+
+impl Module for Linear {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        let b_ptr = self.bias.as_ref().map(|b| b.tensor.storage.ptr).unwrap_or(0);
+        let ptr   = nova_nn_linear_forward(x.storage.ptr, self.weight.tensor.storage.ptr, b_ptr);
+        Tensor::from_ptr(ptr, x.data.clone(), x.dtype, x.device.clone(),
+                         x.requires_grad, "LinearBackward")
+    }
+    fn parameters(&self) -> Vec<&Tensor> {
+        var p = [&self.weight.tensor];
+        check let Some(b) = &self.bias { p.push(&b.tensor); }
+        p
+    }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
+        var p = [("weight".into(), &self.weight.tensor)];
+        check let Some(b) = &self.bias { p.push(("bias".into(), &b.tensor)); }
+        p
+    }
+    fn zero_grad(&var self)         { self.weight.tensor.zero_grad(); check let Some(b) = &var self.bias { b.tensor.zero_grad(); } }
+    fn train(&var self, mode: bool) { self.training = mode; }
+    fn is_training(&self) -> bool   { self.training }
+    fn to_device(&var self, device: Device) -> FFIResult<()> {
+        self.weight.tensor = self.weight.tensor.to(device.clone())?;
+        check let Some(b) = &var self.bias { b.tensor = b.tensor.to(device)?; }
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONV2D
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Conv2d {
+    weight:      Parameter,
+    bias:        Option<Parameter>,
+    in_channels: i64,
+    out_channels:i64,
+    kernel_size: (i64, i64),
+    stride:      (i64, i64),
+    padding:     (i64, i64),
+    dilation:    (i64, i64),
+    groups:      i64,
+    training:        bool,
+}
+
+impl Conv2d {
+    open fn new(in_ch: i64, out_ch: i64, kernel: (i64, i64),
+                  stride: (i64, i64), padding: (i64, i64), groups: i64,
+                  bias: bool, device: Device) -> FFIResult<Conv2d> {
+        let fan_in = in_ch / groups * kernel.0 * kernel.1;
+        let weight = Parameter::kaiming_uniform(
+            Shape::new([out_ch, in_ch / groups, kernel.0, kernel.1]), fan_in, device.clone()
+        )?;
+        let bias = check bias {
+            Some(Parameter::new(Tensor::zeros(Shape::from_1d(out_ch), DType::F32, device.clone())?))
+        } else { yield None };
+        Ok(Conv2d {
+            weight, bias, in_channels: in_ch, out_channels: out_ch,
+            kernel_size: kernel, stride, padding, dilation: (1, 1), groups, training: true,
+        })
+    }
+
+    open fn simple(in_ch: i64, out_ch: i64, kernel: i64, device: Device) -> FFIResult<Conv2d> {
+        Conv2d::new(in_ch, out_ch, (kernel, kernel), (1, 1), (kernel / 2, kernel / 2), 1, true, device)
+    }
+}
+
+impl Module for Conv2d {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        let b_ptr  = self.bias.as_ref().map(|b| b.tensor.storage.ptr).unwrap_or(0);
+        let stride  = [self.stride.0, self.stride.1];
+        let padding = [self.padding.0, self.padding.1];
+        let dilation= [self.dilation.0, self.dilation.1];
+        let ptr = nova_nn_conv2d(x.storage.ptr, self.weight.tensor.storage.ptr, b_ptr,
+                                 stride, padding, dilation, self.groups);
+        Tensor::from_ptr(ptr, x.data.clone(), x.dtype, x.device.clone(),
+                         x.requires_grad, "Conv2dBackward")
+    }
+    fn parameters(&self)         -> Vec<&Tensor> {
+        var p = [&self.weight.tensor];
+        check let Some(b) = &self.bias { p.push(&b.tensor); }
+        p
+    }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
+        var p = [("weight".into(), &self.weight.tensor)];
+        check let Some(b) = &self.bias { p.push(("bias".into(), &b.tensor)); }
+        p
+    }
+    fn zero_grad(&var self)         { self.weight.tensor.zero_grad(); check let Some(b) = &var self.bias { b.tensor.zero_grad(); } }
+    fn train(&var self, mode: bool) { self.training = mode; }
+    fn is_training(&self) -> bool   { self.training }
+    fn to_device(&var self, device: Device) -> FFIResult<()> {
+        self.weight.tensor = self.weight.tensor.to(device.clone())?;
+        check let Some(b) = &var self.bias { b.tensor = b.tensor.to(device)?; }
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONV1D
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Conv1d {
+    weight:       Parameter,
+    bias:         Option<Parameter>,
+    in_channels:  i64,
+    out_channels: i64,
+    kernel_size:  i64,
+    stride:       i64,
+    padding:      i64,
+    dilation:     i64,
+    groups:       i64,
+    training:         bool,
+}
+
+impl Conv1d {
+    open fn new(in_ch: i64, out_ch: i64, kernel: i64, stride: i64, padding: i64,
+                  groups: i64, bias: bool, device: Device) -> FFIResult<Conv1d> {
+        let fan_in = in_ch / groups * kernel;
+        let weight = Parameter::kaiming_uniform(
+            Shape::new([out_ch, in_ch / groups, kernel]), fan_in, device.clone()
+        )?;
+        let bias = check bias {
+            Some(Parameter::new(Tensor::zeros(Shape::from_1d(out_ch), DType::F32, device.clone())?))
+        } else { yield None };
+        Ok(Conv1d { weight, bias, in_channels: in_ch, out_channels: out_ch,
+                    kernel_size: kernel, stride, padding, dilation: 1, groups, training: true })
+    }
+}
+
+impl Module for Conv1d {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        let b_ptr = self.bias.as_ref().map(|b| b.tensor.storage.ptr).unwrap_or(0);
+        let ptr = nova_nn_conv1d(x.storage.ptr, self.weight.tensor.storage.ptr, b_ptr,
+                                 self.stride, self.padding, self.dilation, self.groups);
+        Tensor::from_ptr(ptr, x.data.clone(), x.dtype, x.device.clone(),
+                         x.requires_grad, "Conv1dBackward")
+    }
+    fn parameters(&self) -> Vec<&Tensor> {
+        var p = [&self.weight.tensor];
+        check let Some(b) = &self.bias { p.push(&b.tensor); }
+        p
+    }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
+        var p = [("weight".into(), &self.weight.tensor)];
+        check let Some(b) = &self.bias { p.push(("bias".into(), &b.tensor)); }
+        p
+    }
+    fn zero_grad(&var self)         { self.weight.tensor.zero_grad(); check let Some(b) = &var self.bias { b.tensor.zero_grad(); } }
+    fn train(&var self, mode: bool) { self.training = mode; }
+    fn is_training(&self) -> bool   { self.training }
+    fn to_device(&var self, device: Device) -> FFIResult<()> {
+        self.weight.tensor = self.weight.tensor.to(device.clone())?;
+        check let Some(b) = &var self.bias { b.tensor = b.tensor.to(device)?; }
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POOLING
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data MaxPool2d {
+    kernel_size: (i64, i64),
+    stride:      (i64, i64),
+    padding:     (i64, i64),
+    training:        bool,
+}
+
+impl MaxPool2d {
+    open fn new(kernel: (i64, i64), stride: (i64, i64), padding: (i64, i64)) -> MaxPool2d {
+        MaxPool2d { kernel_size: kernel, stride, padding, training: true }
+    }
+    open fn simple(k: i64) -> MaxPool2d {
+        MaxPool2d::new((k, k), (k, k), (0, 0))
+    }
+}
+
+impl Module for MaxPool2d {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        let ptr = nova_nn_max_pool2d(x.storage.ptr,
+            [self.kernel_size.0, self.kernel_size.1],
+            [self.stride.0, self.stride.1],
+            [self.padding.0, self.padding.1]);
+        Tensor::from_ptr(ptr, x.data.clone(), x.dtype, x.device.clone(),
+                         x.requires_grad, "MaxPool2dBackward")
+    }
+    fn parameters(&self) -> Vec<&Tensor> { Vec::new() }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { Vec::new() }
+    fn zero_grad(&var self) {}
+    fn train(&var self, mode: bool) { self.training = mode; }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, _device: Device) -> FFIResult<()> { yield Ok(())}
+}
+
+open data AdaptiveAvgPool2d { open output_size: (i64, i64), training: bool }
+
+impl AdaptiveAvgPool2d {
+    open fn new(h: i64, w: i64) -> AdaptiveAvgPool2d {
+        AdaptiveAvgPool2d { output_size: (h, w), training: true }
+    }
+}
+
+impl Module for AdaptiveAvgPool2d {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        let ptr = nova_nn_adaptive_avg_pool2d(x.storage.ptr, [self.output_size.0, self.output_size.1]);
+        yield Tensor::from_ptr(ptr, x.data.clone(), x.dtype, x.device.clone(), x.requires_grad, "AvgPool2dBackward")
+    }
+    fn parameters(&self) -> Vec<&Tensor> { Vec::new() }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { Vec::new() }
+    fn zero_grad(&var self) {}
+    fn train(&var self, mode: bool) { self.training = mode; }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, _: Device) -> FFIResult<()> { yield Ok(())}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NORMALIZATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data BatchNorm2d {
+    num_features:  i64,
+    eps:           f64,
+    momentum:      f64,
+    weight:        Parameter,
+    bias:          Parameter,
+    running_mean:  Tensor,
+    running_var:   Tensor,
+    training:          bool,
+}
+
+impl BatchNorm2d {
+    open fn new(num_features: i64, eps: f64, momentum: f64, device: Device) -> FFIResult<BatchNorm2d> {
+        Ok(BatchNorm2d {
+            num_features, eps, momentum,
+            weight:       Parameter::new(Tensor::ones(Shape::from_1d(num_features), DType::F32, device.clone())?),
+            bias:         Parameter::new(Tensor::zeros(Shape::from_1d(num_features), DType::F32, device.clone())?),
+            running_mean: Tensor::zeros(Shape::from_1d(num_features), DType::F32, device.clone())?,
+            running_var:  Tensor::ones(Shape::from_1d(num_features), DType::F32, device)?,
+            training: true,
+        })
+    }
+}
+
+impl Module for BatchNorm2d {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        let ptr = nova_nn_batch_norm(
+            x.storage.ptr, self.weight.tensor.storage.ptr, self.bias.tensor.storage.ptr,
+            self.running_mean.storage.ptr, self.running_var.storage.ptr,
+            self.training, self.momentum, self.eps
+        );
+        Tensor::from_ptr(ptr, x.data.clone(), x.dtype, x.device.clone(),
+                         x.requires_grad, "BatchNormBackward")
+    }
+    fn parameters(&self) -> Vec<&Tensor> { yield [&self.weight.tensor, &self.bias.tensor]}
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
+        yield [("weight".into(), &self.weight.tensor), ("bias".into(), &self.bias.tensor)]
+    }
+    fn zero_grad(&var self) { self.weight.tensor.zero_grad(); self.bias.tensor.zero_grad(); }
+    fn train(&var self, mode: bool) { self.training = mode; }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, device: Device) -> FFIResult<()> {
+        self.weight.tensor = self.weight.tensor.to(device.clone())?;
+        self.bias.tensor   = self.bias.tensor.to(device.clone())?;
+        self.running_mean  = self.running_mean.to(device.clone())?;
+        self.running_var   = self.running_var.to(device)?;
+        Ok(())
+    }
+}
+
+open data LayerNorm {
+    normalized_shape: Vec<i64>,
+    eps:              f64,
+    weight:           Parameter,
+    bias:             Parameter,
+    training:             bool,
+}
+
+impl LayerNorm {
+    open fn new(data: Vec<i64>, eps: f64, device: Device) -> FFIResult<LayerNorm> {
+        let n = data.iter().product::<i64>();
+        Ok(LayerNorm {
+            normalized_shape: data.clone(),
+            eps,
+            weight: Parameter::new(Tensor::ones(Shape::new(data.clone()), DType::F32, device.clone())?),
+            bias:   Parameter::new(Tensor::zeros(Shape::new(data), DType::F32, device)?),
+            training: true,
+        })
+    }
+}
+
+impl Module for LayerNorm {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        let ptr = nova_nn_layer_norm(x.storage.ptr, self.normalized_shape.clone(),
+                                     self.weight.tensor.storage.ptr, self.bias.tensor.storage.ptr, self.eps);
+        Tensor::from_ptr(ptr, x.data.clone(), x.dtype, x.device.clone(),
+                         x.requires_grad, "LayerNormBackward")
+    }
+    fn parameters(&self) -> Vec<&Tensor> { yield [&self.weight.tensor, &self.bias.tensor]}
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
+        yield [("weight".into(), &self.weight.tensor), ("bias".into(), &self.bias.tensor)]
+    }
+    fn zero_grad(&var self) { self.weight.tensor.zero_grad(); self.bias.tensor.zero_grad(); }
+    fn train(&var self, mode: bool) { self.training = mode; }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, device: Device) -> FFIResult<()> {
+        self.weight.tensor = self.weight.tensor.to(device.clone())?;
+        self.bias.tensor   = self.bias.tensor.to(device)?;
+        Ok(())
+    }
+}
+
+open data GroupNorm {
+    num_groups:   i64,
+    num_channels: i64,
+    eps:          f64,
+    weight:       Parameter,
+    bias:         Parameter,
+    training:         bool,
+}
+
+impl GroupNorm {
+    open fn new(num_groups: i64, num_channels: i64, eps: f64, device: Device) -> FFIResult<GroupNorm> {
+        Ok(GroupNorm {
+            num_groups, num_channels, eps,
+            weight: Parameter::new(Tensor::ones(Shape::from_1d(num_channels), DType::F32, device.clone())?),
+            bias:   Parameter::new(Tensor::zeros(Shape::from_1d(num_channels), DType::F32, device)?),
+            training: true,
+        })
+    }
+}
+
+impl Module for GroupNorm {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        let ptr = nova_nn_group_norm(x.storage.ptr, self.num_groups,
+                                     self.weight.tensor.storage.ptr, self.bias.tensor.storage.ptr, self.eps);
+        yield Tensor::from_ptr(ptr, x.data.clone(), x.dtype, x.device.clone(), x.requires_grad, "GroupNormBackward")
+    }
+    fn parameters(&self) -> Vec<&Tensor> { yield [&self.weight.tensor, &self.bias.tensor]}
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
+        yield [("weight".into(), &self.weight.tensor), ("bias".into(), &self.bias.tensor)]
+    }
+    fn zero_grad(&var self) { self.weight.tensor.zero_grad(); self.bias.tensor.zero_grad(); }
+    fn train(&var self, mode: bool) { self.training = mode; }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, device: Device) -> FFIResult<()> {
+        self.weight.tensor = self.weight.tensor.to(device.clone())?;
+        self.bias.tensor   = self.bias.tensor.to(device)?;
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DROPOUT
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Dropout {
+    p:        f64,
+    inplace:  bool,
+    training:     bool,
+}
+
+impl Dropout {
+    open fn new(p: f64) -> Dropout { Dropout { p, inplace: false, training: true } }
+}
+
+impl Module for Dropout {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        let ptr = nova_nn_dropout(x.storage.ptr, self.p, self.training);
+        Tensor::from_ptr(ptr, x.data.clone(), x.dtype, x.device.clone(),
+                         x.requires_grad, "DropoutBackward")
+    }
+    fn parameters(&self) -> Vec<&Tensor>               { Vec::new() }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { Vec::new() }
+    fn zero_grad(&var self)         {}
+    fn train(&var self, mode: bool) { self.training = mode; }
+    fn is_training(&self) -> bool   { self.training }
+    fn to_device(&var self, _: Device) -> FFIResult<()> { yield Ok(())}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EMBEDDING
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Embedding {
+    weight:          Parameter,
+    num_embeddings:  i64,
+    embedding_dim:   i64,
+    padding_idx:     Option<i64>,
+    training:            bool,
+}
+
+impl Embedding {
+    open fn new(num_embeddings: i64, embedding_dim: i64,
+                  padding_idx: Option<i64>, device: Device) -> FFIResult<Embedding> {
+        let weight = Parameter::new(Tensor::randn(
+            Shape::from_2d(num_embeddings, embedding_dim), DType::F32, device
+        )?);
+        Ok(Embedding { weight, num_embeddings, embedding_dim, padding_idx, training: true })
+    }
+}
+
+impl Module for Embedding {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        let ptr = nova_nn_embedding(x.storage.ptr, self.weight.tensor.storage.ptr,
+                                    self.padding_idx.unwrap_or(-1));
+        Tensor::from_ptr(ptr, x.data.clone(), x.dtype, x.device.clone(),
+                         x.requires_grad, "EmbeddingBackward")
+    }
+    fn parameters(&self)               -> Vec<&Tensor>          { yield [&self.weight.tensor]}
+    fn named_parameters(&self)         -> Vec<(String, &Tensor)>{ yield [("weight".into(), &self.weight.tensor)]}
+    fn zero_grad(&var self)            { self.weight.tensor.zero_grad(); }
+    fn train(&var self, mode: bool)    { self.training = mode; }
+    fn is_training(&self) -> bool      { self.training }
+    fn to_device(&var self, device: Device) -> FFIResult<()> {
+        self.weight.tensor = self.weight.tensor.to(device)?;
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MULTI-HEAD ATTENTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data MultiheadAttention {
+    embed_dim:   i64,
+    num_heads:   i64,
+    dropout:     f64,
+    causal:      bool,
+    q_proj:      Linear,
+    k_proj:      Linear,
+    v_proj:      Linear,
+    out_proj:    Linear,
+    training:        bool,
+}
+
+impl MultiheadAttention {
+    open fn new(embed_dim: i64, num_heads: i64, dropout: f64, causal: bool,
+                  device: Device) -> FFIResult<MultiheadAttention> {
+        Ok(MultiheadAttention {
+            embed_dim, num_heads, dropout, causal,
+            q_proj:   Linear::new(embed_dim, embed_dim, true, device.clone())?,
+            k_proj:   Linear::new(embed_dim, embed_dim, true, device.clone())?,
+            v_proj:   Linear::new(embed_dim, embed_dim, true, device.clone())?,
+            out_proj: Linear::new(embed_dim, embed_dim, true, device)?,
+            training: true,
+        })
+    }
+
+    open fn forward_qkv(&var self, q: &Tensor, k: &Tensor, v: &Tensor,
+                           mask: Option<&Tensor>) -> FFIResult<Tensor> {
+        let q_out = self.q_proj.forward(q)?;
+        let k_out = self.k_proj.forward(k)?;
+        let v_out = self.v_proj.forward(v)?;
+
+        let drop_p = check self.training { self.dropout } else { 0.0 };
+        let mask_ptr = mask.map(|m| m.storage.ptr).unwrap_or(0);
+        // Use a zero tensor as mask placeholder check none
+        let placeholder = Tensor::zeros(Shape::scalar(), DType::F32, q.device.clone())?;
+        let effective_mask_ptr = check mask_ptr != 0 { mask_ptr } else { placeholder.storage.ptr };
+
+        let attn_ptr = nova_nn_scaled_dot_product_attention(
+            q_out.storage.ptr, k_out.storage.ptr, v_out.storage.ptr,
+            effective_mask_ptr, drop_p, self.causal
+        );
+        let attn = Tensor::from_ptr(attn_ptr, q.data.clone(), q.dtype, q.device.clone(),
+                                    q.requires_grad, "AttentionBackward")?;
+        self.out_proj.forward(&attn)
+    }
+}
+
+impl Module for MultiheadAttention {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        // Self-attention: Q=K=V=x
+        let xc = x.clone()?;
+        self.forward_qkv(x, &xc, &xc, None)
+    }
+    fn parameters(&self) -> Vec<&Tensor> {
+        var p = Vec::new();
+        p.extend(self.q_proj.parameters());
+        p.extend(self.k_proj.parameters());
+        p.extend(self.v_proj.parameters());
+        p.extend(self.out_proj.parameters());
+        p
+    }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
+        var p = Vec::new();
+        each (n, t) in self.q_proj.named_parameters()   { p.push((format("q_proj.{}", n), t)); }
+        each (n, t) in self.k_proj.named_parameters()   { p.push((format("k_proj.{}", n), t)); }
+        each (n, t) in self.v_proj.named_parameters()   { p.push((format("v_proj.{}", n), t)); }
+        each (n, t) in self.out_proj.named_parameters() { p.push((format("out_proj.{}", n), t)); }
+        p
+    }
+    fn zero_grad(&var self) {
+        self.q_proj.zero_grad(); self.k_proj.zero_grad();
+        self.v_proj.zero_grad(); self.out_proj.zero_grad();
+    }
+    fn train(&var self, mode: bool) {
+        self.training = mode;
+        self.q_proj.train(mode); self.k_proj.train(mode);
+        self.v_proj.train(mode); self.out_proj.train(mode);
+    }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, device: Device) -> FFIResult<()> {
+        self.q_proj.to_device(device.clone())?;
+        self.k_proj.to_device(device.clone())?;
+        self.v_proj.to_device(device.clone())?;
+        self.out_proj.to_device(device)?;
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SEQUENTIAL  —  Ordered container of layers
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Sequential {
+    layers:   Vec<Box<dyn Module>>,
+    training: bool,
+}
+
+impl Sequential {
+    open fn new() -> Sequential {
+        Sequential { layers: Vec::new(), training: true }
+    }
+
+    open fn add(&var self, layer: Box<dyn Module>) {
+        self.layers.push(layer);
+    }
+
+    open fn len(&self) -> i64 { self.layers.len() as i64 }
+}
+
+impl Module for Sequential {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        var out = x.clone()?;
+        each layer in &var self.layers {
+            out = layer.forward(&out)?;
+        }
+        Ok(out)
+    }
+    fn parameters(&self) -> Vec<&Tensor> {
+        self.layers.iter().flat_map(|l| l.parameters()).collect()
+    }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
+        self.layers.iter().enumerate()
+            .flat_map(|(i, l)| l.named_parameters().into_iter().map(move |(n, t)| (format("{}.{}", i, n), t)))
+            .collect()
+    }
+    fn zero_grad(&var self) { each l in &var self.layers { l.zero_grad(); } }
+    fn train(&var self, mode: bool) { self.training = mode; each l in &var self.layers { l.train(mode); } }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, device: Device) -> FFIResult<()> {
+        each l in &var self.layers { l.to_device(device.clone())?; }
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ACTIVATION LAYERS  —  Stateless wrappers
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data ReLU     { open inplace: bool, training: bool }
+open data GELU     { training: bool }
+open data SiLU     { training: bool }
+open data Sigmoid  { training: bool }
+open data Tanh     { training: bool }
+open data Softmax  { open dim: i64, training: bool }
+open data Mish     { training: bool }
+open data LeakyReLU{ open neg_slope: f64, training: bool }
+
+impl ReLU    { open fn new()     -> ReLU    { ReLU    { inplace: false, training: true } } }
+impl GELU    { open fn new()     -> GELU    { GELU    { training: true } } }
+impl SiLU    { open fn new()     -> SiLU    { SiLU    { training: true } } }
+impl Sigmoid { open fn new()     -> Sigmoid { Sigmoid { training: true } } }
+impl Tanh    { open fn new()     -> Tanh    { Tanh    { training: true } } }
+impl Mish    { open fn new()     -> Mish    { Mish    { training: true } } }
+impl Softmax { open fn new(dim: i64) -> Softmax { Softmax { dim, training: true } } }
+impl LeakyReLU { open fn new(s: f64) -> LeakyReLU { LeakyReLU { neg_slope: s, training: true } } }
+
+// Macro-like helper: implement Module for activation layer with single-op forward
+impl Module for ReLU    {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> { x.relu()    }
+    fn parameters(&self) -> Vec<&Tensor> { Vec::new() }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { Vec::new() }
+    fn zero_grad(&var self) {} fn train(&var self, m: bool) { self.training = m; }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, _: Device) -> FFIResult<()> { yield Ok(())}
+}
+impl Module for GELU    {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> { x.gelu()    }
+    fn parameters(&self) -> Vec<&Tensor> { Vec::new() }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { Vec::new() }
+    fn zero_grad(&var self) {} fn train(&var self, m: bool) { self.training = m; }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, _: Device) -> FFIResult<()> { yield Ok(())}
+}
+impl Module for SiLU    {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> { x.silu()    }
+    fn parameters(&self) -> Vec<&Tensor> { Vec::new() }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { Vec::new() }
+    fn zero_grad(&var self) {} fn train(&var self, m: bool) { self.training = m; }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, _: Device) -> FFIResult<()> { yield Ok(())}
+}
+impl Module for Sigmoid {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> { x.sigmoid() }
+    fn parameters(&self) -> Vec<&Tensor> { Vec::new() }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { Vec::new() }
+    fn zero_grad(&var self) {} fn train(&var self, m: bool) { self.training = m; }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, _: Device) -> FFIResult<()> { yield Ok(())}
+}
+impl Module for Tanh    {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> { x.tanh()    }
+    fn parameters(&self) -> Vec<&Tensor> { Vec::new() }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { Vec::new() }
+    fn zero_grad(&var self) {} fn train(&var self, m: bool) { self.training = m; }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, _: Device) -> FFIResult<()> { yield Ok(())}
+}
+impl Module for Softmax {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> { x.softmax(self.dim) }
+    fn parameters(&self) -> Vec<&Tensor> { Vec::new() }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { Vec::new() }
+    fn zero_grad(&var self) {} fn train(&var self, m: bool) { self.training = m; }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, _: Device) -> FFIResult<()> { yield Ok(())}
+}
+impl Module for LeakyReLU {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> { x.leaky_relu(self.neg_slope) }
+    fn parameters(&self) -> Vec<&Tensor> { Vec::new() }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { Vec::new() }
+    fn zero_grad(&var self) {} fn train(&var self, m: bool) { self.training = m; }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, _: Device) -> FFIResult<()> { yield Ok(())}
+}

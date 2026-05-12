@@ -1,0 +1,106 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                    A4: AUTO-PARALLELIZER                                     ║
+// ║                                                                               ║
+// ║  Automatic loop parallelization, SIMD vectorization, data race detection    ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use compiler::ast::{ForLoop, Expression, Statement}
+use compiler::analysis::{DependencyAnalyzer, DataRaceDetector}
+use stdlib::parallel::{ThreadPool, parallel_for, simd}
+
+open data AutoParallelizer {
+    dependency_analyzer: DependencyAnalyzer,
+    race_detector: DataRaceDetector,
+    thread_pool: ThreadPool,
+    enable_simd: bool
+}
+
+impl AutoParallelizer {
+    fn new() -> AutoParallelizer {
+        AutoParallelizer {
+            dependency_analyzer: DependencyAnalyzer::new(),
+            race_detector: DataRaceDetector::new(),
+            thread_pool: ThreadPool::new(num_cpus()),
+            enable_simd: true
+        }
+    }
+    
+    @compile_time
+    fn optimize(self, ast: TypedAST) -> Result<TypedAST> {
+        var optimized = ast
+        
+        each loop_ in optimized.find_all_loops() {
+            check self.can_parallelize(loop_) {
+                optimized = self.parallelize_loop(optimized, loop_)
+            }
+            
+            check self.can_vectorize(loop_) {
+                optimized = self.vectorize_loop(optimized, loop_)
+            }
+        }
+        
+        Ok(optimized)
+    }
+    
+    fn can_parallelize(self, loop_: ForLoop) -> bool {
+        // Check for loop-carried dependencies
+        let deps = self.dependency_analyzer.analyze(loop_)
+        
+        check deps.has_loop_carried_dependency() {
+            yield false  // Can't parallelize
+        }
+        
+        // Check for data races
+        check self.race_detector.has_race(loop_) {
+            yield false
+        }
+        
+        yield true
+    }
+    
+    @compile_time
+    fn parallelize_loop(self, ast: TypedAST, loop_: ForLoop) -> TypedAST {
+        // Transform: each i in range → parallel_for i in range
+        yield ast.replace_loop(loop_, ParallelForLoop {
+            variable: loop_.variable,
+            range: loop_.range,
+            body: loop_.body,
+            chunk_size: self.calculate_chunk_size(loop_)
+        })
+    }
+    
+    fn can_vectorize(self, loop_: ForLoop) -> bool {
+        check !self.enable_simd {
+            yield false
+        }
+        
+        // Check check loop body can be vectorized
+        yield self.is_vectorizable(loop_.body)
+    }
+    
+    @compile_time
+    fn vectorize_loop(self, ast: TypedAST, loop_: ForLoop) -> TypedAST {
+        // Add SIMD annotations
+        yield ast.add_simd_hints(loop_)
+    }
+}
+
+fn example_auto_parallel():
+    // Example 1: Auto-parallelized
+    let data = [1, 2, 3, 4, 5, 6, 7, 8]
+    let results = []
+    
+    each x in data:
+        results.push(expensive_compute(x))
+    // ✅ Compiler automatically parallelizes - no dependencies!
+    
+    // Example 2: SIMD vectorized
+    let a = [1.0, 2.0, 3.0, 4.0]
+    let b = [5.0, 6.0, 7.0, 8.0]
+    let c = []
+    
+    each i in 0..4:
+        c[i] = a[i] + b[i]
+    // ✅ Compiler uses SIMD - 4 operations at once!
+    
+    println("✅ Auto-Parallelization: Free speedup!")

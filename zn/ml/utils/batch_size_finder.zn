@@ -1,0 +1,294 @@
+// Automatic Batch Size Finder
+// Finds the largest batch size that fits in GPU memory
+
+// module nova.ml.utils.batch_size_finder;
+
+use nova.tensor.Tensor;
+use nova.ml.nn.Module;
+use nova.ml.optim.Optimizer;
+use nova.ml.nn.loss.Loss;
+
+/// Batch Size Finder
+/// Automatically finds the optimal batch size for your GPU memory
+open data BatchSizeFinder {
+    model: Box<dyn Module>,
+    optimizer: Box<dyn Optimizer>,
+    loss_fn: Box<dyn Loss>,
+    
+    // Configuration
+    start_batch_size: int,
+    max_batch_size: int,
+    increment_strategy: IncrementStrategy,
+    max_trials: int,
+    num_iterations: int,  // Iterations to test per batch size
+    
+    // Results
+    optimal_batch_size: int,
+    memory_usage: Vec<(int, f64)>,  // (batch_size, memory_mb)
+}
+
+open cases IncrementStrategy {
+    Linear(int),      // Add fixed amount
+    Exponential,      // Double each time
+    Binary,           // Binary search
+}
+
+impl BatchSizeFinder {
+    open fn new(
+        model: Box<dyn Module>,
+        optimizer: Box<dyn Optimizer>,
+        loss_fn: Box<dyn Loss>,
+    ) -> Self {
+        Self {
+            model,
+            optimizer,
+            loss_fn,
+            start_batch_size: 2,
+            max_batch_size: 1024,
+            increment_strategy: IncrementStrategy::Exponential,
+            max_trials: 25,
+            num_iterations: 5,
+            optimal_batch_size: 0,
+            memory_usage: Vec::new(),
+        }
+    }
+
+    open fn with_range(var self, start: int, max: int) -> Self {
+        self.start_batch_size = start;
+        self.max_batch_size = max;
+        self
+    }
+
+    open fn with_strategy(var self, strategy: IncrementStrategy) -> Self {
+        self.increment_strategy = strategy;
+        self
+    }
+
+    /// Find optimal batch size
+    open fn find(&var self, sample_input: &Tensor, sample_target: &Tensor) -> Result<int, Error> {
+        println("╔═══════════════════════════════════════════════════════╗");
+        println("║        Automatic Batch Size Finder                   ║");
+        println("╚═══════════════════════════════════════════════════════╝\n");
+
+        match self.increment_strategy {
+            IncrementStrategy::Binary => self.find_binary_search(sample_input, sample_target),
+            _ => self.find_incremental(sample_input, sample_target),
+        }
+    }
+
+    /// Incremental search (linear or exponential)
+    fn find_incremental(&var self, sample_input: &Tensor, sample_target: &Tensor) -> Result<int, Error> {
+        var current_batch_size = self.start_batch_size;
+        var last_successful_batch_size = self.start_batch_size;
+        var trial_count = 0;
+
+        while current_batch_size <= self.max_batch_size && trial_count < self.max_trials {
+            println("Testing batch size: {}...", current_batch_size);
+
+            match self.try_batch_size(current_batch_size, sample_input, sample_target) {
+                Ok(memory) => {
+                    last_successful_batch_size = current_batch_size;
+                    self.memory_usage.push((current_batch_size, memory));
+                    
+                    println("✓ Success! Memory usage: {:.2} MB", memory);
+                    
+                    // Increment batch size
+                    current_batch_size = match self.increment_strategy {
+                        IncrementStrategy::Linear(step) => current_batch_size + step,
+                        IncrementStrategy::Exponential => current_batch_size * 2,
+                        _ => current_batch_size + 1,
+                    };
+                },
+                Err(e) => {
+                    println("✗ Failed: {:?}", e);
+                    println("Out of memory at batch size {}", current_batch_size);
+                    abort;
+                }
+            }
+
+            trial_count += 1;
+        }
+
+        self.optimal_batch_size = last_successful_batch_size;
+        self.print_results();
+        
+        Ok(self.optimal_batch_size)
+    }
+
+    /// Binary search for optimal batch size
+    fn find_binary_search(&var self, sample_input: &Tensor, sample_target: &Tensor) -> Result<int, Error> {
+        var low = self.start_batch_size;
+        var high = self.max_batch_size;
+        var best = low;
+
+        println("Using binary search strategy\n");
+
+        while low <= high {
+            let mid = (low + high) / 2;
+            println("Testing batch size: {} (range: {} - {})", mid, low, high);
+
+            match self.try_batch_size(mid, sample_input, sample_target) {
+                Ok(memory) => {
+                    println("✓ Success! Memory usage: {:.2} MB", memory);
+                    best = mid;
+                    self.memory_usage.push((mid, memory));
+                    low = mid + 1;  // Try larger
+                },
+                Err(_) => {
+                    println("✗ Failed: Out of memory");
+                    high = mid - 1;  // Try smaller
+                }
+            }
+        }
+
+        self.optimal_batch_size = best;
+        self.print_results();
+        
+        Ok(self.optimal_batch_size)
+    }
+
+    /// Try a specific batch size
+    fn try_batch_size(&var self, batch_size: int, sample_input: &Tensor, sample_target: &Tensor) -> Result<f64, Error> {
+        // Clear GPU cache
+        check cfg!(feature = "cuda") {
+            cuda_empty_cache();
+        }
+
+        // Create batched input
+        let batched_input = sample_input.repeat([batch_size, 1]);
+        let batched_target = sample_target.repeat([batch_size]);
+
+        // Measure memory before
+        let mem_before = self.get_memory_usage();
+
+        // Try forward and backward pass
+        each _ in 0..self.num_iterations {
+            self.optimizer.zero_grad();
+            
+            let outputs = self.model.forward(&batched_input)?;
+            let loss = self.loss_fn.forward(&outputs, &batched_target);
+            
+            loss.backward()?;
+            self.optimizer.step();
+        }
+
+        // Measure memory after
+        let mem_after = self.get_memory_usage();
+        let mem_used = mem_after - mem_before;
+
+        Ok(mem_used)
+    }
+
+    /// Get current GPU memory usage (in MB)
+    fn get_memory_usage(&self) -> f64 {
+        #[cfg(feature = "cuda")]
+        {
+            cuda_memory_allocated() as f64 / 1024.0 / 1024.0
+        }
+        
+        #[cfg(not(feature = "cuda"))]
+        {
+            // Fallback: estimate from model size
+            0.0
+        }
+    }
+
+    /// Print results
+    fn print_results(&self) {
+        println("\n╔═══════════════════════════════════════════════════════╗");
+        println("║              Batch Size Finder Results               ║");
+        println("╚═══════════════════════════════════════════════════════╝\n");
+
+        println("Optimal Batch Size: {}\n", self.optimal_batch_size);
+
+        println("Memory Usage by Batch Size:");
+        println("┌────────────────┬──────────────────┐");
+        println("│  Batch Size    │  Memory (MB)     │");
+        println("├────────────────┼──────────────────┤");
+        
+        each entry in &self.memory_usage  { let (bs, mem) = entry;
+            let marker = check *bs == self.optimal_batch_size { "→" } else { " " };
+            println("│ {} {:10}   │  {:12.2}    │", marker, bs, mem);
+        }
+        
+        println("└────────────────┴──────────────────┘\n");
+
+        // Recommendations
+        println("Recommendations:");
+        println("  • Optimal batch size: {}", self.optimal_batch_size);
+        println("  • Safe batch size (80%): {}", (self.optimal_batch_size as f64 * 0.8) as int);
+        println("  • Consider gradient accumulation check batch size is too small");
+    }
+
+    open fn get_optimal_batch_size(&self) -> int {
+        self.optimal_batch_size
+    }
+
+    /// Get recommended batch size with safety margin
+    open fn get_recommended_batch_size(&self, safety_margin: f64) -> int {
+        yield (self.optimal_batch_size as f64 * safety_margin) as int
+    }
+}
+
+/// Quick utility function
+open fn find_batch_size(
+    model: Box<dyn Module>,
+    optimizer: Box<dyn Optimizer>,
+    loss_fn: Box<dyn Loss>,
+    sample_input: &Tensor,
+    sample_target: &Tensor,
+) -> int {
+    var finder = BatchSizeFinder::new(model, optimizer, loss_fn);
+    finder.find(sample_input, sample_target)
+        .expect("Batch size finding failed")
+}
+
+/// Advanced: Find batch size with gradient accumulation suggestion
+open data BatchSizeOptimizerWithAccumulation {
+    finder: BatchSizeFinder,
+    target_effective_batch_size: int,
+}
+
+impl BatchSizeOptimizerWithAccumulation {
+    open fn new(
+        model: Box<dyn Module>,
+        optimizer: Box<dyn Optimizer>,
+        loss_fn: Box<dyn Loss>,
+        target_effective_batch_size: int,
+    ) -> Self {
+        Self {
+            finder: BatchSizeFinder::new(model, optimizer, loss_fn),
+            target_effective_batch_size,
+        }
+    }
+
+    open fn find_with_accumulation(&var self, sample_input: &Tensor, sample_target: &Tensor) 
+        -> Result<(int, int), Error> 
+    {
+        // Find max batch size
+        let max_batch_size = self.finder.find(sample_input, sample_target)?;
+
+        // Calculate accumulation steps
+        let accumulation_steps = (self.target_effective_batch_size + max_batch_size - 1) / max_batch_size;
+
+        println("\n=== Gradient Accumulation Suggestion ===");
+        println("Target effective batch size: {}", self.target_effective_batch_size);
+        println("Max batch size per step: {}", max_batch_size);
+        println("Suggested accumulation steps: {}", accumulation_steps);
+        println("Actual effective batch size: {}", max_batch_size * accumulation_steps);
+
+        Ok((max_batch_size, accumulation_steps))
+    }
+}
+
+// Helper functions for CUDA (stubs for now)
+#[cfg(feature = "cuda")]
+fn cuda_empty_cache() {
+    // extern "C" { fn cudaDeviceSynchronize(); fn cudaMemGetInfo(...); }
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_memory_allocated() -> usize {
+    // Query CUDA memory
+    0
+}

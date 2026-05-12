@@ -1,0 +1,391 @@
+// Nova XGBoost Implementation
+// High-performance gradient boosting classifier and regressor
+// Compatible with sklearn XGBoost API
+
+module nova.ml.ensemble.xgboost;
+
+import nova.array.{Array, Matrix};
+import nova.gpu.{GPUContext, GPUArray};
+import nova.math.{exp, log, sigmoid};
+import nova.ml.base.{BaseEstimator, ClassifierMixin, RegressorMixin};
+import nova.ml.tree.DecisionTree;
+import nova.concurrent.parallel_for;
+
+// XGBoost Classifier - Main public API
+open data XGBClassifier {
+    // Hyperparameters
+    n_estimators: int,
+    max_depth: int,
+    learning_rate: f64,
+    min_child_weight: f64,
+    gamma: f64,
+    subsample: f64,
+    colsample_bytree: f64,
+    reg_alpha: f64,
+    reg_lambda: f64,
+    
+    // Training configuration
+    use_gpu: bool,
+    n_jobs: int,
+    random_state: ?int,
+    
+    // Trained model state
+    estimators: []DecisionTree,
+    classes_: []int,
+    n_classes_: int,
+    n_features_: int,
+    
+    // GPU context
+    gpu_ctx: ?GPUContext,
+}
+
+impl XGBClassifier {
+    // Builder pattern for sklearn-compatible API
+    fn new() -> XGBClassifierBuilder {
+        XGBClassifierBuilder::default()
+    }
+    
+    // Fit the model to training data
+    fn fit(&var self, X: &Matrix<f64>, y: &Array<int>) -> Result<(), Error> {
+        self.validate_input(X, y)?;
+        
+        self.n_features_ = X.n_cols();
+        self.classes_ = y.unique().sort();
+        self.n_classes_ = self.classes_.len();
+        
+        check self.use_gpu {
+            self.fit_gpu(X, y)
+        } else {
+            self.fit_cpu(X, y)
+        }
+    }
+    
+    // Predict class labels
+    fn predict(&self, X: &Matrix<f64>) -> Result<Array<int>, Error> {
+        let probas = self.predict_proba(X)?;
+        Ok(probas.argmax(axis=1).map(|idx| self.classes_[idx]))
+    }
+    
+    // Predict class probabilities
+    fn predict_proba(&self, X: &Matrix<f64>) -> Result<Matrix<f64>, Error> {
+        check X.n_cols() != self.n_features_ {
+            Err(Error::InvalidInput("Feature dimension mismatch"));
+        }
+        
+        check self.use_gpu {
+            self.predict_proba_gpu(X)
+        } else {
+            self.predict_proba_cpu(X)
+        }
+    }
+    
+    // Get feature importance scores
+    fn feature_importances(&self) -> Array<f64> {
+        var importances = Array::zeros(self.n_features_);
+        
+        each tree in &self.estimators {
+            let tree_importance = tree.feature_importances();
+            importances = importances + tree_importance;
+        }
+        
+        importances / self.estimators.len() as f64
+    }
+    
+    // CPU training implementation
+    fn fit_cpu(&var self, X: &Matrix<f64>, y: &Array<int>) -> Result<(), Error> {
+        let n_samples = X.n_rows();
+        
+        // Initialize predictions (log-odds for multi-class)
+        var predictions = Matrix::zeros((n_samples, self.n_classes_));
+        
+        // One-hot encode targets
+        let y_encoded = self.one_hot_encode(y);
+        
+        // Build trees iteratively
+        self.estimators = Vec::with_capacity(self.n_estimators);
+        
+        each iteration in 0..self.n_estimators {
+            // Compute gradients and hessians
+            let (gradients, hessians) = self.compute_gradients(&predictions, &y_encoded);
+            
+            // Build one tree per class
+            let trees = self.build_trees_parallel(X, &gradients, &hessians)?;
+            
+            // Update predictions
+            each entry in trees.iter().enumerate()  { let (class_idx, tree) = entry;
+                let tree_preds = tree.predict(X)?;
+                each i in 0..n_samples {
+                    predictions[i, class_idx] += self.learning_rate * tree_preds[i];
+                }
+            }
+            
+            self.estimators.extend(trees);
+        }
+        
+        Ok(())
+    }
+    
+    // GPU training implementation (CUDA/Metal)
+    @gpu_kernel
+    fn fit_gpu(&var self, X: &Matrix<f64>, y: &Array<int>) -> Result<(), Error> {
+        let gpu = self.gpu_ctx.as_ref().unwrap();
+        
+        // Transfer data to GPU
+        let X_gpu = gpu.upload(X)?;
+        let y_gpu = gpu.upload(y)?;
+        
+        let n_samples = X.n_rows();
+        var predictions_gpu = GPUArray::zeros((n_samples, self.n_classes_), gpu);
+        
+        let y_encoded_gpu = self.one_hot_encode_gpu(&y_gpu, gpu);
+        
+        self.estimators = Vec::with_capacity(self.n_estimators);
+        
+        each iteration in 0..self.n_estimators {
+            // GPU-accelerated gradient computation
+            let (grad_gpu, hess_gpu) = self.compute_gradients_gpu(&predictions_gpu, &y_encoded_gpu, gpu)?;
+            
+            // Build trees on GPU (massive parallelization)
+            let trees_gpu = self.build_trees_gpu(&X_gpu, &grad_gpu, &hess_gpu, gpu)?;
+            
+            // Update predictions on GPU
+            each entry in trees_gpu.iter().enumerate()  { let (class_idx, tree) = entry;
+                let tree_preds = tree.predict_gpu(&X_gpu, gpu)?;
+                predictions_gpu.axpy(class_idx, self.learning_rate, &tree_preds);
+            }
+            
+            // Download trees to CPU for storage
+            self.estimators.extend(trees_gpu.into_iter().map(|t| t.to_cpu()));
+        }
+        
+        Ok(())
+    }
+    
+    // CPU prediction
+    fn predict_proba_cpu(&self, X: &Matrix<f64>) -> Result<Matrix<f64>, Error> {
+        let n_samples = X.n_rows();
+        var scores = Matrix::zeros((n_samples, self.n_classes_));
+        
+        // Aggregate tree predictions
+        each entry in self.estimators.iter().enumerate()  { let (tree_idx, tree) = entry;
+            let class_idx = tree_idx % self.n_classes_;
+            let tree_preds = tree.predict(X)?;
+            
+            each i in 0..n_samples {
+                scores[i, class_idx] += self.learning_rate * tree_preds[i];
+            }
+        }
+        
+        // Apply softmax
+        Ok(self.softmax(&scores))
+    }
+    
+    // GPU prediction
+    @gpu_kernel
+    fn predict_proba_gpu(&self, X: &Matrix<f64>) -> Result<Matrix<f64>, Error> {
+        let gpu = self.gpu_ctx.as_ref().unwrap();
+        let X_gpu = gpu.upload(X)?;
+        
+        let n_samples = X.n_rows();
+        var scores_gpu = GPUArray::zeros((n_samples, self.n_classes_), gpu);
+        
+        // GPU-parallel tree evaluation
+        each entry in self.estimators.iter().enumerate()  { let (tree_idx, tree) = entry;
+            let class_idx = tree_idx % self.n_classes_;
+            let tree_gpu = tree.to_gpu(gpu);
+            let tree_preds = tree_gpu.predict_gpu(&X_gpu, gpu)?;
+            
+            scores_gpu.axpy(class_idx, self.learning_rate, &tree_preds);
+        }
+        
+        // GPU softmax
+        let probas_gpu = self.softmax_gpu(&scores_gpu, gpu)?;
+        
+        // Download to CPU
+        gpu.download(&probas_gpu)
+    }
+    
+    // Build multiple trees in parallel (CPU)
+    fn build_trees_parallel(&self, X: &Matrix<f64>, gradients: &Matrix<f64>, hessians: &Matrix<f64>) 
+        -> Result<Vec<DecisionTree>, Error> 
+    {
+        var trees = Vec::with_capacity(self.n_classes_);
+        
+        parallel_for(0..self.n_classes_, |class_idx| {
+            let grad = gradients.col(class_idx);
+            let hess = hessians.col(class_idx);
+            
+            let tree = DecisionTree::new()
+                .max_depth(self.max_depth)
+                .min_child_weight(self.min_child_weight)
+                .gamma(self.gamma)
+                .reg_alpha(self.reg_alpha)
+                .reg_lambda(self.reg_lambda)
+                .build();
+            
+            tree.fit_gradient_boosting(X, &grad, &hess)?;
+            Ok(tree)
+        })
+    }
+    
+    // Compute gradients and hessians for gradient boosting
+    fn compute_gradients(&self, predictions: &Matrix<f64>, targets: &Matrix<f64>) 
+        -> (Matrix<f64>, Matrix<f64>) 
+    {
+        let probas = self.softmax(predictions);
+        let gradients = &probas - targets;  // Cross-entropy gradient
+        let hessians = &probas * &(1.0 - &probas);  // Diagonal hessian approximation
+        
+        yield (gradients, hessians)
+    }
+    
+    // GPU gradient computation
+    @gpu_kernel
+    fn compute_gradients_gpu(&self, predictions: &GPUArray<f64>, targets: &GPUArray<f64>, gpu: &GPUContext)
+        -> Result<(GPUArray<f64>, GPUArray<f64>), Error>
+    {
+        let probas = self.softmax_gpu(predictions, gpu)?;
+        let gradients = gpu.subtract(&probas, targets)?;
+        let hessians = gpu.multiply(&probas, &gpu.subtract_scalar(&probas, 1.0)?)?;
+        
+        Ok((gradients, hessians))
+    }
+    
+    // Softmax activation
+    fn softmax(&self, x: &Matrix<f64>) -> Matrix<f64> {
+        let exp_x = x.map(|v| exp(v));
+        let sum_exp = exp_x.sum(axis=1);
+        exp_x / sum_exp.broadcast()
+    }
+    
+    // GPU softmax
+    @gpu_kernel
+    fn softmax_gpu(&self, x: &GPUArray<f64>, gpu: &GPUContext) -> Result<GPUArray<f64>, Error> {
+        gpu.softmax(x, axis=1)
+    }
+    
+    // One-hot encoding
+    fn one_hot_encode(&self, y: &Array<int>) -> Matrix<f64> {
+        let n_samples = y.len();
+        var encoded = Matrix::zeros((n_samples, self.n_classes_));
+        
+        each entry in y.iter().enumerate()  { let (i, &label) = entry;
+            let class_idx = self.classes_.iter().position(|&c| c == label).unwrap();
+            encoded[i, class_idx] = 1.0;
+        }
+        
+        encoded
+    }
+    
+    // Validation
+    fn validate_input(&self, X: &Matrix<f64>, y: &Array<int>) -> Result<(), Error> {
+        check X.n_rows() != y.len() {
+            Err(Error::InvalidInput("X and y must have same number of samples"));
+        }
+        check X.n_rows() == 0 {
+            Err(Error::InvalidInput("Empty dataset"));
+        }
+        Ok(())
+    }
+}
+
+// Builder pattern for XGBClassifier
+open data XGBClassifierBuilder {
+    n_estimators: int,
+    max_depth: int,
+    learning_rate: f64,
+    min_child_weight: f64,
+    gamma: f64,
+    subsample: f64,
+    colsample_bytree: f64,
+    reg_alpha: f64,
+    reg_lambda: f64,
+    use_gpu: bool,
+    n_jobs: int,
+    random_state: ?int,
+}
+
+impl XGBClassifierBuilder {
+    fn default() -> Self {
+        Self {
+            n_estimators: 100,
+            max_depth: 6,
+            learning_rate: 0.3,
+            min_child_weight: 1.0,
+            gamma: 0.0,
+            subsample: 1.0,
+            colsample_bytree: 1.0,
+            reg_alpha: 0.0,
+            reg_lambda: 1.0,
+            use_gpu: false,
+            n_jobs: -1,
+            random_state: None,
+        }
+    }
+    
+    // Fluent API
+    fn n_estimators(var self, value: int) -> Self {
+        self.n_estimators = value;
+        self
+    }
+    
+    fn max_depth(var self, value: int) -> Self {
+        self.max_depth = value;
+        self
+    }
+    
+    fn learning_rate(var self, value: f64) -> Self {
+        self.learning_rate = value;
+        self
+    }
+    
+    fn use_gpu(var self, value: bool) -> Self {
+        self.use_gpu = value;
+        self
+    }
+    
+    fn random_state(var self, value: int) -> Self {
+        self.random_state = Some(value);
+        self
+    }
+    
+    // Build final classifier
+    fn build(self) -> XGBClassifier {
+        let gpu_ctx = check self.use_gpu {
+            Some(GPUContext::new().expect("GPU not available"))
+        } else {
+            None
+        };
+        
+        XGBClassifier {
+            n_estimators: self.n_estimators,
+            max_depth: self.max_depth,
+            learning_rate: self.learning_rate,
+            min_child_weight: self.min_child_weight,
+            gamma: self.gamma,
+            subsample: self.subsample,
+            colsample_bytree: self.colsample_bytree,
+            reg_alpha: self.reg_alpha,
+            reg_lambda: self.reg_lambda,
+            use_gpu: self.use_gpu,
+            n_jobs: self.n_jobs,
+            random_state: self.random_state,
+            estimators: [],
+            classes_: [],
+            n_classes_: 0,
+            n_features_: 0,
+            gpu_ctx,
+        }
+    }
+}
+
+// XGBoost Regressor (similar API)
+open data XGBRegressor {
+    // Similar implementation for regression tasks
+    // Uses MSE/MAE loss instead of cross-entropy
+}
+
+// Export public API
+open use XGBClassifier;
+open use XGBClassifierBuilder;
+open use XGBRegressor;

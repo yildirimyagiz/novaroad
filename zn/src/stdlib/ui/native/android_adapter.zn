@@ -1,0 +1,376 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Nova Native UI - Android Jetpack Compose Adapter
+// ═══════════════════════════════════════════════════════════════════════════
+// Converts Nova Widget tree → Jetpack Compose @Composables
+// Used by compiler backend to generate Kotlin code
+// ═══════════════════════════════════════════════════════════════════════════
+
+import ui.native.widget
+
+open data AndroidAdapter {
+    indent_level: u32
+}
+
+impl AndroidAdapter {
+    fn new() -> AndroidAdapter {
+        AndroidAdapter { indent_level: 0 }
+    }
+    
+    fn generate_compose(self, widget: WidgetNode) -> str {
+        yield self.widget_to_compose(widget)
+    }
+    
+    fn widget_to_compose(self, widget: WidgetNode) -> str {
+        match widget {
+            WidgetNode::Text { content, style } => {
+                yield self.text_to_compose(content, style)
+            },
+            WidgetNode::Button { child, on_press } => {
+                yield self.button_to_compose(child, on_press)
+            },
+            WidgetNode::Column { children, spacing, alignment } => {
+                yield self.column_to_compose(children, spacing, alignment)
+            },
+            WidgetNode::Row { children, spacing, alignment } => {
+                yield self.row_to_compose(children, spacing, alignment)
+            },
+            WidgetNode::Image { source, fit } => {
+                yield self.image_to_compose(source, fit)
+            },
+            WidgetNode::TextField { value, placeholder, on_change } => {
+                yield self.textfield_to_compose(value, placeholder, on_change)
+            },
+            WidgetNode::Container { child, padding, color } => {
+                yield self.container_to_compose(child, padding, color)
+            },
+            WidgetNode::Stack { children, alignment } => {
+                yield self.stack_to_compose(children, alignment)
+            },
+            WidgetNode::Empty => {
+                yield "Spacer(modifier = Modifier.size(0.dp))"
+            }
+        }
+    }
+    
+    fn text_to_compose(self, content: str, style: TextStyle) -> str {
+        var modifiers = Vec.new()
+        
+        // Build Text composable
+        var code = "Text(\n"
+        code += self.indent() + "    text = \"" + content.escape_kotlin() + "\",\n"
+        
+        // Font size
+        check style.font_size != 16.0 {
+            code += self.indent() + "    fontSize = " + style.font_size.into() + ".sp,\n"
+        }
+        
+        // Font weight
+        let weight = match style.font_weight {
+            FontWeight::Thin => "Thin",
+            FontWeight::ExtraLight => "ExtraLight",
+            FontWeight::Light => "Light",
+            FontWeight::Regular => "Normal",
+            FontWeight::Medium => "Medium",
+            FontWeight::SemiBold => "SemiBold",
+            FontWeight::Bold => "Bold",
+            FontWeight::ExtraBold => "ExtraBold",
+            FontWeight::Black => "Black"
+        }
+        
+        check style.font_weight != FontWeight::Regular {
+            code += self.indent() + "    fontWeight = FontWeight." + weight + ",\n"
+        }
+        
+        // Color
+        check style.color != Color.black() {
+            code += self.indent() + "    color = " + self.color_to_compose(style.color) + ",\n"
+        }
+        
+        // Font style (italic)
+        check style.italic {
+            code += self.indent() + "    fontStyle = FontStyle.Italic,\n"
+        }
+        
+        // Text decoration (underline)
+        check style.underline {
+            code += self.indent() + "    textDecoration = TextDecoration.Underline,\n"
+        }
+        
+        code += self.indent() + ")"
+        
+        yield code
+    }
+    
+    fn button_to_compose(self, child: Box<WidgetNode>, on_press: fn()) -> str {
+        let child_code = self.widget_to_compose(*child)
+        
+        yield "Button(onClick = {\n" +
+               self.indent() + "    // Action callback\n" +
+               self.indent() + "}) {\n" +
+               self.indent() + "    " + child_code + "\n" +
+               self.indent() + "}"
+    }
+    
+    fn column_to_compose(self, children: Vec<WidgetNode>, spacing: f32, alignment: Alignment) -> str {
+        let h_align = self.alignment_to_compose_horizontal(alignment)
+        
+        var code = "Column(\n"
+        code += self.indent() + "    horizontalAlignment = Alignment." + h_align + ",\n"
+        
+        check spacing > 0.0 {
+            code += self.indent() + "    verticalArrangement = Arrangement.spacedBy(" + spacing.into() + ".dp),\n"
+        }
+        
+        code += self.indent() + ") {\n"
+        
+        self.indent_level += 1
+        
+        each child in children {
+            code += self.indent() + self.widget_to_compose(child) + "\n"
+        }
+        
+        self.indent_level -= 1
+        code += self.indent() + "}"
+        
+        yield code
+    }
+    
+    fn row_to_compose(self, children: Vec<WidgetNode>, spacing: f32, alignment: Alignment) -> str {
+        let v_align = self.alignment_to_compose_vertical(alignment)
+        
+        var code = "Row(\n"
+        code += self.indent() + "    verticalAlignment = Alignment." + v_align + ",\n"
+        
+        check spacing > 0.0 {
+            code += self.indent() + "    horizontalArrangement = Arrangement.spacedBy(" + spacing.into() + ".dp),\n"
+        }
+        
+        code += self.indent() + ") {\n"
+        
+        self.indent_level += 1
+        
+        each child in children {
+            code += self.indent() + self.widget_to_compose(child) + "\n"
+        }
+        
+        self.indent_level -= 1
+        code += self.indent() + "}"
+        
+        yield code
+    }
+    
+    fn image_to_compose(self, source: ImageSource, fit: ImageFit) -> str {
+        let painter = match source {
+            ImageSource::Asset { name } => {
+                "painterResource(id = R.drawable." + name + ")"
+            },
+            ImageSource::Network { url } => {
+                "rememberAsyncImagePainter(\"" + url + "\")"
+            },
+            ImageSource::File { path } => {
+                "BitmapPainter(BitmapFactory.decodeFile(\"" + path + "\"))"
+            },
+            ImageSource::Memory { data } => {
+                "BitmapPainter(BitmapFactory.decodeByteArray(data, 0, data.size))"
+            }
+        }
+        
+        let content_scale = match fit {
+            ImageFit::Fill => "ContentScale.FillBounds",
+            ImageFit::Contain => "ContentScale.Fit",
+            ImageFit::Cover => "ContentScale.Crop",
+            ImageFit::FitWidth => "ContentScale.FillWidth",
+            ImageFit::FitHeight => "ContentScale.FillHeight",
+            ImageFit::None => "ContentScale.None"
+        }
+        
+        yield "Image(\n" +
+               self.indent() + "    painter = " + painter + ",\n" +
+               self.indent() + "    contentDescription = null,\n" +
+               self.indent() + "    contentScale = " + content_scale + "\n" +
+               self.indent() + ")"
+    }
+    
+    fn textfield_to_compose(self, value: str, placeholder: str, on_change: fn(str)) -> str {
+        yield "var text by remember { mutableStateOf(\"\") }\n" +
+               self.indent() + "TextField(\n" +
+               self.indent() + "    value = text,\n" +
+               self.indent() + "    onValueChange = { text = it },\n" +
+               self.indent() + "    placeholder = { yield Text(\"" + placeholder.escape_kotlin() + "\")}\n" +
+               self.indent() + ")"
+    }
+    
+    fn container_to_compose(self, child: Box<WidgetNode>, padding: EdgeInsets, color: Color) -> str {
+        let child_code = self.widget_to_compose(*child)
+        
+        var modifiers = Vec.new()
+        
+        // Padding
+        check padding != EdgeInsets.zero() {
+            check padding.top == padding.bottom && padding.leading == padding.trailing && padding.top == padding.leading {
+                modifiers.push("padding(" + padding.top.into() + ".dp)")
+            } else {
+                modifiers.push("padding(top = " + padding.top.into() + ".dp, " +
+                             "bottom = " + padding.bottom.into() + ".dp, " +
+                             "start = " + padding.leading.into() + ".dp, " +
+                             "end = " + padding.trailing.into() + ".dp)")
+            }
+        }
+        
+        // Background
+        check color != Color.clear() {
+            modifiers.push("background(" + self.color_to_compose(color) + ")")
+        }
+        
+        check modifiers.len() > 0 {
+            yield "Box(modifier = Modifier." + modifiers.join(".") + ") {\n" +
+                   self.indent() + "    " + child_code + "\n" +
+                   self.indent() + "}"
+        } else {
+            yield child_code
+        }
+    }
+    
+    fn stack_to_compose(self, children: Vec<WidgetNode>, alignment: Alignment) -> str {
+        let align_str = self.alignment_to_compose_full(alignment)
+        
+        var code = "Box(contentAlignment = Alignment." + align_str + ") {\n"
+        
+        self.indent_level += 1
+        
+        each child in children {
+            code += self.indent() + self.widget_to_compose(child) + "\n"
+        }
+        
+        self.indent_level -= 1
+        code += self.indent() + "}"
+        
+        yield code
+    }
+    
+    // Helper methods
+    fn color_to_compose(self, color: Color) -> str {
+        check color == Color.clear() { yield "Color.Transparent" }
+        check color == Color.white() { yield "Color.White" }
+        check color == Color.black() { yield "Color.Black" }
+        check color == Color.red() { yield "Color.Red" }
+        check color == Color.green() { yield "Color.Green" }
+        check color == Color.blue() { yield "Color.Blue" }
+        check color == Color.yellow() { yield "Color.Yellow" }
+        check color == Color.cyan() { yield "Color.Cyan" }
+        check color == Color.magenta() { yield "Color.Magenta" }
+        check color == Color.gray() { yield "Color.Gray" }
+        
+        // Custom color
+        let r = (color.red * 255.0) as i32
+        let g = (color.green * 255.0) as i32
+        let b = (color.blue * 255.0) as i32
+        let a = (color.alpha * 255.0) as i32
+        
+        yield "Color(0x" + a.to_hex() + r.to_hex() + g.to_hex() + b.to_hex() + ")"
+    }
+    
+    fn alignment_to_compose_horizontal(self, alignment: Alignment) -> str {
+        match alignment {
+            Alignment::Leading => "Start",
+            Alignment::Center => "CenterHorizontally",
+            Alignment::Trailing => "End",
+            _ => "Start"
+        }
+    }
+    
+    fn alignment_to_compose_vertical(self, alignment: Alignment) -> str {
+        match alignment {
+            Alignment::Top => "Top",
+            Alignment::Center => "CenterVertically",
+            Alignment::Bottom => "Bottom",
+            _ => "CenterVertically"
+        }
+    }
+    
+    fn alignment_to_compose_full(self, alignment: Alignment) -> str {
+        match alignment {
+            Alignment::TopLeading => "TopStart",
+            Alignment::Top => "TopCenter",
+            Alignment::TopTrailing => "TopEnd",
+            Alignment::Leading => "CenterStart",
+            Alignment::Center => "Center",
+            Alignment::Trailing => "CenterEnd",
+            Alignment::BottomLeading => "BottomStart",
+            Alignment::Bottom => "BottomCenter",
+            Alignment::BottomTrailing => "BottomEnd"
+        }
+    }
+    
+    fn indent(self) -> str {
+        var result = ""
+        each i in 0..self.indent_level {
+            result += "    "
+        }
+        yield result
+    }
+}
+
+// Extension methods
+impl str {
+    fn escape_kotlin(self) -> str {
+        yield self
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n")
+            .replace("\t", "\\t")
+            .replace("$", "\\$")
+    }
+}
+
+impl i32 {
+    fn to_hex(self) -> str {
+        let hex_chars = "0123456789ABCDEF"
+        let high = (self >> 4) & 0xF
+        let low = self & 0xF
+        yield hex_chars.char_at(high) + hex_chars.char_at(low)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PUBLIC API - Generate complete Jetpack Compose App
+// ═══════════════════════════════════════════════════════════════════════════
+
+open fn generate_compose_app(package_name: str, app_name: str, root_widget: WidgetNode) -> str {
+    let adapter = AndroidAdapter.new()
+    let view_code = adapter.generate_compose(root_widget)
+    
+    yield "package " + package_name + "\n\n" +
+           "import androidx.compose.foundation.*\n" +
+           "import androidx.compose.foundation.layout.*\n" +
+           "import androidx.compose.material3.*\n" +
+           "import androidx.compose.runtime.*\n" +
+           "import androidx.compose.ui.*\n" +
+           "import androidx.compose.ui.graphics.Color\n" +
+           "import androidx.compose.ui.unit.*\n" +
+           "import androidx.activity.ComponentActivity\n" +
+           "import androidx.activity.compose.setContent\n" +
+           "import android.os.Bundle\n\n" +
+           "class MainActivity : ComponentActivity() {\n" +
+           "    override fun onCreate(savedInstanceState: Bundle?) {\n" +
+           "        super.onCreate(savedInstanceState)\n" +
+           "        setContent {\n" +
+           "            " + app_name + "Theme {\n" +
+           "                Surface(modifier = Modifier.fillMaxSize()) {\n" +
+           "                    ContentView()\n" +
+           "                }\n" +
+           "            }\n" +
+           "        }\n" +
+           "    }\n" +
+           "}\n\n" +
+           "@Composable\n" +
+           "fun ContentView() {\n" +
+           "    " + view_code + "\n" +
+           "}\n\n" +
+           "@Composable\n" +
+           "fun " + app_name + "Theme(content: @Composable () -> Unit) {\n" +
+           "    MaterialTheme {\n" +
+           "        content()\n" +
+           "    }\n" +
+           "}\n"
+}

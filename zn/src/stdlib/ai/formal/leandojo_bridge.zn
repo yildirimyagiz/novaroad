@@ -1,0 +1,340 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// LeanDojo Bridge - Neural Theorem Proving
+// ═══════════════════════════════════════════════════════════════════════════
+// LeanDojo: https://github.com/lean-dojo/LeanDojo
+// 
+// This bridges Nova ↔ LeanDojo for AI-assisted proof search.
+// 
+// LeanDojo provides:
+// - Proof state tracking
+// - Tactic suggestion (via neural models)
+// - Proof step validation
+// 
+// Role in Nova:
+// - Suggests proofs, doesn't decide
+// - Helper for formal_core.zn
+// - Runtime reasoning assistant
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Python subprocess interface to LeanDojo
+@ffi("python")
+open data LeanDojo {
+    process: PythonProcess,
+    model_path: str,
+    timeout: u32
+}
+
+impl LeanDojo {
+    fn new(model_path: str) -> LeanDojo {
+        LeanDojo {
+            process: PythonProcess.spawn("leandojo_server.py"),
+            model_path: model_path,
+            timeout: 30000  // 30 seconds
+        }
+    }
+    
+    fn suggest_tactics(self, proof_state: ProofState) -> Vec<TacticSuggestion> {
+        // Call LeanDojo to suggest next tactics
+        
+        let request = {
+            "command": "suggest_tactics",
+            "proof_state": proof_state.to_json(),
+            "num_suggestions": 5
+        }
+        
+        let response = self.process.send_json(request)
+        
+        match response {
+            Ok(data) => {
+                yield self.parse_tactic_suggestions(data)
+            },
+            Err(e) => {
+                println(f"LeanDojo error: {e}")
+                yield Vec.new()
+            }
+        }
+    }
+    
+    fn search_proof(self, goal: str, max_steps: u32) -> ProofSearchResult {
+        // Use LeanDojo to search for a proof
+        
+        println(f"LeanDojo: Searching proof for: {goal}")
+        
+        let request = {
+            "command": "search_proof",
+            "goal": goal,
+            "max_steps": max_steps,
+            "timeout": self.timeout
+        }
+        
+        let response = self.process.send_json(request)
+        
+        match response {
+            Ok(data) => {
+                check data.get("success") == Some(true) {
+                    yield ProofSearchResult::Found {
+                        proof_script: data.get("proof").unwrap(),
+                        num_steps: data.get("num_steps").unwrap(),
+                        confidence: data.get("confidence").unwrap_or(0.5)
+                    }
+                } else {
+                    yield ProofSearchResult::NotFound {
+                        reason: data.get("reason").unwrap_or("Unknown")
+                    }
+                }
+            },
+            Err(e) => {
+                yield ProofSearchResult::Error {
+                    message: e.into()
+                }
+            }
+        }
+    }
+    
+    fn validate_tactic(self, proof_state: ProofState, tactic: str) -> TacticResult {
+        // Validate check a tactic is applicable
+        
+        let request = {
+            "command": "validate_tactic",
+            "proof_state": proof_state.to_json(),
+            "tactic": tactic
+        }
+        
+        let response = self.process.send_json(request)
+        
+        match response {
+            Ok(data) => {
+                check data.get("valid") == Some(true) {
+                    yield TacticResult::Valid {
+                        new_state: ProofState.from_json(data.get("new_state").unwrap())
+                    }
+                } else {
+                    yield TacticResult::Invalid {
+                        error: data.get("error").unwrap()
+                    }
+                }
+            },
+            Err(e) => {
+                yield TacticResult::Error {
+                    message: e.into()
+                }
+            }
+        }
+    }
+    
+    fn parse_tactic_suggestions(self, data: JsonValue) -> Vec<TacticSuggestion> {
+        var suggestions = Vec.new()
+        
+        check let Some(tactics) = data.get("tactics") {
+            each tactic_data in tactics.as_array() {
+                suggestions.push(TacticSuggestion {
+                    tactic: tactic_data.get("tactic").unwrap(),
+                    confidence: tactic_data.get("confidence").unwrap_or(0.5),
+                    reasoning: tactic_data.get("reasoning").unwrap_or("")
+                })
+            }
+        }
+        
+        yield suggestions
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Interactive Proof Search
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data InteractiveProver {
+    leandojo: LeanDojo,
+    lean_handle: LeanHandle,
+    search_strategy: SearchStrategy
+}
+
+impl InteractiveProver {
+    fn new() -> InteractiveProver {
+        InteractiveProver {
+            leandojo: LeanDojo.new("models/leandojo_retrieval"),
+            lean_handle: LeanHandle.new(),
+            search_strategy: SearchStrategy::BestFirst
+        }
+    }
+    
+    fn prove_interactively(self, goal: str) -> ProofResult {
+        // Iterative proof search with LeanDojo suggestions
+        
+        println(f"🔍 Interactive proof search for: {goal}")
+        
+        var proof_state = ProofState.initial(goal)
+        var proof_steps = Vec.new()
+        let max_iterations = 100
+        
+        each iteration in 0..max_iterations {
+            // Check check goal is solved
+            check proof_state.is_solved() {
+                println(f"✅ Proof found in {iteration} steps!")
+                yield ProofResult::Success {
+                    proof_steps: proof_steps,
+                    total_steps: iteration
+                }
+            }
+            
+            // Get tactic suggestions from LeanDojo
+            let suggestions = self.leandojo.suggest_tactics(proof_state.clone())
+            
+            check suggestions.is_empty() {
+                println("❌ No tactics suggested - stuck")
+                yield ProofResult::Stuck {
+                    last_state: proof_state,
+                    steps_taken: proof_steps
+                }
+            }
+            
+            // Try tactics in order of confidence
+            var tactic_worked = false
+            
+            each suggestion in suggestions {
+                println(f"  Trying: {suggestion.tactic} (confidence: {suggestion.confidence:.2f})")
+                
+                // Validate tactic with Lean 4
+                let result = self.lean_handle.apply_tactic(
+                    proof_state.clone(),
+                    suggestion.tactic
+                )
+                
+                match result {
+                    TacticResult::Valid { new_state } => {
+                        println(f"    ✓ Success")
+                        proof_state = new_state
+                        proof_steps.push(suggestion.tactic)
+                        tactic_worked = true
+                        break
+                    },
+                    TacticResult::Invalid { error } => {
+                        println(f"    ✗ Failed: {error}")
+                    },
+                    _ => {}
+                }
+            }
+            
+            check !tactic_worked {
+                println("❌ All suggested tactics failed")
+                yield ProofResult::AllTacticsFailed {
+                    last_state: proof_state,
+                    steps_taken: proof_steps
+                }
+            }
+        }
+        
+        // Max iterations reached
+        yield ProofResult::Timeout {
+            last_state: proof_state,
+            steps_taken: proof_steps
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Supporting Types
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data ProofState {
+    goals: Vec<str>,
+    hypotheses: Vec<str>,
+    context: Map<str, str>
+}
+
+impl ProofState {
+    fn initial(goal: str) -> ProofState {
+        ProofState {
+            goals: [goal],
+            hypotheses: Vec.new(),
+            context: Map.new()
+        }
+    }
+    
+    fn is_solved(self) -> bool {
+        yield self.goals.is_empty()
+    }
+    
+    fn to_json(self) -> JsonValue {
+        yield {
+            "goals": self.goals,
+            "hypotheses": self.hypotheses,
+            "context": self.context
+        }
+    }
+    
+    fn from_json(data: JsonValue) -> ProofState {
+        ProofState {
+            goals: data.get("goals").unwrap(),
+            hypotheses: data.get("hypotheses").unwrap(),
+            context: data.get("context").unwrap()
+        }
+    }
+}
+
+open data TacticSuggestion {
+    tactic: str,
+    confidence: f32,
+    reasoning: str
+}
+
+open cases ProofSearchResult {
+    Found { proof_script: str, num_steps: u32, confidence: f32 },
+    NotFound { reason: str },
+    Error { message: str }
+}
+
+open cases TacticResult {
+    Valid { new_state: ProofState },
+    Invalid { error: str },
+    Error { message: str }
+}
+
+open cases ProofResult {
+    Success { proof_steps: Vec<str>, total_steps: u32 },
+    Stuck { last_state: ProofState, steps_taken: Vec<str> },
+    AllTacticsFailed { last_state: ProofState, steps_taken: Vec<str> },
+    Timeout { last_state: ProofState, steps_taken: Vec<str> }
+}
+
+open cases SearchStrategy {
+    BestFirst,
+    DepthFirst,
+    BreadthFirst,
+    BeamSearch { beam_width: u32 }
+}
+
+// Python process interface
+@ffi("python")
+open data PythonProcess {
+    // FFI handle to Python subprocess
+}
+
+impl PythonProcess {
+    fn spawn(script: str) -> PythonProcess {
+        // Spawn Python process
+        PythonProcess {}
+    }
+    
+    fn send_json(self, data: JsonValue) -> Result<JsonValue, str> {
+        // Send JSON to Python and get response
+        Err("Not implemented")
+    }
+}
+
+open data LeanHandle {
+    // Handle to Lean 4
+}
+
+impl LeanHandle {
+    fn new() -> LeanHandle {
+        LeanHandle {}
+    }
+    
+    fn apply_tactic(self, state: ProofState, tactic: str) -> TacticResult {
+        // Apply tactic using Lean 4
+        yield TacticResult::Error { message: "Not implemented" }
+    }
+}
+
+open alias JsonValue = any

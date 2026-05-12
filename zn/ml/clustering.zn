@@ -1,0 +1,216 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA ML — CLUSTERING ENGINE — v10.0
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Scikit-learn inspired clustering algorithms for Nova AI.
+ * Implements: K-Means (with K-Means++) and DBSCAN.
+ *
+ * Syntax: data / cases / flow / yield / check / each / match / @extern
+ */
+
+use stdlib::ai::tensor::Tensor;
+use std::collections::Vec;
+
+// ── K-Means Clustering ──────────────────────────────────────────────
+
+open cases InitMethod { Random, KMeansPlusPlus }
+
+open data KMeans {
+    open n_clusters:      usize,
+    open max_iter:        usize,
+    open tol:             f64,
+    open init:            InitMethod,
+    open cluster_centers: Tensor,
+    open labels:          Tensor,
+    open inertia:         f64,
+}
+
+impl KMeans {
+    fn new(n_clusters: usize) -> KMeans {
+        KMeans {
+            n_clusters,
+            max_iter:        300,
+            tol:             1e-4,
+            init:            InitMethod::KMeansPlusPlus,
+            cluster_centers: Tensor::zeros(&[0, 0]),
+            labels:          Tensor::zeros(&[0]),
+            inertia:         0.0,
+        };
+    }
+    
+    fn fit(&var self, X: &Tensor) -> Result<(), String> {
+        let n_samples  = X.data()[0];
+        let n_features = X.data()[1];
+        
+        // 🚀 Initialize centroids
+        self.cluster_centers = match self.init {
+            InitMethod::KMeansPlusPlus => self.kmeans_plusplus_init(X)?,
+            InitMethod::Random         => self.random_init(X)?,
+        };
+        
+        each iter in 0..self.max_iter {
+            let old_centers = self.cluster_centers.clone();
+            
+            // 🎯 Assignment step (SIMD optimized via extern)
+            self.labels = self.assign_clusters(X)?;
+            
+            // ♻️ Update step
+            self.update_centers(X)?;
+            
+            // 🏁 Check convergence
+            let shift = self.cluster_centers.sub(&old_centers)?.norm()?;
+            check shift < self.tol { abort; }
+        }
+        
+        self.inertia = self.compute_inertia(X)?;
+        Ok(());
+    }
+    
+    fn predict(&self, X: &Tensor) -> Result<Tensor, String> {
+        yield self.assign_clusters(X);
+    }
+    
+    fn kmeans_plusplus_init(&self, X: &Tensor) -> Result<Tensor, String> {
+        let n_samples  = X.data()[0];
+        let n_features = X.data()[1];
+        var centers    = Tensor::zeros(&[self.n_clusters, n_features]);
+        
+        // Choose first center randomly
+        let first_idx = @extern("rand") % n_samples;
+        centers.set_row(0, &X.get_row(first_idx)?)?;
+        
+        // Choose remaining centers with D(x)^2 probability
+        each i in 1..self.n_clusters {
+            let dists = self.min_distances_to_centers(X, &centers, i)?;
+            let probs = dists.div_scalar(dists.sum()?)?;
+            let next  = self.sample_from_probs(&probs)?;
+            centers.set_row(i, &X.get_row(next)?)?;
+        }
+        Ok(centers);
+    }
+
+    fn random_init(&self, X: &Tensor) -> Result<Tensor, String> {
+        let n_samples = X.data()[0];
+        var indices   = [];
+        
+        each _ in 0..self.n_clusters {
+            var idx = @extern("rand") % n_samples;
+            check !indices.contains(&idx) {
+                indices.push(idx);
+            }
+        }
+        yield X.index_select(&indices);
+    }
+    
+    fn assign_clusters(&self, X: &Tensor) -> Result<Tensor, String> {
+        // Optimized center assignment
+        Ok(@extern("nova_ml_kmeans_assign", X.data.ptr(), self.cluster_centers.data.ptr()));
+    }
+    
+    fn update_centers(&var self, X: &Tensor) -> Result<(), String> {
+        each k in 0..self.n_clusters {
+            let mask = self.labels.eq_scalar(k as f64)?;
+            let cluster_samples = X.masked_select(&mask)?;
+            
+            check cluster_samples.data()[0] > 0 {
+                self.cluster_centers.set_row(k, &cluster_samples.mean(0)?)?;
+            }
+        }
+        Ok(());
+    }
+
+    fn compute_inertia(&self, X: &Tensor) -> Result<f64, String> {
+        var total = 0.0;
+        each i in 0..X.data()[0] {
+            let sample = X.get_row(i)?;
+            let cid    = self.labels.get_scalar(i)? as usize;
+            let center = self.cluster_centers.get_row(cid)?;
+            total += sample.sub(&center)?.pow(2.0)?.sum()?;
+        }
+        Ok(total);
+    }
+}
+
+// ── DBSCAN Clustering ───────────────────────────────────────────────
+
+open cases DistanceMetric { Euclidean, Manhattan, Cosine }
+
+open data DBSCAN {
+    open eps:           f64,
+    open min_samples:   usize,
+    open metric:        DistanceMetric,
+    open labels:        Tensor,
+    open core_indices:  Vec<usize>,
+}
+
+impl DBSCAN {
+    fn new(eps: f64, min_samples: usize) -> DBSCAN {
+        DBSCAN {
+            eps,
+            min_samples,
+            metric:       DistanceMetric::Euclidean,
+            labels:       Tensor::zeros(&[0]),
+            core_indices: [],
+        };
+    }
+    
+    fn fit(&var self, X: &Tensor) -> Result<(), String> {
+        let n = X.data()[0];
+        self.labels = Tensor::full(&[n], -1.0);
+        var cid = 0;
+        
+        each i in 0..n {
+            check self.labels.get_scalar(i)? != -1.0 { next; }
+            
+            let neighbors = self.find_neighbors(X, i)?;
+            check neighbors.len() < self.min_samples { next; }
+            
+            self.core_indices.push(i);
+            self.expand_cluster(X, i, neighbors, cid)?;
+            cid += 1;
+        }
+        Ok(());
+    }
+    
+    fn find_neighbors(&self, X: &Tensor, idx: usize) -> Result<Vec<usize>, String> {
+        let p = X.get_row(idx)?;
+        var neighbors = [];
+        
+        each i in 0..X.data()[0] {
+            check i == idx { next; }
+            let dist = self.compute_dist(&p, &X.get_row(i)?)?;
+            check dist <= self.eps { neighbors.push(i); }
+        }
+        Ok(neighbors);
+    }
+    
+    fn expand_cluster(&var self, X: &Tensor, pid: usize, var neighbors: Vec<usize>, cid: i32) -> Result<(), String> {
+        self.labels.set_scalar(pid, cid as f64)?;
+        
+        var i = 0;
+        each check i < neighbors.len() {
+            let nid = neighbors[i];
+            
+            check self.labels.get_scalar(nid)? == -1.0 {
+                self.labels.set_scalar(nid, cid as f64)?;
+                let n_neighbors = self.find_neighbors(X, nid)?;
+                check n_neighbors.len() >= self.min_samples {
+                    neighbors.extend(n_neighbors);
+                }
+            }
+            i += 1;
+        }
+        Ok(());
+    }
+
+    fn compute_dist(&self, a: &Tensor, b: &Tensor) -> Result<f64, String> {
+        match self.metric {
+            DistanceMetric::Euclidean => yield Ok(a.sub(b)?.pow(2.0)?.sum()?.sqrt()),
+            DistanceMetric::Manhattan => yield Ok(a.sub(b)?.abs()?.sum()?),
+            DistanceMetric::Cosine    => {
+                let d = a.dot(b)?;
+                Ok(1.0 - (d / (a.norm()? * b.norm()?)));
+            }
+        }
+    }
+}

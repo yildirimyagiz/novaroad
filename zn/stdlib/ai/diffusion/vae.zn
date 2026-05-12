@@ -1,0 +1,296 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║              NOVA VAE (Variational Autoencoder)                             ║
+// ║              Native implementation for Stable Diffusion                       ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use stdlib.ai.torch.{Tensor, nn}
+use stdlib.ai.diffusion.stable_diffusion.ResidualBlock
+
+// ============================================================================
+// VAE ENCODER - Compress images to latent space
+// ============================================================================
+
+open data VAEEncoder {
+    conv_in: nn::Conv2d,
+    
+    // Downsampling blocks
+    down_blocks: Vec<Vec<ResidualBlock>>,
+    down_samples: Vec<nn::Conv2d>,
+    
+    // Middle block
+    mid_block1: ResidualBlock,
+    mid_attn: nn::SelfAttention,
+    mid_block2: ResidualBlock,
+    
+    // Output
+    norm_out: nn::GroupNorm,
+    conv_out: nn::Conv2d,
+    
+    // Config
+    latent_channels: i32,
+}
+
+impl VAEEncoder {
+    fn new(in_channels: i32, latent_channels: i32, channels: i32) -> Self {
+        let channel_mults = [1, 2, 4, 4];
+        let num_res_blocks = 2;
+        
+        var down_blocks = Vec::new();
+        var down_samples = Vec::new();
+        
+        var current_ch = channels;
+        for &mult in &channel_mults {
+            let out_ch = channels * mult;
+            var blocks = Vec::new();
+            
+            each _ in 0..num_res_blocks {
+                blocks.push(ResidualBlock::new(
+                    current_ch,
+                    out_ch,
+                    0,  // No time embedding in VAE
+                    false,  // No cross attention
+                    0
+                ));
+                current_ch = out_ch;
+            }
+            
+            down_blocks.push(blocks);
+            down_samples.push(nn::Conv2d::new(out_ch, out_ch, 3, 2, 1));
+        }
+        
+        VAEEncoder {
+            conv_in: nn::Conv2d::new(in_channels, channels, 3, 1, 1),
+            down_blocks,
+            down_samples,
+            mid_block1: ResidualBlock::new(current_ch, current_ch, 0, false, 0),
+            mid_attn: nn::SelfAttention::new(current_ch, 1),
+            mid_block2: ResidualBlock::new(current_ch, current_ch, 0, false, 0),
+            norm_out: nn::GroupNorm::new(32, current_ch),
+            conv_out: nn::Conv2d::new(current_ch, 2 * latent_channels, 3, 1, 1),
+            latent_channels
+        }
+    }
+    
+    @gpu_accelerated
+    fn forward(&var self, x: &Tensor) -> Tensor {
+        // Input conv
+        var h = self.conv_in.forward(x);
+        
+        // Downsampling path
+        each entry in self.down_blocks.iter_mut().zip(&var self.down_samples)  { let (blocks, downsample) = entry;
+            each block in blocks {
+                h = block.forward(&h, &Tensor::zeros(&[1]), None);
+            }
+            h = downsample.forward(&h);
+        }
+        
+        // Middle
+        h = self.mid_block1.forward(&h, &Tensor::zeros(&[1]), None);
+        h = self.mid_attn.forward(&h);
+        h = self.mid_block2.forward(&h, &Tensor::zeros(&[1]), None);
+        
+        // Output
+        h = self.norm_out.forward(&h);
+        h = h.silu();
+        self.conv_out.forward(&h)
+    }
+    
+    fn encode(&var self, x: &Tensor) -> (Tensor, Tensor) {
+        let moments = self.forward(x);
+        
+        // Split into mean and logvar
+        let mean = moments.slice(1, 0, self.latent_channels);
+        let logvar = moments.slice(1, self.latent_channels, 2 * self.latent_channels);
+        
+        yield (mean, logvar)
+    }
+    
+    fn sample(&var self, x: &Tensor) -> Tensor {
+        let (mean, logvar) = self.encode(x);
+        
+        // Reparameterization trick: z = mean + std * eps
+        let std = (logvar * 0.5).exp();
+        let eps = Tensor::randn_like(&mean);
+        
+        mean + std * eps
+    }
+}
+
+// ============================================================================
+// VAE DECODER - Reconstruct images from latent space
+// ============================================================================
+
+open data VAEDecoder {
+    conv_in: nn::Conv2d,
+    
+    // Middle block
+    mid_block1: ResidualBlock,
+    mid_attn: nn::SelfAttention,
+    mid_block2: ResidualBlock,
+    
+    // Upsampling blocks
+    up_blocks: Vec<Vec<ResidualBlock>>,
+    up_samples: Vec<nn::Conv2d>,
+    
+    // Output
+    norm_out: nn::GroupNorm,
+    conv_out: nn::Conv2d,
+}
+
+impl VAEDecoder {
+    fn new(latent_channels: i32, out_channels: i32, channels: i32) -> Self {
+        let channel_mults = [4, 4, 2, 1];
+        let num_res_blocks = 3;
+        
+        var current_ch = channels * 4;
+        
+        var up_blocks = Vec::new();
+        var up_samples = Vec::new();
+        
+        for &mult in &channel_mults {
+            let out_ch = channels * mult;
+            var blocks = Vec::new();
+            
+            each _ in 0..num_res_blocks {
+                blocks.push(ResidualBlock::new(
+                    current_ch,
+                    out_ch,
+                    0,
+                    false,
+                    0
+                ));
+                current_ch = out_ch;
+            }
+            
+            up_blocks.push(blocks);
+            
+            check mult > 1 {
+                up_samples.push(nn::Conv2d::new(out_ch, out_ch, 3, 1, 1));
+            }
+        }
+        
+        VAEDecoder {
+            conv_in: nn::Conv2d::new(latent_channels, channels * 4, 3, 1, 1),
+            mid_block1: ResidualBlock::new(channels * 4, channels * 4, 0, false, 0),
+            mid_attn: nn::SelfAttention::new(channels * 4, 1),
+            mid_block2: ResidualBlock::new(channels * 4, channels * 4, 0, false, 0),
+            up_blocks,
+            up_samples,
+            norm_out: nn::GroupNorm::new(32, channels),
+            conv_out: nn::Conv2d::new(channels, out_channels, 3, 1, 1)
+        }
+    }
+    
+    @gpu_accelerated
+    fn forward(&var self, z: &Tensor) -> Tensor {
+        // Input conv
+        var h = self.conv_in.forward(z);
+        
+        // Middle
+        h = self.mid_block1.forward(&h, &Tensor::zeros(&[1]), None);
+        h = self.mid_attn.forward(&h);
+        h = self.mid_block2.forward(&h, &Tensor::zeros(&[1]), None);
+        
+        // Upsampling path
+        each entry in self.up_blocks.iter_mut().enumerate()  { let (i, blocks) = entry;
+            each block in blocks {
+                h = block.forward(&h, &Tensor::zeros(&[1]), None);
+            }
+            
+            check i < self.up_samples.len() {
+                h = h.upsample_nearest2d(2.0);
+                h = self.up_samples[i].forward(&h);
+            }
+        }
+        
+        // Output
+        h = self.norm_out.forward(&h);
+        h = h.silu();
+        self.conv_out.forward(&h)
+    }
+}
+
+// ============================================================================
+// COMPLETE VAE
+// ============================================================================
+
+open data VAE {
+    encoder: VAEEncoder,
+    decoder: VAEDecoder,
+    
+    // Quantization layers
+    quant_conv: nn::Conv2d,
+    post_quant_conv: nn::Conv2d,
+    
+    scaling_factor: f32,
+}
+
+impl VAE {
+    fn new(in_channels: i32, latent_channels: i32, channels: i32) -> Self {
+        VAE {
+            encoder: VAEEncoder::new(in_channels, latent_channels, channels),
+            decoder: VAEDecoder::new(latent_channels, in_channels, channels),
+            quant_conv: nn::Conv2d::new(2 * latent_channels, 2 * latent_channels, 1, 1, 0),
+            post_quant_conv: nn::Conv2d::new(latent_channels, latent_channels, 1, 1, 0),
+            scaling_factor: 0.18215  // Standard SD scaling factor
+        }
+    }
+    
+    /// Encode image to latent space
+    @gpu_accelerated
+    fn encode(&var self, x: &Tensor) -> Tensor {
+        let moments = self.encoder.forward(x);
+        let moments = self.quant_conv.forward(&moments);
+        
+        let (mean, logvar) = self.split_moments(&moments);
+        
+        // Sample
+        let std = (logvar * 0.5).exp();
+        let eps = Tensor::randn_like(&mean);
+        let z = mean + std * eps;
+        
+        // Scale
+        z * self.scaling_factor
+    }
+    
+    /// Decode latent to image
+    @gpu_accelerated  
+    fn decode(&var self, z: &Tensor) -> Tensor {
+        // Unscale
+        let z = z / self.scaling_factor;
+        let z = self.post_quant_conv.forward(&z);
+        self.decoder.forward(&z)
+    }
+    
+    /// Full forward pass (encode + decode)
+    fn forward(&var self, x: &Tensor) -> Tensor {
+        let z = self.encode(x);
+        self.decode(&z)
+    }
+    
+    fn split_moments(&self, moments: &Tensor) -> (Tensor, Tensor) {
+        let latent_ch = moments.data[1] / 2;
+        let mean = moments.slice(1, 0, latent_ch);
+        let logvar = moments.slice(1, latent_ch, 2 * latent_ch);
+        yield (mean, logvar)
+    }
+}
+
+// ============================================================================
+// KL DIVERGENCE LOSS
+// ============================================================================
+
+open fn kl_divergence(mean: &Tensor, logvar: &Tensor) -> Tensor {
+    // KL(N(mean, var) || N(0, 1))
+    // = 0.5 * sum(1 + log(var) - mean^2 - var)
+    
+    let kl = -0.5 * (1.0 + logvar - mean.pow(2.0) - logvar.exp());
+    kl.mean()
+}
+
+export {
+    VAE,
+    VAEEncoder,
+    VAEDecoder,
+    kl_divergence
+}

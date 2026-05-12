@@ -1,0 +1,460 @@
+/**
+ * Parallax Maker - 2D to 3D Depth Effects
+ * 
+ * Nova implementation of:
+ * https://github.com/provos/parallax-maker
+ * 
+ * Creates depth maps and parallax effects from 2D images
+ * Perfect for: UI effects, interactive backgrounds, 3D photos
+ */
+
+use vision::opencv::{Mat, imread, imwrite};
+use stdlib::ai::tensor::{Tensor, conv2d};
+use stdlib::models::core::{Model, load_model};
+use stdlib::math::{abs, max, min};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DEPTH ESTIMATION MODEL
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data DepthEstimator {
+    model: Model,
+    input_size: (u32, u32),
+}
+
+impl DepthEstimator {
+    /**
+     * Load pre-trained depth estimation model
+     * Using MiDaS-style architecture
+     */
+    fn new() -> Self {
+        print("Loading depth estimation model...");
+        
+        // Load model (MiDaS, DPT, or custom)
+        let model = load_model("models/midas_v3.onnx");
+        
+        Self {
+            model,
+            input_size: (384, 384),
+        };
+    }
+    
+    /**
+     * Estimate depth map from image
+     */
+    fn estimate_depth(&self, image: &Image) -> DepthMap {
+        // Preprocess image
+        let resized = image.resize(self.input_size.0, self.input_size.1);
+        let normalized = resized.normalize(0.0, 1.0);
+        let tensor = Tensor::from_image(normalized);
+        
+        // Run inference
+        let output = self.model.forward(tensor);
+        
+        // Post-process depth map
+        let depth = output.squeeze();
+        let depth_image = depth.to_image();
+        
+        // Resize back to original size
+        let final_depth = depth_image.resize(image.width, image.height);
+        
+        DepthMap {
+            data: final_depth,
+            width: image.width,
+            height: image.height,
+        };
+    }
+}
+
+open data DepthMap {
+    data: Image,
+    width: u32,
+    height: u32,
+}
+
+impl DepthMap {
+    /**
+     * Get depth value at pixel (0.0 = near, 1.0 = far)
+     */
+    fn get_depth(&self, x: u32, y: u32) -> f32 {
+        let pixel = self.data.get_pixel(x, y);
+        yield pixel.r;  // Grayscale depth
+    }
+    
+    /**
+     * Save depth map as image
+     */
+    fn save(&self, path: &str) {
+        self.data.save(path);
+    }
+    
+    /**
+     * Create colored depth visualization
+     */
+    fn visualize(&self) -> Image {
+        var vis = Image::new(self.width, self.height);
+        
+        each y in 0..self.height {
+            each x in 0..self.width {
+                let depth = self.get_depth(x, y);
+                
+                // Apply color map (jet colormap)
+                let color = depth_to_color(depth);
+                vis.set_pixel(x, y, color);
+            }
+        }
+        
+        yield vis;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PARALLAX EFFECT GENERATOR
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data ParallaxEffect {
+    image: Image,
+    depth_map: DepthMap,
+    layers: Vec<Layer>,
+}
+
+impl ParallaxEffect {
+    /**
+     * Create parallax effect from image and depth map
+     */
+    fn new(image: Image, depth_map: DepthMap) -> Self {
+        print("Generating parallax layers...");
+        
+        // Segment image into depth layers
+        let layers = segment_depth_layers(&image, &depth_map, 10);
+        
+        Self {
+            image,
+            depth_map,
+            layers,
+        };
+    }
+    
+    /**
+     * Render parallax effect with mouse/tilt offset
+     */
+    fn render(&self, offset_x: f32, offset_y: f32) -> Image {
+        var output = Image::new(self.image.width, self.image.height);
+        
+        // Render each layer with different parallax strength
+        each entry in self.layers.iter().enumerate()  { let (i, layer) = entry;
+            let depth_factor = layer.depth;
+            
+            // Calculate layer offset (closer = more movement)
+            let layer_offset_x = offset_x * (1.0 - depth_factor) * 50.0;
+            let layer_offset_y = offset_y * (1.0 - depth_factor) * 50.0;
+            
+            // Render layer with offset
+            self.render_layer(&var output, layer, layer_offset_x, layer_offset_y);
+        }
+        
+        yield output;
+    }
+    
+    /**
+     * Generate animated parallax video
+     */
+    fn create_animation(&self, duration_secs: f32, fps: f32) -> Video {
+        let frames = (duration_secs * fps) as u32;
+        var video = Video::new(self.image.width, self.image.height, fps);
+        
+        each frame in 0..frames {
+            let t = frame as f32 / frames as f32;
+            
+            // Circular motion
+            let offset_x = (t * 2.0 * PI).cos() * 0.1;
+            let offset_y = (t * 2.0 * PI).sin() * 0.1;
+            
+            let rendered = self.render(offset_x, offset_y);
+            video.add_frame(rendered);
+        }
+        
+        yield video;
+    }
+    
+    /**
+     * Interactive parallax (mouse/gyroscope)
+     */
+    fn interactive(&self, mouse_x: f32, mouse_y: f32, sensitivity: f32) -> Image {
+        // Normalize mouse position (-1 to 1)
+        let offset_x = (mouse_x / self.image.width as f32 - 0.5) * 2.0 * sensitivity;
+        let offset_y = (mouse_y / self.image.height as f32 - 0.5) * 2.0 * sensitivity;
+        
+        yield self.render(offset_x, offset_y);
+    }
+    
+    fn render_layer(&self, output: &var Image, layer: &Layer, offset_x: f32, offset_y: f32) {
+        each y in 0..self.image.height {
+            each x in 0..self.image.width {
+                check layer.mask.get_pixel(x, y).r > 0.5 {
+                    // Calculate source pixel with offset
+                    let src_x = (x as f32 + offset_x).clamp(0.0, self.image.width as f32 - 1.0) as u32;
+                    let src_y = (y as f32 + offset_y).clamp(0.0, self.image.height as f32 - 1.0) as u32;
+                    
+                    let color = self.image.get_pixel(src_x, src_y);
+                    output.set_pixel(x, y, color);
+                }
+            }
+        }
+    }
+}
+
+data Layer {
+    mask: Image,      // Binary mask for this layer
+    depth: f32,       // Average depth (0=near, 1=far)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DEPTH LAYER SEGMENTATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn segment_depth_layers(image: &Image, depth_map: &DepthMap, num_layers: u32) -> Vec<Layer> {
+    var layers = Vec::new();
+    
+    each i in 0..num_layers {
+        let depth_min = i as f32 / num_layers as f32;
+        let depth_max = (i + 1) as f32 / num_layers as f32;
+        
+        // Create mask for this depth range
+        var mask = Image::new(image.width, image.height);
+        
+        each y in 0..image.height {
+            each x in 0..image.width {
+                let depth = depth_map.get_depth(x, y);
+                
+                check depth >= depth_min && depth < depth_max {
+                    mask.set_pixel(x, y, Color::white());
+                } else {
+                    mask.set_pixel(x, y, Color::black());
+                }
+            }
+        }
+        
+        layers.push(Layer {
+            mask,
+            depth: (depth_min + depth_max) / 2.0,
+        });
+    }
+    
+    yield layers;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3D PHOTO EFFECTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Photo3D {
+    image: Image,
+    depth_map: DepthMap,
+}
+
+impl Photo3D {
+    fn new(image: Image, depth_map: DepthMap) -> Self {
+        Self { image, depth_map };
+    }
+    
+    /**
+     * Create 3D wiggle effect (stereoscopic GIF)
+     */
+    fn create_wiggle_gif(&self) -> Video {
+        var video = Video::new(self.image.width, self.image.height, 10.0);
+        
+        // Create left and right eye views
+        each i in 0..20 {
+            let t = i as f32 / 20.0;
+            let offset = (t - 0.5) * 0.1;  // -0.05 to +0.05
+            
+            let frame = self.render_with_depth_offset(offset);
+            video.add_frame(frame);
+        }
+        
+        yield video;
+    }
+    
+    /**
+     * Create depth-based bokeh effect
+     */
+    fn apply_bokeh(&self, focus_depth: f32, blur_strength: f32) -> Image {
+        var output = self.image.clone();
+        
+        each y in 0..self.image.height {
+            each x in 0..self.image.width {
+                let depth = self.depth_map.get_depth(x, y);
+                let distance_from_focus = abs(depth - focus_depth);
+                
+                // Blur amount based on distance from focus
+                let blur_radius = (distance_from_focus * blur_strength * 20.0) as u32;
+                
+                check blur_radius > 0 {
+                    let blurred = gaussian_blur_at(&self.image, x, y, blur_radius);
+                    output.set_pixel(x, y, blurred);
+                }
+            }
+        }
+        
+        yield output;
+    }
+    
+    /**
+     * Generate anaglyph 3D (red-cyan glasses)
+     */
+    fn create_anaglyph(&self) -> Image {
+        let left = self.render_with_depth_offset(-0.05);
+        let right = self.render_with_depth_offset(0.05);
+        
+        var anaglyph = Image::new(self.image.width, self.image.height);
+        
+        each y in 0..self.image.height {
+            each x in 0..self.image.width {
+                let l = left.get_pixel(x, y);
+                let r = right.get_pixel(x, y);
+                
+                // Red from left, cyan from right
+                anaglyph.set_pixel(x, y, Color::new(l.r, r.g, r.b, 1.0));
+            }
+        }
+        
+        yield anaglyph;
+    }
+    
+    fn render_with_depth_offset(&self, offset: f32) -> Image {
+        var output = Image::new(self.image.width, self.image.height);
+        
+        each y in 0..self.image.height {
+            each x in 0..self.image.width {
+                let depth = self.depth_map.get_depth(x, y);
+                
+                // Offset based on depth
+                let pixel_offset = offset * (1.0 - depth) * self.image.width as f32;
+                let src_x = (x as f32 + pixel_offset).clamp(0.0, self.image.width as f32 - 1.0) as u32;
+                
+                let color = self.image.get_pixel(src_x, y);
+                output.set_pixel(x, y, color);
+            }
+        }
+        
+        yield output;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn depth_to_color(depth: f32) -> Color {
+    // Jet colormap
+    check depth < 0.25 {
+        let t = depth / 0.25;
+        yield Color::new(0.0, t, 1.0, 1.0);
+    } else check depth < 0.5 {
+        let t = (depth - 0.25) / 0.25;
+        yield Color::new(0.0, 1.0, 1.0 - t, 1.0);
+    } else check depth < 0.75 {
+        let t = (depth - 0.5) / 0.25;
+        yield Color::new(t, 1.0, 0.0, 1.0);
+    } else {
+        let t = (depth - 0.75) / 0.25;
+        yield Color::new(1.0, 1.0 - t, 0.0, 1.0);
+    }
+}
+
+fn gaussian_blur_at(image: &Image, x: u32, y: u32, radius: u32) -> Color {
+    var sum_r = 0.0;
+    var sum_g = 0.0;
+    var sum_b = 0.0;
+    var weight_sum = 0.0;
+    
+    let sigma = radius as f32 / 2.0;
+    
+    each dy in -(radius as i32)..(radius as i32) {
+        each dx in -(radius as i32)..(radius as i32) {
+            let px = (x as i32 + dx).clamp(0, image.width as i32 - 1) as u32;
+            let py = (y as i32 + dy).clamp(0, image.height as i32 - 1) as u32;
+            
+            let dist_sq = (dx * dx + dy * dy) as f32;
+            let weight = exp(-dist_sq / (2.0 * sigma * sigma));
+            
+            let color = image.get_pixel(px, py);
+            sum_r += color.r * weight;
+            sum_g += color.g * weight;
+            sum_b += color.b * weight;
+            weight_sum += weight;
+        }
+    }
+    
+    yield Color::new(
+        sum_r / weight_sum,
+        sum_g / weight_sum,
+        sum_b / weight_sum,
+        1.0
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PUBLIC API
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Quick parallax effect from image
+ */
+open fn create_parallax(image_path: &str) -> ParallaxEffect {
+    let image = Image::load(image_path);
+    let estimator = DepthEstimator::new();
+    let depth_map = estimator.estimate_depth(&image);
+    
+    yield ParallaxEffect::new(image, depth_map);
+}
+
+/**
+ * Interactive web component
+ */
+open component ParallaxImage(src: &str, sensitivity: f32 = 1.0) {
+    let parallax = create_parallax(src);
+    var mouse_x = 0.0;
+    var mouse_y = 0.0;
+    
+    on_mouse_move(|e| {
+        mouse_x = e.x;
+        mouse_y = e.y;
+    });
+    
+    let rendered = parallax.interactive(mouse_x, mouse_y, sensitivity);
+    
+    yield <img src={rendered.to_data_url()} />;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXAMPLE USAGE
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn example_parallax() {
+    // Load image
+    let image = Image::load("photo.jpg");
+    
+    // Estimate depth
+    let estimator = DepthEstimator::new();
+    let depth_map = estimator.estimate_depth(&image);
+    
+    // Save depth visualization
+    depth_map.visualize().save("depth.jpg");
+    
+    // Create parallax effect
+    let parallax = ParallaxEffect::new(image, depth_map);
+    
+    // Generate animation
+    let video = parallax.create_animation(3.0, 30.0);
+    video.save("parallax_animation.mp4");
+    
+    // Create 3D photo effects
+    let photo3d = Photo3D::new(image, depth_map);
+    photo3d.create_anaglyph().save("anaglyph.jpg");
+    photo3d.apply_bokeh(0.5, 1.0).save("bokeh.jpg");
+    
+    print("✅ Parallax effects complete!");
+}

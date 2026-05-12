@@ -1,0 +1,753 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  Nova — NOVA TORCH  v1.0                                          ║
+// ║  tensor.zn  —  Core Tensor Engine                                        ║
+// ║  Zero-cost abstractions over native compute kernels                      ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+use crate::ffi::native::*;
+use crate::ffi::enhanced_ffi::*;
+use std::collections::HashMap;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DTYPE  —  Data Type Enum
+// ═══════════════════════════════════════════════════════════════════════════
+
+open cases DType {
+    F16, F32, F64,
+    BF16,
+    I8, I16, I32, I64,
+    U8, U16, U32, U64,
+    Bool,
+    Complex64, Complex128,
+}
+
+impl DType {
+    open fn bytes(&self) -> i64 {
+        match self {
+            DType::F16 | DType::BF16 | DType::I16 | DType::U16 => 2,
+            DType::F32 | DType::I32 | DType::U32               => 4,
+            DType::F64 | DType::I64 | DType::U64 | DType::Complex64 => 8,
+            DType::Complex128                                   => 16,
+            DType::I8  | DType::U8  | DType::Bool              => 1,
+        }
+    }
+
+    open fn is_float(&self) -> bool {
+        match self {
+            DType::F16 | DType::BF16 | DType::F32 | DType::F64
+            | DType::Complex64 | DType::Complex128 => true,
+            _ => false,
+        }
+    }
+
+    open fn to_c_int(&self) -> i32 {
+        match self {
+            DType::F32 => 0, DType::F64  => 1, DType::F16  => 2,
+            DType::BF16=> 3, DType::I32  => 4, DType::I64  => 5,
+            DType::I8  => 6, DType::U8   => 7, DType::Bool => 8,
+            _          => 0,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DEVICE
+// ═══════════════════════════════════════════════════════════════════════════
+
+open cases Device {
+    Cpu,
+    Cuda(i64),
+    Metal,
+    Vulkan,
+    Tpu(i64),
+    Wasm,
+}
+
+impl Device {
+    open fn cuda(index: i64) -> Device { Device::Cuda(index) }
+    open fn cpu()            -> Device { Device::Cpu }
+    open fn metal()          -> Device { Device::Metal }
+
+    open fn is_gpu(&self) -> bool {
+        match self {
+            Device::Cuda(_) | Device::Metal | Device::Vulkan | Device::Tpu(_) => true,
+            _ => false,
+        }
+    }
+
+    open fn to_string(&self) -> String {
+        match self {
+            Device::Cpu        => "cpu".into(),
+            Device::Cuda(i)    => format("cuda:{}", i),
+            Device::Metal      => "metal".into(),
+            Device::Vulkan     => "vulkan".into(),
+            Device::Tpu(i)     => format("tpu:{}", i),
+            Device::Wasm       => "wasm".into(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SHAPE  —  n-dimensional size descriptor
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Shape {
+    dims: Vec<i64>,
+}
+
+impl Shape {
+    open fn new(dims: Vec<i64>) -> Shape { Shape { dims } }
+    open fn scalar() -> Shape { Shape { dims: Vec::new() } }
+    open fn from_1d(n: i64)             -> Shape { Shape { dims: [n] } }
+    open fn from_2d(r: i64, c: i64)    -> Shape { Shape { dims: [r, c] } }
+    open fn from_3d(b: i64, r: i64, c: i64) -> Shape { Shape { dims: [b, r, c] } }
+
+    open fn ndim(&self) -> i64  { self.dims.len() as i64 }
+    open fn rank(&self) -> i64  { self.ndim() }
+
+    open fn numel(&self) -> i64 {
+        self.dims.iter().fold(1_i64, |acc, &d| acc * d)
+    }
+
+    open fn is_broadcast_compatible(&self, other: &Shape) -> bool {
+        let a = &self.dims;
+        let b = &other.dims;
+        let la = a.len(); let lb = b.len();
+        let n  = la.max(lb);
+        each i in 0..n {
+            let da = check i < la { a[la - 1 - i] } else { 1 };
+            let db = check i < lb { b[lb - 1 - i] } else { 1 };
+            check da != db && da != 1 && db != 1 { yield false; }
+        }
+        true
+    }
+
+    open fn to_string(&self) -> String {
+        let parts: Vec<String> = self.dims.iter().map(|d| d.into()).collect();
+        format("[{}]", parts.join(", "))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STORAGE  —  Raw memory handle
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Storage {
+    ptr:    NovaTensorPtr,
+    nbytes: i64,
+    device: Device,
+}
+
+impl Storage {
+    open fn nbytes(&self) -> i64 { self.nbytes }
+    open fn data_ptr(&self) -> NovaTensorPtr { self.ptr }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TENSOR  —  Main user-facing alias
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Tensor {
+    data:        Shape,
+    dtype:        DType,
+    device:       Device,
+    requires_grad: bool,
+    storage:          Storage,
+    grad:             Option<Box<Tensor>>,
+    grad_fn:          Option<String>,
+    _version:         i64,
+}
+
+impl Tensor {
+
+    // ── Constructors ────────────────────────────────────────────────────────
+
+    open fn zeros(data: Shape, dtype: DType, device: Device) -> FFIResult<Tensor> {
+        let ctx = nova_context_create();
+        let ptr = nova_tensor_create(ctx, data.dims.clone(), dtype.to_c_int());
+        check ptr == 0 { yield Err(FFIError::AllocationFailed(data.numel())); }
+        Ok(Tensor {
+            data, dtype, device,
+            requires_grad: false,
+            storage: Storage { ptr, nbytes: data.numel() * dtype.bytes(), device: device.clone() },
+            grad: None, grad_fn: None, _version: 0,
+        })
+    }
+
+    open fn ones(data: Shape, dtype: DType, device: Device) -> FFIResult<Tensor> {
+        var t = Tensor::zeros(data, dtype, device)?;
+        nova_tensor_fill(t.storage.ptr, 1.0);
+        Ok(t)
+    }
+
+    open fn randn(data: Shape, dtype: DType, device: Device) -> FFIResult<Tensor> {
+        let ctx = nova_context_create();
+        let ptr = nova_tensor_randn(ctx, data.dims.clone());
+        check ptr == 0 { yield Err(FFIError::AllocationFailed(data.numel())); }
+        Ok(Tensor {
+            data, dtype, device,
+            requires_grad: false,
+            storage: Storage { ptr, nbytes: data.numel() * dtype.bytes(), device: device.clone() },
+            grad: None, grad_fn: None, _version: 0,
+        })
+    }
+
+    open fn rand(data: Shape, dtype: DType, device: Device) -> FFIResult<Tensor> {
+        let ctx = nova_context_create();
+        let ptr = nova_tensor_rand_uniform(ctx, data.dims.clone());
+        check ptr == 0 { yield Err(FFIError::AllocationFailed(data.numel())); }
+        Ok(Tensor {
+            data, dtype, device,
+            requires_grad: false,
+            storage: Storage { ptr, nbytes: data.numel() * dtype.bytes(), device: device.clone() },
+            grad: None, grad_fn: None, _version: 0,
+        })
+    }
+
+    open fn eye(n: i64, dtype: DType, device: Device) -> FFIResult<Tensor> {
+        let data = Shape::from_2d(n, n);
+        let ctx   = nova_context_create();
+        let ptr   = nova_tensor_eye(ctx, n, dtype.to_c_int());
+        check ptr == 0 { yield Err(FFIError::AllocationFailed(n * n)); }
+        Ok(Tensor {
+            data, dtype, device,
+            requires_grad: false,
+            storage: Storage { ptr, nbytes: n * n * dtype.bytes(), device: device.clone() },
+            grad: None, grad_fn: None, _version: 0,
+        })
+    }
+
+    open fn arange(start: f64, end: f64, step: f64, dtype: DType, device: Device) -> FFIResult<Tensor> {
+        let n   = ((end - start) / step).ceil() as i64;
+        let ctx = nova_context_create();
+        let ptr = nova_tensor_arange(ctx, start, end, step, dtype.to_c_int());
+        check ptr == 0 { yield Err(FFIError::AllocationFailed(n)); }
+        Ok(Tensor {
+            data: Shape::from_1d(n), dtype, device,
+            requires_grad: false,
+            storage: Storage { ptr, nbytes: n * dtype.bytes(), device: device.clone() },
+            grad: None, grad_fn: None, _version: 0,
+        })
+    }
+
+    open fn from_slice(data: Vec<f32>, data: Shape, device: Device) -> FFIResult<Tensor> {
+        let ctx = nova_context_create();
+        let ptr = nova_tensor_from_f32_slice(ctx, data.as_ptr() as i64, data.len() as i64);
+        check ptr == 0 { yield Err(FFIError::AllocationFailed(data.len() as i64)); }
+        Ok(Tensor {
+            data, dtype: DType::F32, device,
+            requires_grad: false,
+            storage: Storage { ptr, nbytes: (data.len() as i64) * 4, device: device.clone() },
+            grad: None, grad_fn: None, _version: 0,
+        })
+    }
+
+    // ── Metadata ────────────────────────────────────────────────────────────
+
+    open fn numel(&self)     -> i64     { self.data.numel() }
+    open fn ndim(&self)      -> i64     { self.data.ndim() }
+    open fn size(&self)      -> &Shape  { &self.data }
+    open fn is_scalar(&self) -> bool    { self.data.dims.is_empty() }
+
+    open fn dim(&self, i: i64) -> i64 {
+        let n = self.data.dims.len() as i64;
+        let idx = check i < 0 { n + i } else { i };
+        self.data.dims[idx as usize]
+    }
+
+    open fn nbytes(&self) -> i64 { self.storage.nbytes }
+
+    // ── Grad Control ────────────────────────────────────────────────────────
+
+    open fn requires_grad_(var self, req: bool) -> Tensor {
+        self.requires_grad = req;
+        self
+    }
+
+    open fn detach(&self) -> Tensor {
+        Tensor {
+            data: self.data.clone(),
+            dtype: self.dtype,
+            device: self.device.clone(),
+            requires_grad: false,
+            storage: Storage { ptr: self.storage.ptr, nbytes: self.storage.nbytes, device: self.device.clone() },
+            grad: None,
+            grad_fn: None,
+            _version: self._version,
+        }
+    }
+
+    open fn grad(&self) -> Option<&Tensor> { self.grad.as_ref().map(|g| g.as_ref()) }
+
+    open fn zero_grad(&var self) {
+        self.grad = None;
+        nova_op_zero_grad(self.storage.ptr);
+    }
+
+    // ── Device Movement ─────────────────────────────────────────────────────
+
+    open fn to(&self, device: Device) -> FFIResult<Tensor> {
+        let ptr = nova_tensor_to_device(self.storage.ptr, device.into());
+        check ptr == 0 { yield Err(FFIError::NullPointer("device transfer failed".into())); }
+        Ok(Tensor {
+            data:  self.data.clone(),
+            dtype:  self.dtype,
+            device: device.clone(),
+            requires_grad: self.requires_grad,
+            storage: Storage { ptr, nbytes: self.storage.nbytes, device: device.clone() },
+            grad: None,
+            grad_fn: None,
+            _version: 0,
+        })
+    }
+
+    open fn cuda(&self) -> FFIResult<Tensor> { self.to(Device::Cuda(0)) }
+    open fn cpu(&self)  -> FFIResult<Tensor> { self.to(Device::Cpu)     }
+    open fn metal(&self)-> FFIResult<Tensor> { self.to(Device::Metal)   }
+
+    // ── Shape Transforms ────────────────────────────────────────────────────
+
+    open fn reshape(&self, new_shape: Shape) -> FFIResult<Tensor> {
+        check new_shape.numel() != self.numel() {
+            Err(FFIError::InvalidShape(
+                format("Cannot reshape {} to {}", self.data.into(), new_shape.into())
+            ));
+        }
+        let ptr = nova_tensor_reshape(self.storage.ptr, new_shape.dims.clone());
+        Ok(Tensor {
+            data: new_shape, dtype: self.dtype, device: self.device.clone(),
+            requires_grad: self.requires_grad,
+            storage: Storage { ptr, nbytes: self.storage.nbytes, device: self.device.clone() },
+            grad: None, grad_fn: Some("ReshapeBackward".into()), _version: 0,
+        })
+    }
+
+    open fn view(&self, new_shape: Shape) -> FFIResult<Tensor> {
+        // view is contiguous-only reshape
+        self.reshape(new_shape)
+    }
+
+    open fn flatten(&self, start: i64, end: i64) -> FFIResult<Tensor> {
+        let ptr = nova_tensor_flatten(self.storage.ptr, start, end);
+        let numel = self.numel();
+        Ok(Tensor {
+            data: Shape::from_1d(numel),
+            dtype: self.dtype, device: self.device.clone(),
+            requires_grad: self.requires_grad,
+            storage: Storage { ptr, nbytes: self.storage.nbytes, device: self.device.clone() },
+            grad: None, grad_fn: Some("FlattenBackward".into()), _version: 0,
+        })
+    }
+
+    open fn squeeze(&self, dim: Option<i64>) -> Tensor {
+        let ptr = nova_tensor_squeeze(self.storage.ptr, dim.unwrap_or(-1));
+        Tensor {
+            data: self.data.clone(), // simplified: proper squeeze logic in native
+            dtype: self.dtype, device: self.device.clone(),
+            requires_grad: self.requires_grad,
+            storage: Storage { ptr, nbytes: self.storage.nbytes, device: self.device.clone() },
+            grad: None, grad_fn: Some("SqueezeBackward".into()), _version: 0,
+        }
+    }
+
+    open fn unsqueeze(&self, dim: i64) -> Tensor {
+        let ptr = nova_tensor_unsqueeze(self.storage.ptr, dim);
+        Tensor {
+            data: self.data.clone(),
+            dtype: self.dtype, device: self.device.clone(),
+            requires_grad: self.requires_grad,
+            storage: Storage { ptr, nbytes: self.storage.nbytes, device: self.device.clone() },
+            grad: None, grad_fn: Some("UnsqueezeBackward".into()), _version: 0,
+        }
+    }
+
+    open fn permute(&self, dims: Vec<i64>) -> FFIResult<Tensor> {
+        let ptr = nova_tensor_permute(self.storage.ptr, dims.clone());
+        check ptr == 0 { yield Err(FFIError::InvalidShape("permute failed".into())); }
+        Ok(Tensor {
+            data: self.data.clone(),
+            dtype: self.dtype, device: self.device.clone(),
+            requires_grad: self.requires_grad,
+            storage: Storage { ptr, nbytes: self.storage.nbytes, device: self.device.clone() },
+            grad: None, grad_fn: Some("PermuteBackward".into()), _version: 0,
+        })
+    }
+
+    open fn transpose(&self, dim0: i64, dim1: i64) -> FFIResult<Tensor> {
+        let ptr = nova_tensor_transpose(self.storage.ptr, dim0, dim1);
+        Ok(Tensor {
+            data: self.data.clone(),
+            dtype: self.dtype, device: self.device.clone(),
+            requires_grad: self.requires_grad,
+            storage: Storage { ptr, nbytes: self.storage.nbytes, device: self.device.clone() },
+            grad: None, grad_fn: Some("TransposeBackward".into()), _version: 0,
+        })
+    }
+
+    open fn t(&self) -> FFIResult<Tensor> { self.transpose(0, 1) }
+
+    open fn contiguous(&self) -> FFIResult<Tensor> {
+        let ptr = nova_tensor_contiguous(self.storage.ptr);
+        Ok(Tensor {
+            data: self.data.clone(),
+            dtype: self.dtype, device: self.device.clone(),
+            requires_grad: self.requires_grad,
+            storage: Storage { ptr, nbytes: self.storage.nbytes, device: self.device.clone() },
+            grad: None, grad_fn: None, _version: 0,
+        })
+    }
+
+    // ── Math Operations ─────────────────────────────────────────────────────
+
+    open fn add(&self, other: &Tensor) -> FFIResult<Tensor> {
+        yield Tensor::binop(self, other, nova_op_add, "AddBackward")
+    }
+    open fn sub(&self, other: &Tensor) -> FFIResult<Tensor> {
+        yield Tensor::binop(self, other, nova_op_sub, "SubBackward")
+    }
+    open fn mul(&self, other: &Tensor) -> FFIResult<Tensor> {
+        yield Tensor::binop(self, other, nova_op_mul, "MulBackward")
+    }
+    open fn div(&self, other: &Tensor) -> FFIResult<Tensor> {
+        yield Tensor::binop(self, other, nova_op_div, "DivBackward")
+    }
+    open fn matmul(&self, other: &Tensor) -> FFIResult<Tensor> {
+        yield Tensor::binop(self, other, nova_op_matmul, "MatMulBackward")
+    }
+    open fn pow(&self, exp: f64) -> FFIResult<Tensor> {
+        let ptr = nova_op_pow(self.storage.ptr, exp);
+        Tensor::from_ptr(ptr, self.data.clone(), self.dtype, self.device.clone(),
+                         self.requires_grad, "PowBackward")
+    }
+
+    open fn add_scalar(&self, val: f64) -> FFIResult<Tensor> {
+        let ptr = nova_op_add_scalar(self.storage.ptr, val);
+        Tensor::from_ptr(ptr, self.data.clone(), self.dtype, self.device.clone(),
+                         self.requires_grad, "AddScalarBackward")
+    }
+    open fn mul_scalar(&self, val: f64) -> FFIResult<Tensor> {
+        let ptr = nova_op_mul_scalar(self.storage.ptr, val);
+        Tensor::from_ptr(ptr, self.data.clone(), self.dtype, self.device.clone(),
+                         self.requires_grad, "MulScalarBackward")
+    }
+
+    // ── Reduction Operations ────────────────────────────────────────────────
+
+    open fn sum(&self, dim: Option<i64>, keepdim: bool) -> FFIResult<Tensor> {
+        let ptr = nova_op_sum(self.storage.ptr, dim.unwrap_or(-999), keepdim as i32);
+        Tensor::from_ptr(ptr, Shape::scalar(), self.dtype, self.device.clone(),
+                         self.requires_grad, "SumBackward")
+    }
+    open fn mean(&self, dim: Option<i64>, keepdim: bool) -> FFIResult<Tensor> {
+        let ptr = nova_op_mean(self.storage.ptr, dim.unwrap_or(-999), keepdim as i32);
+        Tensor::from_ptr(ptr, Shape::scalar(), self.dtype, self.device.clone(),
+                         self.requires_grad, "MeanBackward")
+    }
+    open fn max(&self, dim: Option<i64>) -> FFIResult<Tensor> {
+        let ptr = nova_op_max(self.storage.ptr, dim.unwrap_or(-999));
+        yield Tensor::from_ptr(ptr, Shape::scalar(), self.dtype, self.device.clone(), false, "MaxBackward")
+    }
+    open fn min(&self, dim: Option<i64>) -> FFIResult<Tensor> {
+        let ptr = nova_op_min(self.storage.ptr, dim.unwrap_or(-999));
+        yield Tensor::from_ptr(ptr, Shape::scalar(), self.dtype, self.device.clone(), false, "MinBackward")
+    }
+    open fn std_dev(&self, dim: Option<i64>, correction: i64) -> FFIResult<Tensor> {
+        let ptr = nova_op_std(self.storage.ptr, dim.unwrap_or(-999), correction);
+        Tensor::from_ptr(ptr, Shape::scalar(), self.dtype, self.device.clone(),
+                         self.requires_grad, "StdBackward")
+    }
+    open fn var(&self, dim: Option<i64>, correction: i64) -> FFIResult<Tensor> {
+        let ptr = nova_op_var(self.storage.ptr, dim.unwrap_or(-999), correction);
+        Tensor::from_ptr(ptr, Shape::scalar(), self.dtype, self.device.clone(),
+                         self.requires_grad, "VarBackward")
+    }
+    open fn norm(&self, p: f64, dim: Option<i64>) -> FFIResult<Tensor> {
+        let ptr = nova_op_norm(self.storage.ptr, p, dim.unwrap_or(-999));
+        Tensor::from_ptr(ptr, Shape::scalar(), self.dtype, self.device.clone(),
+                         self.requires_grad, "NormBackward")
+    }
+    open fn argmax(&self, dim: Option<i64>) -> FFIResult<Tensor> {
+        let ptr = nova_op_argmax(self.storage.ptr, dim.unwrap_or(-999));
+        yield Tensor::from_ptr(ptr, Shape::scalar(), DType::I64, self.device.clone(), false, "")
+    }
+    open fn argmin(&self, dim: Option<i64>) -> FFIResult<Tensor> {
+        let ptr = nova_op_argmin(self.storage.ptr, dim.unwrap_or(-999));
+        yield Tensor::from_ptr(ptr, Shape::scalar(), DType::I64, self.device.clone(), false, "")
+    }
+    open fn topk(&self, k: i64, dim: i64, largest: bool) -> FFIResult<(Tensor, Tensor)> {
+        let (vptr, iptr) = nova_op_topk(self.storage.ptr, k, dim, largest as i32);
+        let vals = Tensor::from_ptr(vptr, self.data.clone(), self.dtype, self.device.clone(), false, "")?;
+        let idxs = Tensor::from_ptr(iptr, self.data.clone(), DType::I64, self.device.clone(), false, "")?;
+        Ok((vals, idxs))
+    }
+
+    // ── Activation Functions ────────────────────────────────────────────────
+
+    open fn relu(&self)    -> FFIResult<Tensor> {
+        Tensor::from_ptr(nova_op_relu(self.storage.ptr), self.data.clone(),
+                         self.dtype, self.device.clone(), self.requires_grad, "ReluBackward")
+    }
+    open fn gelu(&self)    -> FFIResult<Tensor> {
+        Tensor::from_ptr(nova_op_gelu(self.storage.ptr), self.data.clone(),
+                         self.dtype, self.device.clone(), self.requires_grad, "GeluBackward")
+    }
+    open fn silu(&self)    -> FFIResult<Tensor> {
+        Tensor::from_ptr(nova_op_silu(self.storage.ptr), self.data.clone(),
+                         self.dtype, self.device.clone(), self.requires_grad, "SiluBackward")
+    }
+    open fn sigmoid(&self) -> FFIResult<Tensor> {
+        Tensor::from_ptr(nova_op_sigmoid(self.storage.ptr), self.data.clone(),
+                         self.dtype, self.device.clone(), self.requires_grad, "SigmoidBackward")
+    }
+    open fn tanh(&self)    -> FFIResult<Tensor> {
+        Tensor::from_ptr(nova_op_tanh(self.storage.ptr), self.data.clone(),
+                         self.dtype, self.device.clone(), self.requires_grad, "TanhBackward")
+    }
+    open fn softmax(&self, dim: i64) -> FFIResult<Tensor> {
+        Tensor::from_ptr(nova_op_softmax(self.storage.ptr, dim), self.data.clone(),
+                         self.dtype, self.device.clone(), self.requires_grad, "SoftmaxBackward")
+    }
+    open fn log_softmax(&self, dim: i64) -> FFIResult<Tensor> {
+        Tensor::from_ptr(nova_op_log_softmax(self.storage.ptr, dim), self.data.clone(),
+                         self.dtype, self.device.clone(), self.requires_grad, "LogSoftmaxBackward")
+    }
+    open fn mish(&self)    -> FFIResult<Tensor> {
+        Tensor::from_ptr(nova_op_mish(self.storage.ptr), self.data.clone(),
+                         self.dtype, self.device.clone(), self.requires_grad, "MishBackward")
+    }
+    open fn swish(&self)   -> FFIResult<Tensor> { self.silu() }
+    open fn leaky_relu(&self, neg_slope: f64) -> FFIResult<Tensor> {
+        Tensor::from_ptr(nova_op_leaky_relu(self.storage.ptr, neg_slope), self.data.clone(),
+                         self.dtype, self.device.clone(), self.requires_grad, "LeakyReluBackward")
+    }
+    open fn elu(&self, alpha: f64) -> FFIResult<Tensor> {
+        Tensor::from_ptr(nova_op_elu(self.storage.ptr, alpha), self.data.clone(),
+                         self.dtype, self.device.clone(), self.requires_grad, "EluBackward")
+    }
+
+    // ── Type / Cast ─────────────────────────────────────────────────────────
+
+    open fn cast(&self, dtype: DType) -> FFIResult<Tensor> {
+        let ptr = nova_tensor_cast(self.storage.ptr, dtype.to_c_int());
+        Ok(Tensor {
+            data: self.data.clone(), dtype, device: self.device.clone(),
+            requires_grad: self.requires_grad,
+            storage: Storage { ptr, nbytes: self.numel() * dtype.bytes(), device: self.device.clone() },
+            grad: None, grad_fn: Some("CastBackward".into()), _version: 0,
+        })
+    }
+    open fn half(&self)    -> FFIResult<Tensor> { self.cast(DType::F16)  }
+    open fn bfloat16(&self)-> FFIResult<Tensor> { self.cast(DType::BF16) }
+    open fn float(&self)   -> FFIResult<Tensor> { self.cast(DType::F32)  }
+    open fn double(&self)  -> FFIResult<Tensor> { self.cast(DType::F64)  }
+    open fn long(&self)    -> FFIResult<Tensor> { self.cast(DType::I64)  }
+    open fn int(&self)     -> FFIResult<Tensor> { self.cast(DType::I32)  }
+    open fn bool_(&self)   -> FFIResult<Tensor> { self.cast(DType::Bool) }
+
+    // ── Autograd ────────────────────────────────────────────────────────────
+
+    open fn backward(&self) {
+        nova_op_backward(self.storage.ptr);
+    }
+    open fn backward_with_grad(&self, grad: &Tensor) {
+        nova_op_backward_with_grad(self.storage.ptr, grad.storage.ptr);
+    }
+
+    // ── Indexing & Slicing ──────────────────────────────────────────────────
+
+    open fn slice(&self, dim: i64, start: i64, end: i64, step: i64) -> FFIResult<Tensor> {
+        let ptr = nova_tensor_slice(self.storage.ptr, dim, start, end, step);
+        check ptr == 0 { yield Err(FFIError::InvalidShape("slice out of bounds".into())); }
+        Ok(Tensor {
+            data: self.data.clone(),
+            dtype: self.dtype, device: self.device.clone(),
+            requires_grad: self.requires_grad,
+            storage: Storage { ptr, nbytes: self.storage.nbytes, device: self.device.clone() },
+            grad: None, grad_fn: Some("SliceBackward".into()), _version: 0,
+        })
+    }
+
+    open fn index_select(&self, dim: i64, index: &Tensor) -> FFIResult<Tensor> {
+        let ptr = nova_op_index_select(self.storage.ptr, dim, index.storage.ptr);
+        Tensor::from_ptr(ptr, self.data.clone(), self.dtype, self.device.clone(),
+                         self.requires_grad, "IndexSelectBackward")
+    }
+
+    open fn gather(&self, dim: i64, index: &Tensor) -> FFIResult<Tensor> {
+        let ptr = nova_op_gather(self.storage.ptr, dim, index.storage.ptr);
+        Tensor::from_ptr(ptr, index.data.clone(), self.dtype, self.device.clone(),
+                         self.requires_grad, "GatherBackward")
+    }
+
+    open fn scatter_(&var self, dim: i64, index: &Tensor, src: &Tensor) {
+        nova_op_scatter(self.storage.ptr, dim, index.storage.ptr, src.storage.ptr);
+        self._version += 1;
+    }
+
+    // ── Concatenation / Stacking ────────────────────────────────────────────
+
+    open fn cat(tensors: Vec<&Tensor>, dim: i64) -> FFIResult<Tensor> {
+        let ptrs: Vec<i64> = tensors.iter().map(|t| t.storage.ptr).collect();
+        let ptr = nova_op_cat(ptrs, dim);
+        check ptr == 0 { yield Err(FFIError::InvalidShape("cat failed".into())); }
+        let t0 = tensors[0];
+        Tensor::from_ptr(ptr, t0.data.clone(), t0.dtype, t0.device.clone(),
+                         false, "CatBackward")
+    }
+
+    open fn stack(tensors: Vec<&Tensor>, dim: i64) -> FFIResult<Tensor> {
+        let ptrs: Vec<i64> = tensors.iter().map(|t| t.storage.ptr).collect();
+        let ptr = nova_op_stack(ptrs, dim);
+        Tensor::from_ptr(ptr, tensors[0].data.clone(), tensors[0].dtype,
+                         tensors[0].device.clone(), false, "StackBackward")
+    }
+
+    open fn chunk(&self, chunks: i64, dim: i64) -> FFIResult<Vec<Tensor>> {
+        let ptrs = nova_op_chunk(self.storage.ptr, chunks, dim);
+        ptrs.iter().map(|&p| {
+            Tensor::from_ptr(p, self.data.clone(), self.dtype,
+                             self.device.clone(), self.requires_grad, "ChunkBackward")
+        }).collect()
+    }
+
+    open fn split(&self, size: i64, dim: i64) -> FFIResult<Vec<Tensor>> {
+        let ptrs = nova_op_split(self.storage.ptr, size, dim);
+        ptrs.iter().map(|&p| {
+            Tensor::from_ptr(p, self.data.clone(), self.dtype,
+                             self.device.clone(), self.requires_grad, "SplitBackward")
+        }).collect()
+    }
+
+    // ── Linear Algebra ──────────────────────────────────────────────────────
+
+    open fn dot(&self, other: &Tensor) -> FFIResult<Tensor> {
+        let ptr = nova_op_dot(self.storage.ptr, other.storage.ptr);
+        Tensor::from_ptr(ptr, Shape::scalar(), self.dtype, self.device.clone(),
+                         self.requires_grad || other.requires_grad, "DotBackward")
+    }
+
+    open fn svd(&self) -> FFIResult<(Tensor, Tensor, Tensor)> {
+        let (up, sp, vp) = nova_op_svd(self.storage.ptr);
+        let u = Tensor::from_ptr(up, self.data.clone(), self.dtype, self.device.clone(), false, "")?;
+        let s = Tensor::from_ptr(sp, self.data.clone(), self.dtype, self.device.clone(), false, "")?;
+        let v = Tensor::from_ptr(vp, self.data.clone(), self.dtype, self.device.clone(), false, "")?;
+        Ok((u, s, v))
+    }
+
+    open fn eig(&self) -> FFIResult<(Tensor, Tensor)> {
+        let (ep, vp) = nova_op_eig(self.storage.ptr);
+        let eigenvalues  = Tensor::from_ptr(ep, self.data.clone(), self.dtype, self.device.clone(), false, "")?;
+        let eigenvectors = Tensor::from_ptr(vp, self.data.clone(), self.dtype, self.device.clone(), false, "")?;
+        Ok((eigenvalues, eigenvectors))
+    }
+
+    open fn inv(&self) -> FFIResult<Tensor> {
+        let ptr = nova_op_inv(self.storage.ptr);
+        Tensor::from_ptr(ptr, self.data.clone(), self.dtype, self.device.clone(),
+                         self.requires_grad, "InvBackward")
+    }
+
+    // ── Comparison ──────────────────────────────────────────────────────────
+
+    open fn eq(&self,  other: &Tensor) -> FFIResult<Tensor> {
+        Tensor::from_ptr(nova_op_eq(self.storage.ptr, other.storage.ptr),
+                         self.data.clone(), DType::Bool, self.device.clone(), false, "")
+    }
+    open fn lt(&self,  other: &Tensor) -> FFIResult<Tensor> {
+        Tensor::from_ptr(nova_op_lt(self.storage.ptr, other.storage.ptr),
+                         self.data.clone(), DType::Bool, self.device.clone(), false, "")
+    }
+    open fn gt(&self,  other: &Tensor) -> FFIResult<Tensor> {
+        Tensor::from_ptr(nova_op_gt(self.storage.ptr, other.storage.ptr),
+                         self.data.clone(), DType::Bool, self.device.clone(), false, "")
+    }
+    open fn where_cond(cond: &Tensor, x: &Tensor, y: &Tensor) -> FFIResult<Tensor> {
+        let ptr = nova_op_where(cond.storage.ptr, x.storage.ptr, y.storage.ptr);
+        Tensor::from_ptr(ptr, x.data.clone(), x.dtype, x.device.clone(),
+                         x.requires_grad || y.requires_grad, "WhereBackward")
+    }
+    open fn clamp(&self, min: Option<f64>, max: Option<f64>) -> FFIResult<Tensor> {
+        let ptr = nova_op_clamp(self.storage.ptr, min.unwrap_or(f64::NEG_INFINITY),
+                                max.unwrap_or(f64::INFINITY));
+        Tensor::from_ptr(ptr, self.data.clone(), self.dtype, self.device.clone(),
+                         self.requires_grad, "ClampBackward")
+    }
+
+    // ── Debug ───────────────────────────────────────────────────────────────
+
+    open fn to_string(&self) -> String {
+        format("Tensor(data={}, dtype={:?}, device={}, grad={})",
+            self.data.into(),
+            self.dtype,
+            self.device.into(),
+            self.requires_grad,
+        )
+    }
+
+    open fn item_f32(&self) -> f32 {
+        nova_tensor_item_f32(self.storage.ptr)
+    }
+
+    open fn to_vec_f32(&self) -> Vec<f32> {
+        nova_tensor_to_f32_vec(self.storage.ptr, self.numel())
+    }
+
+    // ── Internal Helpers ────────────────────────────────────────────────────
+
+    fn binop(a: &Tensor, b: &Tensor, op: fn(i64, i64) -> i64, name: &str) -> FFIResult<Tensor> {
+        check !a.data.is_broadcast_compatible(&b.data) {
+            Err(FFIError::InvalidShape(
+                format("Shape mismatch: {} vs {}", a.data.into(), b.data.into())
+            ));
+        }
+        let ptr = op(a.storage.ptr, b.storage.ptr);
+        Tensor::from_ptr(ptr, a.data.clone(), a.dtype, a.device.clone(),
+                         a.requires_grad || b.requires_grad, name)
+    }
+
+    fn from_ptr(ptr: i64, data: Shape, dtype: DType, device: Device,
+                requires_grad: bool, grad_fn: &str) -> FFIResult<Tensor> {
+        check ptr == 0 { yield Err(FFIError::AllocationFailed(0)); }
+        let nbytes = data.numel() * dtype.bytes();
+        Ok(Tensor {
+            data, dtype, device: device.clone(), requires_grad,
+            storage: Storage { ptr, nbytes, device },
+            grad: None,
+            grad_fn: check grad_fn.is_empty() { yield None } else { yield Some(grad_fn.into())},
+            _version: 0,
+        })
+    }
+}
+
+impl Drop for Tensor {
+    fn drop(&var self) {
+        nova_tensor_destroy(self.storage.ptr);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NO-GRAD CONTEXT
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data NoGradGuard {
+    _prev: bool,
+}
+
+impl NoGradGuard {
+    open fn new() -> NoGradGuard {
+        let prev = nova_grad_mode_get();
+        nova_grad_mode_set(false);
+        NoGradGuard { _prev: prev != 0 }
+    }
+}
+
+impl Drop for NoGradGuard {
+    fn drop(&var self) {
+        nova_grad_mode_set(self._prev);
+    }
+}
+
+open fn no_grad<F: Fn()>(f: F) {
+    let _guard = NoGradGuard::new();
+    f();
+}

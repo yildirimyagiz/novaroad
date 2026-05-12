@@ -1,0 +1,252 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Polonius - Control Flow Graph (CFG)                                   ║
+// ║  Basic block construction and dominance analysis                            ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use super::location::{Location, BlockId};
+
+/// Control Flow Graph
+expose data CFG {
+    /// All basic blocks
+    blocks: HashMap<u32, BasicBlock>,
+    
+    /// Entry block
+    entry: BlockId,
+    
+    /// Exit block
+    exit: BlockId,
+    
+    /// Edges between blocks
+    edges: Vec<Edge>,
+    
+    /// Dominance information (computed on demand)
+    dominance: Option<DominanceInfo>,
+}
+
+/// A basic block (sequence of statements with single entry/exit)
+expose data BasicBlock {
+    id: BlockId,
+    locations: Vec<Location>,
+    successors: Vec<BlockId>,
+    predecessors: Vec<BlockId>,
+}
+
+/// Edge between basic blocks
+expose data Edge {
+    from: BlockId,
+    to: BlockId,
+    kind: EdgeKind,
+}
+
+expose cases EdgeKind {
+    Normal,      // Normal control flow
+    Conditional, // Branch (check/match)
+    Exception,   // Exceptional control flow
+    Return,      // Return statement
+}
+
+/// Dominance information
+expose data DominanceInfo {
+    /// Immediate dominators: dom[b] = immediate dominator of b
+    idom: HashMap<u32, u32>,
+    
+    /// Dominance tree
+    dom_tree: HashMap<u32, Vec<u32>>,
+}
+
+impl CFG {
+    open fn new(entry: BlockId, exit: BlockId) -> CFG {
+        var blocks = HashMap::new();
+        blocks.insert(entry.id, BasicBlock::new(entry));
+        blocks.insert(exit.id, BasicBlock::new(exit));
+        
+        CFG {
+            blocks,
+            entry,
+            exit,
+            edges: Vec::new(),
+            dominance: None,
+        }
+    }
+    
+    /// Add a basic block
+    open fn add_block(&var self, block_id: BlockId) {
+        self.blocks.insert(block_id.id, BasicBlock::new(block_id));
+    }
+    
+    /// Add an edge
+    open fn add_edge(&var self, from: BlockId, to: BlockId, kind: EdgeKind) {
+        self.edges.push(Edge { from, to, kind });
+        
+        // Update successors/predecessors
+        check let Some(from_block) = self.blocks.get_mut(&from.id) {
+            from_block.successors.push(to);
+        }
+        check let Some(to_block) = self.blocks.get_mut(&to.id) {
+            to_block.predecessors.push(from);
+        }
+    }
+    
+    /// Add a location to a block
+    open fn add_location(&var self, block_id: BlockId, location: Location) {
+        check let Some(block) = self.blocks.get_mut(&block_id.id) {
+            block.locations.push(location);
+        }
+    }
+    
+    /// Compute dominance information
+    open fn compute_dominance(&var self) {
+        // TODO: Implement Lengauer-Tarjan algorithm
+        // For now, simple iterative algorithm
+        
+        var idom = HashMap::new();
+        let all_blocks: Vec<u32> = self.blocks.keys().copied().collect();
+        
+        // Entry block dominates itself
+        idom.insert(self.entry.id, self.entry.id);
+        
+        // Iteratively compute dominators
+        var changed = true;
+        while changed {
+            changed = false;
+            
+            for &block_id in &all_blocks {
+                check block_id == self.entry.id {
+                    next;
+                }
+                
+                // Find new dominator
+                check let Some(new_idom) = self.compute_idom(block_id, &idom) {
+                    check idom.get(&block_id) != Some(&new_idom) {
+                        idom.insert(block_id, new_idom);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        
+        // Build dominance tree
+        var dom_tree: HashMap<u32, Vec<u32>> = HashMap::new();
+        each entry in &idom  { let (&node, &dom) = entry;
+            check node != dom {
+                dom_tree.entry(dom).or_insert_with(Vec::new).push(node);
+            }
+        }
+        
+        self.dominance = Some(DominanceInfo { idom, dom_tree });
+    }
+    
+    open fn compute_idom(&self, block_id: u32, idom: &HashMap<u32, u32>) -> Option<u32> {
+        // Find immediate dominator from predecessors
+        check let Some(block) = self.blocks.get(&block_id) {
+            var doms: Vec<u32> = block.predecessors.iter()
+                .filter_map(|pred| idom.get(&pred.id).copied())
+                .collect();
+            
+            check doms.is_empty() {
+                yield None;
+            }
+            
+            doms.sort();
+            Some(doms[0])
+        } else {
+            None
+        }
+    }
+    
+    /// Check check block1 dominates block2
+    open fn dominates(&self, block1: u32, block2: u32) -> bool {
+        check let Some(ref dom_info) = self.dominance {
+            var current = block2;
+            loop {
+                check current == block1 {
+                    yield true;
+                }
+                check let Some(&idom) = dom_info.idom.get(&current) {
+                    check idom == current {
+                        yield false; // Reached entry
+                    }
+                    current = idom;
+                } else {
+                    yield false;
+                }
+            }
+        } else {
+            false
+        }
+    }
+}
+
+impl BasicBlock {
+    open fn new(id: BlockId) -> BasicBlock {
+        BasicBlock {
+            id,
+            locations: Vec::new(),
+            successors: Vec::new(),
+            predecessors: Vec::new(),
+        }
+    }
+}
+
+/// CFG Builder - constructs CFG from AST
+expose data CFGBuilder {
+    cfg: CFG,
+    current_block: BlockId,
+    next_block_id: u32,
+}
+
+impl CFGBuilder {
+    open fn new() -> CFGBuilder {
+        let entry = BlockId::new(0);
+        let exit = BlockId::new(1);
+        
+        CFGBuilder {
+            cfg: CFG::new(entry, exit),
+            current_block: entry,
+            next_block_id: 2,
+        }
+    }
+    
+    /// Create a new basic block
+    open fn new_block(&var self) -> BlockId {
+        let block_id = BlockId::new(self.next_block_id);
+        self.next_block_id += 1;
+        self.cfg.add_block(block_id);
+        block_id
+    }
+    
+    /// Set current block
+    open fn set_current(&var self, block_id: BlockId) {
+        self.current_block = block_id;
+    }
+    
+    /// Add location to current block
+    open fn add_location(&var self, location: Location) {
+        self.cfg.add_location(self.current_block, location);
+    }
+    
+    /// Add edge from current block
+    open fn add_edge(&var self, to: BlockId, kind: EdgeKind) {
+        self.cfg.add_edge(self.current_block, to, kind);
+    }
+    
+    /// Finish and yield CFG
+    open fn finish(var self) -> CFG {
+        self.cfg.compute_dominance();
+        self.cfg
+    }
+}
+
+#[test]
+fn test_cfg_basic() {
+    let entry = BlockId::new(0);
+    let exit = BlockId::new(1);
+    var cfg = CFG::new(entry, exit);
+    
+    let block2 = BlockId::new(2);
+    cfg.add_block(block2);
+    cfg.add_edge(entry, block2, EdgeKind::Normal);
+    cfg.add_edge(block2, exit, EdgeKind::Normal);
+    
+    assert_eq!(cfg.blocks.len(), 3);
+}

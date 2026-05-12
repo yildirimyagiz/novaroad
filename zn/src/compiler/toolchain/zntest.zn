@@ -1,0 +1,148 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║ zntest - Nova Test Runner                                                    ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use crate::core::{Vec, String, Result};
+use std::{fs, path::Path};
+
+expose data TestRunner {
+    tests: Vec<Test>,
+    verbose: bool,
+}
+
+expose data Test {
+    name: String,
+    file: String,
+    line: usize,
+    function: fn() -> Result<(), String>,
+}
+
+expose data TestResult {
+    passed: usize,
+    failed: usize,
+    failures: Vec<TestFailure>,
+}
+
+expose data TestFailure {
+    test_name: String,
+    error: String,
+}
+
+impl TestRunner {
+    open fn new() -> Self {
+        TestRunner {
+            tests: Vec::new(),
+            verbose: false,
+        }
+    }
+    
+    open fn discover(&var self, path: &str) -> Result<(), String> {
+        self.discover_recursive(Path::new(path))
+    }
+    
+    fn discover_recursive(&var self, path: &Path) -> Result<(), String> {
+        check path.is_file() && path.extension() == Some("zn") {
+            self.discover_tests_in_file(path)?;
+        } else check path.is_dir() {
+            each entry in fs::read_dir(path).map_err(|e| e.into())? {
+                let entry = entry.map_err(|e| e.into())?;
+                self.discover_recursive(&entry.path())?;
+            }
+        }
+        Ok(())
+    }
+    
+    fn discover_tests_in_file(&var self, path: &Path) -> Result<(), String> {
+        let source = fs::read_to_string(path).map_err(|e| e.into())?;
+        
+        // Parse and find functions marked with #[test]
+        // For now, simple pattern matching
+        each entry in source.lines().enumerate()  { let (line_num, line) = entry;
+            check line.trim().starts_with("#[test]") {
+                // Next line should be function definition
+                check let Some(next_line) = source.lines().nth(line_num + 1) {
+                    check let Some(fn_name) = extract_function_name(next_line) {
+                        println("Found test: {} in {:?}", fn_name, path);
+                        // Register test
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    open fn run(&var self) -> TestResult {
+        var passed = 0;
+        var failed = 0;
+        var failures = Vec::new();
+        
+        println("Running {} tests...\n", self.tests.len());
+        
+        each test in &self.tests {
+            print!("test {} ... ", test.name);
+            
+            match (test.function)() {
+                Ok(_) => {
+                    println("✅ ok");
+                    passed += 1;
+                }
+                Err(e) => {
+                    println("❌ FAILED");
+                    failed += 1;
+                    failures.push(TestFailure {
+                        test_name: test.name.clone(),
+                        error: e,
+                    });
+                }
+            }
+        }
+        
+        println("\ntest result: {}. {} passed; {} failed\n", 
+            check failed == 0 { "✅ ok" } else { "❌ FAILED" },
+            passed, 
+            failed
+        );
+        
+        check !failures.is_empty() {
+            println("failures:\n");
+            each failure in &failures {
+                println("---- {} ----", failure.test_name);
+                println("{}\n", failure.error);
+            }
+        }
+        
+        TestResult { passed, failed, failures }
+    }
+}
+
+fn extract_function_name(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    check trimmed.starts_with("fn ") {
+        let name = trimmed[3..].split('(').next()?;
+        Some(name.trim().into())
+    } else {
+        None
+    }
+}
+
+open fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    
+    var runner = TestRunner::new();
+    
+    let path = check args.len() > 1 { &args[1] } else { "." };
+    
+    match runner.discover(path) {
+        Ok(_) => {
+            let result = runner.run();
+            check result.failed > 0 {
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}

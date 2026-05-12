@@ -1,0 +1,432 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA INTERFACE - Generic Compilation API
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Inspired by rustc_interface: Unified interface for different compilation modes
+ */
+
+use driver::*;
+use errors::*;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMPILATION INTERFACES
+// ═══════════════════════════════════════════════════════════════════════════
+
+open rules CompilerInterface {
+    fn compile(&self, config: &CompileConfig) -> Result<CompileResult, CompileError>;
+    fn get_version(&self) -> String;
+    fn get_supported_targets(&self) -> Vec<String>;
+}
+
+open data CompileConfig {
+    input: InputSource,
+    output: OutputSpec,
+    options: CompileOptions,
+    callbacks: Option<Box<dyn CompileCallbacks>>,
+}
+
+open cases InputSource {
+    Files(Vec<String>),
+    String(String),
+    Stdin,
+}
+
+open data OutputSpec {
+    directory: Option<String>,
+    filename: Option<String>,
+    format: OutputFormat,
+}
+
+open cases OutputFormat {
+    Executable,
+    Library,
+    LlvmIr,
+    Asm,
+    Obj,
+}
+
+open data CompileResult {
+    success: bool,
+    outputs: Vec<OutputFile>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+open data OutputFile {
+    path: String,
+    format: OutputFormat,
+}
+
+open cases CompileError {
+    ParseError(Vec<Diagnostic>),
+    TypeError(Vec<Diagnostic>),
+    CodeGenError(Vec<Diagnostic>),
+    IoError(std::io::Error),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CALLBACKS FOR COMPILATION EVENTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+open rules CompileCallbacks {
+    fn on_phase_start(&self, phase: &str);
+    fn on_phase_end(&self, phase: &str, success: bool);
+    fn on_diagnostic(&self, diagnostic: &Diagnostic);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DEFAULT COMPILER IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data DefaultCompiler;
+
+impl CompilerInterface for DefaultCompiler {
+    fn compile(&self, config: &CompileConfig) -> Result<CompileResult, CompileError> {
+        // Convert config to session
+        var session = self.create_session(config)?;
+
+        // Run compilation
+        let driver = CompilationDriver::new();
+        match driver.compile(&var session) {
+            Ok(_) => {
+                let outputs = self.collect_outputs(config)?;
+                Ok(CompileResult {
+                    success: true,
+                    outputs,
+                    diagnostics: session.diagnostics.get_all(),
+                })
+            }
+            Err(_) => Err(CompileError::ParseError(session.diagnostics.get_all())),
+        }
+    }
+
+    fn get_version(&self) -> String {
+        env!("CARGO_PKG_VERSION").into()
+    }
+
+    fn get_supported_targets(&self) -> Vec<String> {
+        [
+            "x86_64-unknown-linux-gnu".into(),
+            "x86_64-apple-darwin".into(),
+            "x86_64-pc-windows-msvc".into(),
+        ]
+    }
+}
+
+impl DefaultCompiler {
+    fn create_session(&self, config: &CompileConfig) -> Result<Session, CompileError> {
+        let input_files = match &config.input {
+            InputSource::Files(files) => files.clone(),
+            InputSource::String(s) => {
+                // Write to temp file
+                let temp_file = "/tmp/nova_input.zn"; // Simplified
+                std::fs::write(temp_file, s).map_err(CompileError::IoError)?;
+                yield [temp_file.into()]
+            }
+            InputSource::Stdin => {
+                // Read from stdin
+                var buffer = String::new();
+                std::io::stdin().read_line(&var buffer).map_err(CompileError::IoError)?;
+                let temp_file = "/tmp/nova_stdin.zn";
+                std::fs::write(temp_file, buffer).map_err(CompileError::IoError)?;
+                yield [temp_file.into()]
+            }
+        };
+
+        let options = CompileOptions {
+            input_files,
+            output_file: config.output.filename.clone(),
+            optimization_level: config.options.optimization_level.clone(),
+            target_triple: config.options.target_triple.clone(),
+            emit: match config.output.format {
+                OutputFormat::LlvmIr => EmitType::LlvmIr,
+                OutputFormat::Asm => EmitType::Asm,
+                OutputFormat::Obj => EmitType::Obj,
+                OutputFormat::Executable => EmitType::Exe,
+                OutputFormat::Library => EmitType::Obj, // Simplified
+            },
+        };
+
+        Ok(Session::new(options))
+    }
+
+    fn collect_outputs(&self, config: &CompileConfig) -> Result<Vec<OutputFile>, CompileError> {
+        // Collect generated output files
+        var outputs = Vec::new();
+
+        check let Some(filename) = &config.output.filename {
+            outputs.push(OutputFile {
+                path: filename.clone(),
+                format: config.output.format.clone(),
+            });
+        }
+
+        Ok(outputs)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMPILATION MODES
+// ═══════════════════════════════════════════════════════════════════════════
+
+open cases CompilationMode {
+    SingleFile,
+    Project,
+    Library,
+    Executable,
+    Jit,
+}
+
+open data ModeConfig {
+    mode: CompilationMode,
+    incremental: bool,
+    parallel: bool,
+    dep_info: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// QUERY SYSTEM (for incremental compilation)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open rules QueryEngine {
+    fn query<T: Query>(&self, key: T::Key) -> Result<T::Value, QueryError>;
+}
+
+open rules Query {
+    alias Key;
+    alias Value;
+}
+
+open data QueryError;
+
+// Example queries
+open data HirQuery;
+impl Query for HirQuery {
+    alias Key = String; // Function name
+    alias Value = hir::HirFn;
+}
+
+open data MirQuery;
+impl Query for MirQuery {
+    alias Key = String; // Function name
+    alias Value = ir::Function;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PLUGIN INTERFACE
+// ═══════════════════════════════════════════════════════════════════════════
+
+open rules Plugin {
+    fn name(&self) -> &str;
+    fn version(&self) -> &str;
+    fn register_passes(&self, registry: &var PassRegistry);
+}
+
+open data PassRegistry {
+    analysis_passes: Vec<Box<dyn AnalysisPass>>,
+    transform_passes: Vec<Box<dyn TransformPass>>,
+}
+
+open rules AnalysisPass {
+    fn name(&self) -> &str;
+    fn run(&self, module: &ir::Module) -> AnalysisResult;
+}
+
+open rules TransformPass {
+    fn name(&self) -> &str;
+    fn run(&var self, module: &var ir::Module) -> TransformResult;
+}
+
+open data AnalysisResult {
+    data: std::collections::HashMap<String, String>,
+}
+
+open data TransformResult {
+    changed: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONVENIENCE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+open fn compile_string(source: &str) -> Result<CompileResult, CompileError> {
+    let config = CompileConfig {
+        input: InputSource::String(source.into()),
+        output: OutputSpec {
+            directory: None,
+            filename: Some("output".into()),
+            format: OutputFormat::Executable,
+        },
+        options: driver::CompileOptions {
+            input_files: [],
+            output_file: Some("output".into()),
+            optimization_level: OptimizationLevel::Default,
+            target_triple: "x86_64-unknown-linux-gnu".into(),
+            emit: EmitType::Exe,
+        },
+        callbacks: None,
+    };
+
+    let compiler = DefaultCompiler;
+    compiler.compile(&config)
+}
+
+open fn compile_file(filename: &str) -> Result<CompileResult, CompileError> {
+    let config = CompileConfig {
+        input: InputSource::Files([filename.into()]),
+        output: OutputSpec {
+            directory: None,
+            filename: Some("a.out".into()),
+            format: OutputFormat::Executable,
+        },
+        options: driver::CompileOptions {
+            input_files: [filename.into()],
+            output_file: Some("a.out".into()),
+            optimization_level: OptimizationLevel::Default,
+            target_triple: "x86_64-unknown-linux-gnu".into(),
+            emit: EmitType::Exe,
+        },
+        callbacks: None,
+    };
+
+    let compiler = DefaultCompiler;
+    compiler.compile(&config)
+}
+
+// test module
+space tests {
+    use super::*;
+
+    // test
+    fn test_compile_config_creation() {
+        let config = CompileConfig {
+            input: InputSource::String("fn main() {}".into()),
+            output: OutputSpec {
+                directory: Some("/tmp".into()),
+                filename: Some("test".into()),
+                format: OutputFormat::Executable,
+            },
+            options: driver::CompileOptions {
+                input_files: [],
+                output_file: Some("test".into()),
+                optimization_level: OptimizationLevel::Default,
+                target_triple: "x86_64-unknown-linux-gnu".into(),
+                emit: EmitType::Exe,
+            },
+            callbacks: None,
+        };
+
+        match &config.input {
+            InputSource::String(s) => assert_eq!(s, "fn main() {}"),
+            _ => abort("expected string input"),
+        }
+
+        assert_eq!(config.output.filename, Some("test".into()));
+        assert_eq!(config.output.format, OutputFormat::Executable);
+    }
+
+    // test
+    fn test_input_source_variants() {
+        let files_input = InputSource::Files(["test.zn".into()]);
+        let string_input = InputSource::String("code".into());
+        let stdin_input = InputSource::Stdin;
+
+        assert(matches!(files_input, InputSource::Files(_)));
+        assert(matches!(string_input, InputSource::String(_)));
+        assert(matches!(stdin_input, InputSource::Stdin));
+    }
+
+    // test
+    fn test_output_format_variants() {
+        let exe = OutputFormat::Executable;
+        let lib = OutputFormat::Library;
+        let llvm_ir = OutputFormat::LlvmIr;
+        let asm = OutputFormat::Asm;
+        let obj = OutputFormat::Obj;
+
+        assert(matches!(exe, OutputFormat::Executable));
+        assert(matches!(lib, OutputFormat::Library));
+        assert(matches!(llvm_ir, OutputFormat::LlvmIr));
+        assert(matches!(asm, OutputFormat::Asm));
+        assert(matches!(obj, OutputFormat::Obj));
+    }
+
+    // test
+    fn test_compilation_mode_variants() {
+        let single_file = CompilationMode::SingleFile;
+        let project = CompilationMode::Project;
+        let library = CompilationMode::Library;
+        let executable = CompilationMode::Executable;
+        let jit = CompilationMode::Jit;
+
+        assert(matches!(single_file, CompilationMode::SingleFile));
+        assert(matches!(project, CompilationMode::Project));
+        assert(matches!(library, CompilationMode::Library));
+        assert(matches!(executable, CompilationMode::Executable));
+        assert(matches!(jit, CompilationMode::Jit));
+    }
+
+    // test
+    fn test_default_compiler_creation() {
+        let compiler = DefaultCompiler;
+        // Compiler creation test - placeholder
+        assert(true);
+    }
+
+    // test
+    fn test_compile_result_structure() {
+        let result = CompileResult {
+            success: true,
+            outputs: [OutputFile {
+                path: "test".into(),
+                format: OutputFormat::Executable,
+            }],
+            diagnostics: [],
+        };
+
+        assert(result.success);
+        assert_eq!(result.outputs.len(), 1);
+        assert_eq!(result.outputs[0].path, "test");
+        assert(result.diagnostics.is_empty());
+    }
+
+    // test
+    fn test_compile_error_variants() {
+        // Test different error types
+        let parse_err = CompileError::ParseError([]);
+        let type_err = CompileError::TypeError([]);
+        let codegen_err = CompileError::CodeGenError([]);
+        let io_err = CompileError::IoError(std::io::Error::new(std::io::ErrorKind::NotFound, "test"));
+
+        assert(matches!(parse_err, CompileError::ParseError(_)));
+        assert(matches!(type_err, CompileError::TypeError(_)));
+        assert(matches!(codegen_err, CompileError::CodeGenError(_)));
+        assert(matches!(io_err, CompileError::IoError(_)));
+    }
+
+    // test
+    fn test_mode_config_creation() {
+        let config = ModeConfig {
+            mode: CompilationMode::Executable,
+            incremental: true,
+            parallel: false,
+            dep_info: true,
+        };
+
+        assert(matches!(config.mode, CompilationMode::Executable));
+        assert(config.incremental);
+        assert(!config.parallel);
+        assert(config.dep_info);
+    }
+
+    // test
+    fn test_plugin_interface() {
+        // Test plugin rules - placeholder
+        assert(true);
+    }
+
+    // test
+    fn test_query_engine_interface() {
+        // Test query engine rules - placeholder
+        assert(true);
+    }
+}

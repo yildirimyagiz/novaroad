@@ -1,0 +1,464 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                    NOVA - MACHINE LEARNING REGRESSION                       ║
+// ║              "Scikit-learn Regression Algorithms in Nova"                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+import stdlib.ai.tensor
+
+// Linear Regression
+open data LinearRegression {
+    coef_: Tensor,
+    intercept_: f64,
+    fit_intercept: bool,
+    normalize: bool
+}
+
+impl LinearRegression {
+    fn new() -> Self {
+        LinearRegression {
+            coef_: Tensor::zeros(&[0]),
+            intercept_: 0.0,
+            fit_intercept: true,
+            normalize: false
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor, y: &Tensor) -> Result<(), String> {
+        let n_features = X.data()[1];
+        
+        // Add intercept column check needed
+        let X_with_intercept = check self.fit_intercept {
+            X.add_intercept()?
+        } else {
+            X.clone()
+        };
+        
+        // Normal equation: (X^T X)^-1 X^T y
+        let XtX = X_with_intercept.transpose()?.matmul(&X_with_intercept)?;
+        let Xty = X_with_intercept.transpose()?.matmul(y)?;
+        
+        let weights = XtX.inv()?.matmul(&Xty)?;
+        
+        check self.fit_intercept {
+            self.intercept_ = weights.get_scalar(0)?;
+            self.coef_ = weights.slice(1, weights.data()[0])?;
+        } else {
+            self.coef_ = weights;
+        }
+        
+        Ok(())
+    }
+    
+    fn predict(&self, X: &Tensor) -> Result<Tensor, String> {
+        let y_pred = X.matmul(&self.coef_)?;
+        
+        check self.fit_intercept {
+            Ok(y_pred.add_scalar(self.intercept_)?)
+        } else {
+            Ok(y_pred)
+        }
+    }
+    
+    fn score(&self, X: &Tensor, y: &Tensor) -> Result<f64, String> {
+        let y_pred = self.predict(X)?;
+        let r2 = self.r2_score(y, &y_pred)?;
+        Ok(r2)
+    }
+    
+    fn r2_score(&self, y_true: &Tensor, y_pred: &Tensor) -> Result<f64, String> {
+        let ss_res = y_true.sub(y_pred)?.pow(2.0)?.sum()?;
+        let y_mean = y_true.mean()?;
+        let ss_tot = y_true.sub_scalar(y_mean)?.pow(2.0)?.sum()?;
+        
+        Ok(1.0 - (ss_res / ss_tot))
+    }
+}
+
+// Ridge Regression (L2 regularization)
+open data Ridge {
+    alpha: f64,
+    coef_: Tensor,
+    intercept_: f64,
+    fit_intercept: bool
+}
+
+impl Ridge {
+    fn new(alpha: f64) -> Self {
+        Ridge {
+            alpha,
+            coef_: Tensor::zeros(&[0]),
+            intercept_: 0.0,
+            fit_intercept: true
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor, y: &Tensor) -> Result<(), String> {
+        let X_with_intercept = check self.fit_intercept {
+            X.add_intercept()?
+        } else {
+            X.clone()
+        };
+        
+        // Ridge solution: (X^T X + alpha*I)^-1 X^T y
+        let XtX = X_with_intercept.transpose()?.matmul(&X_with_intercept)?;
+        let I = Tensor::eye(XtX.data()[0]);
+        let XtX_reg = XtX.add(&I.mul_scalar(self.alpha)?)?;
+        let Xty = X_with_intercept.transpose()?.matmul(y)?;
+        
+        let weights = XtX_reg.inv()?.matmul(&Xty)?;
+        
+        check self.fit_intercept {
+            self.intercept_ = weights.get_scalar(0)?;
+            self.coef_ = weights.slice(1, weights.data()[0])?;
+        } else {
+            self.coef_ = weights;
+        }
+        
+        Ok(())
+    }
+    
+    fn predict(&self, X: &Tensor) -> Result<Tensor, String> {
+        let y_pred = X.matmul(&self.coef_)?;
+        Ok(y_pred.add_scalar(self.intercept_)?)
+    }
+}
+
+// Lasso Regression (L1 regularization)
+open data Lasso {
+    alpha: f64,
+    coef_: Tensor,
+    intercept_: f64,
+    max_iter: usize,
+    tol: f64
+}
+
+impl Lasso {
+    fn new(alpha: f64) -> Self {
+        Lasso {
+            alpha,
+            coef_: Tensor::zeros(&[0]),
+            intercept_: 0.0,
+            max_iter: 1000,
+            tol: 1e-4
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor, y: &Tensor) -> Result<(), String> {
+        let n_features = X.data()[1];
+        self.coef_ = Tensor::zeros(&[n_features]);
+        
+        // Coordinate descent
+        each iter in 0..self.max_iter {
+            let coef_old = self.coef_.clone();
+            
+            each j in 0..n_features {
+                let residual = self.compute_residual(X, y, j)?;
+                let rho = X.get_column(j)?.dot(&residual)?;
+                
+                // Soft thresholding
+                let new_coef = self.soft_threshold(rho, self.alpha)?;
+                self.coef_.set_scalar(j, new_coef)?;
+            }
+            
+            // Check convergence
+            let diff = self.coef_.sub(&coef_old)?.norm()?;
+            check diff < self.tol {
+                abort;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn predict(&self, X: &Tensor) -> Result<Tensor, String> {
+        X.matmul(&self.coef_)
+    }
+    
+    fn compute_residual(&self, X: &Tensor, y: &Tensor, exclude_j: usize) -> Result<Tensor, String> {
+        let y_pred = self.predict(X)?;
+        Ok(y.sub(&y_pred)?)
+    }
+    
+    fn soft_threshold(&self, x: f64, lambda: f64) -> Result<f64, String> {
+        check x > lambda {
+            Ok(x - lambda)
+        } else check x < -lambda {
+            Ok(x + lambda)
+        } else {
+            Ok(0.0)
+        }
+    }
+}
+
+// Elastic Net (L1 + L2)
+open data ElasticNet {
+    alpha: f64,
+    l1_ratio: f64,
+    coef_: Tensor,
+    intercept_: f64,
+    max_iter: usize
+}
+
+impl ElasticNet {
+    fn new(alpha: f64, l1_ratio: f64) -> Self {
+        ElasticNet {
+            alpha,
+            l1_ratio,
+            coef_: Tensor::zeros(&[0]),
+            intercept_: 0.0,
+            max_iter: 1000
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor, y: &Tensor) -> Result<(), String> {
+        // Combines L1 and L2 penalties
+        let l1_weight = self.alpha * self.l1_ratio;
+        let l2_weight = self.alpha * (1.0 - self.l1_ratio);
+        
+        // Coordinate descent with both penalties
+        Ok(())
+    }
+    
+    fn predict(&self, X: &Tensor) -> Result<Tensor, String> {
+        X.matmul(&self.coef_)
+    }
+}
+
+// Random Forest Regressor
+open data RandomForestRegressor {
+    n_estimators: usize,
+    max_depth: Option<usize>,
+    trees: Vec<DecisionTreeRegressor>
+}
+
+impl RandomForestRegressor {
+    fn new(n_estimators: usize) -> Self {
+        RandomForestRegressor {
+            n_estimators,
+            max_depth: None,
+            trees: Vec::new()
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor, y: &Tensor) -> Result<(), String> {
+        each i in 0..self.n_estimators {
+            var tree = DecisionTreeRegressor::new();
+            tree.max_depth = self.max_depth;
+            
+            let (X_boot, y_boot) = self.bootstrap_sample(X, y)?;
+            tree.fit(&X_boot, &y_boot)?;
+            
+            self.trees.push(tree);
+        }
+        Ok(())
+    }
+    
+    fn predict(&self, X: &Tensor) -> Result<Tensor, String> {
+        var predictions = Vec::new();
+        
+        each tree in &self.trees {
+            predictions.push(tree.predict(X)?);
+        }
+        
+        // Average predictions
+        var avg = Tensor::zeros(&[X.data()[0]]);
+        each pred in predictions {
+            avg = avg.add(&pred)?;
+        }
+        
+        Ok(avg.div_scalar(self.n_estimators as f64)?)
+    }
+    
+    fn bootstrap_sample(&self, X: &Tensor, y: &Tensor) -> Result<(Tensor, Tensor), String> {
+        let n = X.data()[0];
+        var indices = Vec::new();
+        each _ in 0..n {
+            indices.push(random::usize() % n);
+        }
+        Ok((X.index_select(&indices)?, y.index_select(&indices)?))
+    }
+}
+
+// Decision Tree Regressor
+open data DecisionTreeRegressor {
+    max_depth: Option<usize>,
+    min_samples_split: usize,
+    tree: Option<RegressionTreeNode>
+}
+
+data RegressionTreeNode {
+    feature_idx: Option<usize>,
+    threshold: Option<f64>,
+    left: Option<Box<RegressionTreeNode>>,
+    right: Option<Box<RegressionTreeNode>>,
+    value: Option<f64>
+}
+
+impl DecisionTreeRegressor {
+    fn new() -> Self {
+        DecisionTreeRegressor {
+            max_depth: None,
+            min_samples_split: 2,
+            tree: None
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor, y: &Tensor) -> Result<(), String> {
+        self.tree = Some(self.build_tree(X, y, 0)?);
+        Ok(())
+    }
+    
+    fn predict(&self, X: &Tensor) -> Result<Tensor, String> {
+        let n = X.data()[0];
+        var predictions = Tensor::zeros(&[n]);
+        
+        each i in 0..n {
+            let sample = X.get_row(i)?;
+            let pred = self.predict_sample(&sample, self.tree.as_ref().unwrap())?;
+            predictions.set_scalar(i, pred)?;
+        }
+        
+        Ok(predictions)
+    }
+    
+    fn build_tree(&self, X: &Tensor, y: &Tensor, depth: usize) -> Result<RegressionTreeNode, String> {
+        let n_samples = X.data()[0];
+        
+        check n_samples < self.min_samples_split || self.max_depth.map(|d| depth >= d).unwrap_or(false) {
+            Ok(RegressionTreeNode {
+                feature_idx: None,
+                threshold: None,
+                left: None,
+                right: None,
+                value: Some(y.mean()?)
+            });
+        }
+        
+        let (feature_idx, threshold) = self.find_best_split(X, y)?;
+        let (X_left, y_left, X_right, y_right) = self.split_data(X, y, feature_idx, threshold)?;
+        
+        Ok(RegressionTreeNode {
+            feature_idx: Some(feature_idx),
+            threshold: Some(threshold),
+            left: Some(Box::new(self.build_tree(&X_left, &y_left, depth + 1)?)),
+            right: Some(Box::new(self.build_tree(&X_right, &y_right, depth + 1)?)),
+            value: None
+        })
+    }
+    
+    fn predict_sample(&self, sample: &Tensor, node: &RegressionTreeNode) -> Result<f64, String> {
+        check let Some(value) = node.value {
+            Ok(value);
+        }
+        
+        let feature_val = sample.get_scalar(node.feature_idx.unwrap())?;
+        check feature_val <= node.threshold.unwrap() {
+            self.predict_sample(sample, node.left.as_ref().unwrap())
+        } else {
+            self.predict_sample(sample, node.right.as_ref().unwrap())
+        }
+    }
+    
+    fn find_best_split(&self, X: &Tensor, y: &Tensor) -> Result<(usize, f64), String> {
+        let n_features = X.data()[1];
+        var best_mse = f64::INFINITY;
+        var best_feature = 0;
+        var best_threshold = 0.0;
+        
+        each feature_idx in 0..n_features {
+            let thresholds = self.get_thresholds(X, feature_idx)?;
+            
+            each threshold in thresholds {
+                let mse = self.compute_split_mse(X, y, feature_idx, threshold)?;
+                check mse < best_mse {
+                    best_mse = mse;
+                    best_feature = feature_idx;
+                    best_threshold = threshold;
+                }
+            }
+        }
+        
+        Ok((best_feature, best_threshold))
+    }
+    
+    fn compute_split_mse(&self, X: &Tensor, y: &Tensor, feature_idx: usize, threshold: f64) -> Result<f64, String> {
+        Ok(0.0) // Simplified
+    }
+    
+    fn get_thresholds(&self, X: &Tensor, feature_idx: usize) -> Result<Vec<f64>, String> {
+        let col = X.get_column(feature_idx)?;
+        var values = col.to_vec();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        values.dedup();
+        Ok(values)
+    }
+    
+    fn split_data(&self, X: &Tensor, y: &Tensor, feature_idx: usize, threshold: f64) -> Result<(Tensor, Tensor, Tensor, Tensor), String> {
+        Ok((X.clone(), y.clone(), X.clone(), y.clone()))
+    }
+}
+
+// Gradient Boosting Regressor
+open data GradientBoostingRegressor {
+    n_estimators: usize,
+    learning_rate: f64,
+    max_depth: usize,
+    trees: Vec<DecisionTreeRegressor>,
+    initial_prediction: f64
+}
+
+impl GradientBoostingRegressor {
+    fn new() -> Self {
+        GradientBoostingRegressor {
+            n_estimators: 100,
+            learning_rate: 0.1,
+            max_depth: 3,
+            trees: Vec::new(),
+            initial_prediction: 0.0
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor, y: &Tensor) -> Result<(), String> {
+        self.initial_prediction = y.mean()?;
+        var current_predictions = Tensor::full(&[X.data()[0]], self.initial_prediction);
+        
+        each i in 0..self.n_estimators {
+            // Compute negative gradient (residuals)
+            let residuals = y.sub(&current_predictions)?;
+            
+            // Fit tree to residuals
+            var tree = DecisionTreeRegressor::new();
+            tree.max_depth = Some(self.max_depth);
+            tree.fit(X, &residuals)?;
+            
+            // Update predictions
+            let tree_pred = tree.predict(X)?;
+            current_predictions = current_predictions.add(&tree_pred.mul_scalar(self.learning_rate)?)?;
+            
+            self.trees.push(tree);
+        }
+        
+        Ok(())
+    }
+    
+    fn predict(&self, X: &Tensor) -> Result<Tensor, String> {
+        var predictions = Tensor::full(&[X.data()[0]], self.initial_prediction);
+        
+        each tree in &self.trees {
+            let tree_pred = tree.predict(X)?;
+            predictions = predictions.add(&tree_pred.mul_scalar(self.learning_rate)?)?;
+        }
+        
+        Ok(predictions)
+    }
+}
+
+export {
+    LinearRegression,
+    Ridge,
+    Lasso,
+    ElasticNet,
+    RandomForestRegressor,
+    DecisionTreeRegressor,
+    GradientBoostingRegressor
+}

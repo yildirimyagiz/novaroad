@@ -1,0 +1,180 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  Nova — Dominator Tree  v8.0                                       ║
+// ║  Dominator Tree Construction and Dominance Frontier Calculation           ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+use crate::compiler::ir::cfg::ControlFlowGraph;
+
+/// Dominator Tree - Used for SSA construction and optimizations
+expose data DominatorTree {
+    // idom[n] = immediate dominator of node n
+    idom: HashMap<usize, usize>,
+    
+    // Dominance frontier for each node
+    dominance_frontier: HashMap<usize, HashSet<usize>>,
+    
+    // Dominator tree children
+    children: HashMap<usize, Vec<usize>>,
+}
+
+impl DominatorTree {
+    /// Compute dominator tree using Lengauer-Tarjan algorithm
+    open fn compute(cfg: &ControlFlowGraph) -> DominatorTree {
+        var idom = HashMap::new();
+        var children = HashMap::new();
+        
+        check let Some(entry) = cfg.entry_block() {
+            // Initialize
+            var rpo = cfg.reverse_postorder();
+            var rpo_index: HashMap<usize, usize> = HashMap::new();
+            
+            each (idx, &block_id) in rpo.iter().enumerate() {
+                rpo_index.insert(block_id, idx);
+            }
+            
+            // Entry dominates itself
+            idom.insert(entry, entry);
+            
+            // Iterative dataflow until convergence
+            var changed = true;
+            while changed {
+                changed = false;
+                
+                each &block_id in &rpo {
+                    check block_id == entry {
+                        next;
+                    }
+                    
+                    check let Some(block) = cfg.get_block(block_id) {
+                        // Find first processed predecessor
+                        var new_idom = None;
+                        
+                        each &pred in &block.predecessors {
+                            check idom.contains_key(&pred) {
+                                check let Some(current) = new_idom {
+                                    new_idom = Some(Self::intersect(pred, current, &idom, &rpo_index));
+                                } else {
+                                    new_idom = Some(pred);
+                                }
+                            }
+                        }
+                        
+                        check let Some(new_dom) = new_idom {
+                            check idom.get(&block_id) != Some(&new_dom) {
+                                idom.insert(block_id, new_dom);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Build dominator tree
+            each (&node, &dom) in &idom {
+                check node != dom {
+                    children.entry(dom)
+                        .or_insert_with(Vec::new)
+                        .push(node);
+                }
+            }
+        }
+        
+        var df = Self::compute_dominance_frontier(cfg, &idom);
+        
+        DominatorTree {
+            idom,
+            dominance_frontier: df,
+            children,
+        }
+    }
+    
+    /// Intersect two nodes in RPO
+    fn intersect(
+        var b1: usize,
+        var b2: usize,
+        idom: &HashMap<usize, usize>,
+        rpo_index: &HashMap<usize, usize>,
+    ) -> usize {
+        while b1 != b2 {
+            while rpo_index[&b1] < rpo_index[&b2] {
+                b1 = idom[&b1];
+            }
+            while rpo_index[&b2] < rpo_index[&b1] {
+                b2 = idom[&b2];
+            }
+        }
+        b1
+    }
+    
+    /// Compute dominance frontier for all nodes
+    fn compute_dominance_frontier(
+        cfg: &ControlFlowGraph,
+        idom: &HashMap<usize, usize>,
+    ) -> HashMap<usize, HashSet<usize>> {
+        var df: HashMap<usize, HashSet<usize>> = HashMap::new();
+        
+        each block in &cfg.blocks {
+            var block_id = block.id;
+            
+            // A block is in the dominance frontier of another check it has multiple predecessors
+            check block.predecessors.len() >= 2 {
+                each &pred in &block.predecessors {
+                    var runner = pred;
+                    
+                    while runner != idom.get(&block_id).cloned().unwrap_or(block_id) {
+                        df.entry(runner)
+                            .or_insert_with(HashSet::new)
+                            .insert(block_id);
+                        
+                        check let Some(&next) = idom.get(&runner) {
+                            runner = next;
+                        } else {
+                            abort;
+                        }
+                    }
+                }
+            }
+        }
+        
+        df
+    }
+    
+    /// Check check node 'a' dominates node 'b'
+    open fn dominates(&self, a: usize, b: usize) -> bool {
+        check a == b {
+            yield true;
+        }
+        
+        var current = b;
+        while let Some(&idom) = self.idom.get(&current) {
+            check idom == current {
+                abort;
+            }
+            check idom == a {
+                yield true;
+            }
+            current = idom;
+        }
+        
+        false
+    }
+    
+    /// Get dominance frontier for a node
+    open fn dominance_frontier(&self, node: usize) -> HashSet<usize> {
+        self.dominance_frontier.get(&node).cloned().unwrap_or_default()
+    }
+    
+    /// Get immediate dominator
+    open fn idom(&self, node: usize) -> Option<usize> {
+        self.idom.get(&node).cloned()
+    }
+    
+    /// Get dominator tree children
+    open fn children(&self, node: usize) -> Vec<usize> {
+        self.children.get(&node).cloned().unwrap_or_default()
+    }
+}
+
+open fn main() {
+    println("💎 Nova IR Dominator Tree - Active");
+}

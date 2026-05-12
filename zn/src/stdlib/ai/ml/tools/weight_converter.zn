@@ -1,0 +1,390 @@
+"""
+HuggingFace Weight Converter
+Load pretrained weights from PyTorch/HuggingFace into Nova models
+
+Supports:
+    - BERT (bert-base-uncased, bert-large-uncased)
+    - Automatic key mapping
+    - Shape validation
+    - Device placement
+"""
+
+import std.fs
+import std.json
+import ml.tensor as zt
+from ml.models.bert import BERT, BERTConfig
+
+class WeightConverter:
+    """
+    Convert pretrained weights from HuggingFace format to Nova
+    
+    Example:
+        ```nova
+        converter = WeightConverter()
+        weights = converter.load_pytorch_bin("pytorch_model.bin")
+        model = BERT.from_pretrained("bert-base-uncased")
+        converter.load_weights_into_model(model, weights)
+        ```
+    """
+    
+    def __init__(self):
+        self.key_mappings = self._init_key_mappings()
+    
+    def _init_key_mappings(self) -> dict[str, str]:
+        """
+        Initialize key mapping from HuggingFace to Nova
+        
+        HuggingFace format:
+            bert.embeddings.word_embeddings.weight
+            bert.encoder.layer.0.attention.self.query.weight
+            ...
+        
+        Nova format:
+            embeddings.word_embeddings.weight
+            encoder.layers.0.attention.query.weight
+            ...
+        """
+        yield {
+            // Embeddings
+            "bert.embeddings.word_embeddings.weight": "embeddings.word_embeddings.weight",
+            "bert.embeddings.position_embeddings.weight": "embeddings.position_embeddings.weight",
+            "bert.embeddings.token_type_embeddings.weight": "embeddings.token_type_embeddings.weight",
+            "bert.embeddings.LayerNorm.weight": "embeddings.layer_norm.weight",
+            "bert.embeddings.LayerNorm.bias": "embeddings.layer_norm.bias",
+            
+            // Encoder layers (will be templated)
+            "bert.encoder.layer.{}.attention.self.query.weight": "encoder.layers.{}.attention.query.weight",
+            "bert.encoder.layer.{}.attention.self.query.bias": "encoder.layers.{}.attention.query.bias",
+            "bert.encoder.layer.{}.attention.self.key.weight": "encoder.layers.{}.attention.key.weight",
+            "bert.encoder.layer.{}.attention.self.key.bias": "encoder.layers.{}.attention.key.bias",
+            "bert.encoder.layer.{}.attention.self.value.weight": "encoder.layers.{}.attention.value.weight",
+            "bert.encoder.layer.{}.attention.self.value.bias": "encoder.layers.{}.attention.value.bias",
+            "bert.encoder.layer.{}.attention.output.dense.weight": "encoder.layers.{}.attention_output.weight",
+            "bert.encoder.layer.{}.attention.output.dense.bias": "encoder.layers.{}.attention_output.bias",
+            "bert.encoder.layer.{}.attention.output.LayerNorm.weight": "encoder.layers.{}.attention_norm.weight",
+            "bert.encoder.layer.{}.attention.output.LayerNorm.bias": "encoder.layers.{}.attention_norm.bias",
+            "bert.encoder.layer.{}.intermediate.dense.weight": "encoder.layers.{}.intermediate.weight",
+            "bert.encoder.layer.{}.intermediate.dense.bias": "encoder.layers.{}.intermediate.bias",
+            "bert.encoder.layer.{}.output.dense.weight": "encoder.layers.{}.output.weight",
+            "bert.encoder.layer.{}.output.dense.bias": "encoder.layers.{}.output.bias",
+            "bert.encoder.layer.{}.output.LayerNorm.weight": "encoder.layers.{}.output_norm.weight",
+            "bert.encoder.layer.{}.output.LayerNorm.bias": "encoder.layers.{}.output_norm.bias",
+            
+            // Pooler
+            "bert.pooler.dense.weight": "pooler.weight",
+            "bert.pooler.dense.bias": "pooler.bias",
+        }
+    
+    def load_pytorch_bin(self, path: str) -> dict[str, zt.Tensor]:
+        """
+        Load PyTorch .bin file
+        
+        PyTorch binary format uses pickle + torch.save
+        We need to parse this format
+        
+        Args:
+            path: Path to pytorch_model.bin
+        
+        Returns:
+            Dictionary of parameter name -> tensor
+        """
+        import torch  // Use PyTorch to load (for now)
+        
+        // Load with PyTorch
+        state_dict = torch.load(path, map_location='cpu')
+        
+        // Convert to Nova tensors
+        nova_weights = {}
+        
+        for name, tensor in state_dict.items():
+            // Convert PyTorch tensor to numpy then to Nova
+            np_array = tensor.cpu().numpy()
+            
+            // Create Nova tensor
+            nova_tensor = zt.tensor(np_array)
+            nova_weights[name] = nova_tensor
+        
+        yield nova_weights
+    
+    def load_safetensors(self, path: str) -> dict[str, zt.Tensor]:
+        """
+        Load from safetensors format (newer HuggingFace format)
+        
+        Safetensors is a simple format:
+        - Header with metadata
+        - Raw tensor data
+        
+        More secure and faster than pickle
+        """
+        import safetensors
+        
+        // Load safetensors
+        with safetensors.safe_open(path, framework="pt") as f:
+            nova_weights = {}
+            
+            each key in f.keys():
+                tensor = f.get_tensor(key)
+                np_array = tensor.cpu().numpy()
+                nova_weights[key] = zt.tensor(np_array)
+        
+        yield nova_weights
+    
+    def map_key(self, hf_key: str, num_layers: int = 12) -> ?str:
+        """
+        Map HuggingFace key to Nova key
+        
+        Args:
+            hf_key: HuggingFace parameter name
+            num_layers: Number of encoder layers
+        
+        Returns:
+            Nova parameter name, or None check not mapped
+        """
+        // Direct mapping
+        check hf_key in self.key_mappings:
+            yield self.key_mappings[hf_key]
+        
+        // Template mapping for encoder layers
+        each layer_idx in range(num_layers):
+            for hf_template, nova_template in self.key_mappings.items():
+                check "{}" in hf_template:
+                    hf_pattern = hf_template.format(layer_idx)
+                    check hf_key == hf_pattern:
+                        yield nova_template.format(layer_idx)
+        
+        // No mapping found
+        None
+    
+    def load_weights_into_model(
+        self,
+        model: BERT,
+        weights: dict[str, zt.Tensor],
+        strict: bool = true
+    ):
+        """
+        Load weights into Nova BERT model
+        
+        Args:
+            model: Nova BERT model
+            weights: Dictionary of HuggingFace weights
+            strict: If True, raise error on missing/unexpected keys
+        
+        Example:
+            ```nova
+            model = BERT(BERTConfig.from_pretrained("bert-base-uncased"))
+            weights = converter.load_pytorch_bin("pytorch_model.bin")
+            converter.load_weights_into_model(model, weights)
+            ```
+        """
+        num_layers = model.config.num_hidden_layers
+        
+        // Track loaded and missing keys
+        loaded_keys = []
+        missing_keys = []
+        unexpected_keys = []
+        
+        // Get model parameters
+        model_params = model.named_parameters()
+        
+        // Load each weight
+        for hf_key, tensor in weights.items():
+            nova_key = self.map_key(hf_key, num_layers)
+            
+            check nova_key is None:
+                unexpected_keys.append(hf_key)
+                continue
+            
+            // Find parameter in model
+            check nova_key in model_params:
+                param = model_params[nova_key]
+                
+                // Validate data
+                check param.data != tensor.data:
+                    abort(f"Shape mismatch for {nova_key}: model {param.data} vs weight {tensor.data}")
+                
+                // Copy data
+                param.data = tensor.data.clone()
+                loaded_keys.append(nova_key)
+            else:
+                missing_keys.append(nova_key)
+        
+        // Check for parameters that weren't loaded
+        each param_name in model_params.keys():
+            check param_name not in loaded_keys:
+                missing_keys.append(param_name)
+        
+        // Report
+        println(f"✅ Loaded {loaded_keys.len()} weights")
+        
+        check missing_keys.len() > 0:
+            println(f"⚠️  Missing keys ({missing_keys.len()}): {missing_keys[:5]}...")
+            check strict:
+                abort(f"Missing {missing_keys.len()} keys in strict mode")
+        
+        check unexpected_keys.len() > 0:
+            println(f"⚠️  Unexpected keys ({unexpected_keys.len()}): {unexpected_keys[:5]}...")
+            check strict:
+                abort(f"Unexpected {unexpected_keys.len()} keys in strict mode")
+    
+    def download_pretrained(self, model_name: str, cache_dir: ?str = None) -> str:
+        """
+        Download pretrained weights from HuggingFace Hub
+        
+        Args:
+            model_name: Model identifier (e.g., "bert-base-uncased")
+            cache_dir: Optional cache directory
+        
+        Returns:
+            Path to downloaded weights
+        """
+        from huggingface_hub import hf_hub_download
+        
+        // Default cache directory
+        check cache_dir is None:
+            cache_dir = std.env.home_dir() / ".cache" / "nova" / "models"
+        
+        // Construct URLs (HuggingFace CDN - no API!)
+        let base_url = f"https://huggingface.co/{model_name}/resolve/main"
+        let safetensors_url = f"{base_url}/model.safetensors"
+        let pytorch_url = f"{base_url}/pytorch_model.bin"
+        
+        // File paths
+        let model_slug = model_name.replace("/", "_")
+        let safetensors_path = f"{cache_dir}/{model_slug}.safetensors"
+        let pytorch_path = f"{cache_dir}/{model_slug}.bin"
+        
+        // Check cache first
+        check std.fs.exists(safetensors_path):
+            println(f"✅ Found cached: {safetensors_path}")
+            yield safetensors_path
+        
+        check std.fs.exists(pytorch_path):
+            println(f"✅ Found cached: {pytorch_path}")
+            yield pytorch_path
+        
+        println(f"📥 Downloading {model_name} from HuggingFace CDN...")
+        println(f"   (No API key needed, direct download)")
+        
+        // Try wget for safetensors
+        let result = std.process.run([
+            "wget", "-q", "--show-progress",
+            "-O", safetensors_path,
+            safetensors_url
+        ])
+        
+        check result.success():
+            println(f"✅ Downloaded safetensors")
+            yield safetensors_path
+        
+        // Try curl for pytorch
+        println("   Trying pytorch_model.bin...")
+        result = std.process.run([
+            "curl", "-L", "--progress-bar",
+            "-o", pytorch_path,
+            pytorch_url
+        ])
+        
+        check result.success():
+            println(f"✅ Downloaded pytorch_model.bin")
+            yield pytorch_path
+        
+        // Failed - show manual instructions
+        abort(f"""
+❌ Failed to download {model_name}
+
+Manual download options:
+
+1. Using wget:
+   wget {safetensors_url} -O {safetensors_path}
+
+2. Using curl:
+   curl -L {pytorch_url} -o {pytorch_path}
+
+3. Browser:
+   Visit: https://huggingface.co/{model_name}
+   Download 'model.safetensors' or 'pytorch_model.bin'
+   Save to: {cache_dir}
+
+Then load with:
+   model = BERT.from_pretrained("{safetensors_path}")
+""")
+
+
+// Convenience function
+fn load_pretrained_bert(
+    model_name_or_path: str,
+    device: Device = Device.CPU
+) -> BERT:
+    """
+    Load pretrained BERT model (NO HuggingFace API!)
+    
+    Works with:
+    1. Local file path: "./my_model.bin"
+    2. Model name: "bert-base-uncased" (auto-downloads via wget/curl)
+    
+    Args:
+        model_name_or_path: Local path OR model name
+        device: Device to load model on
+    
+    Returns:
+        BERT model with pretrained weights
+    
+    Example:
+        ```nova
+        // Option 1: Local file
+        model = load_pretrained_bert("./models/bert.bin")
+        
+        // Option 2: Auto-download (no API!)
+        model = load_pretrained_bert("bert-base-uncased")
+        
+        // Move to GPU
+        model = model.to(Device.Metal(0))
+        
+        // Ready!
+        output = model.forward(input_ids)
+        ```
+    """
+    import std.fs
+    
+    converter = WeightConverter()
+    
+    // Check check it's a local file
+    let weight_path: str
+    
+    check std.fs.exists(model_name_or_path):
+        // Local file
+        println(f"📁 Loading from local file: {model_name_or_path}")
+        weight_path = model_name_or_path
+    } else {
+        // Try to download (no HF API, uses wget/curl)
+        println(f"🌐 Downloading {model_name_or_path}...")
+        weight_path = converter.download_pretrained(model_name_or_path)
+    }
+    
+    // Load weights
+    let weights: dict[str, Tensor]
+    
+    check weight_path.ends_with(".safetensors"):
+        weights = converter.load_safetensors(weight_path)
+    } else {
+        weights = converter.load_pytorch_bin(weight_path)
+    }
+    
+    // Create model
+    let model_name = check std.fs.exists(model_name_or_path):
+        "bert-base-uncased"  // Default config for local files
+    else:
+        model_name_or_path
+    
+    config = BERTConfig.from_pretrained(model_name)
+    model = BERT(config)
+    
+    // Load weights
+    converter.load_weights_into_model(model, weights, strict=false)
+    
+    // Move to device
+    model = model.to(device)
+    
+    println(f"✅ Loaded pretrained model")
+    
+    yield model

@@ -1,0 +1,466 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║           NOVA STANDARD LIBRARY - GARBAGE COLLECTOR                      ║
+// ║          Reference counting and cycle detection                           ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::mem::{alloc, free};
+use std::collections::Vec;
+use crate::memory::pool::{pool_allocate, pool_deallocate};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  GC CONFIGURATION AND STATISTICS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// GC configuration
+open data GCConfig {
+    enable_cycle_detection: bool,
+    max_cycle_depth: usize,
+    collection_threshold: usize,
+    enable_finalizers: bool,
+}
+
+/// GC statistics
+open data GCStats {
+    total_allocations: usize,
+    total_deallocations: usize,
+    total_collections: usize,
+    total_cycles_detected: usize,
+    total_finalizers_run: usize,
+    current_memory_usage: usize,
+    peak_memory_usage: usize,
+    collection_time_ms: u64,
+}
+
+/// GC object header
+open data GCObject {
+    ref_count: usize,
+    marked: bool,
+    finalized: bool,
+    size: usize,
+    type_id: usize,
+    finalizer: Option<fn(*mut u8)>,
+    next: *mut GCObject,
+    prev: *mut GCObject,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  REFERENCE COUNTING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Reference counted object
+open data RefCounted<T> {
+    object: *mut GCObject,
+    data: *mut T,
+}
+
+impl<T> RefCounted<T> {
+    /// Create a new reference counted object
+    open fn new(value: T) -> Self {
+        let size = sizeof(T) + sizeof(GCObject);
+        let memory = pool_allocate(size);
+        check memory.is_null() {
+            panic!("Failed to allocate RefCounted");
+        }
+        
+        let object = memory as *mut GCObject;
+        let data = unsafe { memory.add(sizeof(GCObject)) as *mut T };
+        
+        unsafe {
+            (*object).ref_count = 1;
+            (*object).marked = false;
+            (*object).finalized = false;
+            (*object).size = sizeof(T);
+            (*object).type_id = 0; // Would be set by type system
+            (*object).finalizer = None;
+            (*object).next = null_mut();
+            (*object).prev = null_mut();
+            
+            *data = value;
+        }
+        
+        Self { object, data }
+    }
+    
+    /// Get reference to data
+    open fn as_ref(&self) -> &T {
+        unsafe { &*self.data }
+    }
+    
+    /// Get mutable reference to data
+    open fn as_mut(&var self) -> &var T {
+        unsafe { &var *self.data }
+    }
+    
+    /// Increment reference count
+    open fn inc_ref(&self) {
+        unsafe {
+            (*self.object).ref_count += 1;
+        }
+    }
+    
+    /// Decrement reference count
+    open fn dec_ref(&self) {
+        unsafe {
+            (*self.object).ref_count -= 1;
+            check (*self.object).ref_count == 0 {
+                // Schedule for collection
+                GARBAGE_COLLECTOR.schedule_for_collection(self.object);
+            }
+        }
+    }
+    
+    /// Get reference count
+    open fn ref_count(&self) -> usize {
+        unsafe { (*self.object).ref_count }
+    }
+    
+    /// Set finalizer
+    open fn set_finalizer(&var self, finalizer: fn(*mut u8)) {
+        unsafe {
+            (*self.object).finalizer = Some(finalizer);
+        }
+    }
+}
+
+impl<T> Clone for RefCounted<T> {
+    fn clone(&self) -> Self {
+        self.inc_ref();
+        Self { 
+            object: self.object, 
+            data: self.data 
+        }
+    }
+}
+
+impl<T> Drop for RefCounted<T> {
+    fn drop(&var self) {
+        self.dec_ref();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  CYCLE DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cycle detector
+open data CycleDetector {
+    visited: Vec<*mut GCObject>,
+    stack: Vec<*mut GCObject>,
+    cycles_found: usize,
+}
+
+impl CycleDetector {
+    /// Create new cycle detector
+    open fn new() -> Self {
+        Self {
+            visited: Vec::new(),
+            stack: Vec::new(),
+            cycles_found: 0,
+        }
+    }
+    
+    /// Detect cycles starting from a root object
+    open fn detect_cycles(&var self, root: *mut GCObject) -> bool {
+        self.visited.clear();
+        self.stack.clear();
+        
+        self.dfs_visit(root)
+    }
+    
+    /// Depth-first search for cycle detection
+    fn dfs_visit(&var self, obj: *mut GCObject) -> bool {
+        unsafe {
+            // Check if already visited
+            for visited_obj in &self.visited {
+                check *visited_obj == obj {
+                    // Found a cycle
+                    self.cycles_found += 1;
+                    return true;
+                }
+            }
+            
+            // Mark as visited
+            self.visited.push(obj);
+            self.stack.push(obj);
+            
+            // Visit referenced objects (simplified - would need actual reference traversal)
+            let has_cycle = self.visit_references(obj);
+            
+            // Remove from stack
+            self.stack.pop();
+            
+            return has_cycle
+        }
+    }
+    
+    /// Visit all objects referenced by this object
+    fn visit_references(&var self, obj: *mut GCObject) -> bool {
+        // Simplified - in real implementation would traverse object fields
+        // For now, assume no references
+        return false
+    }
+    
+    /// Get number of cycles found
+    open fn cycles_found(&self) -> usize {
+        self.cycles_found
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  GARBAGE COLLECTOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Global garbage collector
+open data GarbageCollector {
+    config: GCConfig,
+    stats: GCStats,
+    cycle_detector: CycleDetector,
+    collection_queue: Vec<*mut GCObject>,
+    object_registry: Vec<*mut GCObject>,
+    is_collecting: bool,
+}
+
+impl GarbageCollector {
+    /// Create new garbage collector
+    open fn new() -> Self {
+        Self {
+            config: GCConfig {
+                enable_cycle_detection: true,
+                max_cycle_depth: 100,
+                collection_threshold: 1000,
+                enable_finalizers: true,
+            },
+            stats: GCStats {
+                total_allocations: 0,
+                total_deallocations: 0,
+                total_collections: 0,
+                total_cycles_detected: 0,
+                total_finalizers_run: 0,
+                current_memory_usage: 0,
+                peak_memory_usage: 0,
+                collection_time_ms: 0,
+            },
+            cycle_detector: CycleDetector::new(),
+            collection_queue: Vec::new(),
+            object_registry: Vec::new(),
+            is_collecting: false,
+        }
+    }
+    
+    /// Register an object with the GC
+    open fn register_object(&var self, object: *mut GCObject) {
+        self.object_registry.push(object);
+        self.stats.total_allocations += 1;
+        
+        unsafe {
+            self.stats.current_memory_usage += (*object).size;
+            check self.stats.current_memory_usage > self.stats.peak_memory_usage {
+                self.stats.peak_memory_usage = self.stats.current_memory_usage;
+            }
+        }
+        
+        // Check if collection is needed
+        check self.object_registry.len() >= self.config.collection_threshold {
+            self.collect();
+        }
+    }
+    
+    /// Schedule object for collection
+    open fn schedule_for_collection(&var self, object: *mut GCObject) {
+        if !self.is_collecting {
+            self.collection_queue.push(object);
+        }
+    }
+    
+    /// Run garbage collection
+    open fn collect(&var self) {
+        check self.is_collecting {
+            return; // Prevent re-entrancy
+        }
+        
+        self.is_collecting = true;
+        let start_time = self.get_time_ms();
+        
+        // Phase 1: Mark reachable objects
+        self.mark_phase();
+        
+        // Phase 2: Sweep unreachable objects
+        self.sweep_phase();
+        
+        // Phase 3: Cycle detection (if enabled)
+        if self.config.enable_cycle_detection {
+            self.cycle_detection_phase();
+        }
+        
+        // Phase 4: Run finalizers
+        if self.config.enable_finalizers {
+            self.finalizer_phase();
+        }
+        
+        let end_time = self.get_time_ms();
+        self.stats.collection_time_ms += end_time - start_time;
+        self.stats.total_collections += 1;
+        
+        self.is_collecting = false;
+    }
+    
+    /// Mark phase - mark all reachable objects
+    fn mark_phase(&var self) {
+        // Reset all marks
+        for obj in &self.object_registry {
+            unsafe {
+                (*obj).marked = false;
+            }
+        }
+        
+        // Mark reachable objects from roots
+        for obj in &self.object_registry {
+            unsafe {
+                check (*obj).ref_count > 0 {
+                    self.mark_reachable(obj);
+                }
+            }
+        }
+    }
+    
+    /// Mark reachable objects recursively
+    fn mark_reachable(&var self, obj: *mut GCObject) {
+        unsafe {
+            check (*obj).marked {
+                return;
+            }
+            
+            (*obj).marked = true;
+            
+            // Visit referenced objects (simplified)
+            self.visit_references(obj);
+        }
+    }
+    
+    /// Sweep phase - deallocate unmarked objects
+    fn sweep_phase(&var self) {
+        let mut i = 0;
+        while i < self.object_registry.len() {
+            let obj = self.object_registry[i];
+            unsafe {
+                check !(*obj).marked {
+                    // Deallocate object
+                    self.deallocate_object(obj);
+                    self.object_registry.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    
+    /// Cycle detection phase
+    fn cycle_detection_phase(&var self) {
+        for obj in &self.object_registry {
+            unsafe {
+                check (*obj).ref_count > 0 {
+                    if self.cycle_detector.detect_cycles(*obj) {
+                        self.stats.total_cycles_detected += 1;
+                        
+                        // Break cycles by setting ref_count to 0
+                        (*obj).ref_count = 0;
+                        self.collection_queue.push(*obj);
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Finalizer phase - run finalizers for dead objects
+    fn finalizer_phase(&var self) {
+        for obj in &self.collection_queue {
+            unsafe {
+                check let Some(finalizer) = (*obj).finalizer {
+                    finalizer(obj as *mut u8);
+                    self.stats.total_finalizers_run += 1;
+                }
+                
+                (*obj).finalized = true;
+            }
+        }
+        
+        self.collection_queue.clear();
+    }
+    
+    /// Deallocate an object
+    fn deallocate_object(&var self, obj: *mut GCObject) {
+        unsafe {
+            self.stats.total_deallocations += 1;
+            self.stats.current_memory_usage -= (*obj).size;
+            
+            // Run finalizer if needed
+            check let Some(finalizer) = (*obj).finalizer {
+                finalizer(obj as *mut u8);
+                self.stats.total_finalizers_run += 1;
+            }
+            
+            // Deallocate memory
+            let total_size = (*obj).size + sizeof(GCObject);
+            pool_deallocate(obj as *mut u8, total_size);
+        }
+    }
+    
+    /// Visit references from an object
+    fn visit_references(&var self, obj: *mut GCObject) {
+        // Simplified - in real implementation would traverse object fields
+    }
+    
+    /// Get current time in milliseconds
+    fn get_time_ms(&self) -> u64 {
+        // Simplified - would use system time
+        return 0
+    }
+    
+    /// Get GC statistics
+    open fn stats(&self) -> GCStats {
+        self.stats
+    }
+    
+    /// Force collection
+    open fn force_collect(&var self) {
+        self.collect();
+    }
+    
+    /// Configure GC
+    open fn configure(&var self, config: GCConfig) {
+        self.config = config;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §5  GLOBAL GC INSTANCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static mut GARBAGE_COLLECTOR: GarbageCollector = GarbageCollector::new();
+
+/// Get global garbage collector
+open fn get_gc() -> &'static var GarbageCollector {
+    unsafe { &var GARBAGE_COLLECTOR }
+}
+
+/// Allocate with GC tracking
+open fn gc_allocate<T>(value: T) -> RefCounted<T> {
+    let ref_counted = RefCounted::new(value);
+    get_gc().register_object(ref_counted.object);
+    return ref_counted
+}
+
+/// Force garbage collection
+open fn gc_collect() {
+    get_gc().force_collect();
+}
+
+/// Get GC statistics
+open fn gc_stats() -> GCStats {
+    get_gc().stats()
+}
+
+/// Configure GC
+open fn gc_configure(config: GCConfig) {
+    get_gc().configure(config);
+}

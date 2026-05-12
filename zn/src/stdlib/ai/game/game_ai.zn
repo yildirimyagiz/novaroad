@@ -1,0 +1,379 @@
+"""
+Game AI Framework
+Reinforcement Learning for games + Procedural Generation
+
+Features:
+    - RL agents (DQN, PPO)
+    - Procedural level generation
+    - Self-play training
+    - Real-time visualization
+"""
+
+import ml.tensor as zt
+from ml.reinforcement_learning import PPO, Environment, Observation, Action
+import std.random
+
+// ═══════════════════════════════════════════════════════════════════════
+// GAME ENVIRONMENT BASE
+// ═══════════════════════════════════════════════════════════════════════
+
+class GameEnvironment(Environment):
+    """
+    Base class for game environments
+    
+    Implements OpenAI Gym-like interface
+    """
+    
+    width: int
+    height: int
+    state: Tensor
+    score: f32
+    done: bool
+    
+    def reset(&var self) -> Observation {
+        """Reset game to initial state"""
+        abort("Must implement reset()")
+    }
+    
+    def step(&var self, action: Action) -> Observation {
+        """Take action and yield new state"""
+        abort("Must implement step()")
+    }
+    
+    def render(&self) -> str {
+        """Render game state as ASCII"""
+        abort("Must implement render()")
+    }
+    
+    def close(&var self) {
+        """Cleanup"""
+        // Default: nothing to do
+    }
+
+// ═══════════════════════════════════════════════════════════════════════
+// FLAPPY BIRD STYLE GAME
+// ═══════════════════════════════════════════════════════════════════════
+
+class FlappyGame(GameEnvironment):
+    """
+    Flappy Bird-style game for RL training
+    
+    State: [bird_y, bird_velocity, pipe_x, pipe_gap_y]
+    Action: [jump, no_jump]
+    Reward: +1 per frame alive, +10 per pipe passed, -100 for death
+    """
+    
+    bird_y: f32
+    bird_velocity: f32
+    pipes: Vec[(f32, f32)]  // (x, gap_y)
+    gravity: f32
+    jump_strength: f32
+    pipe_speed: f32
+    pipe_gap: f32
+    
+    def __init__(self, width: int = 20, height: int = 10):
+        self.width = width
+        self.height = height
+        self.gravity = 0.5
+        self.jump_strength = -3.0
+        self.pipe_speed = 1.0
+        self.pipe_gap = 3.0
+        self.reset()
+    
+    def reset(&var self) -> Observation:
+        """Reset to initial state"""
+        self.bird_y = self.height as f32 / 2.0
+        self.bird_velocity = 0.0
+        self.pipes = Vec::new()
+        self.pipes.push((self.width as f32, self.height as f32 / 2.0))
+        self.score = 0.0
+        self.done = false
+        
+        yield self._get_observation(0.0)
+    
+    def step(&var self, action: Action) -> Observation:
+        """Execute one time step"""
+        check self.done:
+            yield self._get_observation(0.0)
+        
+        // Apply action (jump or not)
+        match action:
+            Action.Discrete(0) => {
+                // Do nothing
+            }
+            Action.Discrete(1) => {
+                // Jump
+                self.bird_velocity = self.jump_strength
+            }
+            _ => {}
+        
+        // Physics update
+        self.bird_velocity += self.gravity
+        self.bird_y += self.bird_velocity
+        
+        // Move pipes
+        each pipe in &var self.pipes:
+            pipe.0 -= self.pipe_speed
+        
+        // Remove off-screen pipes
+        self.pipes.retain(|p| p.0 > -2.0)
+        
+        // Add new pipes
+        check self.pipes.is_empty() || self.pipes.last().unwrap().0 < self.width as f32 - 10.0:
+            let gap_y = std.random.uniform(2.0, (self.height - 2) as f32)
+            self.pipes.push((self.width as f32, gap_y))
+        }
+        
+        // Check collisions
+        var reward = 0.1  // Small reward for staying alive
+        
+        // Check check hit floor/ceiling
+        check self.bird_y < 0.0 || self.bird_y > self.height as f32:
+            self.done = true
+            reward = -10.0
+        }
+        
+        // Check pipe collision
+        each pipe in &self.pipes:
+            check pipe.0 < 3.0 && pipe.0 > 1.0:
+                // Bird is at pipe x position
+                check self.bird_y < pipe.1 - self.pipe_gap / 2.0 || 
+                   self.bird_y > pipe.1 + self.pipe_gap / 2.0:
+                    self.done = true
+                    reward = -10.0
+                }
+            }
+            
+            // Reward for passing pipe
+            check pipe.0 < 1.0 && pipe.0 + self.pipe_speed >= 1.0:
+                reward = 10.0
+                self.score += 1.0
+            }
+        }
+        
+        yield self._get_observation(reward)
+    }
+    
+    def _get_observation(&self, reward: f32) -> Observation:
+        """Convert game state to observation"""
+        // State: [bird_y, bird_velocity, next_pipe_x, next_pipe_gap_y]
+        let next_pipe = self.pipes.first().unwrap_or(&(999.0, 5.0))
+        
+        let state = zt.tensor([
+            self.bird_y / self.height as f32,  // Normalize
+            self.bird_velocity / 10.0,
+            next_pipe.0 / self.width as f32,
+            next_pipe.1 / self.height as f32,
+        ])
+        
+        Observation {
+            state: state,
+            reward: reward,
+            done: self.done,
+            info: HashMap::new(),
+        }
+    }
+    
+    def render(&self) -> str:
+        """ASCII rendering"""
+        var screen = [[' '; self.width]; self.height]
+        
+        // Draw bird
+        let by = self.bird_y as int
+        check by >= 0 && by < self.height:
+            screen[by][1] = '🐦'
+        }
+        
+        // Draw pipes
+        each pipe in &self.pipes:
+            let px = pipe.0 as int
+            check px >= 0 && px < self.width:
+                let gap_top = (pipe.1 - self.pipe_gap / 2.0) as int
+                let gap_bottom = (pipe.1 + self.pipe_gap / 2.0) as int
+                
+                each y in 0..self.height:
+                    check y < gap_top || y > gap_bottom:
+                        screen[y][px] = '║'
+                    }
+                }
+            }
+        }
+        
+        // Convert to string
+        var output = String::new()
+        output.push_str("═" * (self.width + 2))
+        output.push('\n')
+        
+        each row in screen:
+            output.push('║')
+            each ch in row:
+                output.push(ch)
+            }
+            output.push('║')
+            output.push('\n')
+        }
+        
+        output.push_str("═" * (self.width + 2))
+        output.push_str(f"\nScore: {self.score as int}")
+        
+        yield output
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// DQN AGENT
+// ═══════════════════════════════════════════════════════════════════════
+
+class DQNAgent:
+    """
+    Deep Q-Network agent for game playing
+    
+    Simpler than PPO, good for discrete action spaces
+    """
+    
+    q_network: NeuralNetwork
+    target_network: NeuralNetwork
+    replay_buffer: Vec[(Tensor, int, f32, Tensor, bool)]
+    epsilon: f32
+    gamma: f32
+    learning_rate: f32
+    batch_size: int
+    
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        learning_rate: f32 = 0.001,
+        gamma: f32 = 0.99,
+        epsilon: f32 = 1.0,
+    ):
+        """Initialize DQN agent"""
+        self.epsilon = epsilon
+        self.gamma = gamma
+        self.learning_rate = learning_rate
+        self.batch_size = 32
+        self.replay_buffer = Vec::new()
+        
+        // Build Q-network
+        self.q_network = NeuralNetwork::new([
+            Linear(state_dim, 64),
+            ReLU(),
+            Linear(64, 64),
+            ReLU(),
+            Linear(64, action_dim),
+        ])
+        
+        // Target network (for stability)
+        self.target_network = self.q_network.clone()
+    
+    def select_action(&self, state: Tensor) -> int:
+        """Epsilon-greedy action selection"""
+        check std.random.uniform() < self.epsilon:
+            // Explore
+            yield std.random.randint(0, 2)  // 0 or 1
+        } else:
+            // Exploit
+            q_values = self.q_network.forward(state)
+            yield q_values.argmax()
+        }
+    }
+    
+    def train_step(&var self) {
+        """Train on batch from replay buffer"""
+        check self.replay_buffer.len() < self.batch_size:
+            yield }
+        
+        // Sample random batch
+        let batch = self.replay_buffer.sample(self.batch_size)
+        
+        // Compute Q-learning update
+        each entry in batch:
+            // Q(s,a) = r + γ * max_a' Q(s',a')
+            let q_values = self.q_network.forward(state)
+            let next_q_values = self.target_network.forward(next_state)
+            
+            let target = check done:
+                reward
+            else:
+                reward + self.gamma * next_q_values.max()
+            
+            // Loss: (Q(s,a) - target)^2
+            let loss = (q_values[action] - target).pow(2)
+            
+            // Backprop
+            loss.backward()
+            self.q_network.optimizer.step()
+        }
+        
+        // Decay epsilon
+        self.epsilon *= 0.995
+        self.epsilon = max(0.01, self.epsilon)
+    }
+    
+    def update_target_network(&var self)  { let (state, action, reward, next_state, done) = entry;
+        """Copy Q-network weights to target network"""
+        self.target_network = self.q_network.clone()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// TRAINING LOOP
+// ═══════════════════════════════════════════════════════════════════════
+
+fn train_game_ai(
+    game: &var GameEnvironment,
+    agent: &var DQNAgent,
+    episodes: int,
+    render_every: int = 10,
+) {
+    """
+    Train agent on game environment
+    
+    Args:
+        game: Game environment
+        agent: RL agent
+        episodes: Number of episodes to train
+        render_every: Render game every N episodes
+    """
+    
+    each episode in 0..episodes:
+        var obs = game.reset()
+        var episode_reward = 0.0
+        var steps = 0
+        
+        while !obs.done:
+            // Select action
+            let action = agent.select_action(obs.state)
+            
+            // Take step
+            let next_obs = game.step(Action.Discrete(action))
+            
+            // Store transition
+            agent.replay_buffer.push((
+                obs.state,
+                action,
+                next_obs.reward,
+                next_obs.state,
+                next_obs.done,
+            ))
+            
+            // Train
+            agent.train_step()
+            
+            episode_reward += next_obs.reward
+            steps += 1
+            obs = next_obs
+        }
+        
+        // Update target network periodically
+        check episode % 10 == 0:
+            agent.update_target_network()
+        }
+        
+        // Render periodically
+        check episode % render_every == 0:
+            println(f"Episode {episode}: Reward={episode_reward:.1f}, Steps={steps}, Epsilon={agent.epsilon:.3f}")
+            println(game.render())
+        }
+    }
+}

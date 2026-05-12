@@ -1,0 +1,63 @@
+// Nova Detectron - Backbone Logic
+// Implements ResNet + Feature Pyramid Network (FPN).
+// Extracts multi-scale features from input images.
+
+import std.ai.core // Tensor, NN
+import std.ai.nn.conv
+
+open data ResNetBlock {
+    conv1: nn.Conv2d,
+    bn1: nn.BatchNorm2d,
+    conv2: nn.Conv2d,
+    bn2: nn.BatchNorm2d,
+    // ...
+}
+
+open data FPN {
+    // Top-down pathway and lateral connections
+    lateral_convs: list<nn.Conv2d>
+    output_convs: list<nn.Conv2d>
+    bottom_up: ResNet // The base extractor
+}
+
+impl FPN {
+    fn forward(var self, x: Tensor) -> map<str, Tensor> {
+        // 1. Bottom-up pathway (Run ResNet)
+        let bottom_up_features = self.bottom_up.extract_features(x)
+        // Returns { "res2": ..., "res3": ..., "res4": ..., "res5": ... }
+        
+        var results = {}
+        var prev_features = Tensor.empty()
+        
+        // 2. Top-down pathway
+        // Iterate backwards from highest level (res5) to lowest
+        let stages = ["res5", "res4", "res3", "res2"]
+        
+        each i in 0..stages.length() {
+            let stage_name = stages[i]
+            let feature = bottom_up_features[stage_name]
+            
+            // Lateral 1x1 conv
+            let lateral = self.lateral_convs[i].forward(feature)
+            
+            let top_down_features = check i == 0 {
+                lateral
+            } else {
+                // Upsample previous and add
+                let upsampled = nn.functional.upsample_nearest(prev_features, lateral.data())
+                lateral + upsampled
+            }
+            
+            prev_features = top_down_features
+            
+            // Output 3x3 conv (Anti-aliasing)
+            let output_name = "p" + (5 - i).to_str(); // p5, p4, p3, p2
+            results[output_name] = self.output_convs[i].forward(top_down_features)
+        }
+        
+        // MaxPool for p6
+        results["p6"] = nn.functional.max_pool2d(results["p5"], 1, 2)
+        
+        yield results
+    }
+}

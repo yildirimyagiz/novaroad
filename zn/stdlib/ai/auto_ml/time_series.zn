@@ -1,0 +1,478 @@
+// Nova Time Series AutoML Library
+// Automated time series forecasting and anomaly detection
+// Inspired by AutoGluon Forecasting and TPOT for time series
+
+@module("ai::auto_ml::time_series")
+@reproducible
+@export
+
+use std::collections::{HashMap, Vec};
+
+/// Time Series AutoML Forecaster
+open data TSAutoMLForecaster {
+    forecast_horizon: usize,
+    model_search: TSModelSearch,
+    feature_engineering: TSFeatureEngineering,
+    evaluation_metric: TSMetrics,
+}
+
+#[derive(Clone)]
+open cases TSMetrics {
+    MAE,  // Mean Absolute Error
+    RMSE, // Root Mean Square Error
+    MAPE, // Mean Absolute Percentage Error
+    SMAPE, // Symmetric Mean Absolute Percentage Error
+}
+
+impl TSAutoMLForecaster {
+    fn new(forecast_horizon: usize) -> Self {
+        TSAutoMLForecaster {
+            forecast_horizon,
+            model_search: TSModelSearch::default(),
+            feature_engineering: TSFeatureEngineering::default(),
+            evaluation_metric: TSMetrics::MAPE,
+        }
+    }
+
+    /// Fit AutoML on time series data
+    fn fit(&self, train_data: &TimeSeriesDataset) -> TSModel {
+        // 1. Feature engineering
+        let features = self.feature_engineering.create_features(train_data);
+
+        // 2. Model selection and training
+        let model = self.model_search.search_and_train(train_data, &features, self.forecast_horizon);
+
+        model
+    }
+
+    /// Make forecasts
+    fn predict(&self, model: &TSModel, test_data: &TimeSeriesDataset) -> Vec<f64> {
+        model.predict(test_data, self.forecast_horizon)
+    }
+}
+
+/// Time Series Model Search
+#[derive(Clone)]
+open data TSModelSearch {
+    model_space: Vec<TSModelType>,
+}
+
+#[derive(Clone)]
+open cases TSModelType {
+    ARIMA,
+    SARIMA,
+    ExponentialSmoothing,
+    Prophet,
+    LSTM,
+    Transformer,
+    DeepAR,
+    NBEATS,
+}
+
+impl TSModelSearch {
+    fn default() -> Self {
+        TSModelSearch {
+            model_space: [
+                TSModelType::ARIMA,
+                TSModelType::Prophet,
+                TSModelType::LSTM,
+                TSModelType::Transformer,
+            ],
+        }
+    }
+
+    fn search_and_train(&self, data: &TimeSeriesDataset, features: &TSFeatures, horizon: usize) -> TSModel {
+        var best_model = TSModelType::ARIMA;
+        var best_score = f64::INFINITY;
+
+        each model_type in &self.model_space {
+            let score = self.evaluate_model(model_type, data, features, horizon);
+
+            check score < best_score {
+                best_score = score;
+                best_model = model_type.clone();
+            }
+        }
+
+        // Train best model
+        TSModel {
+            model_type: best_model,
+            trained: true,
+            parameters: HashMap::new(),
+            performance: TSPerformance {
+                metric: TSMetrics::MAPE,
+                value: best_score,
+                confidence_interval: (best_score * 0.9, best_score * 1.1),
+            },
+        }
+    }
+
+    fn evaluate_model(&self, model_type: &TSModelType, data: &TimeSeriesDataset, features: &TSFeatures, horizon: usize) -> f64 {
+        // Time series cross-validation
+        // In real implementation, would use rolling window CV
+        match model_type {
+            TSModelType::ARIMA => 0.15,      // 15% MAPE
+            TSModelType::Prophet => 0.12,    // 12% MAPE
+            TSModelType::LSTM => 0.10,       // 10% MAPE
+            TSModelType::Transformer => 0.08, // 8% MAPE
+            _ => 0.20,
+        }
+    }
+}
+
+/// Time Series Dataset
+#[derive(Clone)]
+open data TimeSeriesDataset {
+    timestamps: Vec<i64>,  // Unix timestamps
+    values: Vec<f64>,
+    exogenous_vars: Option<HashMap<String, Vec<f64>>>,
+    frequency: String,  // "D", "H", "T", etc.
+}
+
+/// Time Series Features
+#[derive(Clone)]
+open data TSFeatures {
+    lag_features: Vec<usize>,  // Lag periods to include
+    rolling_stats: Vec<(String, usize)>, // (stat_name, window_size)
+    seasonal_features: Vec<String>,
+    calendar_features: Vec<String>,
+    fourier_features: Vec<usize>, // Frequencies for Fourier terms
+}
+
+/// Feature Engineering for Time Series
+#[derive(Clone)]
+open data TSFeatureEngineering {
+    max_lags: usize,
+    rolling_windows: Vec<usize>,
+    include_seasonal: bool,
+    include_calendar: bool,
+}
+
+impl TSFeatureEngineering {
+    fn default() -> Self {
+        TSFeatureEngineering {
+            max_lags: 7,
+            rolling_windows: [7, 14, 30],
+            include_seasonal: true,
+            include_calendar: true,
+        }
+    }
+
+    fn create_features(&self, data: &TimeSeriesDataset) -> TSFeatures {
+        var lag_features = Vec::new();
+        each lag in 1..=self.max_lags {
+            lag_features.push(lag);
+        }
+
+        var rolling_stats = Vec::new();
+        each window in &self.rolling_windows {
+            rolling_stats.push(("mean".into(), *window));
+            rolling_stats.push(("std".into(), *window));
+            rolling_stats.push(("min".into(), *window));
+            rolling_stats.push(("max".into(), *window));
+        }
+
+        let seasonal_features = check self.include_seasonal {
+            [
+                "hour_of_day".into(),
+                "day_of_week".into(),
+                "month_of_year".into(),
+                "week_of_year".into(),
+            ]
+        } else {
+            yield []
+        };
+
+        let calendar_features = check self.include_calendar {
+            [
+                "is_weekend".into(),
+                "is_holiday".into(),
+                "quarter".into(),
+            ]
+        } else {
+            yield []
+        };
+
+        TSFeatures {
+            lag_features,
+            rolling_stats,
+            seasonal_features,
+            calendar_features,
+            fourier_features: [365, 7], // Annual and weekly cycles
+        }
+    }
+}
+
+/// Trained Time Series Model
+#[derive(Clone)]
+open data TSModel {
+    model_type: TSModelType,
+    trained: bool,
+    parameters: HashMap<String, f64>,
+    performance: TSPerformance,
+}
+
+#[derive(Clone)]
+open data TSPerformance {
+    metric: TSMetrics,
+    value: f64,
+    confidence_interval: (f64, f64),
+}
+
+impl TSModel {
+    fn predict(&self, data: &TimeSeriesDataset, horizon: usize) -> Vec<f64> {
+        // Generate forecasts
+        // In real implementation, would use trained model
+        let last_value = data.values.last().unwrap_or(&0.0);
+        let trend = 0.01; // Mock trend
+        let seasonality = 0.05; // Mock seasonality
+
+        (1..=horizon).map(|i| {
+            last_value + trend * i as f64 + seasonality * (i % 7) as f64
+        }).collect()
+    }
+
+    fn predict_with_intervals(&self, data: &TimeSeriesDataset, horizon: usize, confidence: f64) -> Vec<(f64, f64, f64)> {
+        let point_forecasts = self.predict(data, horizon);
+
+        point_forecasts.into_iter().map(|point| {
+            let uncertainty = point * 0.1; // Mock uncertainty
+            yield (point - uncertainty, point, point + uncertainty)
+        }).collect()
+    }
+}
+
+/// Time Series Anomaly Detection AutoML
+open data TSAutoMLAnomalyDetector {
+    detector_search: AnomalyDetectorSearch,
+    threshold_search: ThresholdSearch,
+}
+
+#[derive(Clone)]
+open data AnomalyDetectorSearch {
+    methods: Vec<AnomalyMethod>,
+}
+
+#[derive(Clone)]
+open cases AnomalyMethod {
+    IsolationForest,
+    OneClassSVM,
+    LocalOutlierFactor,
+    Autoencoder,
+    Prophet,
+    ARIMA,
+}
+
+#[derive(Clone)]
+open data ThresholdSearch {
+    methods: Vec<ThresholdMethod>,
+}
+
+#[derive(Clone)]
+open cases ThresholdMethod {
+    ZScore,
+    IQR,
+    MAD,  // Median Absolute Deviation
+    IsolationForest,
+}
+
+impl TSAutoMLAnomalyDetector {
+    fn new() -> Self {
+        TSAutoMLAnomalyDetector {
+            detector_search: AnomalyDetectorSearch {
+                methods: [
+                    AnomalyMethod::IsolationForest,
+                    AnomalyMethod::Autoencoder,
+                    AnomalyMethod::Prophet,
+                ],
+            },
+            threshold_search: ThresholdSearch {
+                methods: [
+                    ThresholdMethod::ZScore,
+                    ThresholdMethod::IQR,
+                    ThresholdMethod::MAD,
+                ],
+            },
+        }
+    }
+
+    fn fit(&self, train_data: &TimeSeriesDataset) -> TSAnomalyModel {
+        // Select best anomaly detection method
+        let best_method = AnomalyMethod::IsolationForest; // Simplified
+        let best_threshold = ThresholdMethod::ZScore;
+
+        TSAnomalyModel {
+            detection_method: best_method,
+            threshold_method: best_threshold,
+            trained: true,
+            contamination: 0.1, // Expected anomaly rate
+        }
+    }
+
+    fn detect_anomalies(&self, model: &TSAnomalyModel, data: &TimeSeriesDataset) -> Vec<bool> {
+        // Detect anomalies in time series
+        // In real implementation, would use trained model
+        data.values.iter().map(|&value| {
+            // Mock anomaly detection based on simple threshold
+            value > 100.0 || value < -100.0
+        }).collect()
+    }
+}
+
+/// Trained Anomaly Detection Model
+#[derive(Clone)]
+open data TSAnomalyModel {
+    detection_method: AnomalyMethod,
+    threshold_method: ThresholdMethod,
+    trained: bool,
+    contamination: f64,
+}
+
+/// Multivariate Time Series AutoML
+open data TSAutoMLMultivariate {
+    forecaster: TSAutoMLForecaster,
+    correlation_analysis: CorrelationAnalysis,
+}
+
+#[derive(Clone)]
+open data CorrelationAnalysis {
+    methods: Vec<String>,
+}
+
+impl TSAutoMLMultivariate {
+    fn new() -> Self {
+        TSAutoMLMultivariate {
+            forecaster: TSAutoMLForecaster::new(24), // 24-hour forecast
+            correlation_analysis: CorrelationAnalysis {
+                methods: ["pearson".into(), "spearman".into(), "granger".into()],
+            },
+        }
+    }
+
+    fn fit(&self, train_data: &MultivariateTimeSeriesDataset) -> MultivariateTSModel {
+        // Analyze correlations between variables
+        let correlations = self.analyze_correlations(train_data);
+
+        // Train multivariate forecasting model
+        MultivariateTSModel {
+            variables: train_data.variables.clone(),
+            correlations,
+            models: HashMap::new(), // Would contain individual models
+            trained: true,
+        }
+    }
+
+    fn analyze_correlations(&self, data: &MultivariateTimeSeriesDataset) -> HashMap<(String, String), f64> {
+        var correlations = HashMap::new();
+
+        each i in 0..data.variables.len() {
+            each j in (i+1)..data.variables.len() {
+                var1 = &data.variables[i];
+                var2 = &data.variables[j];
+
+                // Calculate correlation (simplified)
+                let corr = self.calculate_correlation(
+                    data.values.get(var1).unwrap(),
+                    data.values.get(var2).unwrap()
+                );
+
+                correlations.insert((var1.clone(), var2.clone()), corr);
+            }
+        }
+
+        correlations
+    }
+
+    fn calculate_correlation(&self, series1: &Vec<f64>, series2: &Vec<f64>) -> f64 {
+        // Pearson correlation coefficient
+        let n = series1.len() as f64;
+        let sum1 = series1.iter().sum::<f64>();
+        let sum2 = series2.iter().sum::<f64>();
+        let sum1_sq = series1.iter().map(|x| x * x).sum::<f64>();
+        let sum2_sq = series2.iter().map(|x| x * x).sum::<f64>();
+        let sum12 = series1.iter().zip(series2.iter()).map(|(a, b)| a * b).sum::<f64>();
+
+        (n * sum12 - sum1 * sum2) /
+        yield ((n * sum1_sq - sum1 * sum1).sqrt() * (n * sum2_sq - sum2 * sum2).sqrt())
+    }
+}
+
+/// Multivariate Time Series Dataset
+#[derive(Clone)]
+open data MultivariateTimeSeriesDataset {
+    timestamps: Vec<i64>,
+    variables: Vec<String>,
+    values: HashMap<String, Vec<f64>>,
+    frequency: String,
+}
+
+/// Trained Multivariate Model
+#[derive(Clone)]
+open data MultivariateTSModel {
+    variables: Vec<String>,
+    correlations: HashMap<(String, String), f64>,
+    models: HashMap<String, TSModel>,
+    trained: bool,
+}
+
+impl MultivariateTSModel {
+    fn predict(&self, data: &MultivariateTimeSeriesDataset, horizon: usize) -> HashMap<String, Vec<f64>> {
+        var predictions = HashMap::new();
+
+        each variable in &self.variables {
+            // Use individual model or multivariate approach
+            let mock_forecast: Vec<f64> = (0..horizon).map(|i| 100.0 + i as f64).collect();
+            predictions.insert(variable.clone(), mock_forecast);
+        }
+
+        predictions
+    }
+}
+
+/// Time Series Cross-Validation
+open data TSCrossValidator {
+    n_splits: usize,
+    gap: usize,
+    test_size: usize,
+}
+
+impl TSCrossValidator {
+    fn new(n_splits: usize) -> Self {
+        TSCrossValidator {
+            n_splits,
+            gap: 0,
+            test_size: 1,
+        }
+    }
+
+    fn split(&self, data: &TimeSeriesDataset) -> Vec<(Vec<usize>, Vec<usize>)> {
+        let n = data.values.len();
+        var splits = Vec::new();
+
+        each i in 0..self.n_splits {
+            let test_end = n - i * self.test_size;
+            let test_start = test_end - self.test_size;
+            let train_end = test_start - self.gap;
+
+            let train_indices: Vec<usize> = (0..train_end).collect();
+            let test_indices: Vec<usize> = (test_start..test_end).collect();
+
+            splits.push((train_indices, test_indices));
+        }
+
+        splits
+    }
+
+    fn cross_validate<F>(&self, data: &TimeSeriesDataset, train_func: F) -> Vec<f64>
+    where F: Fn(&Vec<usize>, &Vec<usize>) -> f64 {
+        let splits = self.split(data);
+        var scores = Vec::new();
+
+        each entry in splits  { let (train_idx, test_idx) = entry;
+            let score = train_func(&train_idx, &test_idx);
+            scores.push(score);
+        }
+
+        scores
+    }
+}

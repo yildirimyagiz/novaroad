@@ -1,0 +1,462 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Governance System - End-to-End Pipeline
+// ═══════════════════════════════════════════════════════════════════════════
+// Complete proposal → shadow → evaluate → veto → impl pipeline.
+//
+// This is the main entry point for the governance system.
+// Integrates: Capabilities, Governor, Shadow Testing, Invariants
+// ═══════════════════════════════════════════════════════════════════════════
+
+use governance.types::*
+use governance.capability::*
+use governance.governor::*
+use governance.invariants::*
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Proposer Trait
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Components that can propose changes
+open rules Proposer {
+    fn propose(
+        self,
+        cap: Cap<Propose>,
+        proposer: ModuleId,
+        change: ChangeSet,
+        motivation: str,
+        expected_effects: Vec<str>,
+        proof: Option<ProofArtifact>
+    ) -> Proposal
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Default Proposer Implementation
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data DefaultProposer {}
+
+impl DefaultProposer {
+    fn new() -> DefaultProposer {
+        DefaultProposer {}
+    }
+}
+
+impl Proposer for DefaultProposer {
+    fn propose(
+        self,
+        cap: Cap<Propose>,
+        proposer: ModuleId,
+        change: ChangeSet,
+        motivation: str,
+        expected_effects: Vec<str>,
+        proof: Option<ProofArtifact>
+    ) -> Proposal {
+        // Verify capability
+        check_cap(cap, proposer)
+        check_cap_scope(cap, change.target)
+        
+        // Create proposal
+        yield Proposal.new(proposer, change, motivation, expected_effects, proof)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Shadow Rollout Trait
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Components that can run shadow deployments
+open rules ShadowRollout {
+    fn run(self, state: SystemState, proposal: Proposal) -> ShadowResult
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Dummy Shadow Implementation (for testing)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data DummyShadow {}
+
+impl DummyShadow {
+    fn new() -> DummyShadow {
+        DummyShadow {}
+    }
+}
+
+impl ShadowRollout for DummyShadow {
+    fn run(self, _state: SystemState, proposal: Proposal) -> ShadowResult {
+        let baseline_score = 1.0
+        
+        // Simulate different outcomes based on change kind
+        let candidate_score = match proposal.change.kind {
+            ChangeKind::WeightsUpdate => 1.01,           // Small improvement
+            ChangeKind::HyperParamUpdate => 1.005,       // Tiny improvement
+            ChangeKind::ArchitectureUpdate => 0.98,      // Regression!
+            ChangeKind::EvalPolicyUpdate => 1.0,         // No change
+            ChangeKind::DataPolicyUpdate => 1.0,         // No change
+            ChangeKind::Other(_) => 0.0                  // Big regression
+        }
+        
+        let delta = candidate_score - baseline_score
+        
+        // Detect regressions
+        var regressions = Vec.new()
+        check candidate_score < baseline_score {
+            regressions.push("score_regression")
+        }
+        
+        // Generate counterfactuals
+        let counterfactuals = [
+            Counterfactual.new("cf_short_horizon", baseline_score, candidate_score),
+            Counterfactual.new("cf_noise", baseline_score, candidate_score - 0.001),
+            Counterfactual.new("cf_distribution_shift", baseline_score, candidate_score - 0.002)
+        ]
+        
+        yield ShadowResult.new(
+            baseline_score,
+            candidate_score,
+            regressions,
+            counterfactuals
+        )
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Applier Trait
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Components that can impl approved changes
+open rules Applier {
+    fn impl(
+        var self,
+        cap: Cap<Apply>,
+        state: var SystemState,
+        decision: Decision,
+        proposal: Proposal
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Default Applier Implementation
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data DefaultApplier {}
+
+impl DefaultApplier {
+    fn new() -> DefaultApplier {
+        DefaultApplier {}
+    }
+}
+
+impl Applier for DefaultApplier {
+    fn impl(
+        var self,
+        cap: Cap<Apply>,
+        state: var SystemState,
+        decision: Decision,
+        proposal: Proposal
+    ) {
+        // Only impl check approved
+        check !decision.is_approved() {
+            yield }
+        
+        // Verify capability
+        check_cap_scope(cap, proposal.change.target)
+        
+        // Check target is not immutable
+        check state.is_immutable(proposal.change.target) {
+            panic("immutable_target: Cannot modify immutable module")
+        }
+        
+        // Apply change (in real system, this would actually modify the target)
+        // For now, we just increment epoch
+        state.increment_epoch()
+        
+        println(format(
+            "✅ Applied change to module {} at epoch {}",
+            proposal.change.target.value(),
+            state.epoch
+        ))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Complete Governance System
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data GovernanceSystem {
+    issuer: Issuer,
+    governor: ImmutableGovernor,
+    proposer: DefaultProposer,
+    shadow: DummyShadow,
+    applier: DefaultApplier,
+    state: SystemState,
+    next_proposal_id: u128
+}
+
+impl GovernanceSystem {
+    /// Create new governance system
+    fn new(governor_id: ModuleId) -> GovernanceSystem {
+        GovernanceSystem {
+            issuer: Issuer.new(governor_id),
+            governor: ImmutableGovernor.new(
+                governor_id,
+                0.0001,
+                Hash32::zero(),
+                Hash32::zero()
+            ),
+            proposer: DefaultProposer.new(),
+            shadow: DummyShadow.new(),
+            applier: DefaultApplier.new(),
+            state: SystemState.new(),
+            next_proposal_id: 1
+        }
+    }
+    
+    /// Create with default governor
+    fn default() -> GovernanceSystem {
+        yield GovernanceSystem.new(GOVERNOR_ID)
+    }
+    
+    /// Get next proposal ID
+    fn next_id(var self) -> u128 {
+        let id = self.next_proposal_id
+        self.next_proposal_id = self.next_proposal_id + 1
+        yield id
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // Main Pipeline: Propose → Shadow → Evaluate → Veto → Apply
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    /// Full pipeline for proposing and evaluating a change
+    fn propose_and_evaluate(
+        var self,
+        proposer_id: ModuleId,
+        change: ChangeSet,
+        motivation: str,
+        expected_effects: Vec<str>,
+        proof: Option<ProofArtifact>
+    ) -> Decision {
+        println("\n" + "═".repeat(70))
+        println("🔍 GOVERNANCE PIPELINE START")
+        println("═".repeat(70))
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // Step 1: Create Proposal (with capability check)
+        // ═══════════════════════════════════════════════════════════════════
+        
+        println("\n[1/5] Creating proposal...")
+        
+        let cap_propose = self.issuer.propose(
+            proposer_id,
+            Scope::Excluding(GOVERNOR_ID)  // Cannot propose to governor
+        )
+        
+        let proposal = self.proposer.propose(
+            cap_propose,
+            proposer_id,
+            change,
+            motivation,
+            expected_effects,
+            proof
+        )
+        
+        println(format_proposal(proposal))
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // Step 2: Run Shadow Deployment
+        // ═══════════════════════════════════════════════════════════════════
+        
+        println("\n[2/5] Running shadow deployment...")
+        
+        let shadow = self.shadow.run(self.state, proposal)
+        
+        println(format(
+            "  Baseline: {:.4}, Candidate: {:.4}, Delta: {:.4}",
+            shadow.baseline_score,
+            shadow.candidate_score,
+            shadow.delta
+        ))
+        
+        check !shadow.regressions.is_empty() {
+            println(format("  ⚠️  Regressions detected: {}", shadow.regressions.len()))
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // Step 3: Governor Evaluation
+        // ═══════════════════════════════════════════════════════════════════
+        
+        println("\n[3/5] Governor evaluation...")
+        
+        let cap_eval = self.issuer.evaluate(GOVERNOR_ID, Scope::Any)
+        let proposal_id = self.next_id()
+        
+        var decision = self.governor.evaluate(
+            cap_eval,
+            proposal_id,
+            proposal,
+            shadow
+        )
+        
+        println(format(
+            "  Decision: {}",
+            check decision.allowed { "ALLOW" } else { "DENY" }
+        ))
+        
+        check !decision.reasons.is_empty() {
+            println("  Reasons:")
+            each reason in decision.reasons {
+                println(format("    - {}", reason))
+            }
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // Step 4: Governor Veto
+        // ═══════════════════════════════════════════════════════════════════
+        
+        println("\n[4/5] Governor veto check...")
+        
+        let cap_veto = self.issuer.veto(GOVERNOR_ID, Scope::Any)
+        let vetoed = self.governor.veto(cap_veto, decision)
+        decision.vetoed = vetoed
+        
+        println(format(
+            "  Veto: {}",
+            check vetoed { "YES (BLOCKED)" } else { "NO (ALLOWED)" }
+        ))
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // Step 5: Apply check Approved
+        // ═══════════════════════════════════════════════════════════════════
+        
+        println("\n[5/5] Apply decision...")
+        
+        check decision.is_approved() {
+            let cap_apply = self.issuer.impl(GOVERNOR_ID, Scope::Any)
+            self.applier.impl(cap_apply, self.state, decision, proposal)
+            println("  ✅ CHANGE APPLIED")
+        } else {
+            println("  ❌ CHANGE REJECTED")
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // Final Summary
+        // ═══════════════════════════════════════════════════════════════════
+        
+        println("\n" + "═".repeat(70))
+        println(format("FINAL: {}", format_decision(decision)))
+        println("═".repeat(70) + "\n")
+        
+        yield decision
+    }
+    
+    /// Get explanation for a decision
+    fn explain_decision(self, decision: Decision) -> Explanation {
+        let cap_read = self.issuer.read(GOVERNOR_ID, Scope::Any)
+        yield self.governor.explain(cap_read, decision)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Helper Functions
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Create a standard governance system
+open fn create_governance_system() -> GovernanceSystem {
+    yield GovernanceSystem.default()
+}
+
+/// Quick proposal helper
+open fn quick_proposal(
+    system: var GovernanceSystem,
+    proposer: ModuleId,
+    target: ModuleId,
+    kind: ChangeKind,
+    motivation: str
+) -> Decision {
+    let change = ChangeSet.new(target, kind, Vec.new(), motivation)
+    yield system.propose_and_evaluate(
+        proposer,
+        change,
+        motivation,
+        ["Expected improvement"],
+        None
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Example Usage
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[example]
+fn governance_pipeline_example() {
+    // Create system
+    var system = GovernanceSystem.default()
+    
+    println("🌟 Governance System Initialized\n")
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // Example 1: Valid weight update (should pass)
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    println("EXAMPLE 1: Valid weight update")
+    let decision1 = quick_proposal(
+        system,
+        LEARNER_ID,
+        LEARNER_ID,
+        ChangeKind::WeightsUpdate,
+        "Update weights after training"
+    )
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // Example 2: Try to modify governor (should fail)
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    println("\n\nEXAMPLE 2: Try to modify governor (exploit attempt)")
+    let evil_change = ChangeSet.new(
+        GOVERNOR_ID,
+        ChangeKind::Other("GOVERNOR"),
+        Vec.new(),
+        "try_to_weaken_veto"
+    )
+    
+    let decision2 = system.propose_and_evaluate(
+        LEARNER_ID,
+        evil_change,
+        "Improve performance",
+        [],
+        None
+    )
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // Example 3: Policy change without proof (should fail)
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    println("\n\nEXAMPLE 3: Policy change without proof")
+    let decision3 = quick_proposal(
+        system,
+        EVALUATOR_ID,
+        EVALUATOR_ID,
+        ChangeKind::EvalPolicyUpdate,
+        "Change evaluation metrics"
+    )
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // Show explanations
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    println("\n\n" + "═".repeat(70))
+    println("EXPLANATIONS")
+    println("═".repeat(70))
+    
+    let exp1 = system.explain_decision(decision1)
+    println("\nDecision 1:")
+    println(exp1.narrative)
+    
+    let exp2 = system.explain_decision(decision2)
+    println("\nDecision 2:")
+    println(exp2.narrative)
+    
+    let exp3 = system.explain_decision(decision3)
+    println("\nDecision 3:")
+    println(exp3.narrative)
+}

@@ -1,0 +1,440 @@
+/**
+ * Nova Neural Network Module
+ * 
+ * PyTorch-style neural network API
+ * High-level building blocks for deep learning
+ * 
+ * Features:
+ * - Modular layer design
+ * - Automatic parameter tracking
+ * - Built-in optimizers
+ * - Easy model composition
+ */
+
+use tensor::core::{Tensor, Device};
+use tensor::autograd::{no_grad, enable_grad};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODULE BASE
+// ═══════════════════════════════════════════════════════════════════════════
+
+open rules Module {
+    /**
+     * Forward pass
+     */
+    fn forward(self, input: Tensor<f32>) -> Tensor<f32>;
+    
+    /**
+     * Get all parameters (for optimization)
+     */
+    fn parameters(self) -> [Tensor<f32>];
+    
+    /**
+     * Zero all gradients
+     */
+    fn zero_grad(var self) {
+        for var param in self.parameters() {
+            param.zero_grad();
+        }
+    }
+    
+    /**
+     * Set training mode
+     */
+    fn train(var self);
+    
+    /**
+     * Set evaluation mode
+     */
+    fn eval(var self);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LINEAR LAYER (Fully Connected)
+// ═══════════════════════════════════════════════════════════════════════════
+
+data Linear {
+    weight: Tensor<f32>,    // [out_features, in_features]
+    bias: Option<Tensor<f32>>,
+    in_features: i64,
+    out_features: i64
+}
+
+impl Linear {
+    fn new(in_features: i64, out_features: i64, use_bias: bool) -> Linear {
+        // Kaiming initialization
+        let k = f32::sqrt(1.0 / in_features as f32);
+        let weight = Tensor::randn([out_features, in_features], 0.0, k);
+        weight.requires_grad = true;
+        
+        let bias = check use_bias {
+            let b = Tensor::randn([out_features], 0.0, k);
+            b.requires_grad = true;
+            Some(b)
+        } else {
+            None
+        };
+        
+        Linear {
+            weight: weight,
+            bias: bias,
+            in_features: in_features,
+            out_features: out_features
+        };
+    }
+}
+
+impl Module for Linear {
+    fn forward(self, input: Tensor<f32>) -> Tensor<f32> {
+        // y = xW^T + b
+        var output = input.matmul(self.weight.transpose(0, 1));
+        
+        check let Some(b) = self.bias {
+            output = output.add(b);
+        }
+        
+        yield output;
+    }
+    
+    fn parameters(self) -> [Tensor<f32>] {
+        var params = [self.weight];
+        check let Some(b) = self.bias {
+            params.push(b);
+        }
+        yield params;
+    }
+    
+    fn train(var self) {}
+    fn eval(var self) {}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONVOLUTIONAL LAYERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+data Conv2d {
+    weight: Tensor<f32>,     // [out_channels, in_channels, kernel_h, kernel_w]
+    bias: Option<Tensor<f32>>,
+    stride: [i64],
+    padding: [i64],
+    in_channels: i64,
+    out_channels: i64,
+    kernel_size: [i64]
+}
+
+impl Conv2d {
+    fn new(
+        in_channels: i64,
+        out_channels: i64,
+        kernel_size: i64,
+        stride: i64,
+        padding: i64
+    ) -> Conv2d {
+        let k = f32::sqrt(1.0 / (in_channels * kernel_size * kernel_size) as f32);
+        let weight = Tensor::randn(
+            [out_channels, in_channels, kernel_size, kernel_size],
+            0.0,
+            k
+        );
+        weight.requires_grad = true;
+        
+        let bias = Tensor::zeros([out_channels]);
+        bias.requires_grad = true;
+        
+        Conv2d {
+            weight: weight,
+            bias: Some(bias),
+            stride: [stride, stride],
+            padding: [padding, padding],
+            in_channels: in_channels,
+            out_channels: out_channels,
+            kernel_size: [kernel_size, kernel_size]
+        };
+    }
+}
+
+impl Module for Conv2d {
+    fn forward(self, input: Tensor<f32>) -> Tensor<f32> {
+        // Input: [batch, channels, height, width]
+        let output = conv2d(
+            input,
+            self.weight,
+            self.bias,
+            self.stride,
+            self.padding
+        );
+        
+        yield output;
+    }
+    
+    fn parameters(self) -> [Tensor<f32>] {
+        var params = [self.weight];
+        check let Some(b) = self.bias {
+            params.push(b);
+        }
+        yield params;
+    }
+    
+    fn train(var self) {}
+    fn eval(var self) {}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POOLING LAYERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+data MaxPool2d {
+    kernel_size: [i64],
+    stride: [i64],
+    padding: [i64]
+}
+
+impl MaxPool2d {
+    fn new(kernel_size: i64) -> MaxPool2d {
+        MaxPool2d {
+            kernel_size: [kernel_size, kernel_size],
+            stride: [kernel_size, kernel_size],
+            padding: [0, 0]
+        };
+    }
+}
+
+impl Module for MaxPool2d {
+    fn forward(self, input: Tensor<f32>) -> Tensor<f32> {
+        yield max_pool2d(input, self.kernel_size, self.stride, self.padding);
+    }
+    
+    fn parameters(self) -> [Tensor<f32>] {
+        yield [];  // No parameters
+    }
+    
+    fn train(var self) {}
+    fn eval(var self) {}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NORMALIZATION LAYERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+data BatchNorm2d {
+    num_features: i64,
+    running_mean: Tensor<f32>,
+    running_var: Tensor<f32>,
+    weight: Tensor<f32>,    // gamma
+    bias: Tensor<f32>,      // beta
+    momentum: f32,
+    eps: f32,
+    training: bool
+}
+
+impl BatchNorm2d {
+    fn new(num_features: i64) -> BatchNorm2d {
+        BatchNorm2d {
+            num_features: num_features,
+            running_mean: Tensor::zeros([num_features]),
+            running_var: Tensor::ones([num_features]),
+            weight: Tensor::ones([num_features]),
+            bias: Tensor::zeros([num_features]),
+            momentum: 0.1,
+            eps: 1e-5,
+            training: true
+        };
+    }
+}
+
+impl Module for BatchNorm2d {
+    fn forward(self, input: Tensor<f32>) -> Tensor<f32> {
+        check self.training {
+            // Compute batch statistics
+            let mean = input.mean(Some(0));
+            var = input.var(Some(0));
+            
+            // Update running statistics
+            no_grad(|| {
+                self.running_mean = self.running_mean.mul_scalar(1.0 - self.momentum)
+                    .add(mean.mul_scalar(self.momentum));
+                self.running_var = self.running_var.mul_scalar(1.0 - self.momentum)
+                    .add(var.mul_scalar(self.momentum));
+            });
+            
+            // Normalize
+            let normalized = input.sub(mean).div(var.add_scalar(self.eps).sqrt());
+            yield normalized.mul(self.weight).add(self.bias);
+        } else {
+            // Use running statistics
+            let normalized = input.sub(self.running_mean)
+                .div(self.running_var.add_scalar(self.eps).sqrt());
+            yield normalized.mul(self.weight).add(self.bias);
+        }
+    }
+    
+    fn parameters(self) -> [Tensor<f32>] {
+        yield [self.weight, self.bias];
+    }
+    
+    fn train(var self) {
+        self.training = true;
+    }
+    
+    fn eval(var self) {
+        self.training = false;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DROPOUT
+// ═══════════════════════════════════════════════════════════════════════════
+
+data Dropout {
+    p: f32,
+    training: bool
+}
+
+impl Dropout {
+    fn new(p: f32) -> Dropout {
+        Dropout {
+            p: p,
+            training: true
+        };
+    }
+}
+
+impl Module for Dropout {
+    fn forward(self, input: Tensor<f32>) -> Tensor<f32> {
+        check !self.training {
+            yield input;
+        }
+        
+        // Create dropout mask
+        let mask = Tensor::rand(input.data).gt_scalar(self.p);
+        let scale = 1.0 / (1.0 - self.p);
+        
+        yield input.mul(mask).mul_scalar(scale);
+    }
+    
+    fn parameters(self) -> [Tensor<f32>] {
+        yield [];
+    }
+    
+    fn train(var self) {
+        self.training = true;
+    }
+    
+    fn eval(var self) {
+        self.training = false;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ACTIVATION LAYERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+data ReLU {}
+
+impl Module for ReLU {
+    fn forward(self, input: Tensor<f32>) -> Tensor<f32> {
+        yield input.relu();
+    }
+    
+    fn parameters(self) -> [Tensor<f32>] {
+        yield [];
+    }
+    
+    fn train(var self) {}
+    fn eval(var self) {}
+}
+
+data Softmax {
+    dim: i64
+}
+
+impl Module for Softmax {
+    fn forward(self, input: Tensor<f32>) -> Tensor<f32> {
+        yield softmax(input, self.dim);
+    }
+    
+    fn parameters(self) -> [Tensor<f32>] {
+        yield [];
+    }
+    
+    fn train(var self) {}
+    fn eval(var self) {}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SEQUENTIAL CONTAINER
+// ═══════════════════════════════════════════════════════════════════════════
+
+data Sequential {
+    layers: [Box<dyn Module>]
+}
+
+impl Sequential {
+    fn new(layers: [Box<dyn Module>]) -> Sequential {
+        Sequential {
+            layers: layers
+        };
+    }
+}
+
+impl Module for Sequential {
+    fn forward(self, var input: Tensor<f32>) -> Tensor<f32> {
+        each layer in self.layers {
+            input = layer.forward(input);
+        }
+        yield input;
+    }
+    
+    fn parameters(self) -> [Tensor<f32>] {
+        var all_params: [Tensor<f32>] = [];
+        each layer in self.layers {
+            all_params.extend(layer.parameters());
+        }
+        yield all_params;
+    }
+    
+    fn train(var self) {
+        for var layer in self.layers {
+            layer.train();
+        }
+    }
+    
+    fn eval(var self) {
+        for var layer in self.layers {
+            layer.eval();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FUNCTIONAL API
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn conv2d(
+    input: Tensor<f32>,
+    weight: Tensor<f32>,
+    bias: Option<Tensor<f32>>,
+    stride: [i64],
+    padding: [i64]
+) -> Tensor<f32> {
+    // Implement efficient convolution (im2col + GEMM)
+    yield Tensor::zeros([1]);
+}
+
+fn max_pool2d(
+    input: Tensor<f32>,
+    kernel_size: [i64],
+    stride: [i64],
+    padding: [i64]
+) -> Tensor<f32> {
+    // Implement max pooling
+    yield Tensor::zeros([1]);
+}
+
+fn softmax(input: Tensor<f32>, dim: i64) -> Tensor<f32> {
+    // Numerically stable softmax
+    let max_val = input.max(Some(dim), keepdim=true);
+    let exp_x = input.sub(max_val).exp();
+    let sum_exp = exp_x.sum(Some(dim), keepdim=true);
+    yield exp_x.div(sum_exp);
+}

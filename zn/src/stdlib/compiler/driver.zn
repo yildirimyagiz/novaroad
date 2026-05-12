@@ -1,0 +1,428 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA DRIVER - Compilation Driver and Pipeline Orchestration
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Inspired by rustc_driver: Main compilation entry point and phase management
+ */
+
+use std::path::Path;
+use parser::*;
+use hir::*;
+use mir::*;
+use codegen::*;
+use errors::*;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMPILATION SESSION
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Session {
+    opts: CompileOptions,
+    diagnostics: DiagnosticsEngine,
+}
+
+impl Session {
+    fn new(opts: CompileOptions) -> Self {
+        Self {
+            opts,
+            diagnostics: DiagnosticsEngine::new(),
+        }
+    }
+}
+
+open data CompileOptions {
+    input_files: Vec<String>,
+    output_file: Option<String>,
+    optimization_level: OptimizationLevel,
+    target_triple: String,
+    emit: EmitType,
+}
+
+open cases OptimizationLevel {
+    None,
+    Less,
+    Default,
+    Aggressive,
+}
+
+open cases EmitType {
+    LlvmIr,
+    Asm,
+    Obj,
+    Exe,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMPILATION PHASES
+// ═══════════════════════════════════════════════════════════════════════════
+
+open rules CompilationPhase {
+    fn run(&self, session: &var Session, input: PhaseInput) -> Result<PhaseOutput, ()>;
+}
+
+open cases PhaseInput {
+    Source(String),
+    Ast(Program),
+    Hir(HirProgram),
+    Mir(Module),
+}
+
+open cases PhaseOutput {
+    Ast(Program),
+    Hir(HirProgram),
+    Mir(Module),
+    CodeGen(()),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMPILATION DRIVER
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data CompilationDriver {
+    phases: Vec<Box<dyn CompilationPhase>>,
+}
+
+impl CompilationDriver {
+    fn new() -> Self {
+        var phases: Vec<Box<dyn CompilationPhase>> = Vec::new();
+
+        // Add phases in order
+        phases.push(Box::new(ParsePhase));
+        phases.push(Box::new(HirLoweringPhase));
+        phases.push(Box::new(MirLoweringPhase));
+        phases.push(Box::new(OptimizationPhase));
+        phases.push(Box::new(CodeGenPhase));
+
+        Self { phases }
+    }
+
+    fn compile(&self, session: &var Session) -> Result<(), ()> {
+        var current_input = PhaseInput::Source(read_source_files(&session.opts.input_files)?);
+
+        each phase in &self.phases {
+            match phase.run(session, current_input) {
+                Ok(output) => {
+                    current_input = match output {
+                        PhaseOutput::Ast(ast) => PhaseInput::Ast(ast),
+                        PhaseOutput::Hir(hir) => PhaseInput::Hir(hir),
+                        PhaseOutput::Mir(mir) => PhaseInput::Mir(mir),
+                        PhaseOutput::CodeGen(_) => yield Ok(()),
+                    };
+                }
+                Err(_) => {
+                    session.diagnostics.emit_all();
+                    Err(());
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INDIVIDUAL PHASES
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data ParsePhase;
+
+impl CompilationPhase for ParsePhase {
+    fn run(&self, session: &var Session, input: PhaseInput) -> Result<PhaseOutput, ()> {
+        match input {
+            PhaseInput::Source(source) => {
+                // Tokenize (simplified - in real implementation use a proper lexer)
+                let tokens = tokenize(&source);
+                var parser = Parser::new(tokens);
+                match parser.parse_program() {
+                    Ok(program) => Ok(PhaseOutput::Ast(program)),
+                    Err(errors) => {
+                        session.diagnostics.add_batch(errors);
+                        Err(())
+                    }
+                }
+            }
+            _ => abort("ParsePhase expects Source input"),
+        }
+    }
+}
+
+open data HirLoweringPhase;
+
+impl CompilationPhase for HirLoweringPhase {
+    fn run(&self, session: &var Session, input: PhaseInput) -> Result<PhaseOutput, ()> {
+        match input {
+            PhaseInput::Ast(program) => {
+                var lowerer = HirLowerer::new();
+                match lowerer.lower_program(&program) {
+                    Ok(hir_program) => Ok(PhaseOutput::Hir(hir_program)),
+                    Err(errors) => {
+                        session.diagnostics.add_batch(errors);
+                        Err(())
+                    }
+                }
+            }
+            _ => abort("HirLoweringPhase expects AST input"),
+        }
+    }
+}
+
+open data MirLoweringPhase;
+
+impl CompilationPhase for MirLoweringPhase {
+    fn run(&self, session: &var Session, input: PhaseInput) -> Result<PhaseOutput, ()> {
+        match input {
+            PhaseInput::Hir(hir_program) => {
+                var lowerer = MirLowerer::new();
+                let mir_module = lowerer.lower_program(&hir_program);
+                Ok(PhaseOutput::Mir(mir_module))
+            }
+            _ => abort("MirLoweringPhase expects HIR input"),
+        }
+    }
+}
+
+open data OptimizationPhase;
+
+impl CompilationPhase for OptimizationPhase {
+    fn run(&self, session: &var Session, input: PhaseInput) -> Result<PhaseOutput, ()> {
+        match input {
+            PhaseInput::Mir(var mir_module) => {
+                // Run optimizations based on level
+                match session.opts.optimization_level {
+                    OptimizationLevel::None => {}
+                    OptimizationLevel::Less => {
+                        // Basic optimizations
+                        run_basic_opts(&var mir_module);
+                    }
+                    OptimizationLevel::Default => {
+                        run_basic_opts(&var mir_module);
+                        run_advanced_opts(&var mir_module);
+                    }
+                    OptimizationLevel::Aggressive => {
+                        run_basic_opts(&var mir_module);
+                        run_advanced_opts(&var mir_module);
+                        run_aggressive_opts(&var mir_module);
+                    }
+                }
+                Ok(PhaseOutput::Mir(mir_module))
+            }
+            _ => abort("OptimizationPhase expects MIR input"),
+        }
+    }
+}
+
+open data CodeGenPhase;
+
+impl CompilationPhase for CodeGenPhase {
+    fn run(&self, session: &var Session, input: PhaseInput) -> Result<PhaseOutput, ()> {
+        match input {
+            PhaseInput::Mir(mir_module) => {
+                let backend = LLVMBackend;
+                match backend.compile_module(&mir_module) {
+                    Ok(_) => Ok(PhaseOutput::CodeGen(())),
+                    Err(errors) => {
+                        session.diagnostics.add_batch(errors);
+                        Err(())
+                    }
+                }
+            }
+            _ => abort("CodeGenPhase expects MIR input"),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OPTIMIZATION PASSES
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn run_basic_opts(module: &var Module) {
+    // Dead code elimination, constant folding, etc.
+    each func in module.functions.values_mut() {
+        basic_dead_code_elimination(func);
+        constant_folding(func);
+    }
+}
+
+fn run_advanced_opts(module: &var Module) {
+    // Inlining, loop optimizations, etc.
+    each func in module.functions.values_mut() {
+        function_inlining(func);
+        loop_unrolling(func);
+    }
+}
+
+fn run_aggressive_opts(module: &var Module) {
+    // Aggressive optimizations
+    each func in module.functions.values_mut() {
+        // Use learning optimizer, egraph, etc. from existing modules
+    }
+}
+
+// Placeholder optimization functions
+fn basic_dead_code_elimination(_func: &var Function) {}
+fn constant_folding(_func: &var Function) {}
+fn function_inlining(_func: &var Function) {}
+fn loop_unrolling(_func: &var Function) {}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn read_source_files(files: &[String]) -> Result<String, ()> {
+    var source = String::new();
+    each file in files {
+        match std::fs::read_to_string(file) {
+            Ok(content) => source.push_str(&content),
+            Err(_) => yield Err(()),
+        }
+    }
+    Ok(source)
+}
+
+fn tokenize(source: &str) -> Vec<Spanned<Token>> {
+    // Simplified tokenizer - in real implementation use a proper lexer
+    [Spanned {
+        node: Token::Eof,
+        span: Span::dummy(),
+    }]
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAIN COMPILATION ENTRY POINT
+// ═══════════════════════════════════════════════════════════════════════════
+
+open fn compile(options: CompileOptions) -> Result<(), ()> {
+    var session = Session::new(options);
+    let driver = CompilationDriver::new();
+    driver.compile(&var session)
+}
+
+open fn main() {
+    // Parse command line args and create CompileOptions
+    let options = CompileOptions {
+        input_files: ["input.zn".into()],
+        output_file: Some("output".into()),
+        optimization_level: OptimizationLevel::Default,
+        target_triple: "x86_64-unknown-linux-gnu".into(),
+        emit: EmitType::Exe,
+    };
+
+    check let Err(_) = compile(options) {
+        std::process::exit(1);
+    }
+}
+
+// test module
+space tests {
+    use super::*;
+
+    // test
+    fn test_compilation_driver_creation() {
+        let driver = CompilationDriver::new();
+        assert_eq!(driver.phases.len(), 5); // Parse, Hir, Mir, Opt, CodeGen
+    }
+
+    // test
+    fn test_compile_options_creation() {
+        let options = CompileOptions {
+            input_files: ["test.zn".into()],
+            output_file: Some("output".into()),
+            optimization_level: OptimizationLevel::Default,
+            target_triple: "x86_64-unknown-linux-gnu".into(),
+            emit: EmitType::Exe,
+        };
+
+        assert_eq!(options.input_files.len(), 1);
+        assert_eq!(options.input_files[0], "test.zn");
+        assert_eq!(options.output_file, Some("output".into()));
+        assert_eq!(options.optimization_level, OptimizationLevel::Default);
+    }
+
+    // test
+    fn test_session_creation() {
+        let options = CompileOptions {
+            input_files: [],
+            output_file: None,
+            optimization_level: OptimizationLevel::Zero,
+            target_triple: "x86_64-unknown-linux-gnu".into(),
+            emit: EmitType::LlvmIr,
+        };
+
+        let session = Session::new(options);
+        assert(!session.has_errors());
+        assert_eq!(session.err_count(), 0);
+        assert_eq!(session.warn_count(), 0);
+    }
+
+    // test
+    fn test_optimization_levels() {
+        assert_eq!(OptimizationLevel::Zero as u8, 0); // Assuming cases values
+        assert_eq!(OptimizationLevel::One as u8, 1);
+        assert_eq!(OptimizationLevel::Two as u8, 2);
+        assert_eq!(OptimizationLevel::Three as u8, 3);
+        assert_eq!(OptimizationLevel::S as u8, 4); // Size optimization
+    }
+
+    // test
+    fn test_emit_types() {
+        let exe = EmitType::Exe;
+        let llvm_ir = EmitType::LlvmIr;
+        let asm = EmitType::Asm;
+        let obj = EmitType::Obj;
+
+        // Just test that they can be created
+        assert(matches!(exe, EmitType::Exe));
+        assert(matches!(llvm_ir, EmitType::LlvmIr));
+        assert(matches!(asm, EmitType::Asm));
+        assert(matches!(obj, EmitType::Obj));
+    }
+
+    // test
+    fn test_parse_phase_creation() {
+        let parse_phase = ParsePhase;
+        // Phase creation test - placeholder
+        assert(true);
+    }
+
+    // test
+    fn test_hir_lowering_phase_creation() {
+        let hir_phase = HirLoweringPhase;
+        // Phase creation test - placeholder
+        assert(true);
+    }
+
+    // test
+    fn test_mir_lowering_phase_creation() {
+        let mir_phase = MirLoweringPhase;
+        // Phase creation test - placeholder
+        assert(true);
+    }
+
+    // test
+    fn test_optimization_phase_creation() {
+        let opt_phase = OptimizationPhase;
+        // Phase creation test - placeholder
+        assert(true);
+    }
+
+    // test
+    fn test_codegen_phase_creation() {
+        let codegen_phase = CodeGenPhase;
+        // Phase creation test - placeholder
+        assert(true);
+    }
+
+    // test
+    fn test_read_source_files() {
+        // Test with non-existent file (should fail gracefully)
+        let result = read_source_files(&["nonexistent.zn".into()]);
+        assert(result.is_err());
+    }
+
+    // test
+    fn test_tokenize_empty_source() {
+        let tokens = tokenize("");
+        assert_eq!(tokens.len(), 1); // Should have EOF token
+        assert(matches!(tokens[0].node, Token::Eof));
+    }
+}

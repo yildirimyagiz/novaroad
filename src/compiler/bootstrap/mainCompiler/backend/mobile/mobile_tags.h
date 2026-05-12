@@ -1,0 +1,9 @@
+#ifndef NOVA_MOBILE_TAGS_H
+#define NOVA_MOBILE_TAGS_H
+
+/* MobilePlatform definition */
+#define NOVA_MOBILE_MOBILEPLATFORM_IOS 0
+#define NOVA_MOBILE_MOBILEPLATFORM_ANDROID 1
+
+#endif
+

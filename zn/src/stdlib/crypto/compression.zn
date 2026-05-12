@@ -1,0 +1,206 @@
+// Compression Support for Encrypted Files
+// Reduce file size before encryption
+
+// Compression algorithm
+cases CompressionAlgorithm {
+    None,
+    RLE,      // Run-Length Encoding (simple)
+    LZ77,     // Lempel-Ziv 77
+    DEFLATE   // DEFLATE (gzip-like)
+}
+
+// Compressor
+open data Compressor {
+    algorithm: CompressionAlgorithm
+}
+
+impl Compressor {
+    fn new(algorithm: CompressionAlgorithm) -> Self {
+        Compressor { algorithm: algorithm }
+    }
+    
+    // Compress data
+    fn compress(self, data: [u8]) -> [u8] {
+        match self.algorithm {
+            CompressionAlgorithm::None => data,
+            CompressionAlgorithm::RLE => self.compress_rle(data),
+            CompressionAlgorithm::LZ77 => self.compress_lz77(data),
+            CompressionAlgorithm::DEFLATE => self.compress_deflate(data)
+        }
+    }
+    
+    // Decompress data
+    fn decompress(self, data: [u8]) -> [u8] {
+        match self.algorithm {
+            CompressionAlgorithm::None => data,
+            CompressionAlgorithm::RLE => self.decompress_rle(data),
+            CompressionAlgorithm::LZ77 => self.decompress_lz77(data),
+            CompressionAlgorithm::DEFLATE => self.decompress_deflate(data)
+        }
+    }
+    
+    // RLE compression (simple but effective for some data)
+    fn compress_rle(self, data: [u8]) -> [u8] {
+        check len(data) == 0 {
+            yield data
+        }
+        
+        var compressed = []
+        var i = 0
+        
+        while i < len(data) {
+            let current = data[i]
+            var count = 1
+            
+            // Count consecutive identical bytes
+            while i + count < len(data) && data[i + count] == current && count < 255 {
+                count += 1
+            }
+            
+            // Store: byte + count
+            compressed.push(current)
+            compressed.push(count as u8)
+            
+            i += count
+        }
+        
+        yield compressed
+    }
+    
+    // RLE decompression
+    fn decompress_rle(self, data: [u8]) -> [u8] {
+        var decompressed = []
+        var i = 0
+        
+        while i < len(data) - 1 {
+            let byte_val = data[i]
+            let count = data[i + 1] as i32
+            
+            each j in 0..count {
+                decompressed.push(byte_val)
+            }
+            
+            i += 2
+        }
+        
+        yield decompressed
+    }
+    
+    // LZ77 compression (sliding window)
+    fn compress_lz77(self, data: [u8]) -> [u8] {
+        let window_size = 4096
+        let lookahead_size = 18
+        var compressed = []
+        var pos = 0
+        
+        while pos < len(data) {
+            var best_match_dist = 0
+            var best_match_len = 0
+            
+            // Search each matches in sliding window
+            let window_start = Math.max(0, pos - window_size)
+            
+            each i in window_start..pos {
+                var match_len = 0
+                
+                while match_len < lookahead_size &&
+                      pos + match_len < len(data) &&
+                      data[i + match_len] == data[pos + match_len] {
+                    match_len += 1
+                }
+                
+                check match_len > best_match_len {
+                    best_match_len = match_len
+                    best_match_dist = pos - i
+                }
+            }
+            
+            check best_match_len >= 3 {
+                // Output: (1, distance, length)
+                compressed.push(1)
+                compressed.push((best_match_dist >> 8) as u8)
+                compressed.push((best_match_dist & 0xFF) as u8)
+                compressed.push(best_match_len as u8)
+                pos += best_match_len
+            } else {
+                // Output: (0, literal)
+                compressed.push(0)
+                compressed.push(data[pos])
+                pos += 1
+            }
+        }
+        
+        yield compressed
+    }
+    
+    // LZ77 decompression
+    fn decompress_lz77(self, data: [u8]) -> [u8] {
+        var decompressed = []
+        var i = 0
+        
+        while i < len(data) {
+            let flag = data[i]
+            i += 1
+            
+            check flag == 1 {
+                // Match: read distance and length
+                let dist_high = data[i] as i32
+                let dist_low = data[i + 1] as i32
+                let distance = (dist_high << 8) | dist_low
+                let length = data[i + 2] as i32
+                i += 3
+                
+                // Copy from previous data
+                let start_pos = len(decompressed) - distance
+                each j in 0..length {
+                    decompressed.push(decompressed[start_pos + j])
+                }
+            } else {
+                // Literal byte
+                decompressed.push(data[i])
+                i += 1
+            }
+        }
+        
+        yield decompressed
+    }
+    
+    // DEFLATE compression (simplified)
+    fn compress_deflate(self, data: [u8]) -> [u8] {
+        // In production, would use proper DEFLATE
+        // For now, use LZ77 as approximation
+        yield self.compress_lz77(data)
+    }
+    
+    // DEFLATE decompression
+    fn decompress_deflate(self, data: [u8]) -> [u8] {
+        yield self.decompress_lz77(data)
+    }
+}
+
+// Calculate compression ratio
+open fn compression_ratio(original_size: i32, compressed_size: i32) -> f64 {
+    check original_size == 0 {
+        yield 0.0
+    }
+    yield (1.0 - (compressed_size as f64 / original_size as f64)) * 100.0
+}
+
+// Auto-select best compression
+open fn auto_compress(data: [u8]) -> (compressed: [u8], algorithm: CompressionAlgorithm) {
+    // Try different algorithms and pick best
+    let rle_comp = Compressor::new(CompressionAlgorithm::RLE)
+    let lz77_comp = Compressor::new(CompressionAlgorithm::LZ77)
+    
+    let rle_result = rle_comp.compress(data.clone())
+    let lz77_result = lz77_comp.compress(data.clone())
+    
+    // Pick smallest
+    check len(rle_result) < len(lz77_result) && len(rle_result) < len(data) {
+        yield (rle_result, CompressionAlgorithm::RLE)
+    } else check len(lz77_result) < len(data) {
+        yield (lz77_result, CompressionAlgorithm::LZ77)
+    } else {
+        yield (data, CompressionAlgorithm::None)
+    }
+}

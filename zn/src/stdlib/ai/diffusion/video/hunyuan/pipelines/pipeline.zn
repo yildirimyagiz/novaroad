@@ -1,0 +1,83 @@
+// Nova Video - Hunyuan Video Generation Pipeline
+// Full text-to-video inference pipeline.
+
+import std.ai.core
+import std.ai.diffusion.video.hunyuan.models.vae
+import std.ai.diffusion.video.hunyuan.models.transformer
+import std.ai.diffusion.schedulers.ddim
+
+open data HunyuanVideoPipeline {
+    vae: Hunyuan3DVAE
+    transformer: HunyuanVideoTransformer
+    scheduler: DDIMScheduler
+    
+    // Config
+    height: u32 // 720
+    width: u32  // 1280
+    num_frames: u32 // 129
+}
+
+impl HunyuanVideoPipeline {
+    fn generate(var self,
+        prompt: str,
+        negative_prompt: str,
+        num_inference_steps: u32,
+        guidance_scale: f64,
+        seed: u64
+    ) -> Tensor {
+        // 1. Encode Prompt (MLLM)
+        let text_embeddings = self.encode_prompt(prompt, negative_prompt)
+        
+        // 2. Prepare Latents (Gaussian Noise)
+        let latents = self.prepare_latents(seed)
+        
+        // 3. Denoising Loop
+        self.scheduler.set_timesteps(num_inference_steps)
+        each entry in self.scheduler.timesteps.enumerate()  { let (i, t) = entry;
+            // Expand latents for Classifier-Free Guidance
+            let latent_model_input = Tensor.cat([latents, latents], dim: 0)
+            
+            // Predict Noise using Transformer
+            let noise_pred = self.transformer.forward(
+                latent_model_input,
+                t,
+                text_embeddings
+            )
+            
+            // CFG
+            let (noise_uncond, noise_text) = noise_pred.chunk(2)
+            let noise_final = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+            
+            // Update Latents
+            latents = self.scheduler.step(noise_final, t, latents)
+            
+            std.console.log("Video Generation: Step " + i.into() + " / " + num_inference_steps.into())
+        }
+        
+        // 4. Decode to Video
+        let video = self.vae.decode(latents)
+        
+        // 5. Post-process (B, 3, T, H, W)
+        yield (video / 2.0 + 0.5).clamp(0.0, 1.0)
+    }
+    
+    fn encode_prompt(self, prompt: str, negative_prompt: str) -> Tensor {
+        // In real impl, would call MLLM (e.g. Llama-3 based text encoder)
+        let uncond = Tensor.zeros([1, 77, 4096]) // Dummy negative embedding
+        let cond = Tensor.ones([1, 77, 4096])    // Dummy prompt embedding
+        yield Tensor.cat([uncond, cond], dim: 0)
+    }
+    
+    fn prepare_latents(self, seed: u64) -> Tensor {
+        Random.manual_seed(seed)
+        // Latent space is 8x smaller spatially, 4x smaller temporally
+        let data = [
+            1, 
+            16, 
+            (self.num_frames + 3) / 4, 
+            self.height / 8, 
+            self.width / 8
+        ]
+        yield Tensor.randn(data)
+    }
+}

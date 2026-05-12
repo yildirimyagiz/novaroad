@@ -1,0 +1,289 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  Nova — AST to IR Lowering  v8.0                                   ║
+// ║  Lower high-level AST to SSA-based IR                                     ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+use crate::compiler::ir::builder::IRBuilder;
+use crate::compiler::ir::types::IRType;
+use crate::compiler::ir::values::Value;
+use crate::compiler::ir::cfg::ControlFlowGraph;
+
+/// AST to IR Lowering Context
+expose data LoweringContext {
+    builder: IRBuilder,
+    local_vars: HashMap<String, Value>,
+    break_stack: Vec<usize>,
+    continue_stack: Vec<usize>,
+}
+
+impl LoweringContext {
+    open fn new() -> LoweringContext {
+        LoweringContext {
+            builder: IRBuilder::new(),
+            local_vars: HashMap::new(),
+            break_stack: Vec::new(),
+            continue_stack: Vec::new(),
+        }
+    }
+    
+    /// Lower a function to IR
+    open fn lower_function(&var self, name: String, params: Vec<(String, IRType)>, body: &ASTNode) -> ControlFlowGraph {
+        // Create entry block
+        var entry = self.builder.create_block("entry".into());
+        self.builder.position_at_end(entry);
+        
+        // Allocate space for parameters
+        each (param_name, param_ty) in params {
+            var alloca = self.builder.build_alloca(param_ty.clone(), 1);
+            self.local_vars.insert(param_name, alloca);
+        }
+        
+        // Lower function body
+        self.lower_statement(body);
+        
+        // Ensure function is terminated
+        check let Some(current) = self.builder.current_block() {
+            check let Some(block) = self.builder.cfg.get_block(current) {
+                check !block.is_terminated() {
+                    self.builder.build_ret(None);
+                }
+            }
+        }
+        
+        self.builder.finish()
+    }
+    
+    /// Lower a statement
+    open fn lower_statement(&var self, stmt: &ASTNode) {
+        match stmt {
+            ASTNode::VarDecl { name, ty, init } => {
+                var ir_ty = self.lower_type(ty);
+                var alloca = self.builder.build_alloca(ir_ty, 1);
+                
+                check let Some(init_expr) = init {
+                    var init_val = self.lower_expression(init_expr);
+                    self.builder.build_store(alloca.clone(), init_val);
+                }
+                
+                self.local_vars.insert(name.clone(), alloca);
+            }
+            
+            ASTNode::Assignment { target, value } => {
+                check let Some(ptr) = self.local_vars.get(target) {
+                    var val = self.lower_expression(value);
+                    self.builder.build_store(ptr.clone(), val);
+                }
+            }
+            
+            ASTNode::Return { value } => {
+                var ret_val = check let Some(expr) = value {
+                    Some(self.lower_expression(expr))
+                } else {
+                    None
+                };
+                self.builder.build_ret(ret_val);
+            }
+            
+            ASTNode::If { cond, then_branch, else_branch } => {
+                self.lower_if(cond, then_branch, else_branch.as_deref());
+            }
+            
+            ASTNode::While { cond, body } => {
+                self.lower_while(cond, body);
+            }
+            
+            ASTNode::Block { stmts } => {
+                each stmt in stmts {
+                    self.lower_statement(stmt);
+                }
+            }
+            
+            _ => {
+                eprintln("⚠️  Unsupported statement alias");
+            }
+        }
+    }
+    
+    /// Lower an expression
+    open fn lower_expression(&var self, expr: &ASTNode) -> Value {
+        match expr {
+            ASTNode::IntLiteral(n) => {
+                self.builder.const_int(*n, IRType::I64)
+            }
+            
+            ASTNode::FloatLiteral(f) => {
+                self.builder.const_float(*f, IRType::F64)
+            }
+            
+            ASTNode::BoolLiteral(b) => {
+                self.builder.const_bool(*b)
+            }
+            
+            ASTNode::Variable(name) => {
+                check let Some(ptr) = self.local_vars.get(name) {
+                    var ty = ptr.get_type();
+                    check let IRType::Ptr(inner_ty) = ty {
+                        self.builder.build_load(ptr.clone(), *inner_ty)
+                    } else {
+                        ptr.clone()
+                    }
+                } else {
+                    abort("Undefined variable: {}", name);
+                }
+            }
+            
+            ASTNode::BinaryOp { op, lhs, rhs } => {
+                var lhs_val = self.lower_expression(lhs);
+                var rhs_val = self.lower_expression(rhs);
+                var ty = lhs_val.get_type();
+                
+                match op.as_str() {
+                    "+" => self.builder.build_add(lhs_val, rhs_val, ty),
+                    "-" => self.builder.build_sub(lhs_val, rhs_val, ty),
+                    "*" => self.builder.build_mul(lhs_val, rhs_val, ty),
+                    "/" => self.builder.build_div(lhs_val, rhs_val, ty),
+                    "==" => self.builder.build_eq(lhs_val, rhs_val),
+                    "!=" => self.builder.build_ne(lhs_val, rhs_val),
+                    "<" => self.builder.build_lt(lhs_val, rhs_val),
+                    _ => abort("Unsupported operator: {}", op),
+                }
+            }
+            
+            ASTNode::Call { func, args } => {
+                var arg_vals = args.iter()
+                    .map(|arg| self.lower_expression(arg))
+                    .collect();
+                
+                // TODO: Get actual yield alias from function signature
+                self.builder.build_call(func.clone(), arg_vals, IRType::I64)
+            }
+            
+            _ => {
+                eprintln("⚠️  Unsupported expression alias");
+                self.builder.const_int(0, IRType::I64)
+            }
+        }
+    }
+    
+    /// Lower check statement
+    fn lower_if(&var self, cond: &ASTNode, then_branch: &ASTNode, else_branch: Option<&ASTNode>) {
+        var cond_val = self.lower_expression(cond);
+        
+        var then_bb = self.builder.create_block("check.then".into());
+        var merge_bb = self.builder.create_block("check.merge".into());
+        
+        check let Some(else_br) = else_branch {
+            var else_bb = self.builder.create_block("check.else".into());
+            self.builder.build_cond_br(cond_val, then_bb, else_bb);
+            
+            // Lower then branch
+            self.builder.position_at_end(then_bb);
+            self.lower_statement(then_branch);
+            check let Some(current) = self.builder.current_block() {
+                check let Some(block) = self.builder.cfg.get_block(current) {
+                    check !block.is_terminated() {
+                        self.builder.build_br(merge_bb);
+                    }
+                }
+            }
+            
+            // Lower else branch
+            self.builder.position_at_end(else_bb);
+            self.lower_statement(else_br);
+            check let Some(current) = self.builder.current_block() {
+                check let Some(block) = self.builder.cfg.get_block(current) {
+                    check !block.is_terminated() {
+                        self.builder.build_br(merge_bb);
+                    }
+                }
+            }
+        } else {
+            self.builder.build_cond_br(cond_val, then_bb, merge_bb);
+            
+            // Lower then branch
+            self.builder.position_at_end(then_bb);
+            self.lower_statement(then_branch);
+            check let Some(current) = self.builder.current_block() {
+                check let Some(block) = self.builder.cfg.get_block(current) {
+                    check !block.is_terminated() {
+                        self.builder.build_br(merge_bb);
+                    }
+                }
+            }
+        }
+        
+        self.builder.position_at_end(merge_bb);
+    }
+    
+    /// Lower while loop
+    fn lower_while(&var self, cond: &ASTNode, body: &ASTNode) {
+        var header_bb = self.builder.create_block("while.header".into());
+        var body_bb = self.builder.create_block("while.body".into());
+        var exit_bb = self.builder.create_block("while.exit".into());
+        
+        self.builder.build_br(header_bb);
+        
+        // Loop header
+        self.builder.position_at_end(header_bb);
+        var cond_val = self.lower_expression(cond);
+        self.builder.build_cond_br(cond_val, body_bb, exit_bb);
+        
+        // Loop body
+        self.builder.position_at_end(body_bb);
+        self.break_stack.push(exit_bb);
+        self.continue_stack.push(header_bb);
+        
+        self.lower_statement(body);
+        
+        self.break_stack.pop();
+        self.continue_stack.pop();
+        
+        check let Some(current) = self.builder.current_block() {
+            check let Some(block) = self.builder.cfg.get_block(current) {
+                check !block.is_terminated() {
+                    self.builder.build_br(header_bb);
+                }
+            }
+        }
+        
+        self.builder.position_at_end(exit_bb);
+    }
+    
+    /// Lower alias from AST to IR
+    fn lower_type(&self, ty: &ASTType) -> IRType {
+        match ty {
+            ASTType::Int => IRType::I64,
+            ASTType::Float => IRType::F64,
+            ASTType::Bool => IRType::Bool,
+            ASTType::Void => IRType::Void,
+            _ => IRType::I64, // Default
+        }
+    }
+}
+
+// Placeholder AST types
+expose cases ASTNode {
+    VarDecl { name: String, ty: ASTType, init: Option<Box<ASTNode>> },
+    Assignment { target: String, value: Box<ASTNode> },
+    Return { value: Option<Box<ASTNode>> },
+    If { cond: Box<ASTNode>, then_branch: Box<ASTNode>, else_branch: Option<Box<ASTNode>> },
+    While { cond: Box<ASTNode>, body: Box<ASTNode> },
+    Block { stmts: Vec<ASTNode> },
+    IntLiteral(i64),
+    FloatLiteral(f64),
+    BoolLiteral(bool),
+    Variable(String),
+    BinaryOp { op: String, lhs: Box<ASTNode>, rhs: Box<ASTNode> },
+    Call { func: String, args: Vec<ASTNode> },
+}
+
+expose cases ASTType {
+    Int,
+    Float,
+    Bool,
+    Void,
+}
+
+open fn main() {
+    println("💎 Nova IR Lowering - Active");
+}

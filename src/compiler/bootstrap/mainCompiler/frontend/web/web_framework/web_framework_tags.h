@@ -1,0 +1,5 @@
+#ifndef NOVA_WEB_FRAMEWORK_TAGS_H
+#define NOVA_WEB_FRAMEWORK_TAGS_H
+
+#endif
+

@@ -1,0 +1,375 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  Nova — NOVA TORCH  v1.0                                          ║
+// ║  examples.zn  —  End-to-end Usage Examples                               ║
+// ║  Image Classification · NLP · Segmentation · LLM Inference              ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+use crate::nova_torch::*;
+use crate::ffi::enhanced_ffi::FFIResult;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXAMPLE 1: Custom CNN for Image Classification
+// ═══════════════════════════════════════════════════════════════════════════
+
+expose data MyCNN {
+    features: Sequential,
+    classifier: Sequential,
+    training: bool,
+}
+
+impl MyCNN {
+    open fn new(num_classes: i64, device: Device) -> FFIResult<MyCNN> {
+        var features = Sequential::new();
+        features.add(Box::new(Conv2d::simple(3,  32, 3, device.clone())?));
+        features.add(Box::new(BatchNorm2d::new(32, 1e-5, 0.1, device.clone())?));
+        features.add(Box::new(ReLU::new()));
+        features.add(Box::new(MaxPool2d::simple(2)));
+
+        features.add(Box::new(Conv2d::simple(32, 64, 3, device.clone())?));
+        features.add(Box::new(BatchNorm2d::new(64, 1e-5, 0.1, device.clone())?));
+        features.add(Box::new(ReLU::new()));
+        features.add(Box::new(MaxPool2d::simple(2)));
+
+        features.add(Box::new(Conv2d::simple(64, 128, 3, device.clone())?));
+        features.add(Box::new(BatchNorm2d::new(128, 1e-5, 0.1, device.clone())?));
+        features.add(Box::new(GELU::new()));
+        features.add(Box::new(AdaptiveAvgPool2d::new(4, 4)));
+
+        var classifier = Sequential::new();
+        classifier.add(Box::new(Linear::new(128 * 4 * 4, 512, true, device.clone())?));
+        classifier.add(Box::new(GELU::new()));
+        classifier.add(Box::new(Dropout::new(0.3)));
+        classifier.add(Box::new(Linear::new(512, num_classes, true, device)?));
+
+        Ok(MyCNN { features, classifier, training: true })
+    }
+}
+
+impl Module for MyCNN {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        let feat = self.features.forward(x)?;
+        let flat = feat.flatten(1, -1)?;
+        self.classifier.forward(&flat)
+    }
+    fn parameters(&self) -> Vec<&Tensor> {
+        var p = self.features.parameters();
+        p.extend(self.classifier.parameters());
+        p
+    }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { Vec::new() }
+    fn zero_grad(&var self) { self.features.zero_grad(); self.classifier.zero_grad(); }
+    fn train(&var self, m: bool) { self.training = m; self.features.train(m); self.classifier.train(m); }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, dev: Device) -> FFIResult<()> {
+        self.features.to_device(dev.clone())?;
+        self.classifier.to_device(dev)?;
+        Ok(())
+    }
+}
+
+open fn example_image_classification() -> FFIResult<()> {
+    println("╔══════════════════════════════════════╗");
+    println("║ Example 1: Image Classification      ║");
+    println("╚══════════════════════════════════════╝");
+
+    let device = Device::cuda(0);
+
+    // Build model
+    let model = Box::new(MyCNN::new(10, device.clone())?);
+    println("✓ Model built — {} parameters", model.num_parameters());
+
+    // Optimizer + scheduler
+    var opt = Optimizer::adamw(
+        model.parameters(),
+        lr: 3e-4,
+        betas: (0.9, 0.999),
+        eps: 1e-8,
+        weight_decay: 0.01,
+    )?;
+
+    let sched = Box::new(CosineAnnealingLR::new(&opt, t_max: 10, eta_min: 1e-6));
+    let loss_fn = CrossEntropyLoss::with_smoothing(0.1);
+
+    // Fake loaders (dataset_ptr = 0 for demo)
+    let train_loader = DataLoader::new(0, 64, true, 4, true, device.clone());
+    let val_loader   = DataLoader::new(0, 64, false, 4, false, device.clone());
+
+    // Trainer
+    let config = TrainConfig {
+        epochs: 30,
+        log_every: 50,
+        grad_clip: Some(1.0),
+        amp: true,
+        compile: false,
+        early_stop_patience: Some(5),
+    };
+
+    var trainer = Trainer::new(model, opt, config, device);
+    trainer.with_scheduler(sched);
+    trainer.fit(&train_loader, Some(&val_loader), &loss_fn)?;
+
+    // Final eval
+    let (loss, acc) = trainer.evaluate(&val_loader, &loss_fn)?;
+    println("🏆 Final  — loss: {:.4}  acc: {:.3}", loss, acc);
+
+    trainer.save("checkpoints/mycnn_best.nt".into());
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXAMPLE 2: ResNet-50 Transfer Learning
+// ═══════════════════════════════════════════════════════════════════════════
+
+open fn example_resnet_transfer() -> FFIResult<()> {
+    println("╔══════════════════════════════════════╗");
+    println("║ Example 2: ResNet-50 Transfer Learn  ║");
+    println("╚══════════════════════════════════════╝");
+
+    let device = Device::cuda(0);
+
+    var model = ResNet::resnet50(1000, device.clone())?;
+
+    // Freeze backbone, only train the final FC layer
+    each param in model.layer1.parameters() { param.requires_grad = false; }
+    each param in model.layer2.parameters() { param.requires_grad = false; }
+    each param in model.layer3.parameters() { param.requires_grad = false; }
+
+    // Replace head for 10 classes
+    model.fc = Linear::new(512, 10, true, device.clone())?;
+
+    let trainable: Vec<&Tensor> = model.parameters()
+        .into_iter()
+        .filter(|p| p.requires_grad)
+        .collect();
+
+    println("✓ ResNet-50 — trainable params: {}", trainable.iter().map(|p| p.numel()).sum::<i64>());
+
+    var opt = Optimizer::sgd(trainable, lr: 0.01, momentum: 0.9,
+                                 dampening: 0.0, weight_decay: 1e-4, nesterov: true)?;
+    let sched    = Box::new(StepLR::new(&opt, step_size: 7, gamma: 0.1));
+    let loss_fn  = CrossEntropyLoss::new();
+
+    let train_loader = DataLoader::new(0, 32, true,  8, true, device.clone());
+    let val_loader   = DataLoader::new(0, 32, false, 8, false, device.clone());
+
+    var trainer = Trainer::new(Box::new(model), opt,
+                                   TrainConfig::default(), device);
+    trainer.with_scheduler(sched);
+    trainer.fit(&train_loader, Some(&val_loader), &loss_fn)?;
+
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXAMPLE 3: GPT Language Model Training
+// ═══════════════════════════════════════════════════════════════════════════
+
+open fn example_gpt_training() -> FFIResult<()> {
+    println("╔══════════════════════════════════════╗");
+    println("║ Example 3: GPT Language Model        ║");
+    println("╚══════════════════════════════════════╝");
+
+    let device = Device::cuda(0);
+
+    let config = GptConfig::custom(
+        vocab:  32000,
+        ctx:    2048,
+        dim:    512,
+        heads:  8,
+        layers: 6,
+    );
+
+    var model = GPT::new(config, device.clone())?;
+    println("✓ GPT — {} parameters", model.num_parameters());
+
+    // AdamW with weight decay and learning rate warmup
+    var opt = Optimizer::adamw(
+        model.parameters(),
+        lr: 6e-4,
+        betas: (0.9, 0.95),
+        eps: 1e-8,
+        weight_decay: 0.1,
+    )?;
+
+    let sched = Box::new(WarmupScheduler::new(&opt, warmup_steps: 2000, total_steps: 100_000));
+
+    let train_loader = DataLoader::new(0, 16, true, 8, true, device.clone());
+    let loss_fn      = CrossEntropyLoss::new();
+
+    let config = TrainConfig {
+        epochs: 3,
+        log_every: 100,
+        grad_clip: Some(1.0),
+        amp: true,
+        compile: true,
+        early_stop_patience: None,
+    };
+
+    var trainer = Trainer::new(Box::new(model), opt, config, device.clone());
+    trainer.with_scheduler(sched);
+    trainer.fit(&train_loader, None, &loss_fn)?;
+
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXAMPLE 4: GPT Text Generation (Inference)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open fn example_gpt_inference() -> FFIResult<()> {
+    println("╔══════════════════════════════════════╗");
+    println("║ Example 4: GPT Text Generation       ║");
+    println("╚══════════════════════════════════════╝");
+
+    let device = Device::cuda(0);
+
+    let config = GptConfig::gpt2_small();
+    var model = GPT::new(config, device.clone())?;
+
+    // Load pretrained weights
+    let ptrs = nova_checkpoint_load("gpt2_small.nt".into());
+    println("📂 Pretrained weights loaded");
+
+    model.train(false);
+
+    // Example prompt tokens [BOS, 15496, 11, 262, ...]
+    let prompt_ids = Tensor::from_slice(
+        [50256.0, 15496.0, 11.0, 262.0],
+        Shape::from_2d(1, 4),
+        device.clone()
+    )?.long()?;
+
+    let output_ids = model.generate(
+        &prompt_ids,
+        max_new_tokens: 200,
+        temperature: 0.8,
+        top_k: Some(50),
+    )?;
+
+    println("✓ Generated {} tokens", output_ids.dim(1));
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXAMPLE 5: UNet Image Segmentation
+// ═══════════════════════════════════════════════════════════════════════════
+
+open fn example_unet_segmentation() -> FFIResult<()> {
+    println("╔══════════════════════════════════════╗");
+    println("║ Example 5: UNet Segmentation         ║");
+    println("╚══════════════════════════════════════╝");
+
+    let device = Device::cuda(0);
+
+    let model    = Box::new(UNet::new(3, 21, 64, device.clone())?);
+    let loss_fn  = CrossEntropyLoss::new();
+
+    var opt = Optimizer::adam(
+        model.parameters(),
+        lr: 1e-3,
+        betas: (0.9, 0.999),
+        eps: 1e-8,
+        weight_decay: 1e-5,
+    )?;
+
+    println("✓ UNet — {} parameters", model.num_parameters());
+
+    let train_loader = DataLoader::new(0, 8, true,  4, true, device.clone());
+    let val_loader   = DataLoader::new(0, 8, false, 4, false, device.clone());
+
+    let config = TrainConfig {
+        epochs: 50,
+        log_every: 20,
+        grad_clip: Some(0.5),
+        amp: true,
+        compile: false,
+        early_stop_patience: Some(10),
+    };
+
+    var trainer = Trainer::new(model, opt, config, device);
+    trainer.fit(&train_loader, Some(&val_loader), &loss_fn)?;
+
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXAMPLE 6: Manual Low-level Training Loop
+// (PyTorch-style, without Trainer wrapper)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open fn example_manual_loop() -> FFIResult<()> {
+    println("╔══════════════════════════════════════╗");
+    println("║ Example 6: Manual Training Loop      ║");
+    println("╚══════════════════════════════════════╝");
+
+    let device = Device::cuda(0);
+
+    var model = Sequential::new();
+    model.add(Box::new(Linear::new(784, 256, true, device.clone())?));
+    model.add(Box::new(ReLU::new()));
+    model.add(Box::new(Dropout::new(0.2)));
+    model.add(Box::new(Linear::new(256, 128, true, device.clone())?));
+    model.add(Box::new(GELU::new()));
+    model.add(Box::new(Linear::new(128, 10, true, device.clone())?));
+
+    var opt = Optimizer::adam(model.parameters(), lr: 1e-3,
+                                  betas: (0.9, 0.999), eps: 1e-8, weight_decay: 0.0)?;
+    let loss_fn = CrossEntropyLoss::new();
+    let loader  = DataLoader::new(0, 128, true, 4, false, device.clone());
+
+    each epoch in 0..10 {
+        model.train(true);
+        var loss_acc = MetricAccumulator::new("loss".into());
+        var acc_acc  = MetricAccumulator::new("acc".into());
+
+        loader.reset();
+        while loader.has_next() {
+            let (x, y) = loader.next_batch()?;
+
+            // Forward
+            let logits = model.forward(&x)?;
+            let loss   = loss_fn.call(&logits, &y)?;
+
+            // Backward
+            opt.zero_grad();
+            loss.backward();
+            opt.step();
+
+            // Metrics
+            let loss_val = loss.item_f32() as f64;
+            let acc_val  = accuracy(&logits, &y)?;
+            loss_acc.update(loss_val, x.dim(0));
+            acc_acc.update(acc_val, x.dim(0));
+        }
+
+        println("Epoch [{}/10] loss={:.4}  acc={:.3}",
+            epoch + 1, loss_acc.avg(), acc_acc.avg());
+    }
+
+    println("✅ Manual loop done");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════════════════════
+
+open fn main() {
+    println("╔════════════════════════════════════════════╗");
+    println("║  🔥 NovaTorch v1.0  —  Nova DL Fw   ║");
+    println("║  Better than PyTorch. Written in .zn       ║");
+    println("╚════════════════════════════════════════════╝\n");
+
+    // Run selected examples
+    pick 0 {
+        0 => {
+            example_image_classification().unwrap();
+            example_resnet_transfer().unwrap();
+            example_gpt_training().unwrap();
+            example_gpt_inference().unwrap();
+            example_unet_segmentation().unwrap();
+            example_manual_loop().unwrap();
+        }
+        _ => println("Select an example to run"),
+    }
+}

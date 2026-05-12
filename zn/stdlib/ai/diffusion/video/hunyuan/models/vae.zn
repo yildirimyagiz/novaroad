@@ -1,0 +1,93 @@
+// Nova Video - Hunyuan 3D Causal VAE
+// Causal spatiotemporal compression for video generation.
+
+import std.ai.nn
+import std.ai.core
+
+data CausalConv3d {
+    conv: Conv3d
+}
+
+impl CausalConv3d {
+    fn new(in_channels: u32, out_channels: u32, kernel_size: list<u32>, stride: list<u32>) -> CausalConv3d {
+        // Causal padding: pad the start of temporal dimension
+        CausalConv3d {
+            conv: Conv3d.new(in_channels, out_channels, kernel_size, stride, padding: [kernel_size[0] - 1, 1, 1])
+        }
+    }
+
+    fn forward(self, x: Tensor) -> Tensor {
+        // x: (B, C, T, H, W)
+        let out = self.conv.forward(x)
+        // Trim the extra temporal padding at the end to maintain causality
+        yield out.slice(dim: 2, start: 0, end: x.data()[2])
+    }
+}
+
+data ResnetBlock3d {
+    norm1: GroupNorm
+    conv1: CausalConv3d
+    norm2: GroupNorm
+    conv2: CausalConv3d
+    nin_shortcut: CausalConv3d | null
+}
+
+impl ResnetBlock3d {
+    fn forward(self, x: Tensor) -> Tensor {
+        var h = self.norm1.forward(x)
+        h = Math.silu(h)
+        h = self.conv1.forward(h)
+        
+        h = self.norm2.forward(h)
+        h = Math.silu(h)
+        h = self.conv2.forward(h)
+        
+        let shortcut = match self.nin_shortcut {
+            Some(s) => s.forward(x)
+            None => x
+        }
+        
+        yield h + shortcut
+    }
+}
+
+open data Hunyuan3DVAE {
+    encoder: VAEEncoder
+    decoder: VAEDecoder
+    latent_channels: u32 // 16
+}
+
+impl Hunyuan3DVAE {
+    fn encode(self, video: Tensor) -> Tensor {
+        // video: (B, 3, T, H, W)
+        let moments = self.encoder.forward(video)
+        let (mean, logvar) = moments.chunk(2, dim: 1)
+        
+        // Reparameterization trick
+        let std = (0.5 * logvar).exp()
+        let eps = Tensor.randn_like(std)
+        yield mean + eps * std
+    }
+
+    fn decode(self, latents: Tensor) -> Tensor {
+        // latents: (B, 16, T/4, H/8, W/8)
+        let out = self.decoder.forward(latents)
+        yield out.clamp(-1.0, 1.0)
+    }
+}
+
+data VAEEncoder {
+    conv_in: CausalConv3d
+    down_blocks: list<VAEBlock>
+    mid_block: ResnetBlock3d
+    norm_out: GroupNorm
+    conv_out: CausalConv3d
+}
+
+data VAEDecoder {
+    conv_in: CausalConv3d
+    up_blocks: list<VAEBlock>
+    mid_block: ResnetBlock3d
+    norm_out: GroupNorm
+    conv_out: CausalConv3d
+}

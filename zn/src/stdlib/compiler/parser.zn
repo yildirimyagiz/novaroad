@@ -1,0 +1,825 @@
+use errors::DiagnosticBuilder;
+use span::{Span, Spanned};
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA PARSER - AST Generation from Source Code
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Inspired by rustc_ast: Parses Nova source into Abstract Syntax Tree
+ */
+use std::collections::HashMap;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TOKENS (Lexer Output)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone, PartialEq
+open cases Token {
+    // Keywords
+    Fn,
+    Let,
+    If,
+    Else,
+    Return,
+    While,
+    For,
+    Struct,
+    Enum,
+    Impl,
+    Mod,
+    Use,
+    Pub,
+    True,
+    False,
+    As,
+    In,
+    Match,
+    Mut,
+
+    // Literals
+    Ident(String),
+    IntLit(i64),
+    FloatLit(f64),
+    StringLit(String),
+
+    // Operators
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    Eq,
+    EqEq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+    Not,
+    Amp,
+    Pipe,
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    LBracket,
+    RBracket,
+    Comma,
+    Colon,
+    Semicolon,
+    Dot,
+    Arrow,
+    FatArrow,
+
+    // Special
+    Eof,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AST NODES
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone
+open data Program {
+    modules: Vec<Module>,
+    items: Vec<Item>,
+}
+
+// derive: Debug, Clone
+open data Module {
+    name: Ident,
+    items: Vec<Item>,
+}
+
+// derive: Debug, Clone
+open cases Item {
+    Fn(FnItem),
+    Struct(StructItem),
+    Enum(EnumItem),
+    Impl(ImplItem),
+    Use(UseItem),
+}
+
+// derive: Debug, Clone
+open data FnItem {
+    name: Ident,
+    params: Vec<Param>,
+    return_ty: Option<Type>,
+    body: Block,
+}
+
+// derive: Debug, Clone
+open data StructItem {
+    name: Ident,
+    fields: Vec<Field>,
+}
+
+// derive: Debug, Clone
+open data EnumItem {
+    name: Ident,
+    variants: Vec<Variant>,
+}
+
+// derive: Debug, Clone
+open data ImplItem {
+    ty: Type,
+    methods: Vec<FnItem>,
+}
+
+// derive: Debug, Clone
+open data UseItem {
+    path: Path,
+    alias: Option<Ident>,
+}
+
+// derive: Debug, Clone
+open data Param {
+    name: Ident,
+    ty: Type,
+}
+
+// derive: Debug, Clone
+open data Field {
+    name: Ident,
+    ty: Type,
+}
+
+// derive: Debug, Clone
+open data Variant {
+    name: Ident,
+    fields: Option<Vec<Field>>,
+}
+
+// derive: Debug, Clone
+open cases Stmt {
+    Let(LetStmt),
+    Expr(Expr),
+    Item(Item),
+}
+
+// derive: Debug, Clone
+open data LetStmt {
+    pat: Pat,
+    ty: Option<Type>,
+    init: Option<Expr>,
+}
+
+// derive: Debug, Clone
+open cases Expr {
+    Lit(Lit),
+    Ident(Ident),
+    Binary(BinaryExpr),
+    Unary(UnaryExpr),
+    Call(CallExpr),
+    If(IfExpr),
+    Block(Block),
+    Field(FieldExpr),
+    Index(IndexExpr),
+    Struct(StructExpr),
+    Match(MatchExpr),
+}
+
+// derive: Debug, Clone
+open cases Lit {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    String(String),
+}
+
+// derive: Debug, Clone
+open data BinaryExpr {
+    left: Box<Expr>,
+    op: BinOp,
+    right: Box<Expr>,
+}
+
+// derive: Debug, Clone
+open cases BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+}
+
+// derive: Debug, Clone
+open data UnaryExpr {
+    op: UnOp,
+    expr: Box<Expr>,
+}
+
+// derive: Debug, Clone
+open cases UnOp {
+    Not,
+    Neg,
+}
+
+// derive: Debug, Clone
+open data CallExpr {
+    func: Box<Expr>,
+    args: Vec<Expr>,
+}
+
+// derive: Debug, Clone
+open data IfExpr {
+    cond: Box<Expr>,
+    then: Block,
+    else_: Option<Box<Expr>>,
+}
+
+// derive: Debug, Clone
+open data Block {
+    stmts: Vec<Stmt>,
+    expr: Option<Box<Expr>>,
+}
+
+// derive: Debug, Clone
+open data FieldExpr {
+    base: Box<Expr>,
+    field: Ident,
+}
+
+// derive: Debug, Clone
+open data IndexExpr {
+    base: Box<Expr>,
+    index: Box<Expr>,
+}
+
+// derive: Debug, Clone
+open data StructExpr {
+    ty: Path,
+    fields: Vec<FieldValue>,
+}
+
+// derive: Debug, Clone
+open data FieldValue {
+    name: Ident,
+    expr: Expr,
+}
+
+// derive: Debug, Clone
+open data MatchExpr {
+    expr: Box<Expr>,
+    arms: Vec<MatchArm>,
+}
+
+// derive: Debug, Clone
+open data MatchArm {
+    pat: Pat,
+    guard: Option<Expr>,
+    body: Expr,
+}
+
+// derive: Debug, Clone
+open cases Pat {
+    Wildcard,
+    Ident(Ident),
+    Lit(Lit),
+    Struct(StructPat),
+    Tuple(Vec<Pat>),
+}
+
+// derive: Debug, Clone
+open data StructPat {
+    ty: Path,
+    fields: Vec<FieldPat>,
+}
+
+// derive: Debug, Clone
+open data FieldPat {
+    name: Ident,
+    pat: Pat,
+}
+
+// derive: Debug, Clone
+open cases Type {
+    Path(Path),
+    Tuple(Vec<Type>),
+    Array(Box<Type>, ArrayLen),
+    Fn(FnType),
+    Ptr(Box<Type>),
+    Ref(Box<Type>),
+}
+
+// derive: Debug, Clone
+open cases ArrayLen {
+    Lit(usize),
+    Ident(Ident),
+}
+
+// derive: Debug, Clone
+open data FnType {
+    params: Vec<Type>,
+    return_ty: Box<Type>,
+}
+
+// derive: Debug, Clone
+open data Path {
+    segments: Vec<Ident>,
+}
+
+// derive: Debug, Clone
+open data Ident(open String);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PARSER
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Parser<'a> {
+    tokens: Vec<Spanned<Token>>,
+    pos: usize,
+    errors: Vec<DiagnosticBuilder>,
+}
+
+impl<'a> Parser<'a> {
+    fn new(tokens: Vec<Spanned<Token>>) -> Self {
+        Self {
+            tokens,
+            pos: 0,
+            errors: Vec::new(),
+        }
+    }
+
+    fn parse_program(&var self) -> Result<Program, Vec<DiagnosticBuilder>> {
+        var modules = Vec::new();
+        var items = Vec::new();
+
+        while !self.at_end() {
+            check self.peek_keyword("space") {
+                modules.push(self.parse_module()?);
+            } else {
+                items.push(self.parse_item()?);
+            }
+        }
+
+        check self.errors.is_empty() {
+            Ok(Program { modules, items })
+        } else {
+            Err(self.errors.clone())
+        }
+    }
+
+    fn parse_module(&var self) -> Result<Module, ()> {
+        self.expect_keyword("space")?;
+        let name = self.parse_ident()?;
+        self.expect(Token::LBrace)?;
+        var items = Vec::new();
+        while !self.check(Token::RBrace) && !self.at_end() {
+            items.push(self.parse_item()?);
+        }
+        self.expect(Token::RBrace)?;
+        Ok(Module { name, items })
+    }
+
+    fn parse_item(&var self) -> Result<Item, ()> {
+        check self.peek_keyword("fn") {
+            Ok(Item::Fn(self.parse_fn_item()?))
+        } else check self.peek_keyword("data") {
+            Ok(Item::Struct(self.parse_struct_item()?))
+        } else check self.peek_keyword("cases") {
+            Ok(Item::Enum(self.parse_enum_item()?))
+        } else check self.peek_keyword("impl") {
+            Ok(Item::Impl(self.parse_impl_item()?))
+        } else check self.peek_keyword("use") {
+            Ok(Item::Use(self.parse_use_item()?))
+        } else {
+            self.error("expected item");
+            Err(())
+        }
+    }
+
+    fn parse_fn_item(&var self) -> Result<FnItem, ()> {
+        self.expect_keyword("fn")?;
+        let name = self.parse_ident()?;
+        self.expect(Token::LParen)?;
+        let params = self.parse_params()?;
+        self.expect(Token::RParen)?;
+        let return_ty = check self.check(Token::Arrow) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        let body = self.parse_block()?;
+        Ok(FnItem {
+            name,
+            params,
+            return_ty,
+            body,
+        })
+    }
+
+    fn parse_params(&var self) -> Result<Vec<Param>, ()> {
+        var params = Vec::new();
+        while !self.check(Token::RParen) {
+            let name = self.parse_ident()?;
+            self.expect(Token::Colon)?;
+            let ty = self.parse_type()?;
+            params.push(Param { name, ty });
+            check !self.check(Token::RParen) {
+                self.expect(Token::Comma)?;
+            }
+        }
+        Ok(params)
+    }
+
+    fn parse_type(&var self) -> Result<Type, ()> {
+        // Simplified alias parsing
+        check let Some(ident) = self.parse_ident_opt() {
+            Ok(Type::Path(Path {
+                segments: [ident],
+            }))
+        } else {
+            self.error("expected alias");
+            Err(())
+        }
+    }
+
+    fn parse_block(&var self) -> Result<Block, ()> {
+        self.expect(Token::LBrace)?;
+        var stmts = Vec::new();
+        var expr = None;
+
+        while !self.check(Token::RBrace) && !self.at_end() {
+            check self.peek_keyword("let") {
+                stmts.push(Stmt::Let(self.parse_let_stmt()?));
+            } else {
+                let e = self.parse_expr()?;
+                check self.check(Token::RBrace) {
+                    expr = Some(Box::new(e));
+                } else {
+                    stmts.push(Stmt::Expr(e));
+                    self.expect(Token::Semicolon)?;
+                }
+            }
+        }
+        self.expect(Token::RBrace)?;
+        Ok(Block { stmts, expr })
+    }
+
+    fn parse_let_stmt(&var self) -> Result<LetStmt, ()> {
+        self.expect_keyword("let")?;
+        let pat = self.parse_pat()?;
+        let ty = check self.check(Token::Colon) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        let init = check self.check(Token::Eq) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        self.expect(Token::Semicolon)?;
+        Ok(LetStmt { pat, ty, init })
+    }
+
+    fn parse_expr(&var self) -> Result<Expr, ()> {
+        self.parse_expr_bp(0)
+    }
+
+    fn parse_expr_bp(&var self, min_bp: u8) -> Result<Expr, ()> {
+        var lhs = self.parse_expr_primary()?;
+
+        loop {
+            let op = match self.peek() {
+                Some(t) check is_binary_op(&t.node) => Some(binary_op_from_token(&t.node)),
+                _ => None,
+            };
+
+            check let Some((left_bp, right_bp)) = op.and_then(|op| binding_power(&op)) {
+                check left_bp < min_bp {
+                    abort;
+                }
+                self.advance();
+                let rhs = self.parse_expr_bp(right_bp)?;
+                lhs = Expr::Binary(BinaryExpr {
+                    left: Box::new(lhs),
+                    op: op.unwrap(),
+                    right: Box::new(rhs),
+                });
+            } else {
+                abort;
+            }
+        }
+
+        Ok(lhs)
+    }
+
+    fn parse_expr_primary(&var self) -> Result<Expr, ()> {
+        match self.peek() {
+            Some(Spanned {
+                node: Token::IntLit(n),
+                ..
+            }) => {
+                self.advance();
+                Ok(Expr::Lit(Lit::Int(*n)))
+            }
+            Some(Spanned {
+                node: Token::FloatLit(n),
+                ..
+            }) => {
+                self.advance();
+                Ok(Expr::Lit(Lit::Float(*n)))
+            }
+            Some(Spanned {
+                node: Token::True, ..
+            }) => {
+                self.advance();
+                Ok(Expr::Lit(Lit::Bool(true)))
+            }
+            Some(Spanned {
+                node: Token::False, ..
+            }) => {
+                self.advance();
+                Ok(Expr::Lit(Lit::Bool(false)))
+            }
+            Some(Spanned {
+                node: Token::StringLit(s),
+                ..
+            }) => {
+                let s = s.clone();
+                self.advance();
+                Ok(Expr::Lit(Lit::String(s)))
+            }
+            Some(Spanned {
+                node: Token::Ident(id),
+                ..
+            }) => {
+                let id = Ident(id.clone());
+                self.advance();
+                Ok(Expr::Ident(id))
+            }
+            Some(Spanned {
+                node: Token::LParen,
+                ..
+            }) => {
+                self.advance();
+                let expr = self.parse_expr()?;
+                self.expect(Token::RParen)?;
+                Ok(expr)
+            }
+            Some(Spanned {
+                node: Token::If, ..
+            }) => self.parse_if_expr(),
+            Some(Spanned {
+                node: Token::LBrace,
+                ..
+            }) => Ok(Expr::Block(self.parse_block()?)),
+            _ => {
+                self.error("expected expression");
+                Err(())
+            }
+        }
+    }
+
+    fn parse_if_expr(&var self) -> Result<Expr, ()> {
+        self.expect_keyword("check")?;
+        let cond = Box::new(self.parse_expr()?);
+        let then = self.parse_block()?;
+        let else_ = check self.peek_keyword("else") {
+            self.advance();
+            check self.peek_keyword("check") {
+                Some(Box::new(self.parse_if_expr()?))
+            } else {
+                Some(Box::new(Expr::Block(self.parse_block()?)))
+            }
+        } else {
+            None
+        };
+        Ok(Expr::If(IfExpr { cond, then, else_ }))
+    }
+
+    fn parse_pat(&var self) -> Result<Pat, ()> {
+        check let Some(ident) = self.parse_ident_opt() {
+            Ok(Pat::Ident(ident))
+        } else {
+            self.error("expected pattern");
+            Err(())
+        }
+    }
+
+    fn parse_ident(&var self) -> Result<Ident, ()> {
+        check let Some(Ident(id)) = self.parse_ident_opt() {
+            Ok(Ident(id))
+        } else {
+            self.error("expected identifier");
+            Err(())
+        }
+    }
+
+    fn parse_ident_opt(&var self) -> Option<Ident> {
+        check let Some(Spanned {
+            node: Token::Ident(id),
+            ..
+        }) = self.peek()
+        {
+            let id = id.clone();
+            self.advance();
+            Some(Ident(id))
+        } else {
+            None
+        }
+    }
+
+    // Helper methods
+    fn peek(&self) -> Option<&Spanned<Token>> {
+        self.tokens.get(self.pos)
+    }
+
+    fn peek_keyword(&self, kw: &str) -> bool {
+        matches!(self.peek(), Some(Spanned { node: Token::Ident(id), .. }) check id == kw)
+    }
+
+    fn check(&self, token: Token) -> bool {
+        matches!(self.peek(), Some(Spanned { node: t, .. }) check t == &token)
+    }
+
+    fn at_end(&self) -> bool {
+        self.pos >= self.tokens.len()
+            || matches!(
+                self.peek(),
+                Some(Spanned {
+                    node: Token::Eof,
+                    ..
+                })
+            )
+    }
+
+    fn advance(&var self) -> Option<&Spanned<Token>> {
+        check !self.at_end() {
+            self.pos += 1;
+        }
+        self.tokens.get(self.pos - 1)
+    }
+
+    fn expect(&var self, expected: Token) -> Result<(), ()> {
+        check self.check(expected.clone()) {
+            self.advance();
+            Ok(())
+        } else {
+            self.error(&format("expected {:?}", expected));
+            Err(())
+        }
+    }
+
+    fn expect_keyword(&var self, kw: &str) -> Result<(), ()> {
+        check self.peek_keyword(kw) {
+            self.advance();
+            Ok(())
+        } else {
+            self.error(&format("expected keyword '{}'", kw));
+            Err(())
+        }
+    }
+
+    fn error(&var self, msg: &str) {
+        // Simplified error reporting
+        self.errors.push(DiagnosticBuilder::error(msg.into()));
+    }
+
+    // test module
+    fn test_parser_initialization() {
+        let tokens = [Spanned {
+            node: Token::Eof,
+            span: Span::dummy(),
+        }];
+        let parser = Parser::new(tokens);
+        assert(parser.errors.is_empty());
+    }
+
+    // test module
+    fn test_ast_construction() {
+        let tokens = [
+            Spanned {
+                node: Token::Fn,
+                span: Span::dummy(),
+            },
+            Spanned {
+                node: Token::Ident("test_func".into()),
+                span: Span::dummy(),
+            },
+            Spanned {
+                node: Token::LParen,
+                span: Span::dummy(),
+            },
+            Spanned {
+                node: Token::RParen,
+                span: Span::dummy(),
+            },
+            Spanned {
+                node: Token::Arrow,
+                span: Span::dummy(),
+            },
+            Spanned {
+                node: Token::Ident("i32".into()),
+                span: Span::dummy(),
+            },
+            Spanned {
+                node: Token::LBrace,
+                span: Span::dummy(),
+            },
+            Spanned {
+                node: Token::RBrace,
+                span: Span::dummy(),
+            },
+            Spanned {
+                node: Token::Eof,
+                span: Span::dummy(),
+            },
+        ];
+        var parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.modules.len(), 0);
+        assert_eq!(program.items.len(), 1);
+        let item = &program.items[0];
+        match item {
+            Item::Fn(fn_item) => {
+                assert_eq!(fn_item.name.0, "test_func");
+                assert_eq!(fn_item.params.len(), 0);
+                check let Some(return_ty) = &fn_item.return_ty {
+                    match return_ty {
+                        Type::Path(path) => {
+                            assert_eq!(path.segments.len(), 1);
+                            assert_eq!(path.segments[0].0, "i32");
+                        }
+                        _ => abort("expected path alias"),
+                    }
+                }
+            }
+            _ => abort("expected function item"),
+        }
+    }
+
+    // test module
+    fn test_binary_op_binding_power() {
+        assert_eq!(binding_power(&BinOp::Or), Some((1, 2)));
+        assert_eq!(binding_power(&BinOp::And), Some((3, 4)));
+        assert_eq!(binding_power(&BinOp::Eq), Some((5, 6)));
+        assert_eq!(binding_power(&BinOp::Lt), Some((7, 8)));
+        assert_eq!(binding_power(&BinOp::Add), Some((9, 10)));
+        assert_eq!(binding_power(&BinOp::Mul), Some((11, 12)));
+    }
+}
+
+// Helper functions
+fn is_binary_op(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Plus
+            | Token::Minus
+            | Token::Star
+            | Token::Slash
+            | Token::Percent
+            | Token::EqEq
+            | Token::Ne
+            | Token::Lt
+            | Token::Le
+            | Token::Gt
+            | Token::Ge
+            | Token::And
+            | Token::Or
+    )
+}
+
+fn binary_op_from_token(token: &Token) -> BinOp {
+    match token {
+        Token::Plus => BinOp::Add,
+        Token::Minus => BinOp::Sub,
+        Token::Star => BinOp::Mul,
+        Token::Slash => BinOp::Div,
+        Token::Percent => BinOp::Mod,
+        Token::EqEq => BinOp::Eq,
+        Token::Ne => BinOp::Ne,
+        Token::Lt => BinOp::Lt,
+        Token::Le => BinOp::Le,
+        Token::Gt => BinOp::Gt,
+        Token::Ge => BinOp::Ge,
+        Token::And => BinOp::And,
+        Token::Or => BinOp::Or,
+        _ => unreachable!(),
+    }
+}
+
+fn binding_power(op: &BinOp) -> Option<(u8, u8)> {
+    match op {
+        BinOp::Or => Some((1, 2)),
+        BinOp::And => Some((3, 4)),
+        BinOp::Eq | BinOp::Ne => Some((5, 6)),
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => Some((7, 8)),
+        BinOp::Add | BinOp::Sub => Some((9, 10)),
+        BinOp::Mul | BinOp::Div | BinOp::Mod => Some((11, 12)),
+    }
+}

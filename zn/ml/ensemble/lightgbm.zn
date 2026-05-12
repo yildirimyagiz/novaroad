@@ -1,0 +1,159 @@
+// Nova LightGBM Implementation
+// Light Gradient Boosting Machine
+// Key Features: Gradient-based One-Side Sampling (GOSS), Exclusive Feature Bundling (EFB)
+
+// module nova.ml.ensemble.lightgbm;
+
+use nova.array.{Array, Matrix};
+use nova.math.{exp, log, sigmoid};
+use nova.ml.base.{BaseEstimator, ClassifierMixin};
+use nova.ml.tree.HistogramTreeRegressor; // Specialized tree for LightGBM
+use nova.concurrent.parallel_for;
+
+/// LightGBM Classifier
+open data LGBMClassifier {
+    // Hyperparameters
+    boosting_type: string, // 'gbdt', 'goss', 'dart'
+    num_leaves: int,
+    max_depth: int,
+    learning_rate: f64,
+    n_estimators: int,
+    min_child_samples: int,
+    reg_alpha: f64,
+    reg_lambda: f64,
+    
+    // Internal state
+    estimators: []HistogramTreeRegressor,
+    classes_: []int,
+    n_classes_: int,
+}
+
+impl LGBMClassifier {
+    fn new() -> LGBMClassifierBuilder {
+        LGBMClassifierBuilder::default()
+    }
+
+    /// Fit the model using Histogram-based GBDT
+    fn fit(&var self, X: &Matrix<f64>, y: &Array<int>) -> Result<(), Error> {
+        self.classes_ = y.unique().sort();
+        self.n_classes_ = self.classes_.len();
+        
+        // 1. Binning: Convert continuous features to discrete bins
+        let binned_X = self.construct_histograms(X);
+        
+        // 2. Training Loop
+        var f_m = Matrix::zeros((X.n_rows(), self.n_classes_));
+        
+        each i in 0..self.n_estimators {
+            // Gradient-based One-Side Sampling (GOSS) check enabled
+            let (sampled_X, sampled_y) = check self.boosting_type == "goss" {
+                self.apply_goss(binned_X, y, &f_m)
+            } else {
+                yield (binned_X, y)
+            };
+            
+            // Leaf-wise growth (instead of level-wise)
+            var tree = HistogramTreeRegressor::new()
+                .num_leaves(self.num_leaves)
+                .max_depth(self.max_depth)
+                .min_child_samples(self.min_child_samples)
+                .build();
+            
+            // Compute gradients and hessians
+            let (grad, hess) = self.compute_gradients(&f_m, y);
+            
+            tree.fit_histogram(&sampled_X, &grad, &hess)?;
+            
+            // Update model
+            self.estimators.push(tree);
+            let preds = tree.predict_histogram(&binned_X)?;
+            f_m = f_m + self.learning_rate * preds;
+        }
+        
+        Ok(())
+    }
+
+    fn predict(&self, X: &Matrix<f64>) -> Array<int> {
+        let probas = self.predict_proba(X);
+        probas.argmax(axis=1).map(|idx| self.classes_[idx])
+    }
+
+    fn predict_proba(&self, X: &Matrix<f64>) -> Matrix<f64> {
+        var scores = Matrix::zeros((X.n_rows(), self.n_classes_));
+        let binned_X = self.construct_histograms(X);
+        
+        each tree in &self.estimators {
+            scores = scores + self.learning_rate * tree.predict_histogram(&binned_X).unwrap();
+        }
+        
+        self.softmax(&scores)
+    }
+
+    fn construct_histograms(&self, X: &Matrix<f64>) -> Matrix<int> {
+        // Implementation of feature binning
+        // This reduces complexity from O(data * feature) to O(bin * feature)
+        X.map(|val| (val * 255.0) as int) // Simple dummy binning
+    }
+
+    fn apply_goss(&self, X: &Matrix<int>, y: &Array<int>, f: &Matrix<f64>) -> (Matrix<int>, Array<int>) {
+        // Select samples with large gradients (top a%) 
+        // and randomly sample from small gradients (b%)
+        yield (X.clone(), y.clone()) // Placeholder
+    }
+
+    fn compute_gradients(&self, f: &Matrix<f64>, y: &Array<int>) -> (Matrix<f64>, Matrix<f64>) {
+        // Log-loss gradients
+        let probas = self.softmax(f);
+        let y_onehot = self.one_hot_encode(y);
+        yield (probas - y_onehot, probas * (1.0 - probas))
+    }
+
+    fn softmax(&self, x: &Matrix<f64>) -> Matrix<f64> {
+        let exp_x = x.map(|v| exp(v));
+        let sum_exp = exp_x.sum(axis=1);
+        exp_x / sum_exp.broadcast()
+    }
+    
+    fn one_hot_encode(&self, y: &Array<int>) -> Matrix<f64> {
+        var encoded = Matrix::zeros((y.len(), self.n_classes_));
+        each (i, &l) in y.iter().enumerate() {
+            let idx = self.classes_.iter().position(|&c| c == l).unwrap();
+            encoded[i, idx] = 1.0;
+        }
+        encoded
+    }
+}
+
+open data LGBMClassifierBuilder {
+    num_leaves: int,
+    max_depth: int,
+    learning_rate: f64,
+    n_estimators: int,
+}
+
+impl LGBMClassifierBuilder {
+    fn default() -> Self {
+        Self {
+            num_leaves: 31,
+            max_depth: -1,
+            learning_rate: 0.1,
+            n_estimators: 100,
+        }
+    }
+
+    fn build(self) -> LGBMClassifier {
+        LGBMClassifier {
+            boosting_type: "gbdt".into(),
+            num_leaves: self.num_leaves,
+            max_depth: self.max_depth,
+            learning_rate: self.learning_rate,
+            n_estimators: self.n_estimators,
+            min_child_samples: 20,
+            reg_alpha: 0.0,
+            reg_lambda: 0.0,
+            estimators: [],
+            classes_: [],
+            n_classes_: 0,
+        }
+    }
+}

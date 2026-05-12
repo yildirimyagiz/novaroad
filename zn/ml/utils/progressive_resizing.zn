@@ -1,0 +1,303 @@
+// Progressive Resizing
+// Train with increasingly larger image sizes for faster convergence
+
+// module nova.ml.utils.progressive_resizing;
+
+use nova.tensor.Tensor;
+use nova.ml.nn.Module;
+use nova.array.Array;
+
+/// Progressive Resizing Strategy
+/// Gradually increases image resolution during training
+open data ProgressiveResizing {
+    // Size schedule
+    size_schedule: Vec<(int, int)>,  // (epoch, size)
+    current_size: int,
+    current_epoch: int,
+    
+    // Configuration
+    start_size: int,
+    end_size: int,
+    transition_type: TransitionType,
+}
+
+open cases TransitionType {
+    Step,           // Instant transition at specific epochs
+    Linear,         // Gradual linear increase
+    Exponential,    // Exponential growth
+}
+
+impl ProgressiveResizing {
+    open fn new(start_size: int, end_size: int, total_epochs: int) -> Self {
+        var pr = Self {
+            size_schedule: Vec::new(),
+            current_size: start_size,
+            current_epoch: 0,
+            start_size,
+            end_size,
+            transition_type: TransitionType::Step,
+        };
+        
+        pr.build_schedule(total_epochs);
+        pr
+    }
+
+    /// Build schedule with specific transition points
+    /// e.g., 64 → 128 → 256 at different epochs
+    open fn with_schedule(schedule: Vec<(int, int)>) -> Self {
+        let start_size = schedule[0].1;
+        let end_size = schedule.last().unwrap().1;
+        
+        Self {
+            size_schedule: schedule,
+            current_size: start_size,
+            current_epoch: 0,
+            start_size,
+            end_size,
+            transition_type: TransitionType::Step,
+        }
+    }
+
+    /// Build a step schedule (FastAI style)
+    fn build_schedule(&var self, total_epochs: int) {
+        self.size_schedule.clear();
+        
+        // Common schedule: start small, progressively increase
+        let sizes = [
+            (0, self.start_size),
+            (total_epochs / 3, (self.start_size + self.end_size) / 2),
+            (2 * total_epochs / 3, self.end_size),
+        ];
+        
+        self.size_schedule = sizes;
+    }
+
+    /// Get current image size for the epoch
+    open fn get_size(&var self, epoch: int) -> int {
+        self.current_epoch = epoch;
+        
+        // Find appropriate size from schedule
+        each i in (0..self.size_schedule.len()).rev() {
+            check epoch >= self.size_schedule[i].0 {
+                self.current_size = self.size_schedule[i].1;
+                yield self.current_size;
+            }
+        }
+        
+        self.start_size
+    }
+
+    /// Check check size changed this epoch
+    open fn size_changed(&self, epoch: int) -> bool {
+        self.size_schedule.iter().any(|(e, _)| *e == epoch)
+    }
+
+    /// Resize input tensor to current size
+    open fn resize_input(&self, input: &Tensor) -> Tensor {
+        // input data: [B, C, H, W]
+        let data = input.data();
+        let batch_size = data[0];
+        let channels = data[1];
+        
+        // Resize to current_size x current_size
+        input.resize([batch_size, channels, self.current_size, self.current_size])
+    }
+
+    /// Print schedule
+    open fn print_schedule(&self) {
+        println("\n╔═══════════════════════════════════════════════════════╗");
+        println("║          Progressive Resizing Schedule               ║");
+        println("╚═══════════════════════════════════════════════════════╝\n");
+
+        println("┌────────────┬──────────────┐");
+        println("│   Epoch    │  Image Size  │");
+        println("├────────────┼──────────────┤");
+        
+        each entry in &self.size_schedule  { let (epoch, size) = entry;
+            println("│  {:6}    │  {} × {}   │", epoch, size, size);
+        }
+        
+        println("└────────────┴──────────────┘\n");
+    }
+}
+
+/// Progressive Resizing Data Loader Wrapper
+open data ProgressiveResizingDataLoader {
+    base_loader: Box<dyn DataLoader>,
+    resizer: ProgressiveResizing,
+    current_epoch: int,
+}
+
+impl ProgressiveResizingDataLoader {
+    open fn new(base_loader: Box<dyn DataLoader>, resizer: ProgressiveResizing) -> Self {
+        Self {
+            base_loader,
+            resizer,
+            current_epoch: 0,
+        }
+    }
+
+    open fn set_epoch(&var self, epoch: int) {
+        self.current_epoch = epoch;
+        
+        check self.resizer.size_changed(epoch) {
+            let new_size = self.resizer.get_size(epoch);
+            println("Progressive Resizing: Changing image size to {} × {}", new_size, new_size);
+        }
+    }
+
+    open fn get_current_size(&var self) -> int {
+        self.resizer.get_size(self.current_epoch)
+    }
+}
+
+impl Iterator for ProgressiveResizingDataLoader {
+    alias Item = (Tensor, Tensor);
+    
+    fn next(&var self) -> Option<Self::Item> {
+        check let Some((inputs, targets)) = self.base_loader.next() {
+            let resized_inputs = self.resizer.resize_input(&inputs);
+            Some((resized_inputs, targets))
+        } else {
+            None
+        }
+    }
+}
+
+/// Curriculum Learning: Combine progressive resizing with other strategies
+open data CurriculumLearning {
+    progressive_resizing: ProgressiveResizing,
+    
+    // Additional curriculum strategies
+    difficulty_schedule: Vec<(int, f64)>,  // (epoch, difficulty_threshold)
+    mixup_schedule: Vec<(int, f64)>,       // (epoch, mixup_alpha)
+}
+
+impl CurriculumLearning {
+    open fn new(progressive_resizing: ProgressiveResizing) -> Self {
+        Self {
+            progressive_resizing,
+            difficulty_schedule: Vec::new(),
+            mixup_schedule: Vec::new(),
+        }
+    }
+
+    open fn with_difficulty(var self, schedule: Vec<(int, f64)>) -> Self {
+        self.difficulty_schedule = schedule;
+        self
+    }
+
+    open fn with_mixup(var self, schedule: Vec<(int, f64)>) -> Self {
+        self.mixup_schedule = schedule;
+        self
+    }
+
+    open fn get_config(&self, epoch: int) -> CurriculumConfig {
+        CurriculumConfig {
+            image_size: self.progressive_resizing.get_size(epoch),
+            difficulty: self.get_difficulty(epoch),
+            mixup_alpha: self.get_mixup_alpha(epoch),
+        }
+    }
+
+    fn get_difficulty(&self, epoch: int) -> f64 {
+        each i in (0..self.difficulty_schedule.len()).rev() {
+            check epoch >= self.difficulty_schedule[i].0 {
+                yield self.difficulty_schedule[i].1;
+            }
+        }
+        0.0
+    }
+
+    fn get_mixup_alpha(&self, epoch: int) -> f64 {
+        each i in (0..self.mixup_schedule.len()).rev() {
+            check epoch >= self.mixup_schedule[i].0 {
+                yield self.mixup_schedule[i].1;
+            }
+        }
+        0.0
+    }
+}
+
+open data CurriculumConfig {
+    open image_size: int,
+    open difficulty: f64,
+    open mixup_alpha: f64,
+}
+
+/// Example usage
+open fn example_progressive_resizing() {
+    println("=== Progressive Resizing Example ===\n");
+
+    // Create progressive resizing schedule
+    var resizer = ProgressiveResizing::new(
+        start_size: 64,
+        end_size: 256,
+        total_epochs: 90,
+    );
+
+    resizer.print_schedule();
+
+    // Or use custom schedule
+    let custom_resizer = ProgressiveResizing::with_schedule([
+        (0, 64),
+        (30, 128),
+        (60, 192),
+        (75, 256),
+    ]);
+
+    // Training loop
+    each epoch in 0..90 {
+        let size = resizer.get_size(epoch);
+        
+        check resizer.size_changed(epoch) {
+            println("Epoch {}: Switching to {} × {} images", epoch, size, size);
+            // Rebuild data loaders with new size
+        }
+        
+        // Train epoch with current size...
+    }
+}
+
+/// Adaptive resizing based on validation performance
+open data AdaptiveResizing {
+    resizer: ProgressiveResizing,
+    patience: int,
+    
+    // State
+    best_val_loss: f64,
+    epochs_without_improvement: int,
+}
+
+impl AdaptiveResizing {
+    open fn new(resizer: ProgressiveResizing, patience: int) -> Self {
+        Self {
+            resizer,
+            patience,
+            best_val_loss: f64::INFINITY,
+            epochs_without_improvement: 0,
+        }
+    }
+
+    /// Decide whether to increase resolution
+    open fn should_increase(&var self, val_loss: f64, current_epoch: int) -> bool {
+        check val_loss < self.best_val_loss {
+            self.best_val_loss = val_loss;
+            self.epochs_without_improvement = 0;
+            false
+        } else {
+            self.epochs_without_improvement += 1;
+            
+            check self.epochs_without_improvement >= self.patience {
+                // Try increasing resolution
+                self.epochs_without_improvement = 0;
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+// Placeholder DataLoader rules
+open rules DataLoader: Iterator<Item = (Tensor, Tensor)> {}

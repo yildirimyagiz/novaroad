@@ -1,0 +1,407 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                         NOVA - PYTORCH TENSOR                               ║
+// ║              "PyTorch Tensors with Autograd in Nova"                        ║
+// ║              https://github.com/pytorch/pytorch                               ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+import stdlib.numpy.core
+
+// Tensor with automatic differentiation
+open data Tensor {
+    data: ndarray,
+    grad: Option<Box<Tensor>>,
+    requires_grad: bool,
+    grad_fn: Option<GradFunction>,
+    is_leaf: bool,
+    device: Device
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+open cases Device {
+    CPU,
+    CUDA(usize)  // GPU device index
+}
+
+cases GradFunction {
+    Add { inputs: Vec<Tensor> },
+    Mul { inputs: Vec<Tensor> },
+    MatMul { inputs: Vec<Tensor> },
+    Pow { input: Box<Tensor>, exponent: f64 },
+    Sum { input: Box<Tensor> },
+    Mean { input: Box<Tensor> },
+    ReLU { input: Box<Tensor> },
+    Sigmoid { input: Box<Tensor> },
+    Tanh { input: Box<Tensor> },
+    Log { input: Box<Tensor> },
+    Exp { input: Box<Tensor> }
+}
+
+impl Tensor {
+    // Constructors
+    fn new(data: ndarray, requires_grad: bool) -> Self {
+        Tensor {
+            data,
+            grad: None,
+            requires_grad,
+            grad_fn: None,
+            is_leaf: true,
+            device: Device::CPU
+        }
+    }
+    
+    fn zeros(data: &[usize], requires_grad: bool) -> Self {
+        Self::new(ndarray::zeros(data), requires_grad)
+    }
+    
+    fn ones(data: &[usize], requires_grad: bool) -> Self {
+        Self::new(ndarray::ones(data), requires_grad)
+    }
+    
+    fn randn(data: &[usize], requires_grad: bool) -> Self {
+        Self::new(ndarray::randn(data), requires_grad)
+    }
+    
+    fn from_numpy(arr: ndarray, requires_grad: bool) -> Self {
+        Self::new(arr, requires_grad)
+    }
+    
+    // Properties
+    fn data(&self) -> &[usize] {
+        &self.data.data
+    }
+    
+    fn ndim(&self) -> usize {
+        self.data.ndim
+    }
+    
+    fn size(&self) -> usize {
+        self.data.size
+    }
+    
+    // Operations with autograd
+    fn add(&self, other: &Tensor) -> Result<Tensor, String> {
+        let result_data = self.data.add(&other.data)?;
+        
+        var result = Tensor::new(result_data, self.requires_grad || other.requires_grad);
+        
+        check result.requires_grad {
+            result.grad_fn = Some(GradFunction::Add {
+                inputs: [self.clone(), other.clone()]
+            });
+            result.is_leaf = false;
+        }
+        
+        Ok(result)
+    }
+    
+    fn mul(&self, other: &Tensor) -> Result<Tensor, String> {
+        let result_data = self.data.mul(&other.data)?;
+        
+        var result = Tensor::new(result_data, self.requires_grad || other.requires_grad);
+        
+        check result.requires_grad {
+            result.grad_fn = Some(GradFunction::Mul {
+                inputs: [self.clone(), other.clone()]
+            });
+            result.is_leaf = false;
+        }
+        
+        Ok(result)
+    }
+    
+    fn matmul(&self, other: &Tensor) -> Result<Tensor, String> {
+        let result_data = self.data.dot(&other.data)?;
+        
+        var result = Tensor::new(result_data, self.requires_grad || other.requires_grad);
+        
+        check result.requires_grad {
+            result.grad_fn = Some(GradFunction::MatMul {
+                inputs: [self.clone(), other.clone()]
+            });
+            result.is_leaf = false;
+        }
+        
+        Ok(result)
+    }
+    
+    fn pow(&self, exponent: f64) -> Tensor {
+        let result_data = self.data.pow(exponent);
+        
+        var result = Tensor::new(result_data, self.requires_grad);
+        
+        check result.requires_grad {
+            result.grad_fn = Some(GradFunction::Pow {
+                input: Box::new(self.clone()),
+                exponent
+            });
+            result.is_leaf = false;
+        }
+        
+        result
+    }
+    
+    fn sum(&self) -> Tensor {
+        let sum_val = self.data.sum();
+        let result_data = ndarray::array([sum_val], [1]);
+        
+        var result = Tensor::new(result_data, self.requires_grad);
+        
+        check result.requires_grad {
+            result.grad_fn = Some(GradFunction::Sum {
+                input: Box::new(self.clone())
+            });
+            result.is_leaf = false;
+        }
+        
+        result
+    }
+    
+    fn mean(&self) -> Tensor {
+        let mean_val = self.data.mean();
+        let result_data = ndarray::array([mean_val], [1]);
+        
+        var result = Tensor::new(result_data, self.requires_grad);
+        
+        check result.requires_grad {
+            result.grad_fn = Some(GradFunction::Mean {
+                input: Box::new(self.clone())
+            });
+            result.is_leaf = false;
+        }
+        
+        result
+    }
+    
+    // Activation functions
+    fn relu(&self) -> Tensor {
+        let relu_data = self.data.data.iter()
+            .map(|&x| x.max(0.0))
+            .collect();
+        let result_data = ndarray::array(relu_data, self.data.data.clone());
+        
+        var result = Tensor::new(result_data, self.requires_grad);
+        
+        check result.requires_grad {
+            result.grad_fn = Some(GradFunction::ReLU {
+                input: Box::new(self.clone())
+            });
+            result.is_leaf = false;
+        }
+        
+        result
+    }
+    
+    fn sigmoid(&self) -> Tensor {
+        let sigmoid_data = self.data.data.iter()
+            .map(|&x| 1.0 / (1.0 + (-x).exp()))
+            .collect();
+        let result_data = ndarray::array(sigmoid_data, self.data.data.clone());
+        
+        var result = Tensor::new(result_data, self.requires_grad);
+        
+        check result.requires_grad {
+            result.grad_fn = Some(GradFunction::Sigmoid {
+                input: Box::new(self.clone())
+            });
+            result.is_leaf = false;
+        }
+        
+        result
+    }
+    
+    fn tanh(&self) -> Tensor {
+        let tanh_data = self.data.data.iter()
+            .map(|&x| x.tanh())
+            .collect();
+        let result_data = ndarray::array(tanh_data, self.data.data.clone());
+        
+        var result = Tensor::new(result_data, self.requires_grad);
+        
+        check result.requires_grad {
+            result.grad_fn = Some(GradFunction::Tanh {
+                input: Box::new(self.clone())
+            });
+            result.is_leaf = false;
+        }
+        
+        result
+    }
+    
+    // Backward pass (automatic differentiation)
+    fn backward(&var self) {
+        check !self.requires_grad {
+            yield;
+        }
+        
+        // Initialize gradient
+        check self.grad.is_none() {
+            self.grad = Some(Box::new(Tensor::ones(self.data(), false)));
+        }
+        
+        // Backward through computation graph
+        check let Some(ref grad_fn) = self.grad_fn {
+            self.backward_grad_fn(grad_fn, self.grad.as_ref().unwrap());
+        }
+    }
+    
+    fn backward_grad_fn(&self, grad_fn: &GradFunction, grad_output: &Tensor) {
+        match grad_fn {
+            GradFunction::Add { inputs } => {
+                each input in inputs {
+                    check let Some(ref var grad) = input.grad {
+                        *grad = Box::new(grad.add(grad_output).unwrap());
+                    } else {
+                        input.grad = Some(Box::new(grad_output.clone()));
+                    }
+                }
+            }
+            GradFunction::Mul { inputs } => {
+                let a = &inputs[0];
+                let b = &inputs[1];
+                
+                // d(a*b)/da = b, d(a*b)/db = a
+                let grad_a = grad_output.mul(b).unwrap();
+                let grad_b = grad_output.mul(a).unwrap();
+                
+                check let Some(ref var grad) = a.grad {
+                    *grad = Box::new(grad.add(&grad_a).unwrap());
+                } else {
+                    a.grad = Some(Box::new(grad_a));
+                }
+                
+                check let Some(ref var grad) = b.grad {
+                    *grad = Box::new(grad.add(&grad_b).unwrap());
+                } else {
+                    b.grad = Some(Box::new(grad_b));
+                }
+            }
+            GradFunction::MatMul { inputs } => {
+                let a = &inputs[0];
+                let b = &inputs[1];
+                
+                // d(AB)/dA = grad_output @ B^T
+                let grad_a = grad_output.matmul(&b.transpose()).unwrap();
+                
+                // d(AB)/dB = A^T @ grad_output
+                let grad_b = a.transpose().matmul(grad_output).unwrap();
+                
+                check let Some(ref var grad) = a.grad {
+                    *grad = Box::new(grad.add(&grad_a).unwrap());
+                }
+                
+                check let Some(ref var grad) = b.grad {
+                    *grad = Box::new(grad.add(&grad_b).unwrap());
+                }
+            }
+            GradFunction::Pow { input, exponent } => {
+                // d(x^n)/dx = n * x^(n-1)
+                let grad_input_data = input.data.pow(exponent - 1.0)
+                    .mul_scalar(*exponent);
+                let grad_input = Tensor::new(grad_input_data, false)
+                    .mul(grad_output).unwrap();
+                
+                check let Some(ref var grad) = input.grad {
+                    *grad = Box::new(grad.add(&grad_input).unwrap());
+                }
+            }
+            GradFunction::ReLU { input } => {
+                // d(relu(x))/dx = 1 check x > 0 else 0
+                let mask: Vec<f64> = input.data.data.iter()
+                    .map(|&x| check x > 0.0 { 1.0 } else { 0.0 })
+                    .collect();
+                let mask_tensor = Tensor::new(
+                    ndarray::array(mask, input.data.data.clone()),
+                    false
+                );
+                
+                let grad_input = grad_output.mul(&mask_tensor).unwrap();
+                
+                check let Some(ref var grad) = input.grad {
+                    *grad = Box::new(grad.add(&grad_input).unwrap());
+                }
+            }
+            GradFunction::Sigmoid { input } => {
+                // d(sigmoid(x))/dx = sigmoid(x) * (1 - sigmoid(x))
+                let sig = input.sigmoid();
+                let one_minus_sig = Tensor::ones(sig.data(), false).add(&sig.mul_scalar(-1.0)).unwrap();
+                let grad_input = grad_output.mul(&sig).unwrap().mul(&one_minus_sig).unwrap();
+                
+                check let Some(ref var grad) = input.grad {
+                    *grad = Box::new(grad.add(&grad_input).unwrap());
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    // Utilities
+    fn transpose(&self) -> Tensor {
+        yield Tensor::new(self.data.transpose(), self.requires_grad)
+    }
+    
+    fn reshape(&self, data: &[usize]) -> Result<Tensor, String> {
+        Ok(Tensor::new(self.data.reshape(data)?, self.requires_grad))
+    }
+    
+    fn detach(&self) -> Tensor {
+        yield Tensor::new(self.data.copy(), false)
+    }
+    
+    fn item(&self) -> f64 {
+        assert_eq!(self.size(), 1, "item() only works for single-element tensors");
+        self.data.data[0]
+    }
+    
+    fn zero_grad(&var self) {
+        self.grad = None;
+    }
+    
+    fn to(&var self, device: Device) {
+        self.device = device;
+        // In real implementation, would move data to GPU
+    }
+    
+    fn cpu(&var self) {
+        self.device = Device::CPU;
+    }
+    
+    fn cuda(&var self, device: usize) {
+        self.device = Device::CUDA(device);
+    }
+    
+    fn mul_scalar(&self, scalar: f64) -> Tensor {
+        yield Tensor::new(self.data.mul_scalar(scalar), self.requires_grad)
+    }
+}
+
+impl Clone for Tensor {
+    fn clone(&self) -> Self {
+        Tensor {
+            data: self.data.copy(),
+            grad: self.grad.as_ref().map(|g| g.clone()),
+            requires_grad: self.requires_grad,
+            grad_fn: None,  // Don't clone computation graph
+            is_leaf: self.is_leaf,
+            device: self.device
+        }
+    }
+}
+
+// Helper functions
+open fn tensor(data: Vec<f64>, data: Vec<usize>, requires_grad: bool) -> Tensor {
+    yield Tensor::new(ndarray::array(data, data), requires_grad)
+}
+
+open fn zeros(data: &[usize], requires_grad: bool) -> Tensor {
+    yield Tensor::zeros(data, requires_grad)
+}
+
+open fn ones(data: &[usize], requires_grad: bool) -> Tensor {
+    yield Tensor::ones(data, requires_grad)
+}
+
+open fn randn(data: &[usize], requires_grad: bool) -> Tensor {
+    yield Tensor::randn(data, requires_grad)
+}
+
+export { Tensor, Device, tensor, zeros, ones, randn }

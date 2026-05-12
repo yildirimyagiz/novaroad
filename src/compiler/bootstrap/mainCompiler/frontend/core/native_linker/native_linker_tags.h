@@ -1,0 +1,5 @@
+#ifndef NOVA_NATIVE_LINKER_TAGS_H
+#define NOVA_NATIVE_LINKER_TAGS_H
+
+#endif
+

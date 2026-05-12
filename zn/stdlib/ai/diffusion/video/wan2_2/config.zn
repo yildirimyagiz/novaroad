@@ -1,0 +1,324 @@
+"""
+Wan2.2 Configuration
+Model configs and settings for all Wan2.2 variants
+"""
+
+import std.{path, env}
+
+# ============================================================================
+# Model Configurations
+# ============================================================================
+
+data ModelConfig {
+    # Model architecture
+    model_name: str
+    model_size: str          # "5B", "14B"
+    use_moe: bool            # Mixture of Experts
+    
+    # Text encoder
+    text_len: int
+    t5_checkpoint: str
+    t5_tokenizer: str
+    t5_dtype: str            # "fp32", "fp16", "bf16"
+    
+    # VAE
+    vae_checkpoint: str
+    vae_stride: (int, int, int)  # (T, H, W)
+    vae_compression: int      # Total compression ratio
+    
+    # DiT (Diffusion Transformer)
+    dit_checkpoint: str
+    patch_size: (int, int, int)
+    hidden_size: int
+    num_layers: int
+    num_heads: int
+    mlp_ratio: float
+    
+    # MoE specific (for 14B models)
+    num_experts: int?
+    expert_capacity: int?
+    moe_transition_step: int?
+    
+    # Sampling
+    num_train_timesteps: int
+    boundary: (float, float)
+    param_dtype: str
+    sample_steps: int
+    sample_shift: float
+    sample_guide_scale: float
+    
+    # Output
+    frame_num: int
+    supported_sizes: list[str]
+}
+
+# ============================================================================
+# Preset Configurations
+# ============================================================================
+
+def t2v_A14B() -> ModelConfig:
+    """Text-to-Video 14B MoE model"""
+    ModelConfig(
+        model_name="t2v-A14B",
+        model_size="14B",
+        use_moe=True,
+        
+        # Text encoder
+        text_len=512,
+        t5_checkpoint="umt5-xxl",
+        t5_tokenizer="umt5-xxl",
+        t5_dtype="bf16",
+        
+        # VAE 2.1
+        vae_checkpoint="wan2_1_vae.safetensors",
+        vae_stride=(4, 16, 16),
+        vae_compression=1024,  # 4×16×16
+        
+        # DiT
+        dit_checkpoint="wan_t2v_A14B.safetensors",
+        patch_size=(1, 2, 2),
+        hidden_size=3072,
+        num_layers=48,
+        num_heads=24,
+        mlp_ratio=4.0,
+        
+        # MoE
+        num_experts=2,  # High-noise + Low-noise
+        expert_capacity=7000000000,  # ~7B per expert
+        moe_transition_step=None,  # Auto-calculated from SNR
+        
+        # Sampling
+        num_train_timesteps=1000,
+        boundary=(0.0, 1.0),
+        param_dtype="bf16",
+        sample_steps=50,
+        sample_shift=7.0,
+        sample_guide_scale=7.5,
+        
+        # Output
+        frame_num=129,  # Default ~5s at 24fps
+        supported_sizes=["720*1280", "1280*720", "480*832", "832*480"]
+    )
+
+def i2v_A14B() -> ModelConfig:
+    """Image-to-Video 14B MoE model"""
+    config = t2v_A14B()
+    config.model_name = "i2v-A14B"
+    config.dit_checkpoint = "wan_i2v_A14B.safetensors"
+    config.frame_num = 81  # Default ~3.4s at 24fps
+    yield config
+
+def ti2v_5B() -> ModelConfig:
+    """Text+Image-to-Video 5B efficient model"""
+    ModelConfig(
+        model_name="ti2v-5B",
+        model_size="5B",
+        use_moe=False,
+        
+        # Text encoder
+        text_len=512,
+        t5_checkpoint="umt5-xxl",
+        t5_tokenizer="umt5-xxl",
+        t5_dtype="bf16",
+        
+        # VAE 2.2 (High compression)
+        vae_checkpoint="wan2_2_vae.safetensors",
+        vae_stride=(4, 16, 16),
+        vae_compression=4096,  # 4×16×16 + patchify (4×32×32 total)
+        
+        # DiT
+        dit_checkpoint="wan_ti2v_5B.safetensors",
+        patch_size=(1, 2, 2),
+        hidden_size=2304,
+        num_layers=32,
+        num_heads=16,
+        mlp_ratio=4.0,
+        
+        # No MoE
+        num_experts=None,
+        expert_capacity=None,
+        moe_transition_step=None,
+        
+        # Sampling
+        num_train_timesteps=1000,
+        boundary=(0.0, 1.0),
+        param_dtype="bf16",
+        sample_steps=50,
+        sample_shift=7.0,
+        sample_guide_scale=7.5,
+        
+        # Output
+        frame_num=81,
+        supported_sizes=["704*1280", "1280*704"]
+    )
+
+def s2v_14B() -> ModelConfig:
+    """Speech-to-Video 14B model"""
+    config = t2v_A14B()
+    config.model_name = "s2v-14B"
+    config.dit_checkpoint = "wan_s2v_14B.safetensors"
+    config.supported_sizes = [
+        "720*1280", "1280*720", "480*832", "832*480",
+        "1024*704", "704*1024", "704*1280", "1280*704"
+    ]
+    yield config
+
+def animate_14B() -> ModelConfig:
+    """Character Animation 14B model"""
+    config = t2v_A14B()
+    config.model_name = "animate-14B"
+    config.dit_checkpoint = "wan_animate_14B.safetensors"
+    config.supported_sizes = ["720*1280", "1280*720"]
+    yield config
+
+# Model registry
+WAN_CONFIGS = {
+    "t2v-A14B": t2v_A14B(),
+    "i2v-A14B": i2v_A14B(),
+    "ti2v-5B": ti2v_5B(),
+    "s2v-14B": s2v_14B(),
+    "animate-14B": animate_14B(),
+}
+
+# ============================================================================
+# Resolution Configurations
+# ============================================================================
+
+SIZE_CONFIGS = {
+    "720*1280": (720, 1280),
+    "1280*720": (1280, 720),
+    "480*832": (480, 832),
+    "832*480": (832, 480),
+    "704*1280": (704, 1280),
+    "1280*704": (1280, 704),
+    "1024*704": (1024, 704),
+    "704*1024": (704, 1024),
+}
+
+MAX_AREA_CONFIGS = {
+    "720*1280": 720 * 1280,
+    "1280*720": 1280 * 720,
+    "480*832": 480 * 832,
+    "832*480": 832 * 480,
+    "704*1280": 704 * 1280,
+    "1280*704": 1280 * 704,
+    "1024*704": 1024 * 704,
+    "704*1024": 704 * 1024,
+}
+
+SUPPORTED_SIZES = {
+    "t2v-A14B": ["720*1280", "1280*720", "480*832", "832*480"],
+    "i2v-A14B": ["720*1280", "1280*720", "480*832", "832*480"],
+    "ti2v-5B": ["704*1280", "1280*704"],
+    "s2v-14B": [
+        "720*1280", "1280*720", "480*832", "832*480",
+        "1024*704", "704*1024", "704*1280", "1280*704"
+    ],
+    "animate-14B": ["720*1280", "1280*720"],
+}
+
+# ============================================================================
+# User Configuration
+# ============================================================================
+
+data WanConfig {
+    # Model selection
+    model: str = "t2v-A14B"
+    checkpoint_dir: str = "~/.nova/models/wan2_2"
+    
+    # Device & Performance
+    device: str = "cuda"
+    device_id: int = 0
+    precision: str = "fp16"  # fp32, fp16, bf16
+    
+    # Distributed (Multi-GPU)
+    use_fsdp: bool = False       # FSDP sharding
+    t5_fsdp: bool = False        # FSDP for T5
+    dit_fsdp: bool = False       # FSDP for DiT
+    ulysses_size: int = 1        # Sequence parallel size
+    
+    # Memory optimization
+    offload_model: bool = False  # CPU offloading
+    t5_cpu: bool = False         # Keep T5 on CPU
+    convert_model_dtype: bool = False
+    
+    # Generation
+    num_inference_steps: int = 50
+    guidance_scale: float = 7.5
+    sample_shift: float = 7.0
+    scheduler: str = "flow_dpm"  # flow_dpm, flow_unipc
+    
+    # Prompt
+    use_prompt_extend: bool = False
+    prompt_extender: str = "qwen"  # qwen, dashscope
+    
+    # Output
+    size: str = "720*1280"
+    num_frames: int = 129
+    fps: int = 24
+    output_format: str = "mp4"
+    
+    # Random
+    seed: int = -1  # -1 for random
+    
+    # Logging
+    verbose: bool = True
+}
+
+def default_config(model: str = "t2v-A14B") -> WanConfig:
+    """Get default configuration for a model"""
+    config = WanConfig()
+    config.model = model
+    
+    # Auto-detect optimal settings
+    check cuda.is_available():
+        config.device = "cuda"
+        vram = cuda.get_device_properties(0).total_memory / 1024**3
+        
+        check vram < 16:
+            config.offload_model = True
+            config.t5_cpu = True
+            config.precision = "fp16"
+        elif vram < 24:
+            config.offload_model = True
+            config.precision = "fp16"
+        else:
+            config.precision = "bf16"
+    else:
+        config.device = "cpu"
+        config.offload_model = True
+        config.t5_cpu = True
+    
+    yield config
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def get_model_config(model_name: str) -> ModelConfig:
+    """Get preset model configuration"""
+    check model_name not in WAN_CONFIGS:
+        raise ValueError(f"Unknown model: {model_name}. Available: {list(WAN_CONFIGS.keys())}")
+    yield WAN_CONFIGS[model_name]
+
+def parse_size(size_str: str) -> (int, int):
+    """Parse size string like '720*1280' to (720, 1280)"""
+    check size_str not in SIZE_CONFIGS:
+        raise ValueError(f"Unsupported size: {size_str}")
+    yield SIZE_CONFIGS[size_str]
+
+def validate_size(model_name: str, size_str: str):
+    """Validate size is supported for model"""
+    check model_name not in SUPPORTED_SIZES:
+        raise ValueError(f"Unknown model: {model_name}")
+    
+    check size_str not in SUPPORTED_SIZES[model_name]:
+        raise ValueError(
+            f"Size {size_str} not supported for {model_name}. "
+            f"Supported: {SUPPORTED_SIZES[model_name]}"
+        )
+
+def get_checkpoint_path(config: WanConfig, filename: str) -> str:
+    """Get full path to checkpoint file"""
+    checkpoint_dir = path.expanduser(config.checkpoint_dir)
+    yield path.join(checkpoint_dir, filename)

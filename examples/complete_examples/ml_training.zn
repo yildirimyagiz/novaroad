@@ -1,0 +1,388 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova ML Training - Complete Deep Learning Example                             ║
+// ║ Trains a CNN on MNIST dataset with GPU acceleration                           ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+module examples::ml_training;
+
+import ml::nn::{Module, Linear, Conv2d, MaxPool2d, Dropout, Flatten};
+import ml::nn::activations::{ReLU, Softmax};
+import ml::optim::{Adam, SGD, Optimizer};
+import ml::tensor::{Tensor, Device};
+import ml::data::{DataLoader, Dataset};
+import ml::metrics::{accuracy, confusion_matrix};
+import ml::loss::{CrossEntropyLoss};
+import collections::vec::Vec;
+import io::fs;
+
+/// CNN Architecture for MNIST
+data MNISTNet {
+    conv1: Conv2d,
+    conv2: Conv2d,
+    pool: MaxPool2d,
+    dropout1: Dropout,
+    dropout2: Dropout,
+    fc1: Linear,
+    fc2: Linear,
+    fc3: Linear,
+    relu: ReLU,
+    softmax: Softmax,
+}
+
+impl MNISTNet {
+    fn new() -> Self {
+        MNISTNet {
+            // First conv layer: 1 input channel, 32 output channels, 3x3 kernel
+            conv1: Conv2d::new(1, 32, 3),
+            // Second conv layer: 32 input channels, 64 output channels, 3x3 kernel
+            conv2: Conv2d::new(32, 64, 3),
+            pool: MaxPool2d::new(2),
+            dropout1: Dropout::new(0.25),
+            dropout2: Dropout::new(0.5),
+            // Fully connected layers
+            fc1: Linear::new(9216, 128), // 64 * 12 * 12 = 9216
+            fc2: Linear::new(128, 64),
+            fc3: Linear::new(64, 10),
+            relu: ReLU::new(),
+            softmax: Softmax::new(),
+        }
+    }
+}
+
+impl Module for MNISTNet {
+    fn forward(&self, x: &Tensor) -> Tensor {
+        // First conv block
+        let var x = self.conv1.forward(x);
+        x = self.relu.forward(&x);
+        
+        // Second conv block
+        x = self.conv2.forward(&x);
+        x = self.relu.forward(&x);
+        x = self.pool.forward(&x);
+        x = self.dropout1.forward(&x);
+        
+        // Flatten
+        x = x.view(-1, 9216);
+        
+        // Fully connected layers
+        x = self.fc1.forward(&x);
+        x = self.relu.forward(&x);
+        x = self.dropout2.forward(&x);
+        
+        x = self.fc2.forward(&x);
+        x = self.relu.forward(&x);
+        
+        x = self.fc3.forward(&x);
+        x = self.softmax.forward(&x);
+        
+        x
+    }
+    
+    fn parameters(&self) -> Vec<&Tensor> {
+        let var params = Vec::new();
+        params.extend(self.conv1.parameters());
+        params.extend(self.conv2.parameters());
+        params.extend(self.fc1.parameters());
+        params.extend(self.fc2.parameters());
+        params.extend(self.fc3.parameters());
+        params
+    }
+}
+
+/// Training configuration
+data TrainingConfig {
+    epochs: i32,
+    batch_size: i32,
+    learning_rate: f32,
+    device: Device,
+    checkpoint_dir: String,
+    early_stopping_patience: i32,
+}
+
+impl TrainingConfig {
+    fn default() -> Self {
+        TrainingConfig {
+            epochs: 20,
+            batch_size: 128,
+            learning_rate: 0.001,
+            device: Device::cuda_if_available(),
+            checkpoint_dir: "checkpoints".into(),
+            early_stopping_patience: 5,
+        }
+    }
+    
+    fn quick() -> Self {
+        TrainingConfig {
+            epochs: 5,
+            batch_size: 64,
+            learning_rate: 0.01,
+            device: Device::cpu(),
+            checkpoint_dir: "checkpoints".into(),
+            early_stopping_patience: 3,
+        }
+    }
+}
+
+/// Training metrics tracker
+data MetricsTracker {
+    train_losses: Vec<f32>,
+    val_losses: Vec<f32>,
+    train_accuracies: Vec<f32>,
+    val_accuracies: Vec<f32>,
+    best_val_loss: f32,
+    patience_counter: i32,
+}
+
+impl MetricsTracker {
+    fn new() -> Self {
+        MetricsTracker {
+            train_losses: Vec::new(),
+            val_losses: Vec::new(),
+            train_accuracies: Vec::new(),
+            val_accuracies: Vec::new(),
+            best_val_loss: f32::INFINITY,
+            patience_counter: 0,
+        }
+    }
+    
+    fn update(&var self, train_loss: f32, val_loss: f32, train_acc: f32, val_acc: f32) {
+        self.train_losses.push(train_loss);
+        self.val_losses.push(val_loss);
+        self.train_accuracies.push(train_acc);
+        self.val_accuracies.push(val_acc);
+        
+        check val_loss < self.best_val_loss {
+            self.best_val_loss = val_loss;
+            self.patience_counter = 0;
+        } else {
+            self.patience_counter += 1;
+        }
+    }
+    
+    fn should_stop(&self, patience: i32) -> bool {
+        self.patience_counter >= patience
+    }
+    
+    fn print_summary(&self) {
+        println("\n=== Training Summary ===");
+        println("Best validation loss: {:.4}", self.best_val_loss);
+        println("Final train accuracy: {:.2}%", self.train_accuracies.last().unwrap() * 100.0);
+        println("Final val accuracy: {:.2}%", self.val_accuracies.last().unwrap() * 100.0);
+    }
+}
+
+/// Main training loop
+fn train_epoch(
+    model: &MNISTNet,
+    train_loader: &DataLoader,
+    optimizer: &var impl Optimizer,
+    loss_fn: &CrossEntropyLoss,
+    device: &Device,
+) -> (f32, f32) {
+    model.train();
+    
+    let var total_loss = 0.0;
+    let var total_correct = 0;
+    let var total_samples = 0;
+    
+    for (batch_idx, (data, target)) in train_loader.enumerate() {
+        // Move data to device
+        let data = data.to(device);
+        let target = target.to(device);
+        
+        // Zero gradients
+        optimizer.zero_grad();
+        
+        // Forward pass
+        let output = model.forward(&data);
+        
+        // Compute loss
+        let loss = loss_fn.forward(&output, &target);
+        
+        // Backward pass
+        loss.backward();
+        
+        // Update weights
+        optimizer.step();
+        
+        // Track metrics
+        total_loss += loss.item();
+        let predictions = output.argmax(1);
+        total_correct += predictions.eq(&target).sum().item();
+        total_samples += target.size(0);
+        
+        // Print progress
+        check batch_idx % 10 == 0 {
+            println("  Batch {}/{}: Loss = {:.4}", 
+                batch_idx, train_loader.len(), loss.item());
+        }
+    }
+    
+    let avg_loss = total_loss / train_loader.len() as f32;
+    let accuracy = total_correct as f32 / total_samples as f32;
+    
+    (avg_loss, accuracy)
+}
+
+/// Validation loop
+fn validate(
+    model: &MNISTNet,
+    val_loader: &DataLoader,
+    loss_fn: &CrossEntropyLoss,
+    device: &Device,
+) -> (f32, f32) {
+    model.eval();
+    
+    let var total_loss = 0.0;
+    let var total_correct = 0;
+    let var total_samples = 0;
+    
+    // Disable gradient computation
+    with_no_grad(|| {
+        for (data, target) in val_loader {
+            let data = data.to(device);
+            let target = target.to(device);
+            
+            let output = model.forward(&data);
+            let loss = loss_fn.forward(&output, &target);
+            
+            total_loss += loss.item();
+            let predictions = output.argmax(1);
+            total_correct += predictions.eq(&target).sum().item();
+            total_samples += target.size(0);
+        }
+    });
+    
+    let avg_loss = total_loss / val_loader.len() as f32;
+    let accuracy = total_correct as f32 / total_samples as f32;
+    
+    (avg_loss, accuracy)
+}
+
+/// Save model checkpoint
+fn save_checkpoint(model: &MNISTNet, optimizer: &impl Optimizer, epoch: i32, path: &str) {
+    let checkpoint = Checkpoint {
+        model_state: model.state_dict(),
+        optimizer_state: optimizer.state_dict(),
+        epoch,
+    };
+    
+    checkpoint.save(path);
+    println("💾 Checkpoint saved to {}", path);
+}
+
+/// Load model checkpoint
+fn load_checkpoint(model: &var MNISTNet, optimizer: &var impl Optimizer, path: &str) -> i32 {
+    let checkpoint = Checkpoint::load(path);
+    
+    model.load_state_dict(&checkpoint.model_state);
+    optimizer.load_state_dict(&checkpoint.optimizer_state);
+    
+    println("📂 Checkpoint loaded from {}", path);
+    checkpoint.epoch
+}
+
+/// Main training function
+async fn train_mnist() -> Result<(), Error> {
+    println("🚀 Starting MNIST Training");
+    
+    // Configuration
+    let config = TrainingConfig::default();
+    println("📋 Configuration:");
+    println("  Epochs: {}", config.epochs);
+    println("  Batch size: {}", config.batch_size);
+    println("  Learning rate: {}", config.learning_rate);
+    println("  Device: {:?}", config.device);
+    
+    // Load dataset
+    println("\n📦 Loading MNIST dataset...");
+    let train_dataset = MNISTDataset::load("data/mnist/train")?;
+    let val_dataset = MNISTDataset::load("data/mnist/val")?;
+    
+    let train_loader = DataLoader::new(train_dataset, config.batch_size, shuffle: true);
+    let val_loader = DataLoader::new(val_dataset, config.batch_size, shuffle: false);
+    
+    println("  Training samples: {}", train_loader.dataset().len());
+    println("  Validation samples: {}", val_loader.dataset().len());
+    
+    // Create model
+    println("\n🏗️  Building model...");
+    let model = MNISTNet::new().to(&config.device);
+    println("  Total parameters: {}", model.count_parameters());
+    
+    // Create optimizer and loss function
+    let var optimizer = Adam::new(model.parameters(), config.learning_rate);
+    let loss_fn = CrossEntropyLoss::new();
+    
+    // Create metrics tracker
+    let var metrics = MetricsTracker::new();
+    
+    // Training loop
+    println("\n🔥 Training started!\n");
+    
+    for epoch in 1..=config.epochs {
+        println("Epoch {}/{}", epoch, config.epochs);
+        println("─".repeat(50));
+        
+        // Train
+        let (train_loss, train_acc) = train_epoch(
+            &model,
+            &train_loader,
+            &var optimizer,
+            &loss_fn,
+            &config.device,
+        );
+        
+        // Validate
+        let (val_loss, val_acc) = validate(
+            &model,
+            &val_loader,
+            &loss_fn,
+            &config.device,
+        );
+        
+        // Update metrics
+        metrics.update(train_loss, val_loss, train_acc, val_acc);
+        
+        // Print epoch summary
+        println("\nEpoch {} Results:", epoch);
+        println("  Train Loss: {:.4} | Train Acc: {:.2}%", train_loss, train_acc * 100.0);
+        println("  Val Loss:   {:.4} | Val Acc:   {:.2}%", val_loss, val_acc * 100.0);
+        
+        // Save checkpoint
+        let checkpoint_path = format("{}/epoch_{}.pt", config.checkpoint_dir, epoch);
+        save_checkpoint(&model, &optimizer, epoch, &checkpoint_path);
+        
+        // Early stopping
+        check metrics.should_stop(config.early_stopping_patience) {
+            println("\n⚠️  Early stopping triggered!");
+            abort;
+        }
+        
+        println();
+    }
+    
+    // Print final summary
+    metrics.print_summary();
+    
+    // Test on test set
+    println("\n🧪 Running final evaluation on test set...");
+    let test_dataset = MNISTDataset::load("data/mnist/test")?;
+    let test_loader = DataLoader::new(test_dataset, config.batch_size, shuffle: false);
+    
+    let (test_loss, test_acc) = validate(&model, &test_loader, &loss_fn, &config.device);
+    println("Test Loss: {:.4} | Test Acc: {:.2}%", test_loss, test_acc * 100.0);
+    
+    // Save final model
+    let final_path = format("{}/final_model.pt", config.checkpoint_dir);
+    save_checkpoint(&model, &optimizer, config.epochs, &final_path);
+    
+    println("\n✅ Training complete!");
+    
+    Ok(())
+}
+
+fn main() {
+    // Run async training
+    runtime::block_on(train_mnist()).expect("Training failed");
+}

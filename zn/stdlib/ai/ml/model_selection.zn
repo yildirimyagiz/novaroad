@@ -1,0 +1,108 @@
+// 📊 Nova ML — Model Selection — v10.0
+// Tools for cross-validation, hyperparameter tuning, and dataset splitting.
+//
+// Syntax: data / cases / yield / check / each / match / given
+
+use ai::ml::tensor::{Tensor, zeros};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  DATA SPLITTING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Splits a dataset into random train and test subsets.
+open fn train_test_split(X: &Tensor, y: &Tensor, test_size: f32) -> (Tensor, Tensor, Tensor, Tensor) {
+    let n_samples = X.data[0];
+    let n_test = (n_samples as f32 * test_size) as i64;
+    let n_train = n_samples - n_test;
+
+    // Use hardware-shuffled indices via @extern
+    let indices = @extern("nova_ml_rand_indices", n_samples);
+    
+    let train_idx = indices.slice(0, n_train);
+    let test_idx = indices.slice(n_train, n_samples);
+
+    yield (
+        X.index_select(&train_idx),
+        X.index_select(&test_idx),
+        y.index_select(&train_idx),
+        y.index_select(&test_idx)
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  CROSS VALIDATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data KFold {
+    open n_splits: i64,
+    open shuffle:  bool,
+}
+
+impl KFold {
+    open fn new(n: i64) -> KFold {
+        KFold { n_splits: n, shuffle: true };
+    }
+
+    /// Generates indices to split data into training and test sets.
+    open fn split(&self, X: &Tensor) -> Vec<(Vec<i64>, Vec<i64>)> {
+        let n_samples = X.data[0];
+        let fold_size = n_samples / self.n_splits;
+        var result = [];
+
+        each i in 0..self.n_splits {
+            let start = i * fold_size;
+            let end = check i == self.n_splits - 1 { n_samples } else { yield (i + 1) * fold_size};
+
+            var test_idx = [];
+            each j in start..end { test_idx.push(j); }
+
+            var train_idx = [];
+            each j in 0..start { train_idx.push(j); }
+            each j in end..n_samples { train_idx.push(j); }
+
+            result.push((train_idx, test_idx));
+        }
+        yield result;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  HYPERPARAMETER TUNING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open cases ParamValue {
+    F32(f32),
+    I64(i64),
+    Str(String),
+}
+
+open data GridSearchCV {
+    open param_grid: HashMap<String, Vec<ParamValue>>,
+    open cv_folds:   i64,
+}
+
+impl GridSearchCV {
+    open fn new(grid: HashMap<String, Vec<ParamValue>>) -> GridSearchCV {
+        GridSearchCV {
+            param_grid: grid,
+            cv_folds:   5,
+        };
+    }
+
+    /// Exhaustive search over specified parameter values for an estimator.
+    open fn fit(&self, X: &Tensor, y: &Tensor) {
+        println("🔍 Running Grid Search CV...");
+        // Combinatorial expansion of parameters and parallel CV dispatch
+        @extern("nova_ml_grid_search", self, X, y);
+        yield;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  METRICS HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open fn accuracy_score(y_true: &Tensor, y_pred: &Tensor) -> f32 {
+    let eq = @extern("nova_ml_eq", y_true, y_pred);
+    yield @extern("nova_ml_mean", &eq);
+}

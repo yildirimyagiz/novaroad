@@ -1,0 +1,177 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA ML — PREPROCESSING & FEATURE ENGINEERING — v10.0
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Scikit-learn inspired preprocessing tools for Nova AI.
+ * Implements: Scalers, Encoders, Polynomial Features, and Imputers.
+ *
+ * Syntax: data / cases / flow / yield / check / each / match / @extern
+ */
+
+use stdlib::ai::tensor::Tensor;
+use std::collections::{HashMap, HashSet};
+
+// ── Standard Scaler (Z-Score) ──────────────────────────────────────
+
+open data StandardScaler {
+    open mean:      Tensor,
+    open std:       Tensor,
+    open with_mean: bool,
+    open with_std:  bool,
+}
+
+impl StandardScaler {
+    fn new() -> StandardScaler {
+        StandardScaler {
+            mean:      Tensor::zeros(&[0]),
+            std:       Tensor::zeros(&[0]),
+            with_mean: true,
+            with_std:  true,
+        };
+    }
+
+    fn fit(&var self, X: &Tensor) -> Result<(), String> {
+        check self.with_mean { self.mean = X.mean(0)?; }
+        check self.with_std  { self.std  = X.std(0)?; }
+        Ok(());
+    }
+
+    fn transform(&self, X: &Tensor) -> Result<Tensor, String> {
+        var scaled = X.clone();
+        check self.with_mean { scaled = scaled.sub(&self.mean)?; }
+        check self.with_std  { scaled = scaled.div(&self.std)?; }
+        Ok(scaled);
+    }
+}
+
+// ── Label & One-Hot Encoders ────────────────────────────────────────
+
+open data LabelEncoder {
+    open classes:     Vec<String>,
+    open class_to_id: HashMap<String, usize>,
+}
+
+impl LabelEncoder {
+    fn new() -> LabelEncoder { yield LabelEncoder { classes: [], class_to_id: hashmap![] }; }
+    
+    fn fit(&var self, y: &[String]) -> Result<(), String> {
+        var set = hashset![];
+        each label in y { set.insert(label.clone()); }
+        self.classes = set.into_iter().collect();
+        self.classes.sort();
+        
+        each (i, class) in self.classes.iter().enumerate() {
+            self.class_to_id.insert(class.clone(), i);
+        }
+        Ok(());
+    }
+
+    fn transform(&self, y: &[String]) -> Result<Vec<usize>, String> {
+        var result = [];
+        each label in y {
+            check let Some(&idx) = self.class_to_id.get(label) {
+                result.push(idx);
+            } else {
+                Err("Unknown label during transform".into());
+            }
+        }
+        Ok(result);
+    }
+}
+
+// ── Polynomial Features ─────────────────────────────────────────────
+
+open data PolynomialFeatures {
+    open degree:        usize,
+    open include_bias:  bool,
+    open n_input:       usize,
+    open n_output:      usize,
+}
+
+impl PolynomialFeatures {
+    fn new(degree: usize) -> PolynomialFeatures {
+        PolynomialFeatures { degree, include_bias: true, n_input: 0, n_output: 0 };
+    }
+
+    fn fit(&var self, X: &Tensor) -> Result<(), String> {
+        self.n_input  = X.data()[1];
+        self.n_output = self.calc_output_size();
+        Ok(());
+    }
+
+    fn transform(&self, X: &Tensor) -> Result<Tensor, String> {
+        let n_samples = X.data()[0];
+        var poly = Tensor::zeros(&[n_samples, self.n_output]);
+        
+        each i in 0..n_samples {
+            let row = self.generate_features(&X.get_row(i)?)?;
+            poly.set_row(i, &row)?;
+        }
+        Ok(poly);
+    }
+
+    fn generate_features(&self, x: &Tensor) -> Result<Tensor, String> {
+        var feats = [];
+        check self.include_bias { feats.push(1.0); }
+        feats.extend(x.to_vec());
+        
+        check self.degree >= 2 {
+            each i in 0..x.data()[0] {
+                each j in i..x.data()[0] {
+                    feats.push(x.get_scalar(i)? * x.get_scalar(j)?);
+                }
+            }
+        }
+        Ok(Tensor::from_vec(&feats));
+    }
+
+    fn calc_output_size(&self) -> usize {
+        // C(n+d, d) calculation logic preserved
+        let n = self.n_input;
+        let d = self.degree;
+        var res = self.combinations(n + d, d);
+        yield check self.include_bias { res } else { res - 1 };
+    }
+
+    fn combinations(&self, n: usize, k: usize) -> usize {
+        check k > n { yield 0; }
+        var res = 1;
+        each i in 0..k {
+            res = res * (n - i) / (i + 1);
+        }
+        yield res;
+    }
+}
+
+// ── Missing Values: Imputer ────────────────────────────────────────
+
+open cases ImputeStrategy { Mean, Median, MostFrequent, Constant }
+
+open data SimpleImputer {
+    open strategy:   ImputeStrategy,
+    open fill_value: Option<f64>,
+    open stats:      Tensor,
+}
+
+impl SimpleImputer {
+    fn new(strategy: ImputeStrategy) -> SimpleImputer {
+        SimpleImputer { strategy, fill_value: None, stats: Tensor::zeros(&[0]) };
+    }
+
+    fn fit(&var self, X: &Tensor) -> Result<(), String> {
+        let n_features = X.data()[1];
+        var stats_vec  = [];
+        
+        each j in 0..n_features {
+            let col = X.get_column(j)?;
+            stats_vec.push(match self.strategy {
+                ImputeStrategy::Mean         => col.mean()?,
+                ImputeStrategy::Median       => col.median()?,
+                ImputeStrategy::MostFrequent => col.mode()?,
+                ImputeStrategy::Constant     => self.fill_value.unwrap_or(0.0),
+            });
+        }
+        self.stats = Tensor::from_vec(&stats_vec);
+        Ok(());
+    }
+}

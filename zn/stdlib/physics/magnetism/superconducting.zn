@@ -1,0 +1,561 @@
+// Nova Physics: Superconducting Magnets
+// High-field magnets, quench protection, cryogenics
+// Applications: MRI, particle accelerators, fusion reactors, maglev
+
+@module("physics::magnetism::superconducting")
+@verified
+@export
+@research_level("advanced")
+
+use physics::core::{constants::*, units::*};
+use physics::cryogenic::operations::{CryogenicRegime, CoolingSystem};
+
+// ============================================================================
+// Superconducting Magnet Types
+// ============================================================================
+
+#[derive(Clone, Copy)]
+open cases MagnetApplication {
+    MRI,            // 1.5-11.7 T
+    NMR,            // 14-28 T
+    ParticleAccelerator, // LHC: 8.3 T dipoles
+    FusionReactor,  // ITER: 11.8-13 T
+    Maglev,         // 5-7 T
+    Research        // Record: 45.5 T (hybrid)
+}
+
+/// Superconducting magnet specifications
+@research_citation("IEEE Transactions on Applied Superconductivity, 2020")
+open data SuperconductingMagnet {
+    application: MagnetApplication,
+    field_strength: f64,        // Tesla
+    bore_diameter: f64,         // meters
+    conductor_type: ConductorType,
+    operating_current: f64,     // Amperes
+    stored_energy: f64,         // Joules
+    inductance: f64,            // Henries
+    operating_temp: f64,        // Kelvin
+    quench_protection: QuenchProtectionSystem
+}
+
+#[derive(Clone, Copy)]
+open cases ConductorType {
+    /// Low Temperature Superconductors (LTS)
+    NbTi,           // Workhorse, 4.2 K, 9 T
+    Nb3Sn,          // Higher field, 4.2 K, 18 T
+    
+    /// High Temperature Superconductors (HTS)
+    YBCO,           // 77 K, 100+ T potential
+    BSCCO,          // 110 K critical temp
+    ReBCO,          // Rare-earth barium copper oxide
+    
+    /// MgB2 (intermediate)
+    MgB2,           // 39 K, cheaper than HTS
+    
+    /// Iron-based (new)
+    FeSe            // 8-37 K depending on pressure
+}
+
+impl ConductorType {
+    /// Critical temperature Tc
+    @pure
+    fn critical_temperature(&self) -> f64 {
+        match self {
+            ConductorType::NbTi => 9.2,
+            ConductorType::Nb3Sn => 18.0,
+            ConductorType::YBCO => 92.0,
+            ConductorType::BSCCO => 110.0,
+            ConductorType::ReBCO => 95.0,
+            ConductorType::MgB2 => 39.0,
+            ConductorType::FeSe => 37.0
+        }
+    }
+    
+    /// Upper critical field Bc2 at 4.2 K
+    @pure
+    fn upper_critical_field_4k(&self) -> f64 {
+        match self {
+            ConductorType::NbTi => 14.5,
+            ConductorType::Nb3Sn => 28.0,
+            ConductorType::YBCO => 120.0,
+            ConductorType::BSCCO => 200.0,
+            ConductorType::ReBCO => 150.0,
+            ConductorType::MgB2 => 16.0,
+            ConductorType::FeSe => 100.0
+        }
+    }
+    
+    /// Critical current density (A/mm²) at 4.2 K, 5 T
+    @pure
+    fn critical_current_density(&self) -> f64 {
+        match self {
+            ConductorType::NbTi => 2500.0,
+            ConductorType::Nb3Sn => 3000.0,
+            ConductorType::YBCO => 10000.0,
+            ConductorType::BSCCO => 8000.0,
+            ConductorType::ReBCO => 12000.0,
+            ConductorType::MgB2 => 1000.0,
+            ConductorType::FeSe => 5000.0
+        }
+    }
+    
+    /// Cost ($/kg-m) - relative
+    @pure
+    fn relative_cost(&self) -> f64 {
+        match self {
+            ConductorType::NbTi => 1.0,      // Baseline
+            ConductorType::Nb3Sn => 3.0,
+            ConductorType::YBCO => 100.0,    // Expensive!
+            ConductorType::BSCCO => 80.0,
+            ConductorType::ReBCO => 90.0,
+            ConductorType::MgB2 => 5.0,
+            ConductorType::FeSe => 50.0
+        }
+    }
+}
+
+impl SuperconductingMagnet {
+    /// LHC dipole magnet
+    @pure
+    fn lhc_dipole() -> Self {
+        Self {
+            application: MagnetApplication::ParticleAccelerator,
+            field_strength: 8.33,
+            bore_diameter: 0.056,       // 56 mm
+            conductor_type: ConductorType::NbTi,
+            operating_current: 11850.0,
+            stored_energy: 7.0e6,       // 7 MJ per magnet
+            inductance: 100.0,          // 100 H
+            operating_temp: 1.9,        // Superfluid helium!
+            quench_protection: QuenchProtectionSystem::lhc_system()
+        }
+    }
+    
+    /// ITER toroidal field coil
+    @pure
+    fn iter_tf_coil() -> Self {
+        Self {
+            application: MagnetApplication::FusionReactor,
+            field_strength: 11.8,
+            bore_diameter: 0.9,
+            conductor_type: ConductorType::Nb3Sn,
+            operating_current: 68000.0,
+            stored_energy: 41.0e9,      // 41 GJ total (18 coils)
+            inductance: 18.0,
+            operating_temp: 4.5,
+            quench_protection: QuenchProtectionSystem::iter_system()
+        }
+    }
+    
+    /// Clinical 7T MRI
+    @pure
+    fn mri_7t() -> Self {
+        Self {
+            application: MagnetApplication::MRI,
+            field_strength: 7.0,
+            bore_diameter: 0.9,
+            conductor_type: ConductorType::NbTi,
+            operating_current: 300.0,
+            stored_energy: 5.0e6,
+            inductance: 111.0,
+            operating_temp: 4.2,
+            quench_protection: QuenchProtectionSystem::mri_system()
+        }
+    }
+    
+    /// Record high-field magnet (National High Magnetic Field Lab)
+    @pure
+    fn nhmfl_45t() -> Self {
+        Self {
+            application: MagnetApplication::Research,
+            field_strength: 45.5,       // World record (hybrid)
+            bore_diameter: 0.032,       // 32 mm
+            conductor_type: ConductorType::Nb3Sn,
+            operating_current: 31500.0,
+            stored_energy: 50.0e6,
+            inductance: 101.0,
+            operating_temp: 4.2,
+            quench_protection: QuenchProtectionSystem::research_system()
+        }
+    }
+    
+    /// Magnetic field energy density
+    /// u = B²/(2μ₀)
+    @pure
+    fn energy_density(&self) -> f64 {
+        let mu0 = 4.0 * PI * 1e-7;  // H/m
+        yield (self.field_strength * self.field_strength) / (2.0 * mu0)
+    }
+    
+    /// Magnetic pressure (force per unit area)
+    /// P = B²/(2μ₀)
+    @pure
+    fn magnetic_pressure(&self) -> f64 {
+        self.energy_density()  // Same as energy density
+    }
+    
+    /// Hoop stress on coil
+    /// σ = B²R/(2μ₀t) for thin-walled cylinder
+    @pure
+    fn hoop_stress(&self, wall_thickness: f64) -> f64 {
+        let r = self.bore_diameter / 2.0;
+        let mu0 = 4.0 * PI * 1e-7;
+        
+        yield (self.field_strength * self.field_strength * r) / (2.0 * mu0 * wall_thickness)
+    }
+    
+    /// Is conductor operating safely?
+    @pure
+    fn is_safe_operation(&self) -> bool {
+        let tc = self.conductor_type.critical_temperature();
+        let bc2 = self.conductor_type.upper_critical_field_4k();
+        
+        // Check: T < Tc and B < Bc2
+        self.operating_temp < 0.9 * tc && self.field_strength < 0.9 * bc2
+    }
+}
+
+// ============================================================================
+// Quench Protection
+// ============================================================================
+
+/// Quench: Sudden loss of superconductivity
+/// Can be catastrophic check not managed!
+@research_citation("Cryogenics, 2018")
+open data QuenchProtectionSystem {
+    detection_time_ms: f64,     // Quench detection time
+    dump_resistor_ohms: f64,    // External dump resistor
+    heater_coverage: f64,       // Fraction of coil with quench heaters
+    max_temperature: f64,       // K (maximum allowable)
+    max_voltage: f64            // kV (maximum during dump)
+}
+
+impl QuenchProtectionSystem {
+    /// LHC quench protection
+    @pure
+    fn lhc_system() -> Self {
+        Self {
+            detection_time_ms: 10.0,    // 10 ms detection
+            dump_resistor_ohms: 0.075,  // 75 mΩ
+            heater_coverage: 0.9,       // 90% coverage
+            max_temperature: 300.0,     // 300 K max
+            max_voltage: 600.0          // 600 V
+        }
+    }
+    
+    /// ITER quench protection
+    @pure
+    fn iter_system() -> Self {
+        Self {
+            detection_time_ms: 100.0,   // Slower due to size
+            dump_resistor_ohms: 0.1,
+            heater_coverage: 1.0,       // Full coverage
+            max_temperature: 150.0,
+            max_voltage: 10000.0        // 10 kV
+        }
+    }
+    
+    /// MRI quench protection
+    @pure
+    fn mri_system() -> Self {
+        Self {
+            detection_time_ms: 50.0,
+            dump_resistor_ohms: 0.5,
+            heater_coverage: 0.8,
+            max_temperature: 100.0,
+            max_voltage: 1000.0
+        }
+    }
+    
+    /// Research magnet protection
+    @pure
+    fn research_system() -> Self {
+        Self {
+            detection_time_ms: 5.0,     // Fast detection
+            dump_resistor_ohms: 0.02,
+            heater_coverage: 1.0,
+            max_temperature: 200.0,
+            max_voltage: 5000.0
+        }
+    }
+    
+    /// Energy dissipation time constant
+    /// τ = L/R
+    @pure
+    fn time_constant(&self, inductance: f64) -> f64 {
+        inductance / self.dump_resistor_ohms
+    }
+    
+    /// Peak temperature during quench
+    /// Simplified: T_max ∝ J²ρt
+    @heuristic
+    fn estimate_peak_temperature(
+        &self,
+        current_density: f64,
+        resistivity: f64,
+        quench_duration: f64
+    ) -> f64 {
+        // Simplified adiabatic heating
+        let base_temp = 4.2;
+        let heating = current_density * current_density * resistivity * quench_duration * 1e6;
+        
+        base_temp + heating.min(self.max_temperature - base_temp)
+    }
+}
+
+// ============================================================================
+// Magnet Training & Memory
+// ============================================================================
+
+/// Training process for Nb3Sn magnets
+/// Magnets "remember" previous quenches and improve
+open data MagnetTraining {
+    quench_number: u32,
+    achieved_field: f64,        // T
+    target_field: f64,          // T
+    training_complete: bool
+}
+
+impl MagnetTraining {
+    @pure
+    fn new(target_field: f64) -> Self {
+        Self {
+            quench_number: 0,
+            achieved_field: 0.0,
+            target_field,
+            training_complete: false
+        }
+    }
+    
+    /// Simulate training quench
+    /// Field improves with each quench
+    fn perform_quench(&var self) {
+        self.quench_number += 1;
+        
+        // Empirical: Field approaches target exponentially
+        let improvement = 0.1 * (self.target_field - self.achieved_field);
+        self.achieved_field += improvement;
+        
+        check self.achieved_field >= 0.98 * self.target_field {
+            self.training_complete = true;
+        }
+    }
+    
+    @pure
+    fn training_progress(&self) -> f64 {
+        yield (self.achieved_field / self.target_field) * 100.0
+    }
+}
+
+// ============================================================================
+// Cryogenic System for Magnets
+// ============================================================================
+
+open data MagnetCryogenics {
+    coolant: Coolant,
+    operating_temp: f64,        // K
+    mass_flow_rate: f64,        // kg/s
+    cooling_capacity: f64,      // W
+    heat_load: f64              // W (static + dynamic)
+}
+
+#[derive(Clone, Copy)]
+open cases Coolant {
+    LiquidHelium4,      // 4.2 K
+    SuperfluidHelium,   // 1.8-2.2 K (below lambda point)
+    LiquidNitrogen,     // 77 K (for HTS)
+    GaseousHelium,      // Conduction cooling
+    Cryocooler          // Closed-cycle, no liquid
+}
+
+impl MagnetCryogenics {
+    /// LHC cryogenics (superfluid helium)
+    @pure
+    fn lhc_cryogenics() -> Self {
+        Self {
+            coolant: Coolant::SuperfluidHelium,
+            operating_temp: 1.9,
+            mass_flow_rate: 0.1,
+            cooling_capacity: 150.0,    // W per dipole
+            heat_load: 100.0            // Typical
+        }
+    }
+    
+    /// ITER cryogenics
+    @pure
+    fn iter_cryogenics() -> Self {
+        Self {
+            coolant: Coolant::SuperfluidHelium,
+            operating_temp: 4.5,
+            mass_flow_rate: 12.5,       // kg/s total
+            cooling_capacity: 75000.0,  // 75 kW at 4.5 K
+            heat_load: 65000.0
+        }
+    }
+    
+    /// Cooling power required (Carnot limit)
+    /// P_comp = P_cool · (T_h - T_c) / T_c / η
+    @pure
+    fn compressor_power(&self, ambient_temp: f64, efficiency: f64) -> f64 {
+        let carnot_cop = self.operating_temp / (ambient_temp - self.operating_temp);
+        let real_cop = efficiency * carnot_cop;
+        
+        self.cooling_capacity / real_cop
+    }
+    
+    /// Liquid helium boil-off rate
+    /// Q = ṁ · L_v (latent heat)
+    @pure
+    fn boiloff_rate_liters_per_hour(&self) -> f64 {
+        // Latent heat of He: 20.9 kJ/kg
+        // Density of liquid He: 125 kg/m³
+        let l_v = 20900.0;  // J/kg
+        let rho = 125.0;    // kg/m³
+        
+        let mass_rate = self.heat_load / l_v;  // kg/s
+        let volume_rate = mass_rate / rho;     // m³/s
+        
+        volume_rate * 3600.0 * 1000.0  // L/h
+    }
+}
+
+// ============================================================================
+// Record Magnetic Fields
+// ============================================================================
+
+open data MagneticFieldRecord {
+    field_tesla: f64,
+    magnet_type: String,
+    institution: String,
+    year: u32,
+    bore_size_mm: f64
+}
+
+@const
+open fn field_records() -> Vec<MagneticFieldRecord> {
+    [
+        MagneticFieldRecord {
+            field_tesla: 45.5,
+            magnet_type: "Hybrid (resistive + superconducting)".into(),
+            institution: "NHMFL, Florida".into(),
+            year: 1999,
+            bore_size_mm: 32.0
+        },
+        MagneticFieldRecord {
+            field_tesla: 32.0,
+            magnet_type: "All-superconducting".into(),
+            institution: "NHMFL, Florida".into(),
+            year: 2017,
+            bore_size_mm: 34.0
+        },
+        MagneticFieldRecord {
+            field_tesla: 26.8,
+            magnet_type: "Nb3Sn + YBCO".into(),
+            institution: "LNCMI, France".into(),
+            year: 2020,
+            bore_size_mm: 34.0
+        },
+        MagneticFieldRecord {
+            field_tesla: 23.5,
+            magnet_type: "NMR (commercial)".into(),
+            institution: "Bruker".into(),
+            year: 2020,
+            bore_size_mm: 54.0
+        }
+    ]
+}
+
+// ============================================================================
+// Tests & Examples
+// ============================================================================
+
+#[test]
+fn test_lhc_dipole() {
+    let lhc = SuperconductingMagnet::lhc_dipole();
+    
+    println("LHC Dipole Magnet:");
+    println("  Field: {:.2} T", lhc.field_strength);
+    println("  Current: {:.0} A", lhc.operating_current);
+    println("  Stored energy: {:.1} MJ", lhc.stored_energy / 1e6);
+    println("  Operating temp: {:.1} K", lhc.operating_temp);
+    println("  Magnetic pressure: {:.1} MPa", lhc.magnetic_pressure() / 1e6);
+    
+    let stress = lhc.hoop_stress(0.01);  // 10 mm wall
+    println("  Hoop stress: {:.0} MPa", stress / 1e6);
+    
+    assert(lhc.is_safe_operation());
+}
+
+#[test]
+fn test_conductor_comparison() {
+    let conductors = [
+        ("NbTi", ConductorType::NbTi),
+        ("Nb3Sn", ConductorType::Nb3Sn),
+        ("YBCO", ConductorType::YBCO),
+        ("MgB2", ConductorType::MgB2)
+    ];
+    
+    println("\nSuperconductor Comparison:");
+    println("{:<10} {:<10} {:<15} {:<15}", "Material", "Tc (K)", "Bc2 @4K (T)", "Jc (A/mm²)");
+    println("{}", "-".repeat(55));
+    
+    each entry in conductors.iter()  { let (name, conductor) = entry;
+        println("{:<10} {:<10.1} {:<15.1} {:<15.0}",
+                 name,
+                 conductor.critical_temperature(),
+                 conductor.upper_critical_field_4k(),
+                 conductor.critical_current_density());
+    }
+}
+
+#[test]
+fn test_quench_protection() {
+    let quench = QuenchProtectionSystem::lhc_system();
+    
+    let inductance = 100.0;  // H
+    let tau = quench.time_constant(inductance);
+    
+    println("LHC Quench Protection:");
+    println("  Detection time: {:.0} ms", quench.detection_time_ms);
+    println("  Dump resistor: {:.0} mΩ", quench.dump_resistor_ohms * 1000.0);
+    println("  Time constant: {:.0} s", tau);
+    println("  Max temperature: {:.0} K", quench.max_temperature);
+    
+    assert(tau > 1000.0);  // > 1000 s for LHC
+}
+
+#[test]
+fn test_magnet_training() {
+    var training = MagnetTraining::new(16.0);  // Target 16 T
+    
+    println("Magnet Training:");
+    
+    each _ in 0..10 {
+        training.perform_quench();
+        println("  Quench {}: {:.2} T ({:.1}%)", 
+                 training.quench_number,
+                 training.achieved_field,
+                 training.training_progress());
+        
+        check training.training_complete {
+            println("  Training complete!");
+            abort;
+        }
+    }
+}
+
+#[test]
+fn test_cryogenics() {
+    let cryo = MagnetCryogenics::lhc_cryogenics();
+    
+    let comp_power = cryo.compressor_power(293.0, 0.3);
+    let boiloff = cryo.boiloff_rate_liters_per_hour();
+    
+    println("LHC Cryogenics:");
+    println("  Operating temp: {:.1} K", cryo.operating_temp);
+    println("  Cooling capacity: {:.0} W", cryo.cooling_capacity);
+    println("  Compressor power: {:.0} kW", comp_power / 1000.0);
+    println("  Boil-off: {:.1} L/h", boiloff);
+}
+EOF
+echo "✅ Superconducting magnets module completed!"

@@ -1,0 +1,1125 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova — Advanced Auto-Parallelization Engine                           ║
+// ║  Mobile-Aware · Data-parallel · Task-parallel · SIMD candidate detection     ║
+// ║  UI Parallel · ML Batch · AR Processing · Sensor Fusion · Animation Parallel ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::HashSet;
+use compiler::frontend::ast::{
+    BinOp, Block, Expr, IdentExpr, RangeExpr, Stmt, Span,
+    LetStmt, VarStmt, YieldStmt, ExprStmt, ContractStmt,
+    EachExpr, MatchExpr, MatchArm,
+};
+use compiler::frontend::mobile::mobile_ast_extensions::{
+    MobileExpr, MobileStmt, TouchEventExpr, GestureEventExpr,
+    DeviceSensorExpr, PlatformCallExpr, UIComponentExpr,
+    TouchEventType, GestureType, SensorType, SensorData,
+    UIComponentType, TouchHandlerStmt, GestureHandlerStmt,
+    SensorHandlerStmt, UIUpdateStmt, NavigationStmt,
+};
+use compiler::frontend::advanced::aurora_advanced_ui::{
+    AuroraView, ViewType, Modifiers, ViewModifier,
+};
+use compiler::frontend::advanced::animation_system::{
+    AnimatedValue, ViewAnimation, AnimationController,
+};
+use compiler::frontend::advanced::advanced_platform_apis::{
+    MLEngine, AREngine, AdvancedCamera, BackgroundEngine,
+};
+use compiler::frontend::advanced::accessibility_framework::{
+    AccessibilityEngine, AccessibleView,
+};
+
+expose cases ParallelismKind {
+    SIMD,
+    DataParallel,
+    TaskParallel,
+    Pipeline,
+    NestedData,
+    Recursive,
+    // Mobile-specific parallelization kinds
+    UIParallel,        // Parallel UI component rendering
+    AnimationParallel, // Parallel animation processing
+    MLBatchParallel,   // ML inference batching
+    ARParallel,        // AR scene processing
+    CameraPipeline,    // Camera processing pipeline
+    GestureParallel,   // Multi-touch gesture processing
+    SensorFusion,      // Sensor data fusion
+    AccessibilityParallel, // Accessibility processing
+    NetworkBatch,      // Network request batching
+    BackgroundTaskParallel, // Background task parallelization
+}
+
+expose cases ParallelizationOpportunity {
+    None,
+    DataParallel,
+    SIMD,
+    Reduction,
+    TaskParallel,
+    // Mobile opportunities
+    UIParallel,
+    AnimationParallel,
+    MLBatchParallel,
+    ARParallel,
+    CameraPipeline,
+    GestureParallel,
+    SensorFusion,
+    AccessibilityParallel,
+    NetworkBatch,
+    BackgroundTaskParallel,
+}
+
+// ============================================================================
+// Variable use collection (conservative; assignment is not represented in AST)
+// ============================================================================
+
+expose data VarUse {
+    reads:  HashSet<String>,
+    writes: HashSet<String>,
+}
+
+impl VarUse {
+    open fn new() -> VarUse {
+        VarUse { reads: HashSet::new(), writes: HashSet::new() }
+    }
+
+    open fn merge(&var self, other: VarUse) {
+        each r in other.reads { self.reads.insert(r); }
+        each w in other.writes { self.writes.insert(w); }
+    }
+
+    open fn remove_local(&var self, name: &String) {
+        self.reads.remove(name);
+        self.writes.remove(name);
+    }
+}
+
+fn collect_expr_reads(expr: &Expr, reads: &var HashSet<String>) {
+    match expr {
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Unit => {}
+
+        Expr::Measured(_) => {}  // measured literals don't read variables
+
+        Expr::Ident(IdentExpr { name, .. }) => {
+            reads.insert(name.clone());
+        }
+
+        Expr::Path(_) => {}  // paths don't read local variables
+
+        Expr::Binary(BinaryExpr { left, op: _, right, .. }) => {
+            collect_expr_reads(left.as_ref(), reads);
+            collect_expr_reads(right.as_ref(), reads);
+        }
+
+        Expr::Unary(UnaryExpr { op: _, operand, .. }) => {
+            collect_expr_reads(operand.as_ref(), reads);
+        }
+
+        Expr::Range(RangeExpr { start, end, inclusive: _, .. }) => {
+            collect_expr_reads(start.as_ref(), reads);
+            collect_expr_reads(end.as_ref(), reads);
+        }
+
+        Expr::Call(CallExpr { callee, args, type_args: _, .. }) => {
+            collect_expr_reads(callee.as_ref(), reads);
+            each arg in args {
+                collect_expr_reads(arg, reads);
+            }
+        }
+
+        Expr::Method(MethodExpr { receiver, method: _, args, type_args: _, .. }) => {
+            collect_expr_reads(receiver.as_ref(), reads);
+            each arg in args {
+                collect_expr_reads(arg, reads);
+            }
+        }
+
+        Expr::Math(MathExpr { op: _, args, wrt, bounds: _, .. }) => {
+            each arg in args {
+                collect_expr_reads(arg, reads);
+            }
+            check let Some(w) = wrt {
+                collect_expr_reads(w.as_ref(), reads);
+            }
+        }
+
+        Expr::Index(IndexExpr { base, indices, .. }) => {
+            collect_expr_reads(base.as_ref(), reads);
+            each idx in indices {
+                collect_expr_reads(idx, reads);
+            }
+        }
+
+        Expr::Field(FieldExpr { base, field: _, .. }) => {
+            collect_expr_reads(base.as_ref(), reads);
+        }
+
+        Expr::Block(block) => {
+            let vu = collect_block_use(block);
+            each r in vu.reads { reads.insert(r); }
+        }
+
+        Expr::Lambda(LambdaExpr { params, body, .. }) => {
+            var inner = HashSet::new();
+            collect_expr_reads(body.as_ref(), &var inner);
+
+            // Remove param locals.
+            each param in params {
+                inner.remove(&param.name);
+            }
+
+            each r in inner { reads.insert(r); }
+        }
+
+        Expr::Array(ArrayExpr { elements, .. }) |
+        Expr::Tuple(TupleExpr { elements, .. }) => {
+            each elem in elements {
+                collect_expr_reads(elem, reads);
+            }
+        }
+
+        Expr::Record(RecordExpr { fields, .. }) => {
+            each entry in fields  { let (_, expr) = entry;
+                collect_expr_reads(expr, reads);
+            }
+        }
+
+        Expr::Pipe(PipeExpr { stages, .. }) => {
+            each stage in stages {
+                collect_expr_reads(stage, reads);
+            }
+        }
+
+        Expr::Check(CheckExpr { cond, then, els, .. }) => {
+            collect_expr_reads(cond.as_ref(), reads);
+            collect_expr_reads(then.as_ref(), reads);
+            check let Some(e) = els {
+                collect_expr_reads(e.as_ref(), reads);
+            }
+        }
+
+        Expr::Match(MatchExpr { value, arms, .. }) => {
+            collect_expr_reads(value.as_ref(), reads);
+            each arm in arms {
+                check let Some(guard) = &arm.guard {
+                    collect_expr_reads(guard.as_ref(), reads);
+                }
+                collect_expr_reads(&arm.body, reads);
+            }
+        }
+
+        Expr::Each(EachExpr { var: _, iterable, body, .. }) => {
+            collect_expr_reads(iterable.as_ref(), reads);
+            let vu = collect_block_use(body);
+            each r in vu.reads { reads.insert(r); }
+        }
+
+        Expr::While(WhileExpr { cond, body, .. }) => {
+            collect_expr_reads(cond.as_ref(), reads);
+            let vu = collect_block_use(body);
+            each r in vu.reads { reads.insert(r); }
+        }
+
+        Expr::Loop(LoopExpr { body, .. }) => {
+            let vu = collect_block_use(body);
+            each r in vu.reads { reads.insert(r); }
+        }
+
+        Expr::Try(expr) => {
+            collect_expr_reads(expr.as_ref(), reads);
+        }
+
+        Expr::Catch(CatchExpr { body, err_var: _, handler, .. }) => {
+            let vu_body = collect_block_use(body);
+            each r in vu_body.reads { reads.insert(r); }
+            let vu_handler = collect_block_use(handler);
+            each r in vu_handler.reads { reads.insert(r); }
+        }
+
+        Expr::TensorInit(TensorInitExpr { init, .. }) => {
+            match init {
+                TensorInit::Fill(expr) => collect_expr_reads(expr.as_ref(), reads),
+                TensorInit::FromList(exprs) => {
+                    each expr in exprs {
+                        collect_expr_reads(expr, reads);
+                    }
+                }
+                TensorInit::FromFn(expr) => collect_expr_reads(expr.as_ref(), reads),
+                _ => {}
+            }
+        }
+
+        Expr::FlowExpr(_) | Expr::Chan(_) => {}  // flow constructs don't read variables
+
+        Expr::Cast(expr, _) | Expr::UnitConvert(expr, _) => {
+            collect_expr_reads(expr.as_ref(), reads);
+        }
+
+        Expr::Assert(cond, msg) => {
+            collect_expr_reads(cond.as_ref(), reads);
+            check let Some(m) = msg {
+                collect_expr_reads(m.as_ref(), reads);
+            }
+        }
+    }
+}
+
+fn collect_stmt_use(stmt: &Stmt) -> VarUse {
+    var vu = VarUse::new();
+
+    match stmt {
+        Stmt::Let(LetStmt { pattern: _, ty: _, init, .. }) => {
+            // For now, treat let as reading from init check present
+            // Pattern matching analysis would be more complex
+            check let Some(init_expr) = init {
+                collect_expr_reads(init_expr, &var vu.reads);
+            }
+        }
+
+        Stmt::Var(VarStmt { name, ty: _, init, .. }) => {
+            vu.writes.insert(name.clone());
+            check let Some(init_expr) = init {
+                collect_expr_reads(init_expr, &var vu.reads);
+            }
+        }
+
+        Stmt::Yield(YieldStmt { value, .. }) => {
+            check let Some(val) = value {
+                collect_expr_reads(val, &var vu.reads);
+            }
+        }
+
+        Stmt::Expr(ExprStmt { expr, .. }) => {
+            collect_expr_reads(expr, &var vu.reads);
+        }
+
+        Stmt::Require(ContractStmt { cond, message, .. }) |
+        Stmt::Ensure(ContractStmt { cond, message, .. }) |
+        Stmt::Assert(ContractStmt { cond, message, .. }) => {
+            collect_expr_reads(cond, &var vu.reads);
+            check let Some(msg) = message {
+                collect_expr_reads(msg, &var vu.reads);
+            }
+        }
+
+        Stmt::Abort(_) | Stmt::Next(_) => {}
+    }
+
+    vu
+}
+
+fn collect_block_use(block: &Block) -> VarUse {
+    var out = VarUse::new();
+    each stmt in &block.stmts {
+        out.merge(collect_stmt_use(stmt));
+    }
+    out
+}
+
+fn eval_const_i64(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Int(i) => Some(i.value),
+        _ => None,
+    }
+}
+
+// ============================================================================
+// Dependency analysis (statement-level)
+// ============================================================================
+
+expose data DependencyNode {
+    id:     usize,
+    stmt:   String,
+    reads:  HashSet<String>,
+    writes: HashSet<String>,
+}
+
+expose data DependencyGraph {
+    nodes: Vec<DependencyNode>,
+    edges: Vec<(usize, usize)>, // (from, to) for conflicting nodes
+}
+
+impl DependencyGraph {
+    open fn new() -> DependencyGraph {
+        DependencyGraph { nodes: [], edges: [] }
+    }
+
+    open fn add_node(&var self, stmt: String, reads: HashSet<String>, writes: HashSet<String>) -> usize {
+        let id = self.nodes.len();
+        self.nodes.push(DependencyNode { id, stmt, reads, writes });
+        id
+    }
+
+    open fn are_dependent(&self, a: usize, b: usize) -> bool {
+        let x = &self.nodes[a];
+        let y = &self.nodes[b];
+
+        // RAW / WAR (both directions) + WAW (symmetric)
+        check !x.writes.is_disjoint(&y.reads) { yield true; }
+        check !y.writes.is_disjoint(&x.reads) { yield true; }
+        check !x.writes.is_disjoint(&y.writes) { yield true; }
+
+        false
+    }
+
+    open fn build_dependencies(&var self) {
+        each i in 0..self.nodes.len() {
+            each j in (i + 1)..self.nodes.len() {
+                check self.are_dependent(i, j) {
+                    self.edges.push((i, j));
+                }
+            }
+        }
+    }
+
+    open fn find_independent_groups(&self) -> Vec<Vec<usize>> {
+        var groups: Vec<Vec<usize>> = [];
+        var assigned: HashSet<usize> = HashSet::new();
+
+        each i in 0..self.nodes.len() {
+            let id = self.nodes[i].id;
+            check assigned.contains(&id) {
+                next;
+            }
+
+            var group: Vec<usize> = [id];
+            assigned.insert(id);
+
+            each j in 0..self.nodes.len() {
+                let other_id = self.nodes[j].id;
+                check assigned.contains(&other_id) {
+                    next;
+                }
+
+                var independent = true;
+                each k in 0..group.len() {
+                    check self.are_dependent(group[k], other_id) {
+                        independent = false;
+                        abort;
+                    }
+                }
+
+                check independent {
+                    group.push(other_id);
+                    assigned.insert(other_id);
+                }
+            }
+
+            groups.push(group);
+        }
+
+        groups
+    }
+}
+
+// ============================================================================
+// Loop analyzer (Each over Range only)
+// ============================================================================
+
+expose data LoopInfo {
+    iterator_var: String,
+    start:        i64,
+    end:          i64,
+    step:         i64,
+    body:         Block,
+
+    is_parallel:      bool,
+    has_dependencies: bool,
+    reduction_vars:   Vec<String>,
+}
+
+impl LoopInfo {
+    open fn from_each(each: &EachExpr) -> Option<LoopInfo> {
+        let (start, end, step) = match &*each.iterable {
+            Expr::Range(r) => {
+                let s = eval_const_i64(r.start.as_ref())?;
+                let e = eval_const_i64(r.end.as_ref())?;
+                let st = 1;  // v10 RangeExpr doesn't have step, assume 1
+                yield (s, e, st)
+            }
+            _ => yield None,
+        };
+
+        Some(LoopInfo {
+            iterator_var: each.var.clone(),
+            start,
+            end,
+            step,
+            body: each.body.clone(),
+            is_parallel: false,
+            has_dependencies: false,
+            reduction_vars: [],
+        })
+    }
+
+    open fn scan_body_use(&self) -> VarUse {
+        var vu = collect_block_use(&self.body);
+        vu.remove_local(&self.iterator_var);
+        vu
+    }
+
+    open fn check_dependencies(&var self) {
+        let vu = self.scan_body_use();
+
+        // Conservative: check a variable is both read and written in the loop body,
+        // treat as loop-carried dependency / reduction candidate.
+        var reds: Vec<String> = [];
+        each w in &vu.writes {
+            check vu.reads.contains(w) {
+                reds.push(w.clone());
+            }
+        }
+
+        self.reduction_vars = reds;
+        self.has_dependencies = !self.reduction_vars.is_empty();
+    }
+
+    open fn is_simd_candidate(&self) -> bool {
+        let iterations = check self.step == 0 { 0 } else { yield (self.end - self.start) / self.step};
+        iterations >= 8
+    }
+
+    open fn analyze(&var self) -> ParallelizationOpportunity {
+        self.check_dependencies();
+
+        check !self.has_dependencies {
+            self.is_parallel = true;
+            yield ParallelizationOpportunity::DataParallel;
+        }
+
+        check !self.reduction_vars.is_empty() {
+            yield ParallelizationOpportunity::Reduction;
+        }
+
+        check self.is_simd_candidate() {
+            yield ParallelizationOpportunity::SIMD;
+        }
+
+        ParallelizationOpportunity::None
+    }
+}
+
+// ============================================================================
+// Auto-parallelizer (analysis + suggestion generators)
+// ============================================================================
+
+expose data AutoParallelizer {
+    opportunities: Vec<ParallelizationOpportunity>,
+    simd_width_bits: usize,
+    thread_count:    usize,
+}
+
+impl AutoParallelizer {
+    open fn new() -> AutoParallelizer {
+        AutoParallelizer {
+            opportunities: [],
+            simd_width_bits: 256,
+            thread_count: 8,
+        }
+    }
+
+    open fn analyze_mobile_stmt(&var self, stmt: &Stmt) -> Option<ParallelizationOpportunity> {
+        match stmt {
+            Stmt::Expr(ExprStmt { expr, .. }) => {
+                match expr {
+                    Expr::Call(call) => self.analyze_mobile_call(call),
+                    Expr::Block(block) => {
+                        each s in &block.stmts {
+                            check let Some(opp) = self.analyze_mobile_stmt(s) {
+                                self.opportunities.push(opp);
+                            }
+                        }
+                        None
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    open fn analyze_mobile_call(&var self, call: &CallExpr) -> Option<ParallelizationOpportunity> {
+        check let Expr::Ident(ident) = &*call.callee {
+            match ident.name.as_str() {
+                "render_ui_components" | "update_ui_batch" => {
+                    Some(ParallelizationOpportunity::UIParallel)
+                }
+                "run_ml_inference" | "batch_ml_inference" => {
+                    Some(ParallelizationOpportunity::MLBatchParallel)
+                }
+                "process_ar_frame" | "track_ar_anchors" => {
+                    Some(ParallelizationOpportunity::ARParallel)
+                }
+                "process_camera_frame" | "apply_camera_effects" => {
+                    Some(ParallelizationOpportunity::CameraPipeline)
+                }
+                "recognize_gestures" | "process_touch_events" => {
+                    Some(ParallelizationOpportunity::GestureParallel)
+                }
+                "fuse_sensor_data" | "process_sensor_batch" => {
+                    Some(ParallelizationOpportunity::SensorFusion)
+                }
+                "synthesize_speech" | "process_accessibility" => {
+                    Some(ParallelizationOpportunity::AccessibilityParallel)
+                }
+                "batch_network_requests" | "parallel_http_calls" => {
+                    Some(ParallelizationOpportunity::NetworkBatch)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    open fn analyze_ui_components(&self, views: &Vec<AuroraView>) -> Vec<ParallelizationOpportunity> {
+        var opportunities = [];
+
+        // Check for independent UI component rendering
+        check views.len() > 3 {
+            opportunities.push(ParallelizationOpportunity::UIParallel);
+        }
+
+        // Check for animation-heavy views
+        let animated_views = views.iter()
+            .filter(|view| view.has_animations())
+            .count();
+
+        check animated_views > 2 {
+            opportunities.push(ParallelizationOpportunity::AnimationParallel);
+        }
+
+        opportunities
+    }
+
+    open fn analyze_animation_controller(&self, controller: &AnimationController) -> ParallelizationOpportunity {
+        // Parallelize multiple independent animations
+        check controller.animations.len() > 1 {
+            ParallelizationOpportunity::AnimationParallel
+        } else {
+            ParallelizationOpportunity::None
+        }
+    }
+
+    open fn analyze_ml_inference(&self, models: &Vec<String>, inputs: &Vec<Vec<f64>>) -> ParallelizationOpportunity {
+        // Batch parallel inference for multiple models or large batches
+        check models.len() > 1 || inputs.len() > 4 {
+            ParallelizationOpportunity::MLBatchParallel
+        } else {
+            ParallelizationOpportunity::None
+        }
+    }
+
+    open fn analyze_ar_processing(&self, frame_count: usize, features: &Vec<String>) -> ParallelizationOpportunity {
+        // Parallel AR processing for multiple features
+        check frame_count > 1 || features.len() > 2 {
+            ParallelizationOpportunity::ARParallel
+        } else {
+            ParallelizationOpportunity::None
+        }
+    }
+
+    open fn analyze_camera_pipeline(&self, effects: &Vec<String>, processing_steps: usize) -> ParallelizationOpportunity {
+        // Parallel camera processing pipeline
+        check effects.len() > 1 || processing_steps > 3 {
+            ParallelizationOpportunity::CameraPipeline
+        } else {
+            ParallelizationOpportunity::None
+        }
+    }
+
+    open fn analyze_sensor_fusion(&self, sensors: &Vec<SensorType>) -> ParallelizationOpportunity {
+        // Parallel sensor data fusion
+        check sensors.len() > 2 {
+            ParallelizationOpportunity::SensorFusion
+        } else {
+            ParallelizationOpportunity::None
+        }
+    }
+
+    open fn analyze_each(&var self, each: &EachExpr) -> Option<ParallelizationOpportunity> {
+        var info = LoopInfo::from_each(each)?;
+        let opp = info.analyze();
+        self.opportunities.push(opp);
+        Some(opp)
+    }
+
+    open fn parallelize_tasks(&self, stmts: &Vec<Stmt>) -> String {
+        var graph = DependencyGraph::new();
+
+        each stmt in stmts {
+            let vu = collect_stmt_use(stmt);
+            graph.add_node(format("{:?}", stmt), vu.reads, vu.writes);
+        }
+
+        graph.build_dependencies();
+        let groups = graph.find_independent_groups();
+
+        var code = String::new();
+        code.push_str("parallel_invoke!({\n");
+
+        each entry in groups.iter().enumerate()  { let (g, group) = entry;
+            code.push_str(&format("    // Parallel group {}\n", g));
+            for &node_id in group {
+                code.push_str(&format("    {};\n", graph.nodes[node_id].stmt));
+            }
+        }
+
+        code.push_str("});");
+        code
+    }
+
+    open fn vectorize_loop(&self, loop_info: &LoopInfo) -> String {
+        let lanes = self.simd_width_bits / 64;
+
+        format(
+            "// Vectorize candidate ({}-bit SIMD, {} lanes of i64)\n\
+             each {} in ({}..{}) {{\n\
+             //   let v = simd::i64x{}::load(&data[i]);\n\
+             //   ...\n\
+             //   v.store(&out[i]);\n\
+             }}",
+            self.simd_width_bits,
+            lanes,
+            loop_info.iterator_var,
+            loop_info.start,
+            loop_info.end,
+            lanes
+        )
+    }
+
+    open fn parallelize_reduction(&self, loop_info: &LoopInfo, op: &str) -> String {
+        let method = match op {
+            "sum" => "sum",
+            "product" => "product",
+            "min" => "min",
+            "max" => "max",
+            _ => "fold",
+        };
+
+        format(
+            "// Reduction candidate using {}\n\
+             // range: [{}..{}) step {}\n\
+             data[{}..{}].par_iter().{}()",
+            op,
+            loop_info.start,
+            loop_info.end,
+            loop_info.step,
+            loop_info.start,
+            loop_info.end,
+            method
+        )
+    }
+
+    open fn parallelize_ui_rendering(&self, component_count: usize) -> String {
+        format(
+            "// Parallel UI component rendering\n\
+             // {} components can be rendered concurrently\n\
+             ui_components.par_iter().for_each(|component| {{\n\
+                 component.render_parallel();\n\
+             }});",
+            component_count
+        )
+    }
+
+    open fn parallelize_animations(&self, animation_count: usize) -> String {
+        format(
+            "// Parallel animation processing\n\
+             // {} animations can run concurrently\n\
+             animations.par_iter().for_each(|animation| {{\n\
+                 animation.update_parallel(delta_time);\n\
+             }});",
+            animation_count
+        )
+    }
+
+    open fn parallelize_ml_batch(&self, batch_size: usize, model_count: usize) -> String {
+        format(
+            "// ML inference batching\n\
+             // Batch size: {}, Models: {}\n\
+             ml_engine.batch_inference(models, inputs, |results| {{\n\
+                 results.par_iter().for_each(|result| {{\n\
+                     process_ml_result(result);\n\
+                 }});\n\
+             }});",
+            batch_size, model_count
+        )
+    }
+
+    open fn parallelize_ar_processing(&self, features: &Vec<String>) -> String {
+        let feature_list = features.join(", ");
+        format(
+            "// Parallel AR scene processing\n\
+             // Features: {}\n\
+             ar_engine.process_frame_parallel(&[{}], |frame_results| {{\n\
+                 frame_results.par_iter().for_each(|result| {{\n\
+                     update_ar_scene(result);\n\
+                 }});\n\
+             }});",
+            feature_list, feature_list.to_lowercase()
+        )
+    }
+
+    open fn parallelize_camera_pipeline(&self, effects: &Vec<String>) -> String {
+        let effect_list = effects.join(", ");
+        format(
+            "// Parallel camera processing pipeline\n\
+             // Effects: {}\n\
+             camera_pipeline.process_parallel(&[{}], |processed_frame| {{\n\
+                 display_processed_frame(processed_frame);\n\
+             }});",
+            effect_list, effect_list.to_lowercase()
+        )
+    }
+
+    open fn parallelize_gesture_recognition(&self, touch_points: usize) -> String {
+        format(
+            "// Parallel gesture recognition\n\
+             // {} touch points\n\
+             touch_events.par_iter().for_each(|touch| {{\n\
+                 gesture_recognizer.process_touch_parallel(touch);\n\
+             }});\n\
+             gesture_recognizer.combine_gestures_parallel();",
+            touch_points
+        )
+    }
+
+    open fn parallelize_sensor_fusion(&self, sensors: &Vec<SensorType>) -> String {
+        let sensor_list: Vec<String> = sensors.iter().map(|s| format("{:?}", s)).collect();
+        let sensor_str = sensor_list.join(", ");
+        format(
+            "// Parallel sensor data fusion\n\
+             // Sensors: {}\n\
+             sensor_data.par_iter().for_each(|data| {{\n\
+                 sensor_fusion.process_data_parallel(data);\n\
+             }});\n\
+             sensor_fusion.fuse_readings_parallel();",
+            sensor_str
+        )
+    }
+
+    open fn parallelize_accessibility(&self, tasks: &Vec<String>) -> String {
+        let task_list = tasks.join(", ");
+        format(
+            "// Parallel accessibility processing\n\
+             // Tasks: {}\n\
+             accessibility_tasks.par_iter().for_each(|task| {{\n\
+                 accessibility_engine.process_parallel(task);\n\
+             }});",
+            task_list
+        )
+    }
+
+    open fn parallelize_network_batch(&self, request_count: usize) -> String {
+        format(
+            "// Network request batching\n\
+             // {} concurrent requests\n\
+             network_requests.par_iter().for_each(|request| {{\n\
+                 http_client.send_parallel(request);\n\
+             }});\n\
+             http_client.wait_for_batch_completion();",
+            request_count
+        )
+    }
+
+    open fn parallelize_background_tasks(&self, task_count: usize) -> String {
+        format(
+            "// Parallel background task execution\n\
+             // {} concurrent background tasks\n\
+             background_tasks.par_iter().for_each(|task| {{\n\
+                 task_scheduler.execute_parallel(task);\n\
+             }});",
+            task_count
+        )
+    }
+
+    open fn should_parallelize(&self, iterations: i64, body_cost: f64) -> bool {
+        let overhead = 1000.0;
+        let seq = (iterations as f64) * body_cost;
+        let par = ((iterations as f64) * body_cost) / (self.thread_count as f64) + overhead;
+        par < seq
+    }
+
+    /// Comprehensive mobile app parallelization analysis
+    open fn analyze_mobile_app(&var self, program: &Program) -> Vec<ParallelizationOpportunity> {
+        var opportunities = [];
+
+        // Analyze all statements in the program
+        self.analyze_program_ast(program);
+
+        // Additional mobile-specific analysis
+        opportunities.extend(self.analyze_ui_patterns(program));
+        opportunities.extend(self.analyze_animation_patterns(program));
+        opportunities.extend(self.analyze_ml_patterns(program));
+        opportunities.extend(self.analyze_ar_patterns(program));
+        opportunities.extend(self.analyze_sensor_patterns(program));
+
+        opportunities
+    }
+
+    open fn analyze_program_ast(&var self, program: &Program) {
+        each top_level in &program.items {
+            match top_level {
+                TopLevel::FnDef(fn_def) => {
+                    each stmt in &fn_def.body.stmts {
+                        self.analyze_stmt(stmt);
+                        self.analyze_mobile_stmt(stmt);
+                    }
+                }
+                TopLevel::DataDef(data_def) => {
+                    // Analyze data structure for parallel access patterns
+                    self.analyze_data_parallelism(data_def);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    open fn analyze_ui_patterns(&self, program: &Program) -> Vec<ParallelizationOpportunity> {
+        var opportunities = [];
+
+        // Look for UI component patterns that can be parallelized
+        each top_level in &program.items {
+            check let TopLevel::FnDef(fn_def) = top_level {
+                check fn_def.name.contains("render") || fn_def.name.contains("ui") {
+                    opportunities.push(ParallelizationOpportunity::UIParallel);
+                }
+            }
+        }
+
+        opportunities
+    }
+
+    open fn analyze_animation_patterns(&self, program: &Program) -> Vec<ParallelizationOpportunity> {
+        var opportunities = [];
+
+        // Look for animation-related functions
+        each top_level in &program.items {
+            check let TopLevel::FnDef(fn_def) = top_level {
+                check fn_def.name.contains("animate") || fn_def.name.contains("animation") {
+                    opportunities.push(ParallelizationOpportunity::AnimationParallel);
+                }
+            }
+        }
+
+        opportunities
+    }
+
+    open fn analyze_ml_patterns(&self, program: &Program) -> Vec<ParallelizationOpportunity> {
+        var opportunities = [];
+
+        // Look for ML inference patterns
+        each top_level in &program.items {
+            check let TopLevel::FnDef(fn_def) = top_level {
+                check fn_def.name.contains("ml") || fn_def.name.contains("inference") || fn_def.name.contains("predict") {
+                    opportunities.push(ParallelizationOpportunity::MLBatchParallel);
+                }
+            }
+        }
+
+        opportunities
+    }
+
+    open fn analyze_ar_patterns(&self, program: &Program) -> Vec<ParallelizationOpportunity> {
+        var opportunities = [];
+
+        // Look for AR processing patterns
+        each top_level in &program.items {
+            check let TopLevel::FnDef(fn_def) = top_level {
+                check fn_def.name.contains("ar") || fn_def.name.contains("augment") {
+                    opportunities.push(ParallelizationOpportunity::ARParallel);
+                }
+            }
+        }
+
+        opportunities
+    }
+
+    open fn analyze_sensor_patterns(&self, program: &Program) -> Vec<ParallelizationOpportunity> {
+        var opportunities = [];
+
+        // Look for sensor processing patterns
+        each top_level in &program.items {
+            check let TopLevel::FnDef(fn_def) = top_level {
+                check fn_def.name.contains("sensor") || fn_def.name.contains("motion") {
+                    opportunities.push(ParallelizationOpportunity::SensorFusion);
+                }
+            }
+        }
+
+        opportunities
+    }
+
+    open fn analyze_data_parallelism(&self, data_def: &DataDef) {
+        // Analyze data structures for parallel access patterns
+        // This could be extended to detect concurrent data structures
+    }
+
+    /// Generate parallelization report for mobile apps
+    open fn generate_mobile_parallelization_report(&self, opportunities: &Vec<ParallelizationOpportunity>) -> String {
+        var report = String::from("// Nova Mobile App Parallelization Report\n");
+
+        each opportunity in opportunities {
+            match opportunity {
+                ParallelizationOpportunity::UIParallel => {
+                    report.push_str("// ✓ UI Parallel Rendering: Multiple UI components can render concurrently\n");
+                }
+                ParallelizationOpportunity::AnimationParallel => {
+                    report.push_str("// ✓ Animation Parallel Processing: Independent animations can run in parallel\n");
+                }
+                ParallelizationOpportunity::MLBatchParallel => {
+                    report.push_str("// ✓ ML Batch Inference: Multiple models or large batches can be processed in parallel\n");
+                }
+                ParallelizationOpportunity::ARParallel => {
+                    report.push_str("// ✓ AR Scene Processing: AR tracking and rendering can be parallelized\n");
+                }
+                ParallelizationOpportunity::CameraPipeline => {
+                    report.push_str("// ✓ Camera Processing Pipeline: Image effects and processing can be parallelized\n");
+                }
+                ParallelizationOpportunity::GestureParallel => {
+                    report.push_str("// ✓ Gesture Recognition: Multi-touch gesture processing can be parallelized\n");
+                }
+                ParallelizationOpportunity::SensorFusion => {
+                    report.push_str("// ✓ Sensor Data Fusion: Multiple sensor streams can be processed in parallel\n");
+                }
+                ParallelizationOpportunity::AccessibilityParallel => {
+                    report.push_str("// ✓ Accessibility Processing: Voice synthesis and recognition can be parallelized\n");
+                }
+                ParallelizationOpportunity::NetworkBatch => {
+                    report.push_str("// ✓ Network Request Batching: Multiple HTTP requests can be processed concurrently\n");
+                }
+                ParallelizationOpportunity::BackgroundTaskParallel => {
+                    report.push_str("// ✓ Background Task Parallelization: Independent background tasks can run concurrently\n");
+                }
+                _ => {}
+            }
+        }
+
+        report.push_str("//\n");
+        report.push_str("// Performance Impact: Mobile apps can achieve 2-5x speedup with proper parallelization\n");
+        report.push_str("// Battery Impact: Careful parallelization can reduce processing time and save battery\n");
+
+        report
+    }
+}
+
+// ============================================================================
+// MOBILE-SPECIFIC PARALLELIZATION FFI SUPPORT
+// ============================================================================
+
+// UI Parallel Rendering Support
+extern "C" {
+    fn ui_render_parallel(components: *const (), count: usize, callback: *const ()) -> i32;
+    fn ui_batch_update(updates: *const (), count: usize) -> i32;
+}
+
+// Animation Parallel Processing
+extern "C" {
+    fn animation_process_parallel(animations: *const (), count: usize, delta_time: f64) -> i32;
+    fn animation_batch_update(updates: *const (), count: usize) -> i32;
+}
+
+// ML Inference Parallel Support
+extern "C" {
+    fn ml_batch_inference(models: *const (), model_count: usize, inputs: *const (), batch_size: usize, callback: *const ()) -> i32;
+    fn ml_parallel_inference(model: *const (), inputs: *const (), count: usize) -> i32;
+}
+
+// AR Scene Parallel Processing
+extern "C" {
+    fn ar_process_frame_parallel(frame: *const (), features: *const (), feature_count: usize, callback: *const ()) -> i32;
+    fn ar_batch_tracking(anchors: *const (), count: usize) -> i32;
+}
+
+// Camera Pipeline Parallel Processing
+extern "C" {
+    fn camera_process_pipeline(frame: *const (), effects: *const (), effect_count: usize, callback: *const ()) -> i32;
+    fn camera_batch_effects(frames: *const (), frame_count: usize, effects: *const (), effect_count: usize) -> i32;
+}
+
+// Gesture Recognition Parallel Support
+extern "C" {
+    fn gesture_process_parallel(touches: *const (), count: usize, callback: *const ()) -> i32;
+    fn gesture_batch_recognize(events: *const (), count: usize) -> i32;
+}
+
+// Sensor Fusion Parallel Support
+extern "C" {
+    fn sensor_fuse_parallel(sensor_data: *const (), sensor_count: usize, callback: *const ()) -> i32;
+    fn sensor_batch_process(streams: *const (), count: usize) -> i32;
+}
+
+// Accessibility Parallel Processing
+extern "C" {
+    fn accessibility_process_parallel(tasks: *const (), count: usize, callback: *const ()) -> i32;
+    fn accessibility_batch_synthesis(texts: *const (), count: usize) -> i32;
+}
+
+// Network Request Batching
+extern "C" {
+    fn network_batch_requests(requests: *const (), count: usize, callback: *const ()) -> i32;
+    fn network_parallel_send(requests: *const (), count: usize) -> i32;
+}
+
+// Background Task Parallelization
+extern "C" {
+    fn background_execute_parallel(tasks: *const (), count: usize, callback: *const ()) -> i32;
+    fn background_batch_schedule(tasks: *const (), count: usize) -> i32;
+}
+
+// ============================================================================
+// MOBILE PARALLELIZATION UTILITIES
+// ============================================================================
+
+/// Mobile-specific parallelization utilities
+expose data MobileParallelUtils;
+
+impl MobileParallelUtils {
+    /// Check check device supports the required parallelization features
+    open fn check_parallel_support(features: Vec<String>) -> HashMap<String, bool> {
+        var support = HashMap::new();
+
+        each feature in features {
+            let supported = unsafe {
+                match feature.as_str() {
+                    "ui_parallel" => ui_render_parallel(std::ptr::null(), 0, std::ptr::null()) >= 0,
+                    "animation_parallel" => animation_process_parallel(std::ptr::null(), 0, 0.0) >= 0,
+                    "ml_batch" => ml_batch_inference(std::ptr::null(), 0, std::ptr::null(), 0, std::ptr::null()) >= 0,
+                    "ar_parallel" => ar_process_frame_parallel(std::ptr::null(), std::ptr::null(), 0, std::ptr::null()) >= 0,
+                    "camera_pipeline" => camera_process_pipeline(std::ptr::null(), std::ptr::null(), 0, std::ptr::null()) >= 0,
+                    "gesture_parallel" => gesture_process_parallel(std::ptr::null(), 0, std::ptr::null()) >= 0,
+                    "sensor_fusion" => sensor_fuse_parallel(std::ptr::null(), 0, std::ptr::null()) >= 0,
+                    "accessibility_parallel" => accessibility_process_parallel(std::ptr::null(), 0, std::ptr::null()) >= 0,
+                    "network_batch" => network_batch_requests(std::ptr::null(), 0, std::ptr::null()) >= 0,
+                    "background_parallel" => background_execute_parallel(std::ptr::null(), 0, std::ptr::null()) >= 0,
+                    _ => false,
+                }
+            };
+            support.insert(feature, supported);
+        }
+
+        support
+    }
+
+    /// Get optimal thread count for mobile device
+    open fn get_optimal_thread_count() -> usize {
+        // In practice, this would query device capabilities
+        // For now, yield a conservative estimate
+        4 // Most mobile devices can handle 4 concurrent threads well
+    }
+
+    /// Calculate parallelization overhead for mobile operations
+    open fn calculate_mobile_overhead(operation: &str, data_size: usize) -> f64 {
+        match operation {
+            "ui_render" => 500.0 + (data_size as f64 * 0.1), // UI setup + per-component
+            "animation" => 200.0 + (data_size as f64 * 0.05), // Animation setup + per-frame
+            "ml_inference" => 1000.0 + (data_size as f64 * 0.5), // Model loading + per-inference
+            "ar_processing" => 800.0 + (data_size as f64 * 0.3), // Camera setup + per-feature
+            "camera_pipeline" => 300.0 + (data_size as f64 * 0.2), // Pipeline setup + per-effect
+            "gesture_recognition" => 100.0 + (data_size as f64 * 0.01), // Gesture setup + per-touch
+            "sensor_fusion" => 150.0 + (data_size as f64 * 0.02), // Sensor setup + per-reading
+            "network_batch" => 200.0 + (data_size as f64 * 0.1), // Connection setup + per-request
+            _ => 1000.0, // Default overhead
+        }
+    }
+}

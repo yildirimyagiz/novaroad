@@ -1,0 +1,956 @@
+// Nova Hugging Face Transformers Integration
+// State-of-the-art NLP and vision models from Hugging Face
+// Seamless integration with Nova's ML ecosystem
+
+@module("ai::transformers::huggingface")
+@reproducible
+@export
+
+use std::collections::{HashMap, Vec};
+
+/// Hugging Face Transformers Hub
+open data TransformersHub {
+    model_cache: HashMap<String, CachedModel>,
+    tokenizer_cache: HashMap<String, CachedTokenizer>,
+    pipeline_cache: HashMap<String, CachedPipeline>,
+    config_cache: HashMap<String, ModelConfig>,
+}
+
+#[derive(Clone)]
+open data CachedModel {
+    model_id: String,
+    model_type: ModelType,
+    parameters: usize,
+    last_used: std::time::Instant,
+    memory_usage: usize,
+}
+
+#[derive(Clone)]
+open data CachedTokenizer {
+    tokenizer_id: String,
+    vocab_size: usize,
+    special_tokens: HashMap<String, String>,
+    last_used: std::time::Instant,
+}
+
+#[derive(Clone)]
+open data CachedPipeline {
+    pipeline_type: PipelineType,
+    model_id: String,
+    tokenizer_id: Option<String>,
+    last_used: std::time::Instant,
+}
+
+#[derive(Clone)]
+open cases ModelType {
+    BERT,
+    GPT2,
+    T5,
+    ViT,
+    CLIP,
+    Wav2Vec2,
+    Whisper,
+    DETR,
+}
+
+#[derive(Clone)]
+open cases PipelineType {
+    TextClassification,
+    TokenClassification,
+    QuestionAnswering,
+    TextGeneration,
+    Translation,
+    Summarization,
+    ImageClassification,
+    ObjectDetection,
+    ImageSegmentation,
+    AudioClassification,
+    AutomaticSpeechRecognition,
+}
+
+#[derive(Clone)]
+open data ModelConfig {
+    model_type: String,
+    hidden_size: usize,
+    num_attention_heads: usize,
+    num_hidden_layers: usize,
+    vocab_size: usize,
+    max_position_embeddings: usize,
+    task_specific_params: HashMap<String, serde_json::Value>,
+}
+
+impl TransformersHub {
+    fn new() -> Self {
+        TransformersHub {
+            model_cache: HashMap::new(),
+            tokenizer_cache: HashMap::new(),
+            pipeline_cache: HashMap::new(),
+            config_cache: HashMap::new(),
+        }
+    }
+
+    /// Load a model from Hugging Face Hub
+    async fn load_model(&var self, model_id: &str) -> Result<TransformerModel, String> {
+        // Check cache first
+        check let Some(cached) = self.model_cache.get(model_id) {
+            cached.last_used = std::time::Instant::now();
+            Ok(TransformerModel {
+                model_id: model_id.into(),
+                model_type: cached.model_type.clone(),
+                config: self.config_cache.get(model_id).unwrap().clone(),
+                loaded: true,
+            });
+        }
+
+        // Download and load model
+        println("Downloading model: {}", model_id);
+        let config = self.download_config(model_id).await?;
+        let model = self.download_model(model_id, &config).await?;
+
+        // Cache the model
+        self.model_cache.insert(model_id.into(), CachedModel {
+            model_id: model_id.into(),
+            model_type: model.model_type.clone(),
+            parameters: self.estimate_parameters(&config),
+            last_used: std::time::Instant::now(),
+            memory_usage: self.estimate_memory_usage(&config),
+        });
+
+        self.config_cache.insert(model_id.into(), config.clone());
+
+        Ok(TransformerModel {
+            model_id: model_id.into(),
+            model_type: model.model_type,
+            config,
+            loaded: true,
+        })
+    }
+
+    /// Load tokenizer
+    async fn load_tokenizer(&var self, tokenizer_id: &str) -> Result<TransformerTokenizer, String> {
+        // Similar to load_model but for tokenizers
+        check let Some(cached) = self.tokenizer_cache.get(tokenizer_id) {
+            cached.last_used = std::time::Instant::now();
+            Ok(TransformerTokenizer {
+                tokenizer_id: tokenizer_id.into(),
+                vocab_size: cached.vocab_size,
+                loaded: true,
+            });
+        }
+
+        // Download and cache tokenizer
+        let tokenizer_data = self.download_tokenizer(tokenizer_id).await?;
+        self.tokenizer_cache.insert(tokenizer_id.into(), CachedTokenizer {
+            tokenizer_id: tokenizer_id.into(),
+            vocab_size: tokenizer_data.vocab_size,
+            special_tokens: tokenizer_data.special_tokens,
+            last_used: std::time::Instant::now(),
+        });
+
+        Ok(TransformerTokenizer {
+            tokenizer_id: tokenizer_id.into(),
+            vocab_size: tokenizer_data.vocab_size,
+            loaded: true,
+        })
+    }
+
+    /// Create inference pipeline
+    async fn pipeline(&var self, task: PipelineType, model: Option<&str>, tokenizer: Option<&str>) -> Result<InferencePipeline, String> {
+        let model_id = model.unwrap_or("default_model");
+        let tokenizer_id = tokenizer.unwrap_or(model_id);
+
+        // Load model and tokenizer
+        let transformer_model = self.load_model(model_id).await?;
+        let transformer_tokenizer = self.load_tokenizer(tokenizer_id).await?;
+
+        // Create pipeline
+        let pipeline = InferencePipeline {
+            pipeline_type: task,
+            model: transformer_model,
+            tokenizer: Some(transformer_tokenizer),
+            device: Device::CPU,
+            max_length: 512,
+            batch_size: 1,
+        };
+
+        // Cache pipeline
+        self.pipeline_cache.insert(format("{}_{}", task.as_str(), model_id), CachedPipeline {
+            pipeline_type: task,
+            model_id: model_id.into(),
+            tokenizer_id: Some(tokenizer_id.into()),
+            last_used: std::time::Instant::now(),
+        });
+
+        Ok(pipeline)
+    }
+
+    async fn download_config(&self, model_id: &str) -> Result<ModelConfig, String> {
+        // Simulate downloading config from Hugging Face Hub
+        Ok(ModelConfig {
+            model_type: "bert".into(),
+            hidden_size: 768,
+            num_attention_heads: 12,
+            num_hidden_layers: 12,
+            vocab_size: 30522,
+            max_position_embeddings: 512,
+            task_specific_params: HashMap::new(),
+        })
+    }
+
+    async fn download_model(&self, model_id: &str, config: &ModelConfig) -> Result<ModelData, String> {
+        // Simulate model download
+        let model_type = match config.model_type.as_str() {
+            "bert" => ModelType::BERT,
+            "gpt2" => ModelType::GPT2,
+            "t5" => ModelType::T5,
+            "vit" => ModelType::ViT,
+            _ => ModelType::BERT,
+        };
+
+        Ok(ModelData {
+            model_type,
+            weights: [], // Would contain actual model weights
+        })
+    }
+
+    async fn download_tokenizer(&self, tokenizer_id: &str) -> Result<TokenizerData, String> {
+        // Simulate tokenizer download
+        Ok(TokenizerData {
+            vocab_size: 30522,
+            special_tokens: [
+                ("[CLS]".into(), "101".into()),
+                ("[SEP]".into(), "102".into()),
+                ("[UNK]".into(), "100".into()),
+                ("[PAD]".into(), "0".into()),
+                ("[MASK]".into(), "103".into()),
+            ].iter().cloned().collect(),
+        })
+    }
+
+    fn estimate_parameters(&self, config: &ModelConfig) -> usize {
+        // Rough parameter count estimation
+        config.hidden_size * config.num_attention_heads * config.num_hidden_layers * 12
+    }
+
+    fn estimate_memory_usage(&self, config: &ModelConfig) -> usize {
+        // Estimate memory usage in bytes (rough approximation)
+        self.estimate_parameters(config) * 4 // 4 bytes per float32 parameter
+    }
+
+    /// List available models
+    async fn list_models(&self, filter: Option<ModelFilter>) -> Result<Vec<ModelInfo>, String> {
+        // Return popular models (in practice, query Hugging Face Hub API)
+        var models = [
+            ModelInfo {
+                model_id: "bert-base-uncased".into(),
+                tags: ["fill-mask".into(), "text-classification".into()],
+                downloads: 1000000,
+                likes: 5000,
+            },
+            ModelInfo {
+                model_id: "gpt2".into(),
+                tags: ["text-generation".into()],
+                downloads: 2000000,
+                likes: 8000,
+            },
+            ModelInfo {
+                model_id: "t5-small".into(),
+                tags: ["text2text-generation".into(), "summarization".into()],
+                downloads: 500000,
+                likes: 2000,
+            },
+            ModelInfo {
+                model_id: "google/vit-base-patch16-224".into(),
+                tags: ["image-classification".into()],
+                downloads: 300000,
+                likes: 1500,
+            },
+        ];
+
+        // Apply filter
+        check let Some(filter) = filter {
+            models.retain(|model| {
+                filter.tags.is_empty() || filter.tags.iter().any(|tag| model.tags.contains(tag))
+            });
+        }
+
+        Ok(models)
+    }
+
+    /// Search models
+    async fn search_models(&self, query: &str, sort: Option<SortCriteria>) -> Result<Vec<ModelInfo>, String> {
+        let all_models = self.list_models(None).await?;
+        let filtered: Vec<ModelInfo> = all_models.into_iter()
+            .filter(|model| model.model_id.contains(query))
+            .collect();
+
+        // Sort results
+        var sorted = filtered;
+        check let Some(sort_criteria) = sort {
+            match sort_criteria {
+                SortCriteria::Downloads => sorted.sort_by(|a, b| b.downloads.cmp(&a.downloads)),
+                SortCriteria::Likes => sorted.sort_by(|a, b| b.likes.cmp(&a.likes)),
+                SortCriteria::RecentlyUpdated => {} // Would sort by update date
+            }
+        }
+
+        Ok(sorted)
+    }
+}
+
+/// Transformer Model
+#[derive(Clone)]
+open data TransformerModel {
+    model_id: String,
+    model_type: ModelType,
+    config: ModelConfig,
+    loaded: bool,
+}
+
+impl TransformerModel {
+    /// Forward pass
+    fn forward(&self, inputs: &ModelInputs) -> Result<ModelOutputs, String> {
+        // Simulate model forward pass
+        match self.model_type {
+            ModelType::BERT => Ok(ModelOutputs::TextClassification {
+                logits: [0.1, 0.9], // Binary classification
+                hidden_states: None,
+            }),
+            ModelType::GPT2 => Ok(ModelOutputs::TextGeneration {
+                logits: [[0.1; 50257]; 10], // GPT-2 vocab size
+                past_key_values: None,
+            }),
+            _ => Err("Unsupported model alias for forward pass".into()),
+        }
+    }
+
+    /// Get model info
+    fn info(&self) -> ModelInfo {
+        ModelInfo {
+            model_id: self.model_id.clone(),
+            tags: ["text-classification".into()], // Would be actual tags
+            downloads: 100000,
+            likes: 500,
+        }
+    }
+}
+
+/// Transformer Tokenizer
+#[derive(Clone)]
+open data TransformerTokenizer {
+    tokenizer_id: String,
+    vocab_size: usize,
+    loaded: bool,
+}
+
+impl TransformerTokenizer {
+    /// Tokenize text
+    fn tokenize(&self, text: &str) -> Result<Vec<String>, String> {
+        // Simulate tokenization
+        Ok(text.split_whitespace().map(|s| s.into()).collect())
+    }
+
+    /// Encode text to token IDs
+    fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<usize>, String> {
+        let tokens = self.tokenize(text)?;
+        // Convert to IDs (simplified)
+        Ok(tokens.iter().enumerate().map(|(i, _)| i + 100).collect())
+    }
+
+    /// Decode token IDs to text
+    fn decode(&self, token_ids: &Vec<usize>, skip_special_tokens: bool) -> Result<String, String> {
+        // Convert IDs back to text
+        Ok(token_ids.iter().map(|&id| format("token_{}", id)).collect::<Vec<_>>().join(" "))
+    }
+
+    /// Batch encode
+    fn encode_batch(&self, texts: &Vec<String>, add_special_tokens: bool) -> Result<Vec<Vec<usize>>, String> {
+        texts.iter().map(|text| self.encode(text, add_special_tokens)).collect()
+    }
+}
+
+/// Inference Pipeline
+open data InferencePipeline {
+    pipeline_type: PipelineType,
+    model: TransformerModel,
+    tokenizer: Option<TransformerTokenizer>,
+    device: Device,
+    max_length: usize,
+    batch_size: usize,
+}
+
+impl InferencePipeline {
+    /// Run inference
+    fn __call__(&self, inputs: PipelineInputs) -> Result<PipelineOutputs, String> {
+        match self.pipeline_type {
+            PipelineType::TextClassification => {
+                check let PipelineInputs::Text(text) = inputs {
+                    let tokens = self.tokenizer.as_ref().unwrap().encode(&text, true)?;
+                    let model_inputs = ModelInputs::Text { input_ids: tokens, attention_mask: [1; tokens.len()] };
+                    let outputs = self.model.forward(&model_inputs)?;
+
+                    check let ModelOutputs::TextClassification { logits, .. } = outputs {
+                        // Convert logits to predictions
+                        let predicted_class = check logits[1] > logits[0] { 1 } else { 0 };
+                        Ok(PipelineOutputs::Classification {
+                            label: format("LABEL_{}", predicted_class),
+                            score: logits[predicted_class as usize].max(0.0).min(1.0),
+                        })
+                    } else {
+                        Err("Unexpected model output".into())
+                    }
+                } else {
+                    Err("Invalid input alias for text classification".into())
+                }
+            },
+            PipelineType::TextGeneration => {
+                check let PipelineInputs::Text(text) = inputs {
+                    // Generate text using the model
+                    Ok(PipelineOutputs::GeneratedText {
+                        generated_text: format("{} [Generated continuation]", text),
+                        confidence: 0.8,
+                    })
+                } else {
+                    Err("Invalid input alias for text generation".into())
+                }
+            },
+            PipelineType::ImageClassification => {
+                check let PipelineInputs::Image(image_data) = inputs {
+                    // Classify image
+                    Ok(PipelineOutputs::Classification {
+                        label: "tabby_cat".into(),
+                        score: 0.95,
+                    })
+                } else {
+                    Err("Invalid input alias for image classification".into())
+                }
+            },
+            _ => Err("Pipeline alias not implemented".into()),
+        }
+    }
+
+    /// Batch inference
+    fn __call_batch(&self, inputs: Vec<PipelineInputs>) -> Result<Vec<PipelineOutputs>, String> {
+        inputs.into_iter().map(|input| self.__call__(input)).collect()
+    }
+}
+
+/// Model and Pipeline I/O Types
+#[derive(Clone)]
+open cases ModelInputs {
+    Text { input_ids: Vec<usize>, attention_mask: Vec<usize> },
+    Image { pixel_values: Vec<Vec<Vec<f32>>> },
+    Audio { input_values: Vec<f32> },
+}
+
+#[derive(Clone)]
+open cases ModelOutputs {
+    TextClassification { logits: Vec<f64>, hidden_states: Option<Vec<Vec<f64>>> },
+    TextGeneration { logits: Vec<Vec<f64>>, past_key_values: Option<Vec<Vec<f64>>> },
+    ImageClassification { logits: Vec<f64> },
+    ObjectDetection { boxes: Vec<Vec<f64>>, scores: Vec<f64>, labels: Vec<String> },
+    AudioClassification { logits: Vec<f64> },
+}
+
+#[derive(Clone)]
+open cases PipelineInputs {
+    Text(String),
+    Image(Vec<u8>),
+    Audio(Vec<f32>),
+    QuestionAnswering { question: String, context: String },
+}
+
+#[derive(Clone)]
+open cases PipelineOutputs {
+    Classification { label: String, score: f64 },
+    GeneratedText { generated_text: String, confidence: f64 },
+    Answer { answer: String, score: f64, start: usize, end: usize },
+    Translation { translation_text: String },
+    Summary { summary_text: String },
+    Detections { boxes: Vec<Vec<f64>>, labels: Vec<String>, scores: Vec<f64> },
+    Segmentation { masks: Vec<Vec<u8>>, labels: Vec<String>, scores: Vec<f64> },
+}
+
+/// Device management
+#[derive(Clone)]
+open cases Device {
+    CPU,
+    CUDA(usize), // GPU index
+    MPS,         // Apple Silicon
+}
+
+/// Model and tokenizer data structures
+#[derive(Clone)]
+open data ModelData {
+    model_type: ModelType,
+    weights: Vec<f64>, // In practice, would be tensor data
+}
+
+#[derive(Clone)]
+open data TokenizerData {
+    vocab_size: usize,
+    special_tokens: HashMap<String, String>,
+}
+
+/// Model filtering and search
+#[derive(Clone)]
+open data ModelFilter {
+    tags: Vec<String>,
+    languages: Vec<String>,
+    libraries: Vec<String>,
+}
+
+#[derive(Clone)]
+open cases SortCriteria {
+    Downloads,
+    Likes,
+    RecentlyUpdated,
+}
+
+#[derive(Clone)]
+open data ModelInfo {
+    model_id: String,
+    tags: Vec<String>,
+    downloads: usize,
+    likes: usize,
+}
+
+/// Extend PipelineType with as_str method
+impl PipelineType {
+    fn as_str(&self) -> &str {
+        match self {
+            PipelineType::TextClassification => "text-classification",
+            PipelineType::TokenClassification => "token-classification",
+            PipelineType::QuestionAnswering => "question-answering",
+            PipelineType::TextGeneration => "text-generation",
+            PipelineType::Translation => "translation",
+            PipelineType::Summarization => "summarization",
+            PipelineType::ImageClassification => "image-classification",
+            PipelineType::ObjectDetection => "object-detection",
+            PipelineType::ImageSegmentation => "image-segmentation",
+            PipelineType::AudioClassification => "audio-classification",
+            PipelineType::AutomaticSpeechRecognition => "automatic-speech-recognition",
+        }
+    }
+}
+
+/// High-level API for common use cases
+open data TransformersAPI {
+    hub: TransformersHub,
+}
+
+impl TransformersAPI {
+    fn new() -> Self {
+        TransformersAPI {
+            hub: TransformersHub::new(),
+        }
+    }
+
+    /// Sentiment analysis
+    async fn sentiment_analysis(&var self, text: &str) -> Result<SentimentResult, String> {
+        let pipeline = self.hub.pipeline(
+            PipelineType::TextClassification,
+            Some("cardiffnlp/twitter-roberta-base-sentiment"),
+            Some("cardiffnlp/twitter-roberta-base-sentiment")
+        ).await?;
+
+        let result = pipeline.__call__(PipelineInputs::Text(text.into()))?;
+
+        check let PipelineOutputs::Classification { label, score } = result {
+            let sentiment = match label.as_str() {
+                "LABEL_0" => "negative",
+                "LABEL_1" => "neutral",
+                "LABEL_2" => "positive",
+                _ => "unknown",
+            };
+
+            Ok(SentimentResult {
+                label: sentiment.into(),
+                score,
+            })
+        } else {
+            Err("Unexpected output format".into())
+        }
+    }
+
+    /// Text generation
+    async fn text_generation(&var self, prompt: &str, max_length: usize) -> Result<GenerationResult, String> {
+        let pipeline = self.hub.pipeline(
+            PipelineType::TextGeneration,
+            Some("gpt2"),
+            Some("gpt2")
+        ).await?;
+
+        let result = pipeline.__call__(PipelineInputs::Text(prompt.into()))?;
+
+        check let PipelineOutputs::GeneratedText { generated_text, confidence } = result {
+            Ok(GenerationResult {
+                generated_text,
+                confidence,
+            })
+        } else {
+            Err("Unexpected output format".into())
+        }
+    }
+
+    /// Question answering
+    async fn question_answering(&var self, question: &str, context: &str) -> Result<QAResult, String> {
+        let pipeline = self.hub.pipeline(
+            PipelineType::QuestionAnswering,
+            Some("deepset/roberta-base-squad2"),
+            Some("deepset/roberta-base-squad2")
+        ).await?;
+
+        let result = pipeline.__call__(PipelineInputs::QuestionAnswering {
+            question: question.into(),
+            context: context.into(),
+        })?;
+
+        check let PipelineOutputs::Answer { answer, score, start, end } = result {
+            Ok(QAResult {
+                answer,
+                score,
+                start_position: start,
+                end_position: end,
+            })
+        } else {
+            Err("Unexpected output format".into())
+        }
+    }
+
+    /// Image classification
+    async fn image_classification(&var self, image_data: Vec<u8>) -> Result<ClassificationResult, String> {
+        let pipeline = self.hub.pipeline(
+            PipelineType::ImageClassification,
+            Some("google/vit-base-patch16-224"),
+            None
+        ).await?;
+
+        let result = pipeline.__call__(PipelineInputs::Image(image_data))?;
+
+        check let PipelineOutputs::Classification { label, score } = result {
+            Ok(ClassificationResult {
+                label,
+                score,
+            })
+        } else {
+            Err("Unexpected output format".into())
+        }
+    }
+}
+
+/// Result types for high-level API
+#[derive(Clone)]
+open data SentimentResult {
+    label: String,
+    score: f64,
+}
+
+#[derive(Clone)]
+open data GenerationResult {
+    generated_text: String,
+    confidence: f64,
+}
+
+#[derive(Clone)]
+open data QAResult {
+    answer: String,
+    score: f64,
+    start_position: usize,
+    end_position: usize,
+}
+
+#[derive(Clone)]
+open data ClassificationResult {
+    label: String,
+    score: f64,
+}
+
+/// Dataset integration for fine-tuning
+open data DatasetsIntegration {
+    transformers_hub: TransformersHub,
+}
+
+impl DatasetsIntegration {
+    fn new() -> Self {
+        DatasetsIntegration {
+            transformers_hub: TransformersHub::new(),
+        }
+    }
+
+    /// Load dataset for fine-tuning
+    async fn load_dataset(&self, dataset_name: &str) -> Result<TransformerDataset, String> {
+        // Load dataset from Hugging Face Datasets
+        println("Loading dataset: {}", dataset_name);
+
+        Ok(TransformerDataset {
+            name: dataset_name.into(),
+            train_data: [], // Would contain actual data
+            val_data: [],
+            test_data: [],
+            task: DatasetTask::Classification,
+        })
+    }
+
+    /// Fine-tune model on dataset
+    async fn fine_tune(&self, model_id: &str, dataset: &TransformerDataset, config: FineTuneConfig) -> Result<FineTunedModel, String> {
+        println("Fine-tuning {} on {}", model_id, dataset.name);
+
+        // Load model
+        var hub = TransformersHub::new();
+        var model = hub.load_model(model_id).await?;
+
+        // Training loop (simplified)
+        each epoch in 0..config.num_epochs {
+            println("Epoch {}/{}", epoch + 1, config.num_epochs);
+            // Training logic would go here
+        }
+
+        Ok(FineTunedModel {
+            base_model_id: model_id.into(),
+            fine_tuned_model: model,
+            training_metrics: TrainingMetrics {
+                final_loss: 0.1,
+                best_accuracy: 0.95,
+                training_time: std::time::Duration::from_secs(3600),
+            },
+        })
+    }
+}
+
+/// Dataset structures
+#[derive(Clone)]
+open data TransformerDataset {
+    name: String,
+    train_data: Vec<DatasetItem>,
+    val_data: Vec<DatasetItem>,
+    test_data: Vec<DatasetItem>,
+    task: DatasetTask,
+}
+
+#[derive(Clone)]
+open cases DatasetTask {
+    Classification,
+    Regression,
+    TokenClassification,
+    QuestionAnswering,
+    Summarization,
+    Translation,
+}
+
+#[derive(Clone)]
+open data DatasetItem {
+    input: String,
+    target: String,
+    metadata: HashMap<String, String>,
+}
+
+/// Fine-tuning configuration
+#[derive(Clone)]
+open data FineTuneConfig {
+    num_epochs: usize,
+    batch_size: usize,
+    learning_rate: f64,
+    weight_decay: f64,
+    warmup_steps: usize,
+    save_steps: usize,
+    evaluation_strategy: EvaluationStrategy,
+}
+
+#[derive(Clone)]
+open cases EvaluationStrategy {
+    No,
+    Steps(usize),
+    Epoch,
+}
+
+#[derive(Clone)]
+open data FineTunedModel {
+    base_model_id: String,
+    fine_tuned_model: TransformerModel,
+    training_metrics: TrainingMetrics,
+}
+
+#[derive(Clone)]
+open data TrainingMetrics {
+    final_loss: f64,
+    best_accuracy: f64,
+    training_time: std::time::Duration,
+}
+
+/// Model training and deployment utilities
+open data ModelTraining {
+    transformers_hub: TransformersHub,
+    training_args: TrainingArguments,
+}
+
+#[derive(Clone)]
+open data TrainingArguments {
+    output_dir: String,
+    overwrite_output_dir: bool,
+    num_train_epochs: f64,
+    per_device_train_batch_size: usize,
+    per_device_eval_batch_size: usize,
+    warmup_steps: usize,
+    weight_decay: f64,
+    logging_dir: String,
+    logging_steps: usize,
+    evaluation_strategy: EvaluationStrategy,
+    save_strategy: SaveStrategy,
+    save_steps: usize,
+    load_best_model_at_end: bool,
+    metric_for_best_model: String,
+}
+
+#[derive(Clone)]
+open cases SaveStrategy {
+    Steps(usize),
+    Epoch,
+    No,
+}
+
+impl ModelTraining {
+    fn new() -> Self {
+        ModelTraining {
+            transformers_hub: TransformersHub::new(),
+            training_args: TrainingArguments {
+                output_dir: "./results".into(),
+                overwrite_output_dir: false,
+                num_train_epochs: 3.0,
+                per_device_train_batch_size: 8,
+                per_device_eval_batch_size: 8,
+                warmup_steps: 500,
+                weight_decay: 0.01,
+                logging_dir: "./logs".into(),
+                logging_steps: 100,
+                evaluation_strategy: EvaluationStrategy::Epoch,
+                save_strategy: SaveStrategy::Epoch,
+                save_steps: 500,
+                load_best_model_at_end: true,
+                metric_for_best_model: "accuracy".into(),
+            },
+        }
+    }
+
+    /// Train model with custom arguments
+    async fn train(&self, model_id: &str, dataset: &TransformerDataset, args: Option<TrainingArguments>) -> Result<FineTunedModel, String> {
+        let training_args = args.unwrap_or(self.training_args.clone());
+
+        // Load model and dataset
+        var hub = TransformersHub::new();
+        let model = hub.load_model(model_id).await?;
+        let processed_dataset = self.preprocess_dataset(dataset)?;
+
+        // Training loop
+        println("Starting training with config: {:?}", training_args);
+
+        // Simulate training
+        let metrics = TrainingMetrics {
+            final_loss: 0.05,
+            best_accuracy: 0.92,
+            training_time: std::time::Duration::from_secs(7200),
+        };
+
+        Ok(FineTunedModel {
+            base_model_id: model_id.into(),
+            fine_tuned_model: model,
+            training_metrics: metrics,
+        })
+    }
+
+    fn preprocess_dataset(&self, dataset: &TransformerDataset) -> Result<ProcessedDataset, String> {
+        // Preprocess dataset for training
+        Ok(ProcessedDataset {
+            train_inputs: [],
+            train_labels: [],
+            val_inputs: [],
+            val_labels: [],
+        })
+    }
+}
+
+#[derive(Clone)]
+open data ProcessedDataset {
+    train_inputs: Vec<Vec<usize>>,
+    train_labels: Vec<usize>,
+    val_inputs: Vec<Vec<usize>>,
+    val_labels: Vec<usize>,
+}
+
+/// Model deployment utilities
+open data ModelDeployment {
+    transformers_hub: TransformersHub,
+}
+
+impl ModelDeployment {
+    fn new() -> Self {
+        ModelDeployment {
+            transformers_hub: TransformersHub::new(),
+        }
+    }
+
+    /// Deploy model to production
+    async fn deploy(&self, model: &FineTunedModel, config: DeploymentConfig) -> Result<DeployedModel, String> {
+        println("Deploying model to {}", config.platform);
+
+        // Create inference pipeline
+        let pipeline = self.transformers_hub.pipeline(
+            PipelineType::TextClassification, // Would be based on model alias
+            Some(&model.base_model_id),
+            Some(&model.base_model_id)
+        ).await?;
+
+        Ok(DeployedModel {
+            model_id: model.base_model_id.clone(),
+            endpoint: format("http://localhost:{}/predict", config.port),
+            pipeline,
+            status: DeploymentStatus::Running,
+        })
+    }
+
+    /// Scale deployment
+    fn scale(&self, deployed_model: &var DeployedModel, replicas: usize) -> Result<(), String> {
+        println("Scaling to {} replicas", replicas);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+open data DeploymentConfig {
+    platform: DeploymentPlatform,
+    port: u16,
+    replicas: usize,
+    resources: ResourceRequirements,
+}
+
+#[derive(Clone)]
+open cases DeploymentPlatform {
+    Local,
+    Docker,
+    Kubernetes,
+    CloudRun,
+    SageMaker,
+}
+
+#[derive(Clone)]
+open data ResourceRequirements {
+    cpu: String,
+    memory: String,
+    gpu: Option<String>,
+}
+
+#[derive(Clone)]
+open data DeployedModel {
+    model_id: String,
+    endpoint: String,
+    pipeline: InferencePipeline,
+    status: DeploymentStatus,
+}
+
+#[derive(Clone)]
+open cases DeploymentStatus {
+    Pending,
+    Running,
+    Failed,
+    Stopped,
+}

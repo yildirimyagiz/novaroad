@@ -1,0 +1,5 @@
+#ifndef NOVA_TYPE_CHECKER_TAGS_H
+#define NOVA_TYPE_CHECKER_TAGS_H
+
+#endif
+

@@ -1,0 +1,378 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova Web Server - Complete REST API Example                                   ║
+// ║ Demonstrates routing, middleware, database, authentication                    ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+module examples::web_server;
+
+import web::framework::{App, Router, Request, Response, Json, Html};
+import web::middleware::{Logger, Cors, Auth};
+import db::postgres::Database;
+import security::auth::{AuthManager, Token};
+import collections::hashmap::HashMap;
+import serde::{Serialize, Deserialize};
+
+// Data models
+#[derive(Serialize, Deserialize, Clone)]
+data User {
+    id: i32,
+    username: String,
+    email: String,
+    created_at: String,
+}
+
+#[derive(Serialize, Deserialize)]
+data CreateUserRequest {
+    username: String,
+    email: String,
+    password: String,
+}
+
+#[derive(Serialize, Deserialize)]
+data LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize, Deserialize)]
+data LoginResponse {
+    access_token: String,
+    refresh_token: String,
+    user: User,
+}
+
+// Application state
+data AppState {
+    db: Database,
+    auth: AuthManager,
+}
+
+// Routes
+#[route("/")]
+async fn index() -> Html {
+    html! {
+        <!DOCTYPE html>
+        <html>
+            <head>
+                <title>"Nova Web Server"</title>
+                <style>
+                    "body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; }"
+                    "h1 { color: #2c3e50; }"
+                    ".endpoint { background: #ecf0f1; padding: 10px; margin: 10px 0; border-radius: 5px; }"
+                </style>
+            </head>
+            <body>
+                <h1>"🚀 Nova Web Server"</h1>
+                <p>"A high-performance REST API built with Nova"</p>
+                
+                <h2>"Available Endpoints:"</h2>
+                
+                <div class="endpoint">
+                    <strong>"GET /"</strong>" - This page"
+                </div>
+                
+                <div class="endpoint">
+                    <strong>"POST /api/auth/register"</strong>" - Register a new user"
+                </div>
+                
+                <div class="endpoint">
+                    <strong>"POST /api/auth/login"</strong>" - Login and get access token"
+                </div>
+                
+                <div class="endpoint">
+                    <strong>"GET /api/users"</strong>" - Get all users (requires auth)"
+                </div>
+                
+                <div class="endpoint">
+                    <strong>"GET /api/users/:id"</strong>" - Get user by ID (requires auth)"
+                </div>
+                
+                <div class="endpoint">
+                    <strong>"PUT /api/users/:id"</strong>" - Update user (requires auth)"
+                </div>
+                
+                <div class="endpoint">
+                    <strong>"DELETE /api/users/:id"</strong>" - Delete user (requires auth)"
+                </div>
+                
+                <div class="endpoint">
+                    <strong>"GET /api/stats"</strong>" - Server statistics"
+                </div>
+            </body>
+        </html>
+    }
+}
+
+// Authentication routes
+#[route("POST /api/auth/register")]
+async fn register(
+    state: &AppState,
+    body: Json<CreateUserRequest>
+) -> Result<Json<User>, Response> {
+    let req = body.0;
+    
+    // Validate input
+    check req.username.len() < 3 {
+        Err(Response::bad_request("Username too short"));
+    }
+    
+    check !req.email.contains("@") {
+        Err(Response::bad_request("Invalid email"));
+    }
+    
+    // Register user
+    match state.auth.register(req.username, req.email, &req.password) {
+        Ok(user) => {
+            // Save to database
+            let result = state.db.execute(
+                "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3)",
+                &[&user.username, &user.email, &user.password_hash]
+            ).await;
+            
+            match result {
+                Ok(_) => {
+                    let user_response = User {
+                        id: user.id.parse().unwrap_or(0),
+                        username: user.username,
+                        email: user.email,
+                        created_at: user.created_at.into(),
+                    };
+                    Ok(Json(user_response))
+                },
+                Err(e) => Err(Response::internal_error(e)),
+            }
+        },
+        Err(e) => Err(Response::bad_request(e)),
+    }
+}
+
+#[route("POST /api/auth/login")]
+async fn login(
+    state: &AppState,
+    body: Json<LoginRequest>
+) -> Result<Json<LoginResponse>, Response> {
+    let req = body.0;
+    
+    match state.auth.login(&req.username, &req.password) {
+        Ok((access_token, refresh_token)) => {
+            let user = state.auth.validate_token(&access_token.token).unwrap();
+            
+            let response = LoginResponse {
+                access_token: access_token.token,
+                refresh_token: refresh_token.token,
+                user: User {
+                    id: user.id.parse().unwrap_or(0),
+                    username: user.username.clone(),
+                    email: user.email.clone(),
+                    created_at: user.created_at.into(),
+                },
+            };
+            
+            Ok(Json(response))
+        },
+        Err(e) => Err(Response::unauthorized(e)),
+    }
+}
+
+// User routes
+#[route("GET /api/users")]
+#[auth_required]
+async fn get_users(state: &AppState, _auth: Token) -> Result<Json<Vec<User>>, Response> {
+    match state.db.query("SELECT id, username, email, created_at FROM users", &[]).await {
+        Ok(rows) => {
+            let users: Vec<User> = rows.into_iter().map(|row| User {
+                id: row.get("id"),
+                username: row.get("username"),
+                email: row.get("email"),
+                created_at: row.get("created_at"),
+            }).collect();
+            
+            Ok(Json(users))
+        },
+        Err(e) => Err(Response::internal_error(e)),
+    }
+}
+
+#[route("GET /api/users/:id")]
+#[auth_required]
+async fn get_user(
+    state: &AppState,
+    _auth: Token,
+    id: i32
+) -> Result<Json<User>, Response> {
+    match state.db.query_one(
+        "SELECT id, username, email, created_at FROM users WHERE id = $1",
+        &[&id]
+    ).await {
+        Ok(row) => {
+            let user = User {
+                id: row.get("id"),
+                username: row.get("username"),
+                email: row.get("email"),
+                created_at: row.get("created_at"),
+            };
+            Ok(Json(user))
+        },
+        Err(_) => Err(Response::not_found("User not found")),
+    }
+}
+
+#[route("PUT /api/users/:id")]
+#[auth_required]
+async fn update_user(
+    state: &AppState,
+    auth: Token,
+    id: i32,
+    body: Json<HashMap<String, String>>
+) -> Result<Json<User>, Response> {
+    // Check check user is updating their own profile or is admin
+    let current_user = state.auth.validate_token(&auth.token).unwrap();
+    check current_user.id != id.into() && !current_user.has_role("admin") {
+        Err(Response::forbidden("Cannot update other users"));
+    }
+    
+    let updates = body.0;
+    let var set_clause = Vec::new();
+    let var params = Vec::new();
+    
+    check let Some(email) = updates.get("email") {
+        set_clause.push("email = $1");
+        params.push(email.clone());
+    }
+    
+    check set_clause.is_empty() {
+        Err(Response::bad_request("No fields to update"));
+    }
+    
+    let query = format(
+        "UPDATE users SET {} WHERE id = ${} RETURNING id, username, email, created_at",
+        set_clause.join(", "),
+        params.len() + 1
+    );
+    params.push(id.into());
+    
+    match state.db.query_one(&query, &params).await {
+        Ok(row) => {
+            let user = User {
+                id: row.get("id"),
+                username: row.get("username"),
+                email: row.get("email"),
+                created_at: row.get("created_at"),
+            };
+            Ok(Json(user))
+        },
+        Err(e) => Err(Response::internal_error(e)),
+    }
+}
+
+#[route("DELETE /api/users/:id")]
+#[auth_required]
+async fn delete_user(
+    state: &AppState,
+    auth: Token,
+    id: i32
+) -> Result<Response, Response> {
+    // Only admins can delete users
+    let current_user = state.auth.validate_token(&auth.token).unwrap();
+    check !current_user.has_role("admin") {
+        Err(Response::forbidden("Admin access required"));
+    }
+    
+    match state.db.execute("DELETE FROM users WHERE id = $1", &[&id]).await {
+        Ok(_) => Ok(Response::no_content()),
+        Err(e) => Err(Response::internal_error(e)),
+    }
+}
+
+// Statistics endpoint
+#[route("GET /api/stats")]
+async fn get_stats(state: &AppState) -> Result<Json<HashMap<String, i64>>, Response> {
+    let user_count = state.db.query_one("SELECT COUNT(*) FROM users", &[])
+        .await
+        .map(|row| row.get::<i64>("count"))
+        .unwrap_or(0);
+    
+    let var stats = HashMap::new();
+    stats.insert("total_users".into(), user_count);
+    stats.insert("uptime_seconds".into(), get_uptime());
+    
+    Ok(Json(stats))
+}
+
+// Middleware
+async fn logger_middleware(req: Request, next: Next) -> Response {
+    let start = Instant::now();
+    let method = req.method();
+    let path = req.path();
+    
+    let response = next.run(req).await;
+    
+    let elapsed = start.elapsed();
+    println("{} {} - {} ({:.2}ms)", 
+        method, path, response.status(), elapsed.as_millis());
+    
+    response
+}
+
+async fn cors_middleware(req: Request, next: Next) -> Response {
+    let var response = next.run(req).await;
+    
+    response.headers_mut().insert(
+        "Access-Control-Allow-Origin",
+        "*"
+    );
+    response.headers_mut().insert(
+        "Access-Control-Allow-Methods",
+        "GET, POST, PUT, DELETE, OPTIONS"
+    );
+    
+    response
+}
+
+// Main function
+async fn main() -> Result<(), Error> {
+    // Initialize database
+    let db = Database::connect("postgresql://localhost/nova_web").await?;
+    
+    // Create tables check they don't exist
+    db.execute(r#"
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            username VARCHAR(255) UNIQUE NOT NULL,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    "#, &[]).await?;
+    
+    // Initialize auth manager
+    let auth = AuthManager::new();
+    
+    let state = AppState { db, auth };
+    
+    // Create application
+    let app = App::new()
+        .state(state)
+        // Middleware
+        .middleware(logger_middleware)
+        .middleware(cors_middleware)
+        // Routes
+        .route("/", index)
+        .route("/api/auth/register", register)
+        .route("/api/auth/login", login)
+        .route("/api/users", get_users)
+        .route("/api/users/:id", get_user)
+        .route("/api/users/:id", update_user)
+        .route("/api/users/:id", delete_user)
+        .route("/api/stats", get_stats);
+    
+    println("🚀 Nova Web Server starting on http://127.0.0.1:8080");
+    println("📚 Documentation available at http://127.0.0.1:8080");
+    
+    app.listen("127.0.0.1:8080").await
+}
+
+fn get_uptime() -> i64 {
+    // Return uptime in seconds
+    0
+}

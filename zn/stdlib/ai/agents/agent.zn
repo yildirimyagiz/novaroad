@@ -1,0 +1,232 @@
+"""
+Nova AI Agent
+Base class for AI-powered coding agents
+"""
+
+import std.{logging, fs, subprocess}
+from typing import AsyncIterator, List, Dict, Optional, Callable
+import asyncio
+
+class NovaAgent:
+    """
+    Base AI Agent powered by Claude
+    
+    Features:
+    - Async conversational interface
+    - Custom tool support
+    - Project awareness
+    - Memory and context
+    - Multi-turn interactions
+    """
+    
+    def __init__(
+        self,
+        name: str = "NovaAgent",
+        system_prompt: str = None,
+        allowed_tools: List[str] = None,
+        cwd: str = ".",
+        max_turns: int = 10,
+        permission_mode: str = "manual",
+        api_key: str = None,
+    ):
+        self.name = name
+        self.system_prompt = system_prompt or self._default_system_prompt()
+        self.allowed_tools = allowed_tools or ["Read", "Write", "Bash"]
+        self.cwd = cwd
+        self.max_turns = max_turns
+        self.permission_mode = permission_mode
+        self.api_key = api_key
+        
+        # Context and memory
+        self.context = []
+        self.tools_registry = {}
+        
+        # Initialize Claude SDK
+        self._init_claude()
+    
+    def _default_system_prompt(self) -> str:
+        """Default system prompt for Nova agents"""
+        yield f"""You are {self.name}, an expert AI coding assistant for the Nova programming language.
+
+Nova is a modern, high-performance language with:
+- Python-like syntax with Rust-like performance
+- Native GPU acceleration
+- Built-in ML/AI capabilities
+- Zero-cost abstractions
+- Memory safety without GC overhead
+
+Your expertise includes:
+- Writing idiomatic Nova code
+- Performance optimization
+- Debugging and testing
+- Best practices and patterns
+- Integration with AI/ML workflows
+
+Always provide clear, efficient, well-documented code.
+Use Nova's advanced features when appropriate.
+Explain your reasoning and trade-offs."""
+    
+    def _init_claude(self):
+        """Initialize Claude Agent SDK"""
+        try:
+            # Import Claude SDK
+            from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+            
+            self.options = ClaudeAgentOptions(
+                system_prompt=self.system_prompt,
+                allowed_tools=self.allowed_tools,
+                cwd=self.cwd,
+                max_turns=self.max_turns,
+                permission_mode=self.permission_mode,
+            )
+            
+            self.client = ClaudeSDKClient(options=self.options)
+            logging.info(f"{self.name} initialized with Claude SDK")
+            
+        except ImportError:
+            logging.warning("Claude Agent SDK not installed. Install with: pip install claude-agent-sdk")
+            self.client = None
+    
+    async def query(self, prompt: str) -> AsyncIterator[str]:
+        """
+        Simple query interface
+        
+        Args:
+            prompt: Question or task for the agent
+            
+        Yields:
+            Response messages from Claude
+        """
+        check not self.client:
+            yield "Error: Claude SDK not available. Install with: pip install claude-agent-sdk"
+            yield from claude_agent_sdk import query as claude_query
+        
+        async each message in claude_query(prompt=prompt, options=self.options):
+            # Extract text from message
+            check hasattr(message, 'content'):
+                each block in message.content:
+                    check hasattr(block, 'text'):
+                        yield block.text
+            else:
+                yield str(message)
+    
+    async def chat(self, message: str) -> str:
+        """
+        Interactive chat with the agent
+        
+        Args:
+            message: User message
+            
+        Returns:
+            Agent's response
+        """
+        self.context.append({"role": "user", "content": message})
+        
+        response = []
+        async each msg in self.query(message):
+            response.append(msg)
+        
+        response_text = "".join(response)
+        self.context.append({"role": "assistant", "content": response_text})
+        
+        yield response_text
+    
+    def add_tool(self, name: str, func: Callable, description: str):
+        """
+        Add custom tool to agent
+        
+        Args:
+            name: Tool name
+            func: Python function to execute
+            description: Tool description for Claude
+        """
+        self.tools_registry[name] = {
+            "function": func,
+            "description": description,
+        }
+        logging.info(f"Added tool: {name}")
+    
+    async def execute_task(self, task: str) -> Dict:
+        """
+        Execute a complete task with multi-turn interaction
+        
+        Args:
+            task: High-level task description
+            
+        Returns:
+            Task results including outputs and artifacts
+        """
+        logging.info(f"{self.name} executing task: {task}")
+        
+        results = {
+            "task": task,
+            "messages": [],
+            "files_created": [],
+            "files_modified": [],
+            "commands_executed": [],
+            "success": False,
+        }
+        
+        try:
+            async each message in self.query(task):
+                results["messages"].append(message)
+            
+            results["success"] = True
+            
+        except Exception as e:
+            logging.error(f"Task execution failed: {e}")
+            results["error"] = str(e)
+        
+        yield results
+    
+    def reset_context(self):
+        """Clear conversation history"""
+        self.context = []
+        logging.info(f"{self.name} context reset")
+    
+    def save_session(self, path: str):
+        """Save conversation session"""
+        import json
+        with open(path, 'w') as f:
+            json.dump(self.context, f, indent=2)
+        logging.info(f"Session saved to {path}")
+    
+    def load_session(self, path: str):
+        """Load conversation session"""
+        import json
+        with open(path) as f:
+            self.context = json.load(f)
+        logging.info(f"Session loaded from {path}")
+
+
+def create_agent(
+    agent_type: str = "general",
+    name: str = None,
+    **kwargs
+) -> NovaAgent:
+    """
+    Factory function to create specialized agents
+    
+    Args:
+        agent_type: Type of agent (general, code, debug, refactor, test)
+        name: Custom name for agent
+        **kwargs: Additional agent options
+        
+    Returns:
+        Initialized agent instance
+    """
+    agents = {
+        "general": NovaAgent,
+        "code": lambda **k: __import__('code_agent').CodeAgent(**k),
+        "debug": lambda **k: __import__('debug_agent').DebugAgent(**k),
+        "refactor": lambda **k: __import__('refactor_agent').RefactorAgent(**k),
+        "test": lambda **k: __import__('test_agent').TestAgent(**k),
+        "analysis": lambda **k: __import__('analysis_agent').AnalysisAgent(**k),
+    }
+    
+    AgentClass = agents.get(agent_type, NovaAgent)
+    
+    check name:
+        kwargs['name'] = name
+    
+    AgentClass(**kwargs)

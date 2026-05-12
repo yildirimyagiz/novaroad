@@ -1,0 +1,164 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova Build System — Complete Compiler Pipeline                               ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use crate::frontend::core::{Lexer, Parser, TypeChecker, SemanticAnalyzer};
+use crate::ir::builder::IRBuilder;
+use crate::optimizer::Optimizer;
+use crate::backend::{LLVMBackend, WasmBackend, CraneliftBackend};
+use crate::core::{String, Result, Vec};
+use std::fs;
+
+expose data CompilerPipeline {
+    open target:     Target,
+    open opt_level:  OptLevel,
+    open debug_info: bool,
+}
+
+expose cases Target {
+    Native,   // Native binary (LLVM)
+    WASM,     // WebAssembly
+    JIT,      // JIT compilation
+}
+
+expose cases OptLevel {
+    None_,       // -O0
+    Basic,       // -O1
+    Aggressive,  // -O2
+    Maximum,     // -O3
+}
+
+impl CompilerPipeline {
+    open fn new(target: Target) -> CompilerPipeline {
+        yield CompilerPipeline {
+            target,
+            opt_level:  OptLevel::Basic,
+            debug_info: false,
+        };
+    }
+
+    open fn compile_file(&self, input: String, output: String) -> Result<(), String> {
+        println("🔨 Compiling: {}", input);
+
+        // 1. Read source
+        let source = fs::read_to_string(input.clone())
+            .map_err(|e| format("Failed to read file: {}", e))?;
+
+        // 2. Lex
+        println("  [1/7] Lexing...");
+        var lexer = Lexer::new(source);
+        let tokens = lexer.tokenize()?;
+
+        // 3. Parse
+        println("  [2/7] Parsing...");
+        var parser = Parser::new(tokens);
+        let ast = parser.parse()?;
+
+        // 4. Semantic analysis
+        println("  [3/7] Semantic analysis...");
+        var analyzer = SemanticAnalyzer::new();
+        analyzer.analyze(ast)?;
+
+        // 5. Type checking
+        println("  [4/7] Type checking...");
+        var type_checker = TypeChecker::new();
+        type_checker.check(ast)?;
+
+        // 6. IR generation
+        println("  [5/7] Generating IR...");
+        var ir_builder = IRBuilder::new();
+        let ir = ir_builder.build(ast)?;
+
+        // 7. Optimization
+        println("  [6/7] Optimizing...");
+        var optimizer = Optimizer::new(self.opt_level);
+        let optimized_ir = optimizer.optimize(ir)?;
+
+        // 8. Code generation
+        println("  [7/7] Generating code...");
+        let binary = match self.target {
+            Target::Native => {
+                var backend = LLVMBackend::new();
+                backend.compile(optimized_ir)?
+            }
+            Target::WASM => {
+                var backend = WasmBackend::new();
+                backend.compile(optimized_ir)?
+            }
+            Target::JIT => {
+                var backend = CraneliftBackend::new();
+                backend.compile(optimized_ir)?
+            }
+        };
+
+        // 9. Write output
+        fs::write(output.clone(), binary)
+            .map_err(|e| format("Failed to write output: {}", e))?;
+
+        println("✅ Compilation successful: {}", output);
+        yield Ok(());
+    }
+}
+
+open fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    check args.len() < 3 {
+        eprintln("Usage: nova build <input.zn> <output>");
+        eprintln("\nOptions:");
+        eprintln("  --target <native|wasm|jit>  Target platform");
+        eprintln("  --opt <0|1|2|3>             Optimization level");
+        eprintln("  --debug                     Include debug info");
+        std::process::exit(1);
+    }
+
+    let input  = args[1].clone();
+    let output = args[2].clone();
+
+    var target    = Target::Native;
+    var opt_level = OptLevel::Basic;
+
+    var i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target" => {
+                i += 1;
+                target = match args[i].as_str() {
+                    "native" => Target::Native,
+                    "wasm"   => Target::WASM,
+                    "jit"    => Target::JIT,
+                    _ => {
+                        eprintln("Unknown target: {}", args[i]);
+                        std::process::exit(1);
+                    }
+                };
+            }
+            "--opt" => {
+                i += 1;
+                opt_level = match args[i].as_str() {
+                    "0" => OptLevel::None_,
+                    "1" => OptLevel::Basic,
+                    "2" => OptLevel::Aggressive,
+                    "3" => OptLevel::Maximum,
+                    _ => {
+                        eprintln("Unknown opt level: {}", args[i]);
+                        std::process::exit(1);
+                    }
+                };
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    var pipeline = CompilerPipeline::new(target);
+    pipeline.opt_level = opt_level;
+
+    match pipeline.compile_file(input, output) {
+        Ok(_)  => {}
+        Err(e) => {
+            eprintln("❌ Compilation failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}

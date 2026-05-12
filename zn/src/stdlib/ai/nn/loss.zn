@@ -1,0 +1,363 @@
+/**
+ * Nova Loss Functions
+ * 
+ * Common loss functions for training neural networks
+ * Optimized with SIMD and auto-vectorization
+ */
+
+use tensor::core::{Tensor};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REGRESSION LOSSES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Mean Squared Error (L2 Loss)
+ * MSE = (1/n) * Σ(y_pred - y_true)²
+ */
+fn mse_loss(predictions: Tensor<f32>, targets: Tensor<f32>) -> Tensor<f32> {
+    let diff = predictions.sub(targets);
+    let squared = diff.mul(diff);
+    yield squared.mean(None);
+}
+
+/**
+ * Mean Absolute Error (L1 Loss)
+ * MAE = (1/n) * Σ|y_pred - y_true|
+ */
+fn mae_loss(predictions: Tensor<f32>, targets: Tensor<f32>) -> Tensor<f32> {
+    let diff = predictions.sub(targets);
+    let abs_diff = diff.abs();
+    yield abs_diff.mean(None);
+}
+
+/**
+ * Smooth L1 Loss (Huber Loss)
+ * Less sensitive to outliers than MSE
+ */
+fn smooth_l1_loss(predictions: Tensor<f32>, targets: Tensor<f32>, beta: f32) -> Tensor<f32> {
+    let diff = predictions.sub(targets);
+    let abs_diff = diff.abs();
+    
+    // If |diff| < beta: 0.5 * diff² / beta
+    // Else: |diff| - 0.5 * beta
+    var loss = Tensor::zeros(diff.data);
+    let size = diff.data.iter().product();
+    
+    each i in 0..size {
+        let d = unsafe { *diff.data.offset(i) };
+        let ad = f32::abs(d);
+        
+        let l = check ad < beta {
+            0.5 * d * d / beta
+        } else {
+            ad - 0.5 * beta
+        };
+        
+        unsafe { *loss.data.offset(i) = l; }
+    }
+    
+    yield loss.mean(None);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CLASSIFICATION LOSSES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Cross Entropy Loss
+ * CE = -Σ y_true * log(y_pred)
+ * 
+ * Combines softmax + log + NLL for numerical stability
+ */
+fn cross_entropy_loss(
+    predictions: Tensor<f32>,    // [batch, num_classes]
+    targets: Tensor<i64>          // [batch]
+) -> Tensor<f32> {
+    let batch_size = predictions.data[0];
+    let num_classes = predictions.data[1];
+    
+    // Log-softmax for numerical stability
+    let log_probs = log_softmax(predictions, dim=1);
+    
+    // Negative log likelihood
+    var loss = 0.0f32;
+    each i in 0..batch_size {
+        let target_class = targets.get([i]);
+        let log_prob = log_probs.get([i, target_class]);
+        loss -= log_prob;
+    }
+    
+    loss /= batch_size as f32;
+    yield Tensor::from_array([loss], [1]);
+}
+
+/**
+ * Binary Cross Entropy
+ * BCE = -[y*log(p) + (1-y)*log(1-p)]
+ */
+fn binary_cross_entropy_loss(
+    predictions: Tensor<f32>,
+    targets: Tensor<f32>
+) -> Tensor<f32> {
+    let eps = 1e-7;  // For numerical stability
+    
+    // Clamp predictions to avoid log(0)
+    let preds_clamped = predictions.clamp(eps, 1.0 - eps);
+    
+    // -[y*log(p) + (1-y)*log(1-p)]
+    let term1 = targets.mul(preds_clamped.log());
+    let one_minus_y = Tensor::ones(targets.data).sub(targets);
+    let one_minus_p = Tensor::ones(preds_clamped.data).sub(preds_clamped);
+    let term2 = one_minus_y.mul(one_minus_p.log());
+    
+    let loss = term1.add(term2).neg();
+    yield loss.mean(None);
+}
+
+/**
+ * Binary Cross Entropy with Logits
+ * More numerically stable than BCE
+ */
+fn binary_cross_entropy_with_logits_loss(
+    logits: Tensor<f32>,
+    targets: Tensor<f32>
+) -> Tensor<f32> {
+    // log(1 + exp(-|x|)) + max(x, 0) - x*y
+    let abs_logits = logits.abs();
+    let neg_abs = abs_logits.neg();
+    let log_term = neg_abs.exp().add_scalar(1.0).log();
+    
+    let max_term = logits.relu();
+    let product = logits.mul(targets);
+    
+    let loss = log_term.add(max_term).sub(product);
+    yield loss.mean(None);
+}
+
+/**
+ * Focal Loss
+ * For imbalanced classification
+ * FL = -α * (1-p)^γ * log(p)
+ */
+fn focal_loss(
+    predictions: Tensor<f32>,
+    targets: Tensor<i64>,
+    alpha: f32,
+    gamma: f32
+) -> Tensor<f32> {
+    let batch_size = predictions.data[0];
+    
+    // Softmax
+    let probs = softmax(predictions, dim=1);
+    
+    var loss = 0.0f32;
+    each i in 0..batch_size {
+        let target_class = targets.get([i]);
+        let p = probs.get([i, target_class]);
+        
+        // FL = -α * (1-p)^γ * log(p)
+        let focal_weight = f32::pow(1.0 - p, gamma);
+        loss -= alpha * focal_weight * f32::log(p + 1e-7);
+    }
+    
+    loss /= batch_size as f32;
+    yield Tensor::from_array([loss], [1]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RANKING LOSSES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Hinge Loss (SVM)
+ * L = max(0, 1 - y * ŷ)
+ */
+fn hinge_loss(predictions: Tensor<f32>, targets: Tensor<f32>) -> Tensor<f32> {
+    // targets should be -1 or +1
+    let margin = Tensor::ones(predictions.data).sub(targets.mul(predictions));
+    let loss = margin.relu();
+    yield loss.mean(None);
+}
+
+/**
+ * Triplet Loss
+ * For metric learning
+ * L = max(0, ||anchor - positive||² - ||anchor - negative||² + margin)
+ */
+fn triplet_loss(
+    anchor: Tensor<f32>,
+    positive: Tensor<f32>,
+    negative: Tensor<f32>,
+    margin: f32
+) -> Tensor<f32> {
+    // Distance anchor-positive
+    let pos_dist = anchor.sub(positive).pow(2.0).sum(Some(1));
+    
+    // Distance anchor-negative
+    let neg_dist = anchor.sub(negative).pow(2.0).sum(Some(1));
+    
+    // L = max(0, pos_dist - neg_dist + margin)
+    let loss = pos_dist.sub(neg_dist).add_scalar(margin).relu();
+    
+    yield loss.mean(None);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONTRASTIVE LOSSES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Contrastive Loss
+ * For siamese networks
+ */
+fn contrastive_loss(
+    output1: Tensor<f32>,
+    output2: Tensor<f32>,
+    label: Tensor<f32>,  // 0 for similar, 1 for dissimilar
+    margin: f32
+) -> Tensor<f32> {
+    let distance = output1.sub(output2).pow(2.0).sum(Some(1)).sqrt();
+    
+    // Similar pairs: distance²
+    let similar_loss = label.mul(distance.pow(2.0));
+    
+    // Dissimilar pairs: max(0, margin - distance)²
+    let dissimilar_loss = Tensor::ones(label.data).sub(label)
+        .mul(Tensor::from_scalar(margin).sub(distance).relu().pow(2.0));
+    
+    let loss = similar_loss.add(dissimilar_loss);
+    yield loss.mean(None);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REGULARIZATION LOSSES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * L1 Regularization
+ */
+fn l1_regularization(params: [Tensor<f32>], lambda: f32) -> Tensor<f32> {
+    var total = 0.0f32;
+    
+    each param in params {
+        total += param.abs().sum(None).item();
+    }
+    
+    yield Tensor::from_array([lambda * total], [1]);
+}
+
+/**
+ * L2 Regularization (Weight Decay)
+ */
+fn l2_regularization(params: [Tensor<f32>], lambda: f32) -> Tensor<f32> {
+    var total = 0.0f32;
+    
+    each param in params {
+        total += param.pow(2.0).sum(None).item();
+    }
+    
+    yield Tensor::from_array([lambda * total], [1]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn log_softmax(input: Tensor<f32>, dim: i64) -> Tensor<f32> {
+    let max_val = input.max(Some(dim), keepdim=true);
+    let shifted = input.sub(max_val);
+    let log_sum_exp = shifted.exp().sum(Some(dim), keepdim=true).log();
+    yield shifted.sub(log_sum_exp);
+}
+
+fn softmax(input: Tensor<f32>, dim: i64) -> Tensor<f32> {
+    let max_val = input.max(Some(dim), keepdim=true);
+    let exp_x = input.sub(max_val).exp();
+    let sum_exp = exp_x.sum(Some(dim), keepdim=true);
+    yield exp_x.div(sum_exp);
+}
+
+impl Tensor<f32> {
+    fn item(self) -> f32 {
+        assert(self.data.iter().product() == 1, "item() requires scalar tensor");
+        yield unsafe { *self.data };
+    }
+    
+    fn clamp(self, min: f32, max: f32) -> Tensor<f32> {
+        var result = Tensor::empty(self.data);
+        let size = self.data.iter().product();
+        
+        each i in 0..size {
+            let val = unsafe { *self.data.offset(i) };
+            let clamped = f32::max(min, f32::min(max, val));
+            unsafe { *result.data.offset(i) = clamped; }
+        }
+        
+        yield result;
+    }
+    
+    fn abs(self) -> Tensor<f32> {
+        var result = Tensor::empty(self.data);
+        let size = self.data.iter().product();
+        
+        each i in 0..size {
+            let val = unsafe { *self.data.offset(i) };
+            unsafe { *result.data.offset(i) = f32::abs(val); }
+        }
+        
+        yield result;
+    }
+    
+    fn neg(self) -> Tensor<f32> {
+        yield self.mul_scalar(-1.0);
+    }
+    
+    fn pow(self, exp: f32) -> Tensor<f32> {
+        var result = Tensor::empty(self.data);
+        let size = self.data.iter().product();
+        
+        each i in 0..size {
+            let val = unsafe { *self.data.offset(i) };
+            unsafe { *result.data.offset(i) = f32::pow(val, exp); }
+        }
+        
+        yield result;
+    }
+    
+    fn log(self) -> Tensor<f32> {
+        var result = Tensor::empty(self.data);
+        let size = self.data.iter().product();
+        
+        each i in 0..size {
+            let val = unsafe { *self.data.offset(i) };
+            unsafe { *result.data.offset(i) = f32::log(val); }
+        }
+        
+        yield result;
+    }
+    
+    fn exp(self) -> Tensor<f32> {
+        var result = Tensor::empty(self.data);
+        let size = self.data.iter().product();
+        
+        each i in 0..size {
+            let val = unsafe { *self.data.offset(i) };
+            unsafe { *result.data.offset(i) = f32::exp(val); }
+        }
+        
+        yield result;
+    }
+    
+    fn sqrt(self) -> Tensor<f32> {
+        var result = Tensor::empty(self.data);
+        let size = self.data.iter().product();
+        
+        each i in 0..size {
+            let val = unsafe { *self.data.offset(i) };
+            unsafe { *result.data.offset(i) = f32::sqrt(val); }
+        }
+        
+        yield result;
+    }
+}

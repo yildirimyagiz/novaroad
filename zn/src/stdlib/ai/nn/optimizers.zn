@@ -1,0 +1,699 @@
+/**
+ * Nova Neural Network Optimizers
+ * Complete PyTorch-compatible optimizer implementations
+ */
+
+use tensor::core::{Tensor};
+use std::collections::HashMap;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OPTIMIZER BASE
+// ═══════════════════════════════════════════════════════════════════════════
+
+open rules Optimizer {
+    fn step(var self);
+    fn zero_grad(var self);
+    fn state_dict(self) -> HashMap<str, Tensor>;
+    fn load_state_dict(var self, state: HashMap<str, Tensor>);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SGD (Stochastic Gradient Descent)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data SGD {
+    params: Vec<Tensor>,
+    lr: f64,
+    momentum: f64,
+    dampening: f64,
+    weight_decay: f64,
+    nesterov: bool,
+    velocity: HashMap<i64, Tensor>
+}
+
+impl SGD {
+    fn new(params: Vec<Tensor>, lr: f64, momentum: f64 = 0.0, 
+               weight_decay: f64 = 0.0, dampening: f64 = 0.0, nesterov: bool = false) -> Self {
+        SGD {
+            params,
+            lr,
+            momentum,
+            dampening,
+            weight_decay,
+            nesterov,
+            velocity: HashMap::new()
+        }
+    }
+}
+
+impl Optimizer for SGD {
+    fn step(var self) {
+        each entry in self.params.iter_mut().enumerate()  { let (i, param) = entry;
+            check param.grad.is_none() {
+                next;
+            }
+            
+            var grad = param.grad.as_ref().unwrap().clone();
+            
+            // Weight decay
+            check self.weight_decay != 0.0 {
+                grad = grad + param.mul_scalar(self.weight_decay);
+            }
+            
+            // Momentum
+            check self.momentum != 0.0 {
+                let param_id = i as i64;
+                
+                check !self.velocity.contains_key(&param_id) {
+                    let v = grad.clone();
+                    self.velocity.insert(param_id, v);
+                } else {
+                    let v = self.velocity.get_mut(&param_id).unwrap();
+                    *v = v.mul_scalar(self.momentum) + grad.mul_scalar(1.0 - self.dampening);
+                }
+                
+                check self.nesterov {
+                    grad = grad + self.velocity.get(&param_id).unwrap().mul_scalar(self.momentum);
+                } else {
+                    grad = self.velocity.get(&param_id).unwrap().clone();
+                }
+            }
+            
+            // Update parameters
+            *param = param.sub(grad.mul_scalar(self.lr));
+        }
+    }
+    
+    fn zero_grad(var self) {
+        each param in &var self.params {
+            param.grad = None;
+        }
+    }
+    
+    fn state_dict(self) -> HashMap<str, Tensor> {
+        var state = HashMap::new();
+        
+        each entry in &self.velocity  { let (k, v) = entry;
+            state.insert(format("velocity_{}", k), v.clone());
+        }
+        
+        yield state;
+    }
+    
+    fn load_state_dict(var self, state: HashMap<str, Tensor>) {
+        each entry in state  { let (key, value) = entry;
+            check key.starts_with("velocity_") {
+                let id: i64 = key[9..].parse().unwrap();
+                self.velocity.insert(id, value);
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADAM (Adaptive Moment Estimation)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Adam {
+    params: Vec<Tensor>,
+    lr: f64,
+    betas: (f64, f64),
+    eps: f64,
+    weight_decay: f64,
+    amsgrad: bool,
+    m: HashMap<i64, Tensor>,  // First moment
+    v: HashMap<i64, Tensor>,  // Second moment
+    max_v: HashMap<i64, Tensor>,  // Max second moment (for AMSGrad)
+    step_count: i64
+}
+
+impl Adam {
+    fn new(params: Vec<Tensor>, lr: f64 = 1e-3, betas: (f64, f64) = (0.9, 0.999),
+               eps: f64 = 1e-8, weight_decay: f64 = 0.0, amsgrad: bool = false) -> Self {
+        Adam {
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            amsgrad,
+            m: HashMap::new(),
+            v: HashMap::new(),
+            max_v: HashMap::new(),
+            step_count: 0
+        }
+    }
+}
+
+impl Optimizer for Adam {
+    fn step(var self) {
+        self.step_count += 1;
+        let (beta1, beta2) = self.betas;
+        
+        each entry in self.params.iter_mut().enumerate()  { let (i, param) = entry;
+            check param.grad.is_none() {
+                next;
+            }
+            
+            var grad = param.grad.as_ref().unwrap().clone();
+            let param_id = i as i64;
+            
+            // Weight decay
+            check self.weight_decay != 0.0 {
+                grad = grad + param.mul_scalar(self.weight_decay);
+            }
+            
+            // Initialize moments check needed
+            check !self.m.contains_key(&param_id) {
+                self.m.insert(param_id, Tensor::zeros_like(param));
+                self.v.insert(param_id, Tensor::zeros_like(param));
+                check self.amsgrad {
+                    self.max_v.insert(param_id, Tensor::zeros_like(param));
+                }
+            }
+            
+            // Update biased first moment
+            let m = self.m.get_mut(&param_id).unwrap();
+            *m = m.mul_scalar(beta1) + grad.mul_scalar(1.0 - beta1);
+            
+            // Update biased second moment
+            let v = self.v.get_mut(&param_id).unwrap();
+            *v = v.mul_scalar(beta2) + grad.pow(2.0).mul_scalar(1.0 - beta2);
+            
+            // Compute bias-corrected moments
+            let m_hat = m.div_scalar(1.0 - f64::powf(beta1, self.step_count as f64));
+            let v_hat = v.div_scalar(1.0 - f64::powf(beta2, self.step_count as f64));
+            
+            // Compute update
+            let update = check self.amsgrad {
+                let max_v = self.max_v.get_mut(&param_id).unwrap();
+                *max_v = Tensor::maximum(max_v.clone(), v_hat.clone());
+                m_hat.div(max_v.sqrt().add_scalar(self.eps))
+            } else {
+                m_hat.div(v_hat.sqrt().add_scalar(self.eps))
+            };
+            
+            // Update parameters
+            *param = param.sub(update.mul_scalar(self.lr));
+        }
+    }
+    
+    fn zero_grad(var self) {
+        each param in &var self.params {
+            param.grad = None;
+        }
+    }
+    
+    fn state_dict(self) -> HashMap<str, Tensor> {
+        var state = HashMap::new();
+        
+        each entry in &self.m  { let (k, v) = entry;
+            state.insert(format("m_{}", k), v.clone());
+        }
+        each entry in &self.v  { let (k, v) = entry;
+            state.insert(format("v_{}", k), v.clone());
+        }
+        check self.amsgrad {
+            each entry in &self.max_v  { let (k, v) = entry;
+                state.insert(format("max_v_{}", k), v.clone());
+            }
+        }
+        
+        yield state;
+    }
+    
+    fn load_state_dict(var self, state: HashMap<str, Tensor>) {
+        each entry in state  { let (key, value) = entry;
+            check key.starts_with("m_") {
+                let id: i64 = key[2..].parse().unwrap();
+                self.m.insert(id, value);
+            } else check key.starts_with("v_") {
+                let id: i64 = key[2..].parse().unwrap();
+                self.v.insert(id, value);
+            } else check key.starts_with("max_v_") {
+                let id: i64 = key[6..].parse().unwrap();
+                self.max_v.insert(id, value);
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADAMW (Adam with Weight Decay)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data AdamW {
+    params: Vec<Tensor>,
+    lr: f64,
+    betas: (f64, f64),
+    eps: f64,
+    weight_decay: f64,
+    m: HashMap<i64, Tensor>,
+    v: HashMap<i64, Tensor>,
+    step_count: i64
+}
+
+impl AdamW {
+    fn new(params: Vec<Tensor>, lr: f64 = 1e-3, betas: (f64, f64) = (0.9, 0.999),
+               eps: f64 = 1e-8, weight_decay: f64 = 0.01) -> Self {
+        AdamW {
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            m: HashMap::new(),
+            v: HashMap::new(),
+            step_count: 0
+        }
+    }
+}
+
+impl Optimizer for AdamW {
+    fn step(var self) {
+        self.step_count += 1;
+        let (beta1, beta2) = self.betas;
+        
+        each entry in self.params.iter_mut().enumerate()  { let (i, param) = entry;
+            check param.grad.is_none() {
+                next;
+            }
+            
+            let grad = param.grad.as_ref().unwrap().clone();
+            let param_id = i as i64;
+            
+            // Initialize moments check needed
+            check !self.m.contains_key(&param_id) {
+                self.m.insert(param_id, Tensor::zeros_like(param));
+                self.v.insert(param_id, Tensor::zeros_like(param));
+            }
+            
+            // Update biased first moment
+            let m = self.m.get_mut(&param_id).unwrap();
+            *m = m.mul_scalar(beta1) + grad.mul_scalar(1.0 - beta1);
+            
+            // Update biased second moment
+            let v = self.v.get_mut(&param_id).unwrap();
+            *v = v.mul_scalar(beta2) + grad.pow(2.0).mul_scalar(1.0 - beta2);
+            
+            // Compute bias-corrected moments
+            let m_hat = m.div_scalar(1.0 - f64::powf(beta1, self.step_count as f64));
+            let v_hat = v.div_scalar(1.0 - f64::powf(beta2, self.step_count as f64));
+            
+            // AdamW: decouple weight decay from gradient
+            let update = m_hat.div(v_hat.sqrt().add_scalar(self.eps));
+            
+            // Update parameters with decoupled weight decay
+            *param = param.mul_scalar(1.0 - self.lr * self.weight_decay)
+                          .sub(update.mul_scalar(self.lr));
+        }
+    }
+    
+    fn zero_grad(var self) {
+        each param in &var self.params {
+            param.grad = None;
+        }
+    }
+    
+    fn state_dict(self) -> HashMap<str, Tensor> {
+        var state = HashMap::new();
+        
+        each entry in &self.m  { let (k, v) = entry;
+            state.insert(format("m_{}", k), v.clone());
+        }
+        each entry in &self.v  { let (k, v) = entry;
+            state.insert(format("v_{}", k), v.clone());
+        }
+        
+        yield state;
+    }
+    
+    fn load_state_dict(var self, state: HashMap<str, Tensor>) {
+        each entry in state  { let (key, value) = entry;
+            check key.starts_with("m_") {
+                let id: i64 = key[2..].parse().unwrap();
+                self.m.insert(id, value);
+            } else check key.starts_with("v_") {
+                let id: i64 = key[2..].parse().unwrap();
+                self.v.insert(id, value);
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RMSPROP
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data RMSprop {
+    params: Vec<Tensor>,
+    lr: f64,
+    alpha: f64,
+    eps: f64,
+    weight_decay: f64,
+    momentum: f64,
+    centered: bool,
+    v: HashMap<i64, Tensor>,
+    buf: HashMap<i64, Tensor>,
+    grad_avg: HashMap<i64, Tensor>
+}
+
+impl RMSprop {
+    fn new(params: Vec<Tensor>, lr: f64 = 1e-2, alpha: f64 = 0.99,
+               eps: f64 = 1e-8, weight_decay: f64 = 0.0, momentum: f64 = 0.0,
+               centered: bool = false) -> Self {
+        RMSprop {
+            params,
+            lr,
+            alpha,
+            eps,
+            weight_decay,
+            momentum,
+            centered,
+            v: HashMap::new(),
+            buf: HashMap::new(),
+            grad_avg: HashMap::new()
+        }
+    }
+}
+
+impl Optimizer for RMSprop {
+    fn step(var self) {
+        each entry in self.params.iter_mut().enumerate()  { let (i, param) = entry;
+            check param.grad.is_none() {
+                next;
+            }
+            
+            var grad = param.grad.as_ref().unwrap().clone();
+            let param_id = i as i64;
+            
+            // Weight decay
+            check self.weight_decay != 0.0 {
+                grad = grad + param.mul_scalar(self.weight_decay);
+            }
+            
+            // Initialize state check needed
+            check !self.v.contains_key(&param_id) {
+                self.v.insert(param_id, Tensor::zeros_like(param));
+                check self.momentum > 0.0 {
+                    self.buf.insert(param_id, Tensor::zeros_like(param));
+                }
+                check self.centered {
+                    self.grad_avg.insert(param_id, Tensor::zeros_like(param));
+                }
+            }
+            
+            // Update squared gradient moving average
+            let v = self.v.get_mut(&param_id).unwrap();
+            *v = v.mul_scalar(self.alpha) + grad.pow(2.0).mul_scalar(1.0 - self.alpha);
+            
+            let avg = check self.centered {
+                // Update gradient moving average
+                let grad_avg = self.grad_avg.get_mut(&param_id).unwrap();
+                *grad_avg = grad_avg.mul_scalar(self.alpha) + grad.mul_scalar(1.0 - self.alpha);
+                v.clone() - grad_avg.pow(2.0)
+            } else {
+                v.clone()
+            };
+            
+            check self.momentum > 0.0 {
+                let buf = self.buf.get_mut(&param_id).unwrap();
+                *buf = buf.mul_scalar(self.momentum) + grad.div(avg.sqrt().add_scalar(self.eps));
+                *param = param.sub(buf.mul_scalar(self.lr));
+            } else {
+                *param = param.sub(grad.div(avg.sqrt().add_scalar(self.eps)).mul_scalar(self.lr));
+            }
+        }
+    }
+    
+    fn zero_grad(var self) {
+        each param in &var self.params {
+            param.grad = None;
+        }
+    }
+    
+    fn state_dict(self) -> HashMap<str, Tensor> {
+        var state = HashMap::new();
+        
+        each entry in &self.v  { let (k, v) = entry;
+            state.insert(format("v_{}", k), v.clone());
+        }
+        each entry in &self.buf  { let (k, v) = entry;
+            state.insert(format("buf_{}", k), v.clone());
+        }
+        check self.centered {
+            each entry in &self.grad_avg  { let (k, v) = entry;
+                state.insert(format("grad_avg_{}", k), v.clone());
+            }
+        }
+        
+        yield state;
+    }
+    
+    fn load_state_dict(var self, state: HashMap<str, Tensor>) {
+        each entry in state  { let (key, value) = entry;
+            check key.starts_with("v_") {
+                let id: i64 = key[2..].parse().unwrap();
+                self.v.insert(id, value);
+            } else check key.starts_with("buf_") {
+                let id: i64 = key[4..].parse().unwrap();
+                self.buf.insert(id, value);
+            } else check key.starts_with("grad_avg_") {
+                let id: i64 = key[9..].parse().unwrap();
+                self.grad_avg.insert(id, value);
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADAGRAD
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Adagrad {
+    params: Vec<Tensor>,
+    lr: f64,
+    lr_decay: f64,
+    weight_decay: f64,
+    eps: f64,
+    sum: HashMap<i64, Tensor>,
+    step_count: i64
+}
+
+impl Adagrad {
+    fn new(params: Vec<Tensor>, lr: f64 = 1e-2, lr_decay: f64 = 0.0,
+               weight_decay: f64 = 0.0, eps: f64 = 1e-10) -> Self {
+        Adagrad {
+            params,
+            lr,
+            lr_decay,
+            weight_decay,
+            eps,
+            sum: HashMap::new(),
+            step_count: 0
+        }
+    }
+}
+
+impl Optimizer for Adagrad {
+    fn step(var self) {
+        self.step_count += 1;
+        
+        each entry in self.params.iter_mut().enumerate()  { let (i, param) = entry;
+            check param.grad.is_none() {
+                next;
+            }
+            
+            var grad = param.grad.as_ref().unwrap().clone();
+            let param_id = i as i64;
+            
+            // Weight decay
+            check self.weight_decay != 0.0 {
+                grad = grad + param.mul_scalar(self.weight_decay);
+            }
+            
+            // Initialize state check needed
+            check !self.sum.contains_key(&param_id) {
+                self.sum.insert(param_id, Tensor::zeros_like(param));
+            }
+            
+            // Accumulate gradient squares
+            let sum = self.sum.get_mut(&param_id).unwrap();
+            *sum = sum.clone() + grad.pow(2.0);
+            
+            // Compute learning rate with decay
+            let clr = self.lr / (1.0 + (self.step_count - 1) as f64 * self.lr_decay);
+            
+            // Update parameters
+            let std = sum.sqrt().add_scalar(self.eps);
+            *param = param.sub(grad.div(std).mul_scalar(clr));
+        }
+    }
+    
+    fn zero_grad(var self) {
+        each param in &var self.params {
+            param.grad = None;
+        }
+    }
+    
+    fn state_dict(self) -> HashMap<str, Tensor> {
+        var state = HashMap::new();
+        
+        each entry in &self.sum  { let (k, v) = entry;
+            state.insert(format("sum_{}", k), v.clone());
+        }
+        
+        yield state;
+    }
+    
+    fn load_state_dict(var self, state: HashMap<str, Tensor>) {
+        each entry in state  { let (key, value) = entry;
+            check key.starts_with("sum_") {
+                let id: i64 = key[4..].parse().unwrap();
+                self.sum.insert(id, value);
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LION (Evolved Sign Momentum)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Lion {
+    params: Vec<Tensor>,
+    lr: f64,
+    betas: (f64, f64),
+    weight_decay: f64,
+    m: HashMap<i64, Tensor>
+}
+
+impl Lion {
+    fn new(params: Vec<Tensor>, lr: f64 = 1e-4, betas: (f64, f64) = (0.9, 0.99),
+               weight_decay: f64 = 0.0) -> Self {
+        Lion {
+            params,
+            lr,
+            betas,
+            weight_decay,
+            m: HashMap::new()
+        }
+    }
+}
+
+impl Optimizer for Lion {
+    fn step(var self) {
+        let (beta1, beta2) = self.betas;
+        
+        each entry in self.params.iter_mut().enumerate()  { let (i, param) = entry;
+            check param.grad.is_none() {
+                next;
+            }
+            
+            let grad = param.grad.as_ref().unwrap().clone();
+            let param_id = i as i64;
+            
+            // Initialize momentum check needed
+            check !self.m.contains_key(&param_id) {
+                self.m.insert(param_id, Tensor::zeros_like(param));
+            }
+            
+            let m = self.m.get_mut(&param_id).unwrap();
+            
+            // Compute update: sign(beta1 * m + (1 - beta1) * grad)
+            let update = (m.mul_scalar(beta1) + grad.mul_scalar(1.0 - beta1)).sign();
+            
+            // Update parameters with weight decay
+            *param = param.mul_scalar(1.0 - self.lr * self.weight_decay)
+                          .sub(update.mul_scalar(self.lr));
+            
+            // Update momentum: beta2 * m + (1 - beta2) * grad
+            *m = m.mul_scalar(beta2) + grad.mul_scalar(1.0 - beta2);
+        }
+    }
+    
+    fn zero_grad(var self) {
+        each param in &var self.params {
+            param.grad = None;
+        }
+    }
+    
+    fn state_dict(self) -> HashMap<str, Tensor> {
+        var state = HashMap::new();
+        
+        each entry in &self.m  { let (k, v) = entry;
+            state.insert(format("m_{}", k), v.clone());
+        }
+        
+        yield state;
+    }
+    
+    fn load_state_dict(var self, state: HashMap<str, Tensor>) {
+        each entry in state  { let (key, value) = entry;
+            check key.starts_with("m_") {
+                let id: i64 = key[2..].parse().unwrap();
+                self.m.insert(id, value);
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LEARNING RATE SCHEDULERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data StepLR {
+    optimizer: Box<dyn Optimizer>,
+    step_size: i64,
+    gamma: f64,
+    last_epoch: i64
+}
+
+impl StepLR {
+    fn new(optimizer: Box<dyn Optimizer>, step_size: i64, gamma: f64 = 0.1) -> Self {
+        StepLR {
+            optimizer,
+            step_size,
+            gamma,
+            last_epoch: 0
+        }
+    }
+    
+    fn step(var self) {
+        self.last_epoch += 1;
+        
+        check self.last_epoch % self.step_size == 0 {
+            // Multiply learning rate by gamma
+            self.optimizer.lr *= self.gamma;
+        }
+    }
+}
+
+open data CosineAnnealingLR {
+    optimizer: Box<dyn Optimizer>,
+    T_max: i64,
+    eta_min: f64,
+    base_lr: f64,
+    last_epoch: i64
+}
+
+impl CosineAnnealingLR {
+    fn new(optimizer: Box<dyn Optimizer>, T_max: i64, eta_min: f64 = 0.0) -> Self {
+        let base_lr = optimizer.lr;
+        
+        CosineAnnealingLR {
+            optimizer,
+            T_max,
+            eta_min,
+            base_lr,
+            last_epoch: 0
+        }
+    }
+    
+    fn step(var self) {
+        self.last_epoch += 1;
+        
+        let cos_val = f64::cos(std::f64::consts::PI * self.last_epoch as f64 / self.T_max as f64);
+        self.optimizer.lr = self.eta_min + (self.base_lr - self.eta_min) * (1.0 + cos_val) / 2.0;
+    }
+}

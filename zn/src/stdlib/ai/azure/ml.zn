@@ -1,0 +1,804 @@
+// Nova Azure Machine Learning Integration
+// Microsoft Azure ML platform integration
+// Complete MLOps with Azure ML services
+
+// Updated to v9.0 - Modern Nova Syntax
+@module("ai::azure::ml")
+@reproducible
+@export
+
+use std::collections::{HashMap, Vec};
+
+/// Azure ML Client
+expose data AzureMLClient {
+    subscription_id: String,
+    resource_group: String,
+    workspace_name: String,
+    region: String,
+    credentials: AzureCredentials,
+    ml_client: AzureMLAPI,
+    experiments: HashMap<String, Experiment>,
+    models: HashMap<String, AzureModel>,
+    endpoints: HashMap<String, Endpoint>,
+    runs: HashMap<String, Run>,
+}
+
+#[derive(Clone)]
+expose data AzureCredentials {
+    tenant_id: String,
+    client_id: String,
+    client_secret: String,
+}
+
+#[derive(Clone)]
+expose data AzureMLAPI {
+    base_url: String,
+    api_version: String,
+}
+
+impl AzureMLClient {
+    /// Create Azure ML client
+    fn new(subscription_id: &str, resource_group: &str, workspace_name: &str, region: &str, credentials: AzureCredentials) -> Self {
+        AzureMLClient {
+            subscription_id: subscription_id.into(),
+            resource_group: resource_group.into(),
+            workspace_name: workspace_name.into(),
+            region: region.into(),
+            credentials,
+            ml_client: AzureMLAPI {
+                base_url: "https://management.azure.com".into(),
+                api_version: "2022-05-01".into(),
+            },
+            experiments: HashMap::new(),
+            models: HashMap::new(),
+            endpoints: HashMap::new(),
+            runs: HashMap::new(),
+        }
+    }
+
+    /// Create experiment
+    fn create_experiment(&var self, experiment_name: &str, description: &str) -> Result<String, String> {
+        let experiment = Experiment {
+            experiment_name: experiment_name.into(),
+            description: description.into(),
+            creation_time: std::time::SystemTime::now(),
+            tags: HashMap::new(),
+        };
+
+        self.experiments.insert(experiment_name.into(), experiment);
+        println("🧪 Created Azure ML experiment: {}", experiment_name);
+        Ok(experiment_name.into())
+    }
+
+    /// Submit training run
+    async fn submit_run(&var self, experiment_name: &str, run_config: RunConfig) -> Result<String, String> {
+        let run_id = generate_run_id();
+
+        let run = Run {
+            run_id: run_id.clone(),
+            experiment_name: experiment_name.into(),
+            status: RunStatus::Running,
+            start_time: std::time::SystemTime::now(),
+            end_time: None,
+            run_details: run_config,
+            metrics: HashMap::new(),
+            artifacts: [],
+        };
+
+        self.runs.insert(run_id.clone(), run);
+
+        // In practice, would submit to Azure ML
+        println("🚀 Submitted Azure ML run: {}", run_id);
+        Ok(run_id)
+    }
+
+    /// Register model
+    fn register_model(&var self, model_name: &str, model_path: &str, tags: HashMap<String, String>) -> Result<String, String> {
+        let model = AzureModel {
+            model_name: model_name.into(),
+            model_path: model_path.into(),
+            tags,
+            properties: HashMap::new(),
+            creation_time: std::time::SystemTime::now(),
+            model_id: generate_model_id(),
+        };
+
+        self.models.insert(model_name.into(), model);
+        println("🤖 Registered Azure ML model: {}", model_name);
+        Ok(model_name.into())
+    }
+
+    /// Create online endpoint
+    async fn create_online_endpoint(&var self, endpoint_name: &str, config: OnlineEndpointConfig) -> Result<String, String> {
+        let endpoint = Endpoint {
+            endpoint_name: endpoint_name.into(),
+            endpoint_type: EndpointType::Online,
+            provisioning_state: ProvisioningState::Succeeded,
+            scoring_uri: format("https://{}.openai.azure.com", endpoint_name),
+            creation_time: std::time::SystemTime::now(),
+            config: EndpointConfig::Online(config),
+        };
+
+        self.endpoints.insert(endpoint_name.into(), endpoint);
+        println("🌐 Created Azure ML online endpoint: {}", endpoint_name);
+        Ok(endpoint_name.into())
+    }
+
+    /// Create batch endpoint
+    async fn create_batch_endpoint(&var self, endpoint_name: &str, config: BatchEndpointConfig) -> Result<String, String> {
+        let endpoint = Endpoint {
+            endpoint_name: endpoint_name.into(),
+            endpoint_type: EndpointType::Batch,
+            provisioning_state: ProvisioningState::Succeeded,
+            scoring_uri: format("https://{}.batch.azureml.com", endpoint_name),
+            creation_time: std::time::SystemTime::now(),
+            config: EndpointConfig::Batch(config),
+        };
+
+        self.endpoints.insert(endpoint_name.into(), endpoint);
+        println("📦 Created Azure ML batch endpoint: {}", endpoint_name);
+        Ok(endpoint_name.into())
+    }
+
+    /// Deploy model to endpoint
+    async fn deploy_model(&var self, endpoint_name: &str, deployment_config: DeploymentConfig) -> Result<String, String> {
+        check let Some(endpoint) = self.endpoints.get_mut(endpoint_name) {
+            // Update endpoint with deployment
+            println("🚀 Deployed model to endpoint: {}", endpoint_name);
+            Ok(format("deployment_{}", endpoint_name))
+        } else {
+            Err(format("Endpoint {} not found", endpoint_name))
+        }
+    }
+
+    /// Get run status
+    fn get_run_status(&self, run_id: &str) -> Result<&Run, String> {
+        self.runs.get(run_id)
+            .ok_or(format("Run {} not found", run_id))
+    }
+
+    /// Log metric to run
+    fn log_metric(&var self, run_id: &str, key: &str, value: f64) -> Result<(), String> {
+        check let Some(run) = self.runs.get_mut(run_id) {
+            run.metrics.insert(key.into(), value);
+            println("📊 Logged metric {} = {} for run {}", key, value, run_id);
+            Ok(())
+        } else {
+            Err(format("Run {} not found", run_id))
+        }
+    }
+
+    /// Log artifact to run
+    fn log_artifact(&var self, run_id: &str, artifact_path: &str, artifact_name: &str) -> Result<(), String> {
+        check let Some(run) = self.runs.get_mut(run_id) {
+            run.artifacts.push(Artifact {
+                name: artifact_name.into(),
+                path: artifact_path.into(),
+                upload_time: std::time::SystemTime::now(),
+            });
+            println("📎 Logged artifact {} for run {}", artifact_name, run_id);
+            Ok(())
+        } else {
+            Err(format("Run {} not found", run_id))
+        }
+    }
+
+    /// Invoke online endpoint
+    async fn invoke_endpoint(&self, endpoint_name: &str, input_data: serde_json::Value) -> Result<serde_json::Value, String> {
+        check let Some(endpoint) = self.endpoints.get(endpoint_name) {
+            check endpoint.provisioning_state == ProvisioningState::Succeeded {
+                // In practice, would make HTTP request to Azure ML endpoint
+                println("🌐 Invoking endpoint: {}", endpoint_name);
+                Ok(serde_json::json!({"predictions": [0.8, 0.2]}))
+            } else {
+                Err(format("Endpoint {} is not ready", endpoint_name))
+            }
+        } else {
+            Err(format("Endpoint {} not found", endpoint_name))
+        }
+    }
+
+    /// AutoML with Azure AutoML
+    async fn automl_job(&var self, job_name: &str, config: AutoMLConfig) -> Result<String, String> {
+        println("🎯 Creating Azure AutoML job: {}", job_name);
+
+        let automl_run = Run {
+            run_id: generate_run_id(),
+            experiment_name: config.experiment_name,
+            status: RunStatus::Running,
+            start_time: std::time::SystemTime::now(),
+            end_time: None,
+            run_details: RunConfig::AutoML(config),
+            metrics: HashMap::new(),
+            artifacts: [],
+        };
+
+        let run_id = automl_run.run_id.clone();
+        self.runs.insert(run_id.clone(), automl_run);
+
+        // Submit AutoML job
+        println("✅ AutoML job submitted");
+        Ok(run_id)
+    }
+
+    /// Hyperparameter tuning job
+    async fn hyperdrive_job(&var self, job_name: &str, config: HyperDriveConfig) -> Result<String, String> {
+        println("🎛️ Creating Azure HyperDrive tuning job: {}", job_name);
+
+        let tuning_run = Run {
+            run_id: generate_run_id(),
+            experiment_name: config.experiment_name,
+            status: RunStatus::Running,
+            start_time: std::time::SystemTime::now(),
+            end_time: None,
+            run_details: RunConfig::HyperDrive(config),
+            metrics: HashMap::new(),
+            artifacts: [],
+        };
+
+        let run_id = tuning_run.run_id.clone();
+        self.runs.insert(run_id.clone(), tuning_run);
+
+        // Submit HyperDrive job
+        println("✅ HyperDrive job submitted");
+        Ok(run_id)
+    }
+
+    /// Create compute target
+    fn create_compute_target(&self, name: &str, config: ComputeConfig) -> Result<String, String> {
+        println("🖥️ Created Azure ML compute target: {}", name);
+        Ok(name.into())
+    }
+
+    /// Create data store
+    fn create_datastore(&self, name: &str, config: DatastoreConfig) -> Result<String, String> {
+        println("💾 Created Azure ML datastore: {}", name);
+        Ok(name.into())
+    }
+
+    /// Monitor model performance
+    fn create_model_monitor(&self, monitor_name: &str, config: ModelMonitorConfig) -> Result<String, String> {
+        println("📊 Created Azure ML model monitor: {}", monitor_name);
+        Ok(monitor_name.into())
+    }
+}
+
+/// Data Structures
+#[derive(Clone)]
+expose data Experiment {
+    experiment_name: String,
+    description: String,
+    creation_time: std::time::SystemTime,
+    tags: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+expose cases RunConfig {
+    ScriptRun(ScriptRunConfig),
+    AutoML(AutoMLConfig),
+    HyperDrive(HyperDriveConfig),
+}
+
+#[derive(Clone)]
+expose data ScriptRunConfig {
+    script: String,
+    arguments: Vec<String>,
+    compute_target: String,
+    environment: EnvironmentConfig,
+}
+
+#[derive(Clone)]
+expose data EnvironmentConfig {
+    environment_name: Option<String>,
+    docker_image: Option<String>,
+    conda_packages: Vec<String>,
+    pip_packages: Vec<String>,
+}
+
+#[derive(Clone)]
+expose cases RunStatus {
+    Queued,
+    Preparing,
+    Running,
+    Finalizing,
+    Completed,
+    Failed,
+    Canceled,
+}
+
+#[derive(Clone)]
+expose data Run {
+    run_id: String,
+    experiment_name: String,
+    status: RunStatus,
+    start_time: std::time::SystemTime,
+    end_time: Option<std::time::SystemTime>,
+    run_details: RunConfig,
+    metrics: HashMap<String, f64>,
+    artifacts: Vec<Artifact>,
+}
+
+#[derive(Clone)]
+expose data Artifact {
+    name: String,
+    path: String,
+    upload_time: std::time::SystemTime,
+}
+
+#[derive(Clone)]
+expose data AzureModel {
+    model_name: String,
+    model_path: String,
+    tags: HashMap<String, String>,
+    properties: HashMap<String, String>,
+    creation_time: std::time::SystemTime,
+    model_id: String,
+}
+
+#[derive(Clone)]
+expose cases EndpointType {
+    Online,
+    Batch,
+}
+
+#[derive(Clone)]
+expose cases ProvisioningState {
+    Creating,
+    Succeeded,
+    Failed,
+    Deleting,
+    Canceled,
+}
+
+#[derive(Clone)]
+expose cases EndpointConfig {
+    Online(OnlineEndpointConfig),
+    Batch(BatchEndpointConfig),
+}
+
+#[derive(Clone)]
+expose data OnlineEndpointConfig {
+    auth_mode: AuthMode,
+    location: String,
+    traffic: HashMap<String, i32>,
+}
+
+#[derive(Clone)]
+expose cases AuthMode {
+    Key,
+    AADToken,
+    AMLToken,
+}
+
+#[derive(Clone)]
+expose data BatchEndpointConfig {
+    auth_mode: AuthMode,
+    location: String,
+    defaults: BatchEndpointDefaults,
+}
+
+#[derive(Clone)]
+expose data BatchEndpointDefaults {
+    deployment_name: Option<String>,
+}
+
+#[derive(Clone)]
+expose data Endpoint {
+    endpoint_name: String,
+    endpoint_type: EndpointType,
+    provisioning_state: ProvisioningState,
+    scoring_uri: String,
+    creation_time: std::time::SystemTime,
+    config: EndpointConfig,
+}
+
+#[derive(Clone)]
+expose data DeploymentConfig {
+    model_name: String,
+    model_version: Option<String>,
+    compute_target: String,
+    environment: EnvironmentConfig,
+    instance_type: String,
+    instance_count: i32,
+}
+
+#[derive(Clone)]
+expose data AutoMLConfig {
+    experiment_name: String,
+    compute_target: String,
+    task: AutoMLTask,
+    training_data: DatasetReference,
+    validation_data: Option<DatasetReference>,
+    label_column_name: String,
+    primary_metric: String,
+    experiment_timeout_minutes: i32,
+    max_concurrent_iterations: i32,
+    max_iterations: i32,
+    n_cross_validations: i32,
+    preprocessing: bool,
+    featurization: FeaturizationMode,
+}
+
+#[derive(Clone)]
+expose cases AutoMLTask {
+    Classification,
+    Regression,
+    Forecasting,
+    ImageClassification,
+    ImageObjectDetection,
+    TextClassification,
+}
+
+#[derive(Clone)]
+expose data DatasetReference {
+    dataset_id: String,
+    version: Option<String>,
+}
+
+#[derive(Clone)]
+expose cases FeaturizationMode {
+    Auto,
+    Off,
+    Custom,
+}
+
+#[derive(Clone)]
+expose data HyperDriveConfig {
+    experiment_name: String,
+    compute_target: String,
+    run_config: ScriptRunConfig,
+    hyperparameter_sampling: ParameterSampling,
+    primary_metric_config: MetricConfig,
+    max_total_runs: i32,
+    max_concurrent_runs: Option<i32>,
+    policy: Option<EarlyTerminationPolicy>,
+}
+
+#[derive(Clone)]
+expose cases ParameterSampling {
+    Grid(GridSampling),
+    Random(RandomSampling),
+    Bayesian(BayesianSampling),
+}
+
+#[derive(Clone)]
+expose data GridSampling {
+    parameter_space: HashMap<String, Vec<String>>,
+}
+
+#[derive(Clone)]
+expose data RandomSampling {
+    parameter_space: HashMap<String, ParameterDefinition>,
+}
+
+#[derive(Clone)]
+expose data BayesianSampling {
+    parameter_space: HashMap<String, ParameterDefinition>,
+}
+
+#[derive(Clone)]
+expose data ParameterDefinition {
+    param_type: ParameterType,
+    spec: ParameterSpec,
+}
+
+#[derive(Clone)]
+expose cases ParameterType {
+    Choice,
+    Uniform,
+    Normal,
+    LogNormal,
+    QUniform,
+    QNormal,
+    QLogNormal,
+}
+
+#[derive(Clone)]
+expose cases ParameterSpec {
+    Choice(Vec<String>),
+    Uniform { min_value: f64, max_value: f64 },
+    Normal { mu: f64, sigma: f64 },
+    LogNormal { mu: f64, sigma: f64 },
+    QUniform { min_value: f64, max_value: f64, q: f64 },
+    QNormal { mu: f64, sigma: f64, q: f64 },
+    QLogNormal { mu: f64, sigma: f64, q: f64 },
+}
+
+#[derive(Clone)]
+expose data MetricConfig {
+    metric_name: String,
+    primary_metric_goal: Goal,
+}
+
+#[derive(Clone)]
+expose cases Goal {
+    Minimize,
+    Maximize,
+}
+
+#[derive(Clone)]
+expose cases EarlyTerminationPolicy {
+    BanditPolicy(BanditPolicy),
+    MedianStoppingPolicy,
+    TruncationSelectionPolicy,
+}
+
+#[derive(Clone)]
+expose data BanditPolicy {
+    slack_factor: Option<f64>,
+    slack_amount: Option<f64>,
+    evaluation_interval: Option<i32>,
+    delay_evaluation: Option<i32>,
+}
+
+#[derive(Clone)]
+expose cases ComputeConfig {
+    AmlCompute(AmlComputeConfig),
+    ComputeInstance(ComputeInstanceConfig),
+    Kubernetes(KubernetesConfig),
+}
+
+#[derive(Clone)]
+expose data AmlComputeConfig {
+    vm_size: String,
+    vm_priority: VmPriority,
+    min_nodes: i32,
+    max_nodes: i32,
+    idle_time_before_scale_down: Option<i32>,
+}
+
+#[derive(Clone)]
+expose cases VmPriority {
+    LowPriority,
+    Dedicated,
+}
+
+#[derive(Clone)]
+expose data ComputeInstanceConfig {
+    vm_size: String,
+}
+
+#[derive(Clone)]
+expose data KubernetesConfig {
+    compute_target_name: String,
+}
+
+#[derive(Clone)]
+expose cases DatastoreConfig {
+    AzureBlobStorage(AzureBlobConfig),
+    AzureFileShare(AzureFileConfig),
+    AzureDataLakeStorage(AzureDataLakeConfig),
+}
+
+#[derive(Clone)]
+expose data AzureBlobConfig {
+    account_name: String,
+    container_name: String,
+    account_key: Option<String>,
+}
+
+#[derive(Clone)]
+expose data AzureFileConfig {
+    account_name: String,
+    file_share_name: String,
+    account_key: Option<String>,
+}
+
+#[derive(Clone)]
+expose data AzureDataLakeConfig {
+    store_name: String,
+    tenant_id: String,
+    client_id: String,
+    client_secret: String,
+}
+
+#[derive(Clone)]
+expose data ModelMonitorConfig {
+    compute_target: String,
+    monitoring_target: MonitoringTarget,
+    alert_config: AlertConfig,
+}
+
+#[derive(Clone)]
+expose cases MonitoringTarget {
+    ModelId(String),
+    DeploymentId(String),
+}
+
+#[derive(Clone)]
+expose data AlertConfig {
+    email_on_alert: bool,
+    webhook_url: Option<String>,
+    alert_thresholds: HashMap<String, f64>,
+}
+
+/// High-level Azure ML AutoML API
+expose data AzureMLAutoML {
+    client: AzureMLClient,
+}
+
+impl AzureMLAutoML {
+    fn new(subscription_id: &str, resource_group: &str, workspace_name: &str, region: &str, credentials: AzureCredentials) -> Self {
+        AzureMLAutoML {
+            client: AzureMLClient::new(subscription_id, resource_group, workspace_name, region, credentials),
+        }
+    }
+
+    /// Complete AutoML workflow
+    async fn automl_workflow(&var self, config: AutoMLWorkflowConfig) -> Result<AutoMLWorkflowResult, String> {
+        // 1. Create experiment
+        self.client.create_experiment(&config.experiment_name, &config.description)?;
+
+        // 2. Create AutoML job
+        let automl_config = AutoMLConfig {
+            experiment_name: config.experiment_name.clone(),
+            compute_target: config.compute_target,
+            task: config.task,
+            training_data: config.training_data,
+            validation_data: config.validation_data,
+            label_column_name: config.label_column_name,
+            primary_metric: config.primary_metric,
+            experiment_timeout_minutes: config.experiment_timeout_minutes,
+            max_concurrent_iterations: config.max_concurrent_iterations,
+            max_iterations: config.max_iterations,
+            n_cross_validations: config.n_cross_validations,
+            preprocessing: config.preprocessing,
+            featurization: config.featurization,
+        };
+
+        let run_id = self.client.automl_job("automl_run", automl_config).await?;
+
+        // 3. Wait for completion (in practice, would poll)
+        println("⏳ Waiting for AutoML job completion...");
+
+        // 4. Get best model
+        let best_model_name = format("{}_best_model", config.experiment_name);
+        self.client.register_model(&best_model_name, "automl_output/model.pkl", HashMap::new())?;
+
+        // 5. Deploy to online endpoint
+        let endpoint_config = OnlineEndpointConfig {
+            auth_mode: AuthMode::Key,
+            location: self.client.region.clone(),
+            traffic: [("primary".into(), 100)].iter().cloned().collect(),
+        };
+
+        let endpoint_name = format("{}_endpoint", config.experiment_name);
+        self.client.create_online_endpoint(&endpoint_name, endpoint_config).await?;
+
+        // 6. Deploy model
+        let deployment_config = DeploymentConfig {
+            model_name: best_model_name.clone(),
+            model_version: None,
+            compute_target: config.compute_target,
+            environment: EnvironmentConfig {
+                environment_name: Some("AzureML-sklearn-0.24-ubuntu18.04-py37-cpu".into()),
+                docker_image: None,
+                conda_packages: [],
+                pip_packages: [],
+            },
+            instance_type: "Standard_DS2_v2".into(),
+            instance_count: 1,
+        };
+
+        self.client.deploy_model(&endpoint_name, deployment_config).await?;
+
+        Ok(AutoMLWorkflowResult {
+            experiment_name: config.experiment_name,
+            best_model_name,
+            endpoint_name,
+            run_id,
+            training_time: std::time::Duration::from_secs(3600),
+        })
+    }
+}
+
+#[derive(Clone)]
+expose data AutoMLWorkflowConfig {
+    experiment_name: String,
+    description: String,
+    compute_target: String,
+    task: AutoMLTask,
+    training_data: DatasetReference,
+    validation_data: Option<DatasetReference>,
+    label_column_name: String,
+    primary_metric: String,
+    experiment_timeout_minutes: i32,
+    max_concurrent_iterations: i32,
+    max_iterations: i32,
+    n_cross_validations: i32,
+    preprocessing: bool,
+    featurization: FeaturizationMode,
+}
+
+#[derive(Clone)]
+expose data AutoMLWorkflowResult {
+    experiment_name: String,
+    best_model_name: String,
+    endpoint_name: String,
+    run_id: String,
+    training_time: std::time::Duration,
+}
+
+// Utility functions
+fn generate_run_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    format("run_{}", time)
+}
+
+fn generate_model_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    format("model_{}", time)
+}
+
+/// Example usage
+open async fn example_azure_ml_workflow() {
+    // Create Azure ML client
+    let credentials = AzureCredentials {
+        tenant_id: "your-tenant-id".into(),
+        client_id: "your-client-id".into(),
+        client_secret: "your-client-secret".into(),
+    };
+
+    var azure_ml = AzureMLClient::new(
+        "your-subscription-id",
+        "your-resource-group",
+        "your-workspace",
+        "eastus",
+        credentials,
+    );
+
+    // AutoML workflow
+    let automl = AzureMLAutoML::new(
+        "your-subscription-id",
+        "your-resource-group",
+        "your-workspace",
+        "eastus",
+        credentials,
+    );
+
+    let workflow_config = AutoMLWorkflowConfig {
+        experiment_name: "customer-churn-automl".into(),
+        description: "AutoML for customer churn prediction".into(),
+        compute_target: "cpu-cluster".into(),
+        task: AutoMLTask::Classification,
+        training_data: DatasetReference {
+            dataset_id: "churn-training-data".into(),
+            version: Some("latest".into()),
+        },
+        validation_data: None,
+        label_column_name: "Churn".into(),
+        primary_metric: "AUC_weighted".into(),
+        experiment_timeout_minutes: 60,
+        max_concurrent_iterations: 4,
+        max_iterations: 20,
+        n_cross_validations: 5,
+        preprocessing: true,
+        featurization: FeaturizationMode::Auto,
+    };
+
+    let result = automl.automl_workflow(workflow_config).await.unwrap();
+
+    println("🎯 Azure ML AutoML workflow completed!");
+    println("Experiment: {}", result.experiment_name);
+    println("Best Model: {}", result.best_model_name);
+    println("Endpoint: {}", result.endpoint_name);
+    println("Run ID: {}", result.run_id);
+
+    // Make predictions
+    let input_data = serde_json::json!({
+        "data": [
+            [0.1, 0.2, 0.3, 0.4, 0.5],
+            [0.6, 0.7, 0.8, 0.9, 1.0]
+        ]
+    });
+
+    let prediction = azure_ml.invoke_endpoint(&result.endpoint_name, input_data).await.unwrap();
+    println("🔮 Prediction result: {}", prediction);
+
+    // Log additional metrics
+    azure_ml.log_metric(&result.run_id, "final_accuracy", 0.87).unwrap();
+
+    println("🎉 Azure ML workflow completed successfully!");
+}

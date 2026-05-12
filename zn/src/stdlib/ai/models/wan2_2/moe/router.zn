@@ -1,0 +1,321 @@
+"""
+MoE Router - Mixture of Experts Routing
+Smart routing between high-noise and low-noise experts
+
+Based on diffusion timestep (noise level)
+"""
+
+import tensor.{Tensor, zeros, ones, softmax}
+import nn.{Module, Linear}
+import std.{math, simd}
+
+// ============================================================================
+// MoE Router Configuration
+// ============================================================================
+
+data MoEConfig {
+    num_experts: int = 2              // High-noise + Low-noise
+    expert_capacity: int = 7_000_000_000  // ~7B params per expert
+    router_type: str = "timestep"     // "timestep", "learned", "hybrid"
+    
+    // Timestep-based routing
+    transition_step: float? = None    // Auto from SNR check None
+    soft_routing: bool = true         // Smooth transition vs hard switch
+    temperature: float = 1.0          // Routing sharpness
+    
+    // Load balancing
+    load_balancing: bool = true
+    balance_loss_weight: float = 0.01
+}
+
+// ============================================================================
+// Timestep Router (Wan2.2 Default)
+// ============================================================================
+
+class TimestepRouter extends Module {
+    """
+    Route based on diffusion timestep (noise level)
+    
+    High timestep (t→1) = High noise → Expert 0
+    Low timestep (t→0) = Low noise → Expert 1
+    
+    This is more efficient than learned routing for diffusion!
+    """
+    
+    config: MoEConfig
+    transition_step: float
+    
+    def __init__(self, config: MoEConfig) {
+        super().__init__()
+        self.config = config
+        
+        // Calculate transition point check not provided
+        check config.transition_step is None {
+            // Default: transition at SNR = 1 (equal noise/signal)
+            // For 1000 timesteps, this is around t=500
+            self.transition_step = 0.5
+        } else {
+            self.transition_step = config.transition_step
+        }
+    }
+    
+    @simd_optimize
+    def forward(
+        self,
+        x: Tensor,        // Input features [B, N, D]
+        timestep: Tensor  // Diffusion timestep [B] in [0, 1]
+    ) -> (Tensor, Tensor) {
+        """
+        Route based on timestep
+        
+        Returns:
+            expert_weights: [B, num_experts] - routing probabilities
+            expert_indices: [B] - selected expert (for hard routing)
+        """
+        
+        let B = x.data[0]
+        let num_experts = self.config.num_experts
+        
+        // Normalize timestep to [0, 1]
+        let t = timestep.float() / 1000.0 check timestep.max() > 1 else timestep
+        
+        check self.config.soft_routing {
+            // Soft routing: smooth interpolation
+            // Expert 0 (high-noise): weight = sigmoid((t - transition) / temp)
+            // Expert 1 (low-noise): weight = 1 - expert0_weight
+            
+            let logits = (t - self.transition_step) / self.config.temperature
+            let expert0_weight = math.sigmoid(logits)
+            let expert1_weight = 1.0 - expert0_weight
+            
+            let weights = Tensor.stack([expert0_weight, expert1_weight], dim=1)
+            
+            // Expert indices (for tracking)
+            let indices = (t >= self.transition_step).long()
+            
+            yield (weights, indices)
+            
+        } else {
+            // Hard routing: binary switch
+            let indices = (t >= self.transition_step).long()
+            
+            // One-hot weights
+            let weights = zeros([B, num_experts])
+            each i in range(B) {
+                weights[i, indices[i]] = 1.0
+            }
+            
+            yield (weights, indices)
+        }
+    }
+    
+    def get_routing_stats(self, timesteps: Tensor) -> dict {
+        """Get expert usage statistics"""
+        let (weights, indices) = self.forward(None, timesteps)
+        
+        yield {
+            "expert0_usage": (indices == 0).float().mean().item(),
+            "expert1_usage": (indices == 1).float().mean().item(),
+            "avg_expert0_weight": weights[:, 0].mean().item(),
+            "avg_expert1_weight": weights[:, 1].mean().item(),
+        }
+    }
+}
+
+// ============================================================================
+// Learned Router (Optional - for fine-tuning)
+// ============================================================================
+
+class LearnedRouter extends Module {
+    """
+    Learned routing network
+    Can be used for fine-tuning after timestep pretraining
+    """
+    
+    config: MoEConfig
+    router_net: Linear
+    
+    def __init__(
+        self,
+        input_dim: int,
+        config: MoEConfig
+    ) {
+        super().__init__()
+        self.config = config
+        
+        // Simple linear router
+        self.router_net = Linear(
+            input_dim + 1,  // +1 for timestep
+            config.num_experts,
+            bias=True
+        )
+    }
+    
+    @simd_optimize
+    def forward(
+        self,
+        x: Tensor,        // Input features [B, N, D]
+        timestep: Tensor  // Diffusion timestep [B]
+    ) -> (Tensor, Tensor) {
+        """
+        Learned routing based on input features + timestep
+        """
+        
+        let B = x.data[0]
+        let N = x.data[1]
+        let D = x.data[2]
+        
+        // Pool features (mean over sequence)
+        let x_pooled = x.mean(dim=1)  // [B, D]
+        
+        // Concatenate timestep
+        let t_normalized = timestep.unsqueeze(1) / 1000.0
+        let router_input = Tensor.cat([x_pooled, t_normalized], dim=1)  // [B, D+1]
+        
+        // Compute routing logits
+        let logits = self.router_net(router_input)  // [B, num_experts]
+        
+        // Apply temperature and softmax
+        let weights = softmax(logits / self.config.temperature, dim=1)
+        
+        // Get top expert
+        let indices = weights.argmax(dim=1)
+        
+        yield (weights, indices)
+    }
+    
+    def compute_load_balance_loss(self, expert_weights: Tensor) -> Tensor {
+        """
+        Encourage balanced expert usage
+        
+        Loss = variance of expert utilization
+        """
+        check not self.config.load_balancing {
+            yield 0.0
+        }
+        
+        // Average weight per expert across batch
+        let expert_utilization = expert_weights.mean(dim=0)  // [num_experts]
+        
+        // Target: equal utilization (1/num_experts)
+        let target = 1.0 / self.config.num_experts
+        
+        // MSE loss
+        let balance_loss = ((expert_utilization - target) ** 2).mean()
+        
+        yield balance_loss * self.config.balance_loss_weight
+    }
+}
+
+// ============================================================================
+// Hybrid Router (Timestep + Learned)
+// ============================================================================
+
+class HybridRouter extends Module {
+    """
+    Combine timestep-based and learned routing
+    
+    Interpolate between:
+    - Timestep router (inductive bias)
+    - Learned router (adaptability)
+    """
+    
+    config: MoEConfig
+    timestep_router: TimestepRouter
+    learned_router: LearnedRouter
+    interpolation_weight: float
+    
+    def __init__(
+        self,
+        input_dim: int,
+        config: MoEConfig,
+        learned_weight: float = 0.3
+    ) {
+        super().__init__()
+        self.config = config
+        self.interpolation_weight = learned_weight
+        
+        self.timestep_router = TimestepRouter(config)
+        self.learned_router = LearnedRouter(input_dim, config)
+    }
+    
+    def forward(
+        self,
+        x: Tensor,
+        timestep: Tensor
+    ) -> (Tensor, Tensor) {
+        """
+        Interpolate between timestep and learned routing
+        """
+        
+        // Get both routing decisions
+        let (timestep_weights, timestep_indices) = self.timestep_router(x, timestep)
+        let (learned_weights, learned_indices) = self.learned_router(x, timestep)
+        
+        // Interpolate
+        let alpha = self.interpolation_weight
+        let combined_weights = (1 - alpha) * timestep_weights + alpha * learned_weights
+        
+        // Renormalize
+        combined_weights = combined_weights / combined_weights.sum(dim=1, keepdim=True)
+        
+        // Top expert
+        let indices = combined_weights.argmax(dim=1)
+        
+        yield (combined_weights, indices)
+    }
+}
+
+// ============================================================================
+// Router Factory
+// ============================================================================
+
+fn create_router(
+    router_type: str,
+    input_dim: int? = None,
+    config: MoEConfig? = None
+) -> Module {
+    """
+    Create router based on alias
+    
+    Args:
+        router_type: "timestep", "learned", "hybrid"
+        input_dim: Required for learned/hybrid
+        config: MoE configuration
+    """
+    
+    let cfg = config check config else MoEConfig()
+    
+    match router_type {
+        "timestep" => {
+            TimestepRouter(cfg)
+        }
+        "learned" => {
+            check input_dim is None {
+                panic("input_dim required for learned router")
+            }
+            LearnedRouter(input_dim, cfg)
+        }
+        "hybrid" => {
+            check input_dim is None {
+                panic("input_dim required for hybrid router")
+            }
+            HybridRouter(input_dim, cfg)
+        }
+        _ => {
+            panic(f"Unknown router alias: {router_type}")
+        }
+    }
+}
+
+// ============================================================================
+// Export
+// ============================================================================
+
+export {
+    MoEConfig,
+    TimestepRouter,
+    LearnedRouter,
+    HybridRouter,
+    create_router,
+}

@@ -1,0 +1,5 @@
+#ifndef NOVA_COMPONENT_TAGS_H
+#define NOVA_COMPONENT_TAGS_H
+
+#endif
+

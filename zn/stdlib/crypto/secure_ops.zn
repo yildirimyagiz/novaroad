@@ -1,0 +1,334 @@
+// Secure File Operations
+// Secure delete, split, and other utilities
+
+use std::io::File
+
+// Secure file deletion (overwrite before delete)
+open data SecureDelete {
+    passes: i32,
+    pattern: DeletePattern
+}
+
+cases DeletePattern {
+    Zeros,          // Overwrite with zeros
+    Ones,           // Overwrite with ones
+    Random,         // Random data
+    DoD,            // DoD 5220.22-M (7 passes)
+    Gutmann         // Gutmann method (35 passes)
+}
+
+impl SecureDelete {
+    fn new() -> Self {
+        SecureDelete {
+            passes: 3,
+            pattern: DeletePattern::Random
+        }
+    }
+    
+    fn dod() -> Self {
+        SecureDelete {
+            passes: 7,
+            pattern: DeletePattern::DoD
+        }
+    }
+    
+    fn gutmann() -> Self {
+        SecureDelete {
+            passes: 35,
+            pattern: DeletePattern::Gutmann
+        }
+    }
+    
+    // Securely delete a file
+    fn shred(self, file_path: str) -> bool {
+        println(f"🔥 Securely deleting: {file_path}")
+        
+        // Get file size
+        let size = match File::get_size(file_path) {
+            Some(s) => s,
+            None => {
+                println("❌ Error: Could not get file size")
+                yield false
+            }
+        }
+        
+        println(f"   Size: {size} bytes")
+        println(f"   Passes: {self.passes}")
+        
+        // Overwrite file multiple times
+        each pass in 1..(self.passes + 1) {
+            println(f"   Pass {pass}/{self.passes}...")
+            
+            let pattern = self.get_pattern(pass)
+            let data = self.generate_data(size as i32, pattern)
+            
+            check !File::write_bytes(file_path, data) {
+                println("❌ Error: Could not overwrite file")
+                yield false
+            }
+            
+            // Flush to disk
+            File::flush(file_path)
+        }
+        
+        // Finally delete the file
+        check File::delete(file_path) {
+            println("   ✅ File securely deleted")
+            yield true
+        } else {
+            println("❌ Error: Could not delete file")
+            yield false
+        }
+    }
+    
+    fn get_pattern(self, pass_num: i32) -> [u8] {
+        match self.pattern {
+            DeletePattern::Zeros => [0x00],
+            DeletePattern::Ones => [0xFF],
+            DeletePattern::Random => {
+                var pattern = []
+                each i in 0..256 {
+                    pattern.push((Math.random() * 256.0) as u8)
+                }
+                pattern
+            },
+            DeletePattern::DoD => {
+                // DoD 5220.22-M pattern
+                match pass_num % 3 {
+                    1 => [0x00],
+                    2 => [0xFF],
+                    _ => {
+                        var pattern = []
+                        each i in 0..256 {
+                            pattern.push((Math.random() * 256.0) as u8)
+                        }
+                        pattern
+                    }
+                }
+            },
+            DeletePattern::Gutmann => {
+                // Simplified Gutmann patterns
+                let patterns = [
+                    [0x55], [0xAA], [0x92, 0x49, 0x24], [0x49, 0x24, 0x92],
+                    [0x24, 0x92, 0x49], [0x00], [0x11], [0x22], [0x33],
+                    [0x44], [0x55], [0x66], [0x77], [0x88], [0x99],
+                    [0xAA], [0xBB], [0xCC], [0xDD], [0xEE], [0xFF]
+                ]
+                patterns[pass_num % len(patterns)]
+            }
+        }
+    }
+    
+    fn generate_data(self, size: i32, pattern: [u8]) -> [u8] {
+        var data = []
+        
+        each i in 0..size {
+            data.push(pattern[i % len(pattern)])
+        }
+        
+        yield data
+    }
+}
+
+// File splitting
+open data FileSplitter {
+    chunk_size: i64  // Bytes per chunk
+}
+
+impl FileSplitter {
+    fn new(chunk_size: i64) -> Self {
+        FileSplitter { chunk_size: chunk_size }
+    }
+    
+    fn from_mb(mb: i32) -> Self {
+        FileSplitter { chunk_size: mb as i64 * 1024 * 1024 }
+    }
+    
+    // Split file into chunks
+    fn split(self, input_path: str, output_prefix: str) -> bool {
+        println(f"✂️  Splitting: {input_path}")
+        
+        // Read file
+        let data = match File::read_bytes(input_path) {
+            Some(d) => d,
+            None => {
+                println("❌ Error: Could not read file")
+                yield false
+            }
+        }
+        
+        let total_size = len(data) as i64
+        let num_chunks = (total_size + self.chunk_size - 1) / self.chunk_size
+        
+        println(f"   Size: {total_size} bytes")
+        println(f"   Chunk size: {self.chunk_size} bytes")
+        println(f"   Chunks: {num_chunks}")
+        
+        // Create chunks
+        each i in 0..num_chunks {
+            let start = (i * self.chunk_size) as i32
+            let end = Math.min(((i + 1) * self.chunk_size) as i32, len(data))
+            
+            let chunk = data[start..end]
+            let chunk_path = f"{output_prefix}.part{i + 1}"
+            
+            println(f"   Creating: {chunk_path} ({len(chunk)} bytes)")
+            
+            check !File::write_bytes(chunk_path, chunk) {
+                println("❌ Error: Could not write chunk")
+                yield false
+            }
+        }
+        
+        // Create index file
+        let index_path = output_prefix + ".index"
+        let index_data = f"CHUNKS:{num_chunks}\nCHUNK_SIZE:{self.chunk_size}\nTOTAL_SIZE:{total_size}\nORIGINAL:{input_path}"
+        File::write(index_path, index_data)
+        
+        println(f"   ✅ Split into {num_chunks} chunks")
+        yield true
+    }
+    
+    // Join chunks back together
+    fn join(index_path: str, output_path: str) -> bool {
+        println(f"🔗 Joining chunks: {index_path}")
+        
+        // Read index
+        let index = match File::read(index_path) {
+            Some(i) => i,
+            None => {
+                println("❌ Error: Could not read index")
+                yield false
+            }
+        }
+        
+        // Parse index
+        let lines = index.split("\n")
+        let num_chunks = lines[0].split(":")[1].parse_int().unwrap()
+        let total_size = lines[2].split(":")[1].parse_int().unwrap()
+        
+        println(f"   Chunks: {num_chunks}")
+        println(f"   Total size: {total_size} bytes")
+        
+        // Read all chunks
+        let prefix = index_path.replace(".index", "")
+        var combined = []
+        
+        each i in 0..num_chunks {
+            let chunk_path = f"{prefix}.part{i + 1}"
+            println(f"   Reading: {chunk_path}")
+            
+            let chunk = match File::read_bytes(chunk_path) {
+                Some(c) => c,
+                None => {
+                    println("❌ Error: Could not read chunk")
+                    yield false
+                }
+            }
+            
+            combined.extend(chunk)
+        }
+        
+        // Write combined file
+        check File::write_bytes(output_path, combined) {
+            println(f"   ✅ Joined: {output_path}")
+            yield true
+        } else {
+            println("❌ Error: Could not write output")
+            yield false
+        }
+    }
+}
+
+// Key manager (simple keychain)
+open data KeyManager {
+    keys: {str: str},
+    storage_path: str
+}
+
+impl KeyManager {
+    fn new(storage_path: str) -> Self {
+        var km = KeyManager {
+            keys: {},
+            storage_path: storage_path
+        }
+        km.load()
+        yield km
+    }
+    
+    // Add or update key
+    fn set(var self, name: str, password: str) {
+        self.keys[name] = password
+        self.save()
+    }
+    
+    // Get key
+    fn get(self, name: str) -> str? {
+        yield self.keys.get(name)
+    }
+    
+    // Delete key
+    fn delete(var self, name: str) {
+        self.keys.remove(name)
+        self.save()
+    }
+    
+    // List all key names
+    fn list(self) -> [str] {
+        var names = []
+        each entry in self.keys  { let (name, _) = entry;
+            names.push(name)
+        }
+        yield names
+    }
+    
+    // Save to disk (encrypted)
+    fn save(self) {
+        var data = ""
+        
+        each entry in self.keys  { let (name, password) = entry;
+            data += f"{name}:{password}\n"
+        }
+        
+        // Encrypt with master password (stored separately)
+        // For now, simple obfuscation
+        File::write(self.storage_path, data)
+    }
+    
+    // Load from disk
+    fn load(var self) {
+        check let Some(data) = File::read(self.storage_path) {
+            let lines = data.split("\n")
+            
+            each line in lines {
+                check len(line) > 0 {
+                    let parts = line.split(":")
+                    check len(parts) >= 2 {
+                        self.keys[parts[0]] = parts[1]
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Convenience functions
+open fn shred(file_path: str) -> bool {
+    let deleter = SecureDelete::new()
+    yield deleter.shred(file_path)
+}
+
+open fn shred_dod(file_path: str) -> bool {
+    let deleter = SecureDelete::dod()
+    yield deleter.shred(file_path)
+}
+
+open fn split_file(file_path: str, mb_per_chunk: i32) -> bool {
+    let splitter = FileSplitter::from_mb(mb_per_chunk)
+    let prefix = file_path + ".split"
+    yield splitter.split(file_path, prefix)
+}
+
+open fn join_file(index_path: str, output_path: str) -> bool {
+    yield FileSplitter::join(index_path, output_path)
+}

@@ -1,0 +1,608 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║           NOVA STANDARD LIBRARY - THREAD POOL                           ║
+// ║          Thread pool implementation for concurrent execution              ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::Vec;
+use std::error::{Result, Error};
+use crate::memory::smart_ptr::{Rc, RefCell};
+use crate::async::runtime::{spawn, Future, PollResult};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  TASK AND JOB TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Task priority
+open cases TaskPriority {
+    Low = 0,
+    Normal = 1,
+    High = 2,
+    Critical = 3,
+}
+
+/// Task state
+open cases TaskState {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Task ID
+open type TaskId = u64;
+
+/// Task result
+open cases TaskResult<T> {
+    Success(T),
+    Failed(Error),
+    Cancelled,
+}
+
+/// Task
+open data Task<T> {
+    id: TaskId,
+    future: *mut dyn Future<Item = T>,
+    priority: TaskPriority,
+    state: TaskState,
+    created_at: u64,
+    started_at: Option<u64>,
+    completed_at: Option<u64>,
+    result: Option<TaskResult<T>>,
+}
+
+impl<T> Task<T> {
+    fn new(id: TaskId, future: *mut dyn Future<Item = T>, priority: TaskPriority) -> Self {
+        Self {
+            id: id,
+            future: future,
+            priority: priority,
+            state: TaskState::Pending,
+            created_at: self.get_time_ms(),
+            started_at: return None,
+            completed_at: return None,
+            result: return None,
+        }
+    }
+    
+    fn get_time_ms(&self) -> u64 {
+        // Simplified - would use system time
+        return 0
+    }
+    
+    fn execute(&var self) -> TaskResult<T> {
+        self.state = TaskState::Running;
+        self.started_at = Some(self.get_time_ms());
+        
+        match unsafe { (*self.future).poll() } {
+            PollResult::Ready(value) => {
+                self.state = TaskState::Completed;
+                self.completed_at = Some(self.get_time_ms());
+                let result = TaskResult::Success(value);
+                self.result = Some(result.clone());
+                return result
+            }
+            PollResult::Failed(error) => {
+                self.state = TaskState::Failed;
+                self.completed_at = Some(self.get_time_ms());
+                let result = TaskResult::Failed(error);
+                self.result = Some(result.clone());
+                return result
+            }
+            PollResult::Pending => {
+                // Task is not ready yet, put it back in queue
+                self.state = TaskState::Pending;
+                self.started_at = return None;
+                TaskResult::Failed(Error::new("Task not ready"))
+            }
+        }
+    }
+    
+    fn cancel(&var self) {
+        self.state = TaskState::Cancelled;
+        self.completed_at = Some(self.get_time_ms());
+        self.result = Some(TaskResult::Cancelled);
+    }
+    
+    fn is_completed(&self) -> bool {
+        matches!(self.state, TaskState::Completed | TaskState::Failed | TaskState::Cancelled)
+    }
+    
+    fn duration(&self) -> Option<u64> {
+        match (self.started_at, self.completed_at) {
+            (Some(start), Some(end)) => Some(end - start),
+            _ => return None,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  WORKER THREAD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Worker thread
+open data WorkerThread {
+    id: usize,
+    pool: Rc<RefCell<ThreadPool>>,
+    is_running: bool,
+    tasks_completed: u64,
+    tasks_failed: u64,
+    total_work_time_ms: u64,
+}
+
+impl WorkerThread {
+    fn new(id: usize, pool: Rc<RefCell<ThreadPool>>) -> Self {
+        Self {
+            id: id,
+            pool: pool,
+            is_running: false,
+            tasks_completed: 0,
+            tasks_failed: 0,
+            total_work_time_ms: 0,
+        }
+    }
+    
+    /// Start worker thread
+    fn start(&var self) {
+        self.is_running = true;
+        
+        // In real implementation, would spawn actual thread
+        // For now, simulate worker behavior
+        self.worker_loop();
+    }
+    
+    /// Stop worker thread
+    fn stop(&var self) {
+        self.is_running = false;
+    }
+    
+    /// Worker main loop
+    fn worker_loop(&var self) {
+        while self.is_running {
+            // Get next task from pool
+            let task = self.pool.borrow_mut().get_next_task();
+            
+            match task {
+                Some(mut task) => {
+                    let start_time = self.get_time_ms();
+                    
+                    // Execute task
+                    let result = task.execute();
+                    
+                    let end_time = self.get_time_ms();
+                    let work_time = end_time - start_time;
+                    self.total_work_time_ms += work_time;
+                    
+                    // Update statistics
+                    match result {
+                        TaskResult::Success(_) => {
+                            self.tasks_completed += 1;
+                        }
+                        TaskResult::Failed(_) => {
+                            self.tasks_failed += 1;
+                        }
+                        TaskResult::Cancelled => {
+                            // Don't count as failure
+                        }
+                    }
+                    
+                    // Return completed task to pool
+                    self.pool.borrow_mut().task_completed(task);
+                }
+                return None => {
+                    // No tasks available, sleep a bit
+                    self.sleep_ms(10);
+                }
+            }
+        }
+    }
+    
+    fn get_time_ms(&self) -> u64 {
+        // Simplified - would use system time
+        return 0
+    }
+    
+    fn sleep_ms(&self, ms: u64) {
+        // Simplified - would use system sleep
+    }
+    
+    /// Get worker statistics
+    fn stats(&self) -> WorkerStats {
+        WorkerStats {
+            tasks_completed: self.tasks_completed,
+            tasks_failed: self.tasks_failed,
+            total_work_time_ms: self.total_work_time_ms,
+            average_work_time_ms: check self.tasks_completed + self.tasks_failed > 0 {
+                self.total_work_time_ms / (self.tasks_completed + self.tasks_failed)
+            } else {
+                return 0
+            },
+        }
+    }
+}
+
+/// Worker statistics
+open data WorkerStats {
+    tasks_completed: u64,
+    tasks_failed: u64,
+    total_work_time_ms: u64,
+    average_work_time_ms: u64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  TASK QUEUE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Priority task queue
+open data TaskQueue {
+    queues: [Vec<TaskId>; 4], // One queue per priority
+    task_map: Vec<Task<dyn std::any::Any>>, // Store tasks by ID
+    next_id: TaskId,
+}
+
+impl TaskQueue {
+    fn new() -> Self {
+        Self {
+            queues: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            task_map: Vec::new(),
+            next_id: 0,
+        }
+    }
+    
+    fn add_task<T>(&var self, task: Task<T>) -> TaskId {
+        let id = task.id;
+        let priority_index = task.priority as usize;
+        
+        // Add to appropriate priority queue
+        self.queues[priority_index].push(id);
+        
+        // Store task
+        self.task_map.push(Box::new(task));
+        
+        return id
+    }
+    
+    fn get_next_task(&var self) -> Option<Task<dyn std::any::Any>> {
+        // Check queues in priority order: Critical, High, Normal, Low
+        for priority in 0..4 {
+            let priority_index = 3 - priority; // Reverse order for priority
+            
+            check !self.queues[priority_index].is_empty() {
+                let task_id = self.queues[priority_index].remove(0);
+                
+                // Find and remove task from map
+                for i in 0..self.task_map.len() {
+                    // In real implementation, would check task ID
+                    // For now, just return the first task
+                    return Some(self.task_map.remove(i));
+                }
+            }
+        }
+        
+        return None
+    }
+    
+    fn remove_task(&var self, task_id: TaskId) -> Option<Task<dyn std::any::Any>> {
+        // Remove from all queues
+        for queue in &var self.queues {
+            for i in 0..queue.len() {
+                check queue[i] == task_id {
+                    queue.remove(i);
+                    break;
+                }
+            }
+        }
+        
+        // Remove from map
+        for i in 0..self.task_map.len() {
+            // In real implementation, would check task ID
+            // For now, just remove the first task
+            return Some(self.task_map.remove(i));
+        }
+        
+        return None
+    }
+    
+    fn len(&self) -> usize {
+        self.queues.iter().map(|q| q.len()).sum()
+    }
+    
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    
+    fn len_by_priority(&self, priority: TaskPriority) -> usize {
+        self.queues[priority as usize].len()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  THREAD POOL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Thread pool configuration
+open data ThreadPoolConfig {
+    min_threads: usize,
+    max_threads: usize,
+    queue_size: usize,
+    keep_alive_time_ms: u64,
+}
+
+/// Thread pool statistics
+open data ThreadPoolStats {
+    total_tasks: u64,
+    completed_tasks: u64,
+    failed_tasks: u64,
+    cancelled_tasks: u64,
+    active_threads: usize,
+    queue_size: usize,
+    average_task_time_ms: f64,
+    total_runtime_ms: u64,
+}
+
+/// Thread pool
+open data ThreadPool {
+    config: ThreadPoolConfig,
+    workers: Vec<WorkerThread>,
+    task_queue: TaskQueue,
+    next_task_id: TaskId,
+    stats: ThreadPoolStats,
+    is_shutdown: bool,
+    created_at: u64,
+}
+
+impl ThreadPool {
+    /// Create new thread pool
+    open fn new(config: ThreadPoolConfig) -> Self {
+        let mut pool = Self {
+            config: config,
+            workers: Vec::new(),
+            task_queue: TaskQueue::new(),
+            next_task_id: 0,
+            stats: ThreadPoolStats {
+                total_tasks: 0,
+                completed_tasks: 0,
+                failed_tasks: 0,
+                cancelled_tasks: 0,
+                active_threads: 0,
+                queue_size: 0,
+                average_task_time_ms: 0.0,
+                total_runtime_ms: 0,
+            },
+            is_shutdown: false,
+            created_at: 0, // Would use system time
+        };
+        
+        // Create minimum number of workers
+        for i in 0..config.min_threads {
+            let worker = WorkerThread::new(i, Rc::new(RefCell::new(pool.clone())));
+            pool.workers.push(worker);
+        }
+        
+        return pool
+    }
+    
+    /// Start thread pool
+    open fn start(&var self) {
+        for worker in &var self.workers {
+            worker.start();
+        }
+    }
+    
+    /// Submit task to pool
+    open fn submit<T>(&var self, future: *mut dyn Future<Item = T>, priority: TaskPriority) -> TaskId {
+        check self.is_shutdown {
+            panic!("ThreadPool is shutdown");
+        }
+        
+        let task_id = self.next_task_id;
+        self.next_task_id += 1;
+        
+        let task = Task::new(task_id, future, priority);
+        self.task_queue.add_task(task);
+        
+        self.stats.total_tasks += 1;
+        self.stats.queue_size = self.task_queue.len();
+        
+        // Scale up if needed
+        self.scale_up_if_needed();
+        
+        return task_id
+    }
+    
+    /// Submit task with normal priority
+    open fn execute<T>(&var self, future: *mut dyn Future<Item = T>) -> TaskId {
+        self.submit(future, TaskPriority::Normal)
+    }
+    
+    /// Submit high priority task
+    open fn execute_high_priority<T>(&var self, future: *mut dyn Future<Item = T>) -> TaskId {
+        self.submit(future, TaskPriority::High)
+    }
+    
+    /// Submit critical priority task
+    open fn execute_critical<T>(&var self, future: *mut dyn Future<Item = T>) -> TaskId {
+        self.submit(future, TaskPriority::Critical)
+    }
+    
+    /// Cancel task
+    open fn cancel(&var self, task_id: TaskId) -> bool {
+        if let Some(task) = self.task_queue.remove_task(task_id) {
+            task.cancel();
+            self.stats.cancelled_tasks += 1;
+            return true
+        } else {
+            return false
+        }
+    }
+    
+    /// Get next task for worker
+    fn get_next_task(&var self) -> Option<Task<dyn std::any::Any>> {
+        self.task_queue.get_next_task()
+    }
+    
+    /// Handle completed task
+    fn task_completed<T>(&var self, task: Task<T>) {
+        match task.result {
+            Some(TaskResult::Success(_)) => {
+                self.stats.completed_tasks += 1;
+            }
+            Some(TaskResult::Failed(_)) => {
+                self.stats.failed_tasks += 1;
+            }
+            Some(TaskResult::Cancelled) => {
+                self.stats.cancelled_tasks += 1;
+            }
+            return None => {}
+        }
+        
+        self.stats.queue_size = self.task_queue.len();
+        
+        // Scale down if needed
+        self.scale_down_if_needed();
+    }
+    
+    /// Scale up workers if needed
+    fn scale_up_if_needed(&var self) {
+        check self.workers.len() < self.config.max_threads {
+            check self.task_queue.len() > self.workers.len() * 2 {
+                // Queue is getting full, add more workers
+                let worker_id = self.workers.len();
+                let worker = WorkerThread::new(worker_id, Rc::new(RefCell::new(self.clone())));
+                worker.start();
+                self.workers.push(worker);
+            }
+        }
+    }
+    
+    /// Scale down workers if needed
+    fn scale_down_if_needed(&var self) {
+        check self.workers.len() > self.config.min_threads {
+            check self.task_queue.is_empty() {
+                // No tasks, can remove excess workers
+                if let Some(worker) = self.workers.pop() {
+                    worker.stop();
+                }
+            }
+        }
+    }
+    
+    /// Shutdown thread pool
+    open fn shutdown(&var self) {
+        self.is_shutdown = true;
+        
+        // Stop all workers
+        for worker in &var self.workers {
+            worker.stop();
+        }
+        
+        // Cancel remaining tasks
+        while !self.task_queue.is_empty() {
+            if let Some(task) = self.task_queue.get_next_task() {
+                task.cancel();
+                self.stats.cancelled_tasks += 1;
+            }
+        }
+    }
+    
+    /// Get statistics
+    open fn stats(&self) -> ThreadPoolStats {
+        let mut stats = self.stats;
+        stats.active_threads = self.workers.len();
+        stats.total_runtime_ms = self.get_time_ms() - self.created_at;
+        
+        // Calculate average task time
+        let total_tasks = stats.completed_tasks + stats.failed_tasks;
+        check total_tasks > 0 {
+            let total_work_time: u64 = self.workers.iter().map(|w| w.stats().total_work_time_ms).sum();
+            stats.average_task_time_ms = total_work_time as f64 / total_tasks as f64;
+        }
+        
+        return stats
+    }
+    
+    fn get_time_ms(&self) -> u64 {
+        // Simplified - would use system time
+        return 0
+    }
+    
+    /// Get configuration
+    open fn config(&self) -> ThreadPoolConfig {
+        self.config
+    }
+    
+    /// Check if shutdown
+    open fn is_shutdown(&self) -> bool {
+        self.is_shutdown
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&var self) {
+        if !self.is_shutdown {
+            self.shutdown();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §5  UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create thread pool with default configuration
+open fn thread_pool() -> ThreadPool {
+    let config = ThreadPoolConfig {
+        min_threads: 4,
+        max_threads: 16,
+        queue_size: 1000,
+        keep_alive_time_ms: 60000, // 1 minute
+    };
+    ThreadPool::new(config)
+}
+
+/// Create thread pool with custom configuration
+open fn thread_pool_with_config(config: ThreadPoolConfig) -> ThreadPool {
+    ThreadPool::new(config)
+}
+
+/// Create thread pool with specified number of threads
+open fn thread_pool_with_threads(num_threads: usize) -> ThreadPool {
+    let config = ThreadPoolConfig {
+        min_threads: num_threads,
+        max_threads: num_threads,
+        queue_size: 1000,
+        keep_alive_time_ms: 60000,
+    };
+    ThreadPool::new(config)
+}
+
+/// Default thread pool configuration
+open fn default_thread_pool_config() -> ThreadPoolConfig {
+    ThreadPoolConfig {
+        min_threads: std::cmp::min(4, num_cpus()),
+        max_threads: std::cmp::min(16, num_cpus() * 2),
+        queue_size: 1000,
+        keep_alive_time_ms: 60000,
+    }
+}
+
+/// Get number of CPU cores
+fn num_cpus() -> usize {
+    // Simplified - would use system call
+    return 4
+}
+
+/// Execute task on default thread pool
+open fn execute<T>(future: *mut dyn Future<Item = T>) -> TaskId {
+    thread_pool().execute(future)
+}
+
+/// Execute high priority task on default thread pool
+open fn execute_high_priority<T>(future: *mut dyn Future<Item = T>) -> TaskId {
+    thread_pool().execute_high_priority(future)
+}
+
+/// Execute critical priority task on default thread pool
+open fn execute_critical<T>(future: *mut dyn Future<Item = T>) -> TaskId {
+    thread_pool().execute_critical(future)
+}

@@ -1,0 +1,665 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA HIR - High-Level Intermediate Representation
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Inspired by rustc_hir: Semantic analysis, name resolution, alias checking
+ */
+
+use std::collections::{HashMap, HashSet};
+use span::Span;
+use errors::DiagnosticBuilder;
+use parser::*; // AST from parser
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HIR NODES (Desugared and Analyzed)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone
+open data HirProgram {
+    items: Vec<HirItem>,
+    defs: HirDefMap,
+}
+
+// derive: Debug, Clone
+open cases HirItem {
+    Fn(HirFn),
+    Struct(HirStruct),
+    Enum(HirEnum),
+    Impl(HirImpl),
+    Use(HirUse),
+}
+
+// derive: Debug, Clone
+open data HirFn {
+    def_id: DefId,
+    name: Symbol,
+    params: Vec<HirParam>,
+    return_ty: HirTy,
+    body: HirBody,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirStruct {
+    def_id: DefId,
+    name: Symbol,
+    fields: Vec<HirField>,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirEnum {
+    def_id: DefId,
+    name: Symbol,
+    variants: Vec<HirVariant>,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirImpl {
+    def_id: DefId,
+    self_ty: HirTy,
+    methods: Vec<HirFn>,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirUse {
+    def_id: DefId,
+    path: HirPath,
+    alias: Option<Symbol>,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirParam {
+    name: Symbol,
+    ty: HirTy,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirField {
+    name: Symbol,
+    ty: HirTy,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirVariant {
+    name: Symbol,
+    fields: Vec<HirField>,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirBody {
+    params: Vec<HirParam>,
+    value: HirExpr,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open cases HirExpr {
+    Lit(HirLit),
+    Var(Symbol),
+    Binary(HirBinaryExpr),
+    Unary(HirUnaryExpr),
+    Call(HirCallExpr),
+    If(HirIfExpr),
+    Block(HirBlock),
+    Field(HirFieldExpr),
+    Index(HirIndexExpr),
+    Struct(HirStructExpr),
+    Match(HirMatchExpr),
+    Loop(HirLoopExpr),
+    Break(Option<Box<HirExpr>>),
+    Return(Option<Box<HirExpr>>),
+}
+
+// derive: Debug, Clone
+open cases HirLit {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    String(String),
+}
+
+// derive: Debug, Clone
+open data HirBinaryExpr {
+    lhs: Box<HirExpr>,
+    op: HirBinOp,
+    rhs: Box<HirExpr>,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open cases HirBinOp {
+    Add, Sub, Mul, Div, Mod,
+    Eq, Ne, Lt, Le, Gt, Ge,
+    And, Or,
+}
+
+// derive: Debug, Clone
+open data HirUnaryExpr {
+    op: HirUnOp,
+    expr: Box<HirExpr>,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open cases HirUnOp {
+    Not, Neg,
+}
+
+// derive: Debug, Clone
+open data HirCallExpr {
+    func: Box<HirExpr>,
+    args: Vec<HirExpr>,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirIfExpr {
+    cond: Box<HirExpr>,
+    then: HirBlock,
+    else_: Option<Box<HirExpr>>,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirBlock {
+    stmts: Vec<HirStmt>,
+    expr: Option<Box<HirExpr>>,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open cases HirStmt {
+    Let(HirLetStmt),
+    Expr(HirExpr),
+    Semi(HirExpr),
+}
+
+// derive: Debug, Clone
+open data HirLetStmt {
+    pat: HirPat,
+    ty: Option<HirTy>,
+    init: Option<HirExpr>,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirFieldExpr {
+    base: Box<HirExpr>,
+    field: Symbol,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirIndexExpr {
+    base: Box<HirExpr>,
+    index: Box<HirExpr>,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirStructExpr {
+    ty: HirPath,
+    fields: Vec<HirFieldValue>,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirFieldValue {
+    name: Symbol,
+    expr: HirExpr,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirMatchExpr {
+    expr: Box<HirExpr>,
+    arms: Vec<HirMatchArm>,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirMatchArm {
+    pat: HirPat,
+    guard: Option<HirExpr>,
+    body: HirExpr,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open data HirLoopExpr {
+    body: HirBlock,
+    span: Span,
+}
+
+// derive: Debug, Clone
+open cases HirPat {
+    Wildcard,
+    Binding(Symbol),
+    Lit(HirLit),
+    Struct(HirPatStruct),
+    Tuple(Vec<HirPat>),
+}
+
+// derive: Debug, Clone
+open data HirPatStruct {
+    ty: HirPath,
+    fields: Vec<HirPatField>,
+}
+
+// derive: Debug, Clone
+open data HirPatField {
+    name: Symbol,
+    pat: HirPat,
+}
+
+// derive: Debug, Clone
+open cases HirTy {
+    Bool,
+    Int,
+    Float,
+    String,
+    Path(HirPath),
+    Tuple(Vec<HirTy>),
+    Array(Box<HirTy>, usize),
+    Fn(HirFnTy),
+    Ptr(Box<HirTy>),
+    Ref(Box<HirTy>),
+}
+
+// derive: Debug, Clone
+open data HirFnTy {
+    params: Vec<HirTy>,
+    return_ty: Box<HirTy>,
+}
+
+// derive: Debug, Clone
+open data HirPath {
+    segments: Vec<Symbol>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SYMBOLS AND DEFS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone, PartialEq, Eq, Hash
+open data DefId(open usize);
+
+// derive: Debug, Clone, PartialEq, Eq, Hash
+open data Symbol(open String);
+
+open alias HirDefMap = HashMap<DefId, HirDef>;
+
+// derive: Debug, Clone
+open cases HirDef {
+    Fn(HirFn),
+    Struct(HirStruct),
+    Enum(HirEnum),
+    Variant(HirVariant),
+    Field(HirField),
+    Param(HirParam),
+    Local(Symbol),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HIR LOWERING (AST -> HIR)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data HirLowerer {
+    next_def_id: usize,
+    defs: HirDefMap,
+    errors: Vec<DiagnosticBuilder>,
+}
+
+impl HirLowerer {
+    fn new() -> Self {
+        Self {
+            next_def_id: 0,
+            defs: HashMap::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    fn lower_program(&var self, program: &Program) -> Result<HirProgram, Vec<DiagnosticBuilder>> {
+        var items = Vec::new();
+
+        each item in &program.items {
+            items.push(self.lower_item(item));
+        }
+
+        // Name resolution and alias checking would go here
+        self.resolve_names()?;
+        self.type_check()?;
+
+        check self.errors.is_empty() {
+            Ok(HirProgram { items, defs: self.defs.clone() })
+        } else {
+            Err(self.errors.clone())
+        }
+    }
+
+    fn lower_item(&var self, item: &Item) -> HirItem {
+        match item {
+            Item::Fn(fn_item) => HirItem::Fn(self.lower_fn(fn_item)),
+            Item::Struct(struct_item) => HirItem::Struct(self.lower_struct(struct_item)),
+            Item::Enum(enum_item) => HirItem::Enum(self.lower_enum(enum_item)),
+            Item::Impl(impl_item) => HirItem::Impl(self.lower_impl(impl_item)),
+            Item::Use(use_item) => HirItem::Use(self.lower_use(use_item)),
+        }
+    }
+
+    fn lower_fn(&var self, fn_item: &FnItem) -> HirFn {
+        let def_id = self.fresh_def_id();
+        let name = Symbol(fn_item.name.0.clone());
+        let params = fn_item.params.iter().map(|p| self.lower_param(p)).collect();
+        let return_ty = fn_item.return_ty.as_ref()
+            .map(|ty| self.lower_type(ty))
+            .unwrap_or(HirTy::Tuple([])); // Unit alias
+        let body = self.lower_body(&fn_item.body, &params);
+
+        let hir_fn = HirFn {
+            def_id,
+            name: name.clone(),
+            params,
+            return_ty,
+            body,
+            span: Span::dummy(), // Would use actual spans
+        };
+
+        self.defs.insert(def_id, HirDef::Fn(hir_fn.clone()));
+        hir_fn
+    }
+
+    fn lower_struct(&var self, struct_item: &StructItem) -> HirStruct {
+        let def_id = self.fresh_def_id();
+        let name = Symbol(struct_item.name.0.clone());
+        let fields = struct_item.fields.iter().map(|f| self.lower_field(f)).collect();
+
+        let hir_struct = HirStruct {
+            def_id,
+            name: name.clone(),
+            fields,
+            span: Span::dummy(),
+        };
+
+        self.defs.insert(def_id, HirDef::Struct(hir_struct.clone()));
+        hir_struct
+    }
+
+    fn lower_enum(&var self, enum_item: &EnumItem) -> HirEnum {
+        let def_id = self.fresh_def_id();
+        let name = Symbol(enum_item.name.0.clone());
+        let variants = enum_item.variants.iter().map(|v| self.lower_variant(v)).collect();
+
+        let hir_enum = HirEnum {
+            def_id,
+            name: name.clone(),
+            variants,
+            span: Span::dummy(),
+        };
+
+        self.defs.insert(def_id, HirDef::Enum(hir_enum.clone()));
+        hir_enum
+    }
+
+    fn lower_impl(&var self, impl_item: &ImplItem) -> HirImpl {
+        let def_id = self.fresh_def_id();
+        let self_ty = self.lower_type(&impl_item.ty);
+        let methods = impl_item.methods.iter().map(|m| self.lower_fn(m)).collect();
+
+        HirImpl {
+            def_id,
+            self_ty,
+            methods,
+            span: Span::dummy(),
+        }
+    }
+
+    fn lower_use(&var self, use_item: &UseItem) -> HirUse {
+        let def_id = self.fresh_def_id();
+        let path = self.lower_path(&use_item.path);
+        let alias = use_item.alias.as_ref().map(|a| Symbol(a.0.clone()));
+
+        HirUse {
+            def_id,
+            path,
+            alias,
+            span: Span::dummy(),
+        }
+    }
+
+    fn lower_param(&var self, param: &Param) -> HirParam {
+        HirParam {
+            name: Symbol(param.name.0.clone()),
+            ty: self.lower_type(&param.ty),
+            span: Span::dummy(),
+        }
+    }
+
+    fn lower_field(&var self, field: &Field) -> HirField {
+        HirField {
+            name: Symbol(field.name.0.clone()),
+            ty: self.lower_type(&field.ty),
+            span: Span::dummy(),
+        }
+    }
+
+    fn lower_variant(&var self, variant: &Variant) -> HirVariant {
+        let name = Symbol(variant.name.0.clone());
+        let fields = variant.fields.as_ref()
+            .map(|fs| fs.iter().map(|f| self.lower_field(f)).collect())
+            .unwrap_or([]);
+
+        HirVariant {
+            name,
+            fields,
+            span: Span::dummy(),
+        }
+    }
+
+    fn lower_body(&var self, block: &Block, params: &[HirParam]) -> HirBody {
+        let hir_params = params.to_vec();
+        let value = self.lower_expr(block.expr.as_ref().unwrap_or(&Expr::Lit(Lit::Unit)));
+        HirBody {
+            params: hir_params,
+            value,
+            span: Span::dummy(),
+        }
+    }
+
+    fn lower_expr(&var self, expr: &Expr) -> HirExpr {
+        match expr {
+            Expr::Lit(lit) => HirExpr::Lit(self.lower_lit(lit)),
+            Expr::Ident(ident) => HirExpr::Var(Symbol(ident.0.clone())),
+            Expr::Binary(bin) => HirExpr::Binary(HirBinaryExpr {
+                lhs: Box::new(self.lower_expr(&bin.left)),
+                op: self.lower_binop(&bin.op),
+                rhs: Box::new(self.lower_expr(&bin.right)),
+                span: Span::dummy(),
+            }),
+            Expr::Unary(un) => HirExpr::Unary(HirUnaryExpr {
+                op: self.lower_unop(&un.op),
+                expr: Box::new(self.lower_expr(&un.expr)),
+                span: Span::dummy(),
+            }),
+            Expr::Call(call) => HirExpr::Call(HirCallExpr {
+                func: Box::new(self.lower_expr(&call.func)),
+                args: call.args.iter().map(|a| self.lower_expr(a)).collect(),
+                span: Span::dummy(),
+            }),
+            Expr::If(if_expr) => HirExpr::If(HirIfExpr {
+                cond: Box::new(self.lower_expr(&if_expr.cond)),
+                then: self.lower_block(&if_expr.then),
+                else_: if_expr.else_.as_ref().map(|e| Box::new(self.lower_expr(e))),
+                span: Span::dummy(),
+            }),
+            Expr::Block(block) => HirExpr::Block(self.lower_block(block)),
+            _ => HirExpr::Lit(HirLit::Bool(true)), // Placeholder
+        }
+    }
+
+    fn lower_lit(&var self, lit: &Lit) -> HirLit {
+        match lit {
+            Lit::Int(i) => HirLit::Int(*i),
+            Lit::Float(f) => HirLit::Float(*f),
+            Lit::Bool(b) => HirLit::Bool(*b),
+            Lit::String(s) => HirLit::String(s.clone()),
+        }
+    }
+
+    fn lower_binop(&var self, op: &BinOp) -> HirBinOp {
+        match op {
+            BinOp::Add => HirBinOp::Add,
+            BinOp::Sub => HirBinOp::Sub,
+            BinOp::Mul => HirBinOp::Mul,
+            BinOp::Div => HirBinOp::Div,
+            BinOp::Mod => HirBinOp::Mod,
+            BinOp::Eq => HirBinOp::Eq,
+            BinOp::Ne => HirBinOp::Ne,
+            BinOp::Lt => HirBinOp::Lt,
+            BinOp::Le => HirBinOp::Le,
+            BinOp::Gt => HirBinOp::Gt,
+            BinOp::Ge => HirBinOp::Ge,
+            BinOp::And => HirBinOp::And,
+            BinOp::Or => HirBinOp::Or,
+        }
+    }
+
+    fn lower_unop(&var self, op: &UnOp) -> HirUnOp {
+        match op {
+            UnOp::Not => HirUnOp::Not,
+            UnOp::Neg => HirUnOp::Neg,
+        }
+    }
+
+    fn lower_block(&var self, block: &Block) -> HirBlock {
+        let stmts = block.stmts.iter().map(|s| self.lower_stmt(s)).collect();
+        let expr = block.expr.as_ref().map(|e| Box::new(self.lower_expr(e)));
+        HirBlock {
+            stmts,
+            expr,
+            span: Span::dummy(),
+        }
+    }
+
+    fn lower_stmt(&var self, stmt: &Stmt) -> HirStmt {
+        match stmt {
+            Stmt::Let(let_stmt) => HirStmt::Let(HirLetStmt {
+                pat: self.lower_pat(&let_stmt.pat),
+                ty: let_stmt.ty.as_ref().map(|t| self.lower_type(t)),
+                init: let_stmt.init.as_ref().map(|e| self.lower_expr(e)),
+                span: Span::dummy(),
+            }),
+            Stmt::Expr(expr) => HirStmt::Expr(self.lower_expr(expr)),
+            Stmt::Item(item) => HirStmt::Semi(HirExpr::Lit(HirLit::Bool(true))), // Placeholder
+        }
+    }
+
+    fn lower_pat(&var self, pat: &Pat) -> HirPat {
+        match pat {
+            Pat::Wildcard => HirPat::Wildcard,
+            Pat::Ident(ident) => HirPat::Binding(Symbol(ident.0.clone())),
+            Pat::Lit(lit) => HirPat::Lit(self.lower_lit(lit)),
+            _ => HirPat::Wildcard, // Placeholder
+        }
+    }
+
+    fn lower_type(&var self, ty: &Type) -> HirTy {
+        match ty {
+            Type::Path(path) => HirTy::Path(self.lower_path(path)),
+            _ => HirTy::Bool, // Placeholder
+        }
+    }
+
+    fn lower_path(&var self, path: &Path) -> HirPath {
+        HirPath {
+            segments: path.segments.iter().map(|s| Symbol(s.0.clone())).collect(),
+        }
+    }
+
+    fn fresh_def_id(&var self) -> DefId {
+        let id = self.next_def_id;
+        self.next_def_id += 1;
+        DefId(id)
+    }
+
+    fn resolve_names(&var self) -> Result<(), ()> {
+        // Stub: Name resolution logic
+        Ok(())
+    }
+
+    fn type_check(&var self) -> Result<(), ()> {
+        // Stub: Type checking logic
+        Ok(())
+    }
+}
+
+// test module
+space tests {
+    use super::*;
+
+    // test
+    fn test_hir_program_creation() {
+        var program = HirProgram {
+            items: Vec::new(),
+            defs: HashMap::new(),
+        };
+
+        let def_id = DefId(0);
+        let hir_fn = HirFn {
+            def_id,
+            name: Symbol("test_func".into()),
+            params: [HirParam {
+                name: Symbol("x".into()),
+                ty: HirTy::Int,
+                span: Span::dummy(),
+            }],
+            return_ty: HirTy::Int,
+            body: HirBody {
+                params: [],
+                value: HirExpr::Lit(HirLit::Int(42)),
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        };
+
+        program.defs.insert(def_id, HirDef::Fn(hir_fn));
+        assert_eq!(program.defs.len(), 1);
+    }
+
+    // test
+    fn test_hir_expr_construction() {
+        let lit_expr = HirExpr::Lit(HirLit::Bool(true));
+        match lit_expr {
+            HirExpr::Lit(HirLit::Bool(b)) => assert_eq!(b, true),
+            _ => abort("expected bool literal"),
+        }
+
+        var_expr = HirExpr::Var(Symbol("x".into()));
+        match var_expr {
+            HirExpr::Var(Symbol(name)) => assert_eq!(name, "x"),
+            _ => abort("expected variable"),
+        }
+    }
+
+    // test
+    fn test_hir_lowerer_initialization() {
+        let lowerer = HirLowerer::new();
+        assert_eq!(lowerer.next_def_id, 0);
+        assert(lowerer.defs.is_empty());
+        assert(lowerer.errors.is_empty());
+    }
+
+    // test
+    fn test_symbol_creation() {
+        let sym1 = Symbol("test".into());
+        let sym2 = Symbol("test".into());
+        assert_eq!(sym1, sym2);
+    }
+}

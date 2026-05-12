@@ -1,0 +1,317 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║           NOVA STANDARD LIBRARY - MEMORY POOL                             ║
+// ║          Memory pool allocation and management                           ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::mem::{alloc, free};
+use std::collections::Vec;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  MEMORY POOL CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Pool sizes for different allocation categories
+open cases PoolSize {
+    Small = 64,      // 64 bytes
+    Medium = 512,    // 512 bytes  
+    Large = 4096,    // 4KB
+    Huge = 32768,    // 32KB
+}
+
+/// Memory pool statistics
+open data PoolStats {
+    total_allocated: usize,
+    total_freed: usize,
+    current_usage: usize,
+    peak_usage: usize,
+    allocation_count: usize,
+    free_count: usize,
+}
+
+/// Memory pool block
+open data PoolBlock {
+    data: *mut u8,
+    size: usize,
+    is_free: bool,
+    next: *mut PoolBlock,
+}
+
+/// Memory pool for specific size category
+open data MemoryPool {
+    block_size: usize,
+    total_size: usize,
+    free_list: *mut PoolBlock,
+    used_list: *mut PoolBlock,
+    stats: PoolStats,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  MEMORY POOL IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl MemoryPool {
+    /// Create a new memory pool
+    open fn new(block_size: usize, total_size: usize) -> Self {
+        let pool_data = alloc(total_size);
+        check pool_data.is_null() {
+            panic!("Failed to allocate memory pool");
+        }
+        
+        let pool = Self {
+            block_size: block_size,
+            total_size: total_size,
+            free_list: null_mut(),
+            used_list: null_mut(),
+            stats: PoolStats {
+                total_allocated: 0,
+                total_freed: 0,
+                current_usage: 0,
+                peak_usage: 0,
+                allocation_count: 0,
+                free_count: 0,
+            },
+        };
+        
+        // Initialize free list
+        pool.initialize_free_list(pool_data);
+        return pool;
+    }
+    
+    /// Initialize free list with blocks
+    fn initialize_free_list(&var self, pool_data: *mut u8) {
+        let num_blocks = self.total_size / self.block_size;
+        let mut current_block = pool_data as *mut PoolBlock;
+        
+        for i in 0..num_blocks {
+            let block_data = unsafe { 
+                pool_data.add(i * self.block_size + sizeof(PoolBlock) * num_blocks) 
+            };
+            
+            unsafe {
+                (*current_block).data = block_data;
+                (*current_block).size = self.block_size;
+                (*current_block).is_free = true;
+                
+                if i < num_blocks - 1 {
+                    let next_block = current_block.add(1);
+                    (*current_block).next = next_block;
+                } else {
+                    (*current_block).next = null_mut();
+                }
+            }
+            
+            current_block = current_block.add(1);
+        }
+        
+        self.free_list = pool_data as *mut PoolBlock;
+    }
+    
+    /// Allocate a block from the pool
+    open fn allocate(&var self) -> *mut u8 {
+        check self.free_list.is_null() {
+            return null_mut(); // Pool exhausted
+        }
+        
+        let block = self.free_list;
+        unsafe {
+            check (*block).is_free {
+                // Remove from free list
+                self.free_list = (*block).next;
+                
+                // Add to used list
+                (*block).is_free = false;
+                (*block).next = self.used_list;
+                self.used_list = block;
+                
+                // Update statistics
+                self.stats.allocation_count += 1;
+                self.stats.total_allocated += self.block_size;
+                self.stats.current_usage += self.block_size;
+                
+                if self.stats.current_usage > self.stats.peak_usage {
+                    self.stats.peak_usage = self.stats.current_usage;
+                }
+                
+                (*block).data
+            } else {
+                null_mut() // Block not free (shouldn't happen)
+            }
+        }
+    }
+    
+    /// Free a block back to the pool
+    open fn deallocate(&var self, ptr: *mut u8) {
+        // Find the block containing this pointer
+        let mut current = self.used_list;
+        let mut prev = null_mut();
+        
+        while !current.is_null() {
+            unsafe {
+                if (*current).data == ptr {
+                    // Remove from used list
+                    check prev.is_null() {
+                        self.used_list = (*current).next;
+                    } else {
+                        (*prev).next = (*current).next;
+                    }
+                    
+                    // Add to free list
+                    (*current).is_free = true;
+                    (*current).next = self.free_list;
+                    self.free_list = current;
+                    
+                    // Update statistics
+                    self.stats.free_count += 1;
+                    self.stats.total_freed += self.block_size;
+                    self.stats.current_usage -= self.block_size;
+                    
+                    return;
+                }
+                
+                prev = current;
+                current = (*current).next;
+            }
+        }
+        
+        panic!("Pointer not found in pool");
+    }
+    
+    /// Get pool statistics
+    open fn stats(&self) -> PoolStats {
+        self.stats
+    }
+    
+    /// Check if pool is exhausted
+    open fn is_exhausted(&self) -> bool {
+        self.free_list.is_null()
+    }
+    
+    /// Get pool utilization (0.0 to 1.0)
+    open fn utilization(&self) -> f64 {
+        let total_blocks = self.total_size / self.block_size;
+        let used_blocks = self.stats.allocation_count - self.stats.free_count;
+        used_blocks as f64 / total_blocks as f64
+    }
+}
+
+impl Drop for MemoryPool {
+    fn drop(&var self) {
+        free(self.free_list as *mut u8);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  GLOBAL POOL MANAGER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Global pool manager
+open data PoolManager {
+    small_pool: MemoryPool,
+    medium_pool: MemoryPool,
+    large_pool: MemoryPool,
+    huge_pool: MemoryPool,
+    total_allocated: usize,
+    total_freed: usize,
+}
+
+impl PoolManager {
+    /// Create new pool manager
+    open fn new() -> Self {
+        Self {
+            small_pool: MemoryPool::new(64, 1024 * 1024),     // 1MB for small blocks
+            medium_pool: MemoryPool::new(512, 4 * 1024 * 1024), // 4MB for medium blocks
+            large_pool: MemoryPool::new(4096, 16 * 1024 * 1024), // 16MB for large blocks
+            huge_pool: MemoryPool::new(32768, 64 * 1024 * 1024), // 64MB for huge blocks
+            total_allocated: 0,
+            total_freed: 0,
+        }
+    }
+    
+    /// Allocate memory from appropriate pool
+    open fn allocate(&var self, size: usize) -> *mut u8 {
+        let ptr = match size {
+            0..=64 => self.small_pool.allocate(),
+            65..=512 => self.medium_pool.allocate(),
+            513..=4096 => self.large_pool.allocate(),
+            4097..=32768 => self.huge_pool.allocate(),
+            _ => {
+                // Fall back to system allocator for very large allocations
+                alloc(size)
+            }
+        };
+        
+        if !ptr.is_null() {
+            self.total_allocated += size;
+        }
+        
+        return ptr
+    }
+    
+    /// Deallocate memory to appropriate pool
+    open fn deallocate(&var self, ptr: *mut u8, size: usize) {
+        match size {
+            0..=64 => self.small_pool.deallocate(ptr),
+            65..=512 => self.medium_pool.deallocate(ptr),
+            513..=4096 => self.large_pool.deallocate(ptr),
+            4097..=32768 => self.huge_pool.deallocate(ptr),
+            _ => {
+                // Fall back to system allocator for very large allocations
+                free(ptr);
+            }
+        }
+        
+        self.total_freed += size;
+    }
+    
+    /// Get global statistics
+    open fn global_stats(&self) -> (usize, usize, usize) {
+        let current_usage = self.total_allocated - self.total_freed;
+        (self.total_allocated, self.total_freed, current_usage)
+    }
+    
+    /// Get pool utilization statistics
+    open fn utilization_stats(&self) -> (f64, f64, f64, f64) {
+        (
+            self.small_pool.utilization(),
+            self.medium_pool.utilization(),
+            self.large_pool.utilization(),
+            self.huge_pool.utilization(),
+        )
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  GLOBAL INSTANCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static mut POOL_MANAGER: Option<PoolManager> = None;
+
+/// Get global pool manager
+open fn get_pool_manager() -> &'static var PoolManager {
+    unsafe {
+        check POOL_MANAGER.is_none() {
+            POOL_MANAGER = Some(PoolManager::new());
+        }
+        POOL_MANAGER.as_mut().unwrap()
+    }
+}
+
+/// Allocate from global pool
+open fn pool_allocate(size: usize) -> *mut u8 {
+    get_pool_manager().allocate(size)
+}
+
+/// Deallocate to global pool
+open fn pool_deallocate(ptr: *mut u8, size: usize) {
+    get_pool_manager().deallocate(ptr, size)
+}
+
+/// Get global memory statistics
+open fn get_memory_stats() -> (usize, usize, usize) {
+    get_pool_manager().global_stats()
+}
+
+/// Get pool utilization
+open fn get_pool_utilization() -> (f64, f64, f64, f64) {
+    get_pool_manager().utilization_stats()
+}

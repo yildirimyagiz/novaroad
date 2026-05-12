@@ -1,0 +1,323 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                        Nova iOS TARGET                                 ║
+// ║                   iOS Compilation & Xcode Project Generation                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// iOS-specific compilation target for Nova
+// Generates Swift code, Xcode projects, and handles iOS deployment
+
+use crate::compiler::frontend::mobile::*;
+use std::collections::HashMap;
+
+// ============================================================================
+// iOS TARGET CONFIGURATION
+// ============================================================================
+
+/// iOS-specific target configuration
+expose data IOSTarget derives [Clone] {
+    deployment_target: String,     // e.g., "15.0"
+    device_family: IOSDeviceFamily,
+    supported_architectures: Vec<String>, // ["arm64", "x86_64"]
+    bundle_identifier: String,
+    team_id: Option<String>,
+    provisioning_profile: Option<String>,
+    enable_bitcode: bool,
+    enable_testflight: bool,
+    app_store_connect_key: Option<String>,
+}
+
+/// iOS device families
+expose cases IOSDeviceFamily {
+    IPhone,
+    IPad,
+    Universal, // iPhone + iPad
+    MacCatalyst, // iPad apps on Mac
+}
+
+// ============================================================================
+// iOS CODE GENERATOR
+// ============================================================================
+
+/// iOS-specific code generator
+expose data IOSCodeGenerator {
+    swift_generator: SwiftCodeGenerator,
+    xcode_project_generator: XcodeProjectGenerator,
+    asset_compiler: AssetCompiler,
+}
+
+/// Swift code generation
+expose data SwiftCodeGenerator {
+    indentation_level: i32,
+    imports: Vec<String>,
+    generated_code: String,
+}
+
+/// Xcode project generation
+expose data XcodeProjectGenerator {
+    project_name: String,
+    organization_name: String,
+    bundle_id: String,
+}
+
+/// Asset compilation for iOS
+expose data AssetCompiler {
+    asset_catalog_path: String,
+    compiled_assets: HashMap<String, Vec<u8>>,
+}
+
+// ============================================================================
+// SWIFT CODE GENERATION
+// ============================================================================
+
+impl SwiftCodeGenerator {
+
+    /// Generate Swift code from Nova AST
+    open fn generate_swift(ast: &Ast, target: &IOSTarget) -> Result<String, CompilationError> {
+        self.imports.clear();
+        self.generated_code.clear();
+        self.indentation_level = 0;
+
+        // Add standard imports
+        self::add_import("UIKit");
+        self::add_import("Foundation");
+
+        // Generate code for each declaration
+        each decl in &ast.declarations {
+            match self::generate_declaration(decl) {
+                Ok(_) => continue,
+                Err(e) => yield Err(e)
+            }
+        }
+
+        // Combine imports and code
+        var result = String::new();
+
+        // Add imports
+        each import in &self.imports {
+            result.push_str(&format("import {}\n", import));
+        }
+        result.push_str("\n");
+
+        // Add generated code
+        result.push_str(&self.generated_code);
+
+        Ok(result);
+    }
+
+    fn generate_declaration(&var self, decl: &Declaration) -> Result<(), CompilationError> {
+        match decl {
+            Declaration::Function(func) => self::generate_swift_function(func),
+            Declaration::Data(data) => self::generate_swift_struct(data),
+            Declaration::Skill(impl) => self::generate_swift_protocol(impl),
+            _ => Ok(()) // Skip other declarations for now
+        }
+    }
+
+    fn generate_swift_function(&var self, func: &FunctionDecl) -> Result<(), CompilationError> {
+        var code = format("func {} (", func.name);
+
+        // Generate parameters
+        each entry in func.parameters.iter().enumerate()  { let (i, param) = entry;
+            check i > 0 { code.push_str(", "); }
+            code.push_str(&format("{}: {}", param.name, self::nova_type_to_swift(&param.type_)));
+        }
+        code.push_str(")");
+
+        // Generate yield alias
+        check let Some(return_type) = &func.return_type {
+            code.push_str(&format(" -> {}", self::nova_type_to_swift(return_type)));
+        }
+
+        code.push_str(" {\n");
+
+        // Generate function body (placeholder for now)
+        self::increase_indent();
+        code.push_str(&self::indent_string("// Function body - to be implemented\n"));
+        self::decrease_indent();
+        code.push_str("}\n\n");
+
+        self.generated_code.push_str(&code);
+        Ok(());
+    }
+
+    fn generate_swift_struct(&var self, data: &DataDecl) -> Result<(), CompilationError> {
+        var code = format("data {} {{\n", data.name);
+
+        self::increase_indent();
+
+        // Generate properties
+        each field in &data.fields {
+            code.push_str(&self::indent_string(&format("var {}: {}\n",
+                field.name, self::nova_type_to_swift(&field.type_))));
+        }
+
+        self::decrease_indent();
+        code.push_str("}\n\n");
+
+        self.generated_code.push_str(&code);
+        Ok(());
+    }
+
+    fn generate_swift_protocol(&var self, impl: &SkillDecl) -> Result<(), CompilationError> {
+        var code = format("protocol {} {{\n", impl.name);
+
+        self::increase_indent();
+
+        // Generate function signatures
+        each func in &impl.functions {
+            var signature = format("func {}(", func.name);
+
+            each entry in func.parameters.iter().enumerate()  { let (i, param) = entry;
+                check i > 0 { signature.push_str(", "); }
+                signature.push_str(&format("{}: {}", param.name, self::nova_type_to_swift(&param.type_)));
+            }
+            signature.push_str(")");
+
+            check let Some(return_type) = &func.return_type {
+                signature.push_str(&format(" -> {}", self::nova_type_to_swift(return_type)));
+            }
+
+            code.push_str(&self::indent_string(&signature));
+            code.push_str("\n");
+        }
+
+        self::decrease_indent();
+        code.push_str("}\n\n");
+
+        self.generated_code.push_str(&code);
+        Ok(());
+    }
+
+    fn nova_type_to_swift(&self, type_expr: &TypeExpr) -> String {
+        match type_expr {
+            TypeExpr::Named(name) => match name.as_str() {
+                "i32" => "Int32".into(),
+                "i64" => "Int64".into(),
+                "f64" => "Double".into(),
+                "bool" => "Bool".into(),
+                "str" => "String".into(),
+                _ => name.clone(),
+            },
+            TypeExpr::Pointer(inner) => format("UnsafeMutablePointer<{}>", self::nova_type_to_swift(inner)),
+            TypeExpr::Reference(inner) => format("UnsafePointer<{}>", self::nova_type_to_swift(inner)),
+            TypeExpr::Array(element_type, size) => format("[{}]", self::nova_type_to_swift(element_type)),
+            TypeExpr::Generic(base, args) => {
+                var result = base.clone();
+                result.push_str("<");
+                each entry in args.iter().enumerate()  { let (i, arg) = entry;
+                    check i > 0 { result.push_str(", "); }
+                    result.push_str(&self::nova_type_to_swift(arg));
+                }
+                result.push_str(">");
+                result
+            }
+        }
+    }
+
+    fn add_import(&var self, import: &str) -> () {
+        check !self.imports.contains(&import.into()) {
+            self.imports.push(import.into());
+        }
+    }
+
+    fn increase_indent(&var self) -> () {
+        self.indentation_level += 1;
+    }
+
+    fn decrease_indent(&var self) -> () {
+        self.indentation_level -= 1;
+    }
+
+    fn indent_string(&self, s: &str) -> String {
+        let indent = "    ".repeat(self.indentation_level as usize);
+        format("{}{}", indent, s)
+    }
+}
+
+// ============================================================================
+// XCODE PROJECT GENERATION
+// ============================================================================
+
+impl XcodeProjectGenerator {
+
+    /// Generate Xcode project structure
+    open fn generate_xcode_project(target: &IOSTarget, swift_code: &str) -> Result<XcodeProject, ProjectError> {
+        // Create project structure
+        let project = XcodeProject {
+            name: target.bundle_identifier.split('.').last().unwrap_or("App").into(),
+            bundle_id: target.bundle_identifier.clone(),
+            deployment_target: target.deployment_target.clone(),
+            swift_files: ["AppDelegate.swift".into(), "ViewController.swift".into()],
+            asset_catalogs: ["Assets.xcassets".into()],
+            info_plist: self::generate_info_plist(target),
+            entitlements: self::generate_entitlements(target),
+        };
+
+        Ok(project);
+    }
+
+    fn generate_info_plist(target: &IOSTarget) -> String {
+        format(r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>{}</string>
+    <key>CFBundleName</key>
+    <string>{}</string>
+    <key>CFBundleVersion</key>
+    <string>1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>UIRequiredDeviceCapabilities</key>
+    <array>
+        <string>arm64</string>
+    </array>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+    </array>
+</dict>
+</plist>"#, target.bundle_identifier, target.bundle_identifier.split('.').last().unwrap_or("App"))
+    }
+
+    fn generate_entitlements(target: &IOSTarget) -> Option<String> {
+        // Generate entitlements plist check needed
+        None
+    }
+}
+
+// ============================================================================
+// XCODE PROJECT STRUCTURE
+// ============================================================================
+
+/// Xcode project representation
+expose data XcodeProject {
+    name: String,
+    bundle_id: String,
+    deployment_target: String,
+    swift_files: Vec<String>,
+    asset_catalogs: Vec<String>,
+    info_plist: String,
+    entitlements: Option<String>,
+}
+
+// ============================================================================
+// ERROR TYPES
+// ============================================================================
+
+/// iOS compilation errors
+expose cases CompilationError {
+    SwiftGenerationError(String),
+    XcodeProjectError(String),
+    AssetCompilationError(String),
+}
+
+/// Xcode project generation errors
+expose cases ProjectError {
+    InvalidBundleId(String),
+    MissingProvisioningProfile(String),
+    CodeSigningError(String),
+}

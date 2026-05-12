@@ -1,0 +1,135 @@
+// Nova Detectron - Region Proposal Network (RPN)
+// Proposes candidate object locations in an image.
+// Consists of: Anchor Generation -> Conv Heads -> Loss/Inference
+
+import std.ai.core
+import std.ai.nn
+import std.vision.detectron.modeling.proposal_generator.anchor_generator
+import std.vision.detectron.modeling.matcher
+import std.vision.detectron.structures.boxes
+import std.vision.detectron.layers.nms
+
+open data RPN {
+    anchor_generator: AnchorGenerator
+    rpn_head: RPNHead
+    anchor_matcher: Matcher
+    box2box_transform: Box2BoxTransform,
+    
+    // Training hyperparams
+    batch_size_per_image: u32,  // 256
+    positive_fraction: f64,     // 0.5
+    
+    // Inference hyperparams
+    pre_nms_topk_train: u32,    // 12000
+    pre_nms_topk_test: u32,     // 6000
+    post_nms_topk_train: u32,   // 2000
+    post_nms_topk_test: u32,    // 1000
+    nms_thresh: f64,            // 0.7
+    min_box_size: f64           // 0.0
+}
+
+open data RPNHead {
+    conv: nn.Conv2d,           // 3x3 conv
+    objectness_logits: nn.Conv2d, // 1x1 conv -> (num_anchors, 1)
+    anchor_deltas: nn.Conv2d      // 1x1 conv -> (num_anchors, 4)
+}
+
+impl RPNHead {
+    fn new(in_channels: u32, num_anchors: u32) -> RPNHead {
+        RPNHead {
+            conv: nn.Conv2d::new(in_channels, in_channels, kernel: 3, padding: 1),
+            objectness_logits: nn.Conv2d::new(in_channels, num_anchors, kernel: 1),
+            anchor_deltas: nn.Conv2d::new(in_channels, num_anchors * 4, kernel: 1)
+        }
+    }
+    
+    fn forward(var self, features: list<Tensor>) -> (list<Tensor>, list<Tensor>) {
+        var pred_objectness_logits = []
+        var pred_anchor_deltas = []
+        
+        each feature in features {
+            let t = nn.functional.relu(self.conv.forward(feature))
+            pred_objectness_logits.push(self.objectness_logits.forward(t))
+            pred_anchor_deltas.push(self.anchor_deltas.forward(t))
+        }
+        
+        yield (pred_objectness_logits, pred_anchor_deltas)
+    }
+}
+
+impl RPN {
+    fn forward(var self, images: Tensor, features: map<str, Tensor>, gt_instances: list<Instances>) -> (list<Instances>, map<str, Tensor>) {
+        // features: dict like {"p2": tensor, "p3": tensor, ...}
+        
+        let feature_list = [features["p2"], features["p3"], features["p4"], features["p5"], features["p6"]]
+        let feature_shapes = feature_list.map(|f| (f.data()[2], f.data()[3]))
+        
+        // 1. Generate anchors
+        let anchors = self.anchor_generator.forward(feature_shapes)
+        
+        // 2. Predict objectness and deltas
+        let (pred_objectness_logits, pred_anchor_deltas) = self.rpn_head.forward(feature_list)
+        
+        // Reshape predictions: (N, A, H, W) -> (N, H*W*A)
+        let pred_objectness_logits = self.reshape_predictions(pred_objectness_logits)
+        let pred_anchor_deltas = self.reshape_predictions(pred_anchor_deltas)
+        
+        check self.training {
+            // TRAINING PATH
+            let losses = self.losses(anchors, pred_objectness_logits, gt_instances, pred_anchor_deltas)
+            
+            // Also yield proposals for ROI heads
+            let proposals = self.predict_proposals(anchors, pred_objectness_logits, pred_anchor_deltas, images.data())
+            
+            yield (proposals, losses)
+        } else {
+            // INFERENCE PATH
+            let proposals = self.predict_proposals(anchors, pred_objectness_logits, pred_anchor_deltas, images.data())
+            yield (proposals, {})
+        }
+    }
+    
+    fn losses(self, anchors: list<Boxes>, pred_objectness_logits: list<Tensor>, gt_instances: list<Instances>, pred_anchor_deltas: list<Tensor>) -> map<str, Tensor> {
+        // Match anchors to GT
+        // ... (label_and_sample_anchors logic - 100+ lines)
+        
+        // Compute losses
+        let objectness_loss = nn.functional.binary_cross_entropy_with_logits(...)
+        let localization_loss = nn.functional.smooth_l1_loss(...)
+        
+        yield {
+            "loss_rpn_cls": objectness_loss,
+            "loss_rpn_loc": localization_loss
+        }
+    }
+    
+    fn predict_proposals(self, anchors: list<Boxes>, pred_objectness_logits: list<Tensor>, pred_anchor_deltas: list<Tensor>, image_sizes: (u32, u32)) -> list<Instances> {
+        // 1. Decode box deltas
+        let proposals = self.box2box_transform.apply_deltas(pred_anchor_deltas, anchors)
+        
+        // 2. Clip to image
+        proposals.clip(image_sizes)
+        
+        // 3. Remove small boxes
+        let keep = proposals.nonempty(self.min_box_size)
+        proposals = proposals.filter(keep)
+        
+        // 4. Apply NMS
+        let scores = pred_objectness_logits.sigmoid()
+        let topk = check self.training { self.pre_nms_topk_train } else { self.pre_nms_topk_test }
+        
+        // Take top K before NMS
+        let (top_scores, top_idxs) = scores.topk(topk)
+        proposals = proposals.filter(top_idxs)
+        
+        // NMS
+        let keep_nms = nms(proposals, top_scores, self.nms_thresh)
+        proposals = proposals.filter(keep_nms)
+        
+        // Final top K
+        let post_topk = check self.training { self.post_nms_topk_train } else { self.post_nms_topk_test }
+        proposals = proposals.slice(0, post_topk)
+        
+        yield proposals
+    }
+}

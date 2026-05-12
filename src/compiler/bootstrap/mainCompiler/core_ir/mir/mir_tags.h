@@ -1,0 +1,26 @@
+#ifndef NOVA_MIR_TAGS_H
+#define NOVA_MIR_TAGS_H
+
+/* MIRStmt definition */
+#define NOVA_MIR_MIRSTMT_ASSIGN 0
+#define NOVA_MIR_MIRSTMT_CALL 1
+#define NOVA_MIR_MIRSTMT_NOP 2
+
+/* MIRTerminator definition */
+#define NOVA_MIR_MIRTERMINATOR_RETURN 3
+#define NOVA_MIR_MIRTERMINATOR_GOTO 4
+#define NOVA_MIR_MIRTERMINATOR_BRANCH 5
+#define NOVA_MIR_MIRTERMINATOR_UNREACHABLE 6
+
+/* Operand definition */
+#define NOVA_MIR_OPERAND_COPY 7
+#define NOVA_MIR_OPERAND_MOVE 8
+#define NOVA_MIR_OPERAND_CONST 9
+
+/* MIRExpr definition */
+#define NOVA_MIR_MIREXPR_USE 10
+#define NOVA_MIR_MIREXPR_BINOP 11
+#define NOVA_MIR_MIREXPR_UNOP 12
+
+#endif
+

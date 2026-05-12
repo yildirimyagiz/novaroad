@@ -1,0 +1,522 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                     Nova SEMANTIC ANALYZER                          ║
+// ║                    Advanced Feature Validation & Analysis                     ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// Semantic analyzer for Nova's advanced features:
+// - Contract verification
+// - Flow alias analysis
+// - Unit algebra consistency
+// - Tensor data validation
+// - Control flow analysis
+// - Safety checks
+
+use crate::frontend::ast::*;
+use crate::frontend::errors::*;
+
+/// Semantic analysis context
+expose data SemanticContext {
+    current_function: Option<String>,
+    loop_depth: i32,
+    contract_context: Option<ContractContext>,
+    flow_context: Vec<FlowBinding>,
+    unit_context: HashMap<String, UnitInfo>,
+}
+
+expose data ContractContext {
+    preconditions: Vec<Expr>,
+    postconditions: Vec<Expr>,
+    invariants: Vec<Expr>,
+    assumptions: Vec<Expr>,
+}
+
+expose data FlowBinding {
+    name: String,
+    flow_type: FlowKind,
+    span: Span,
+}
+
+expose data UnitInfo {
+    base_unit: String,
+    dimensions: Vec<String>,
+    conversions: HashMap<String, Expr>,
+}
+
+/// Main semantic analyzer
+expose data SemanticAnalyzer {
+    context: SemanticContext,
+    program: Program,
+    reporter: ErrorReporter,
+}
+
+impl SemanticAnalyzer {
+    fn new(program: Program) -> SemanticAnalyzer {
+        SemanticAnalyzer {
+            context: SemanticContext {
+                current_function: None,
+                loop_depth: 0,
+                contract_context: None,
+                flow_context: [],
+                unit_context: HashMap::new(),
+            },
+            program,
+            reporter: ErrorReporter::new(),
+        }
+    }
+
+    /// Run full semantic analysis
+    fn analyze(&var self) -> bool {
+        // Phase 1: Collect global information
+        self.collect_globals();
+
+        // Phase 2: Analyze all top-level items
+        each item in &self.program.items {
+            self.analyze_top_level(item);
+        }
+
+        // Phase 3: Cross-reference analysis
+        self.cross_reference_analysis();
+
+        !self.reporter.has_errors()
+    }
+
+    fn collect_globals(&var self) {
+        each item in &self.program.items {
+            match item {
+                TopLevel::Unit(unit_def) => {
+                    let unit_info = UnitInfo {
+                        base_unit: unit_def.base_unit.clone(),
+                        dimensions: [], // Would need to extract from unit expressions
+                        conversions: unit_def.conversions.iter()
+                            .map(|c| (c.from_unit.clone(), c.to_base.clone()))
+                            .collect(),
+                    };
+                    self.context.unit_context.insert(unit_def.name.clone(), unit_info);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn analyze_top_level(&var self, item: &TopLevel) {
+        match item {
+            TopLevel::Fn(fn_def) => self.analyze_function(fn_def),
+            TopLevel::Data(data_def) => self.analyze_data_type(data_def),
+            TopLevel::Flow(flow_def) => self.analyze_flow_type(flow_def),
+            TopLevel::Unit(unit_def) => self.analyze_unit_family(unit_def),
+            TopLevel::Qty(qty_def) => self.analyze_quantity_type(qty_def),
+            TopLevel::Tensor(tensor_def) => self.analyze_tensor_type(tensor_def),
+            TopLevel::Kernel(kernel_def) => self.analyze_kernel(kernel_def),
+            _ => {}
+        }
+    }
+
+    fn analyze_function(&var self, fn_def: &FnDef) {
+        self.context.current_function = Some(fn_def.name.clone());
+
+        // Set up contract context
+        let contract_ctx = ContractContext {
+            preconditions: fn_def.requires.iter().map(|c| c.cond.clone()).collect(),
+            postconditions: fn_def.ensures.iter().map(|c| c.cond.clone()).collect(),
+            invariants: [], // Could be extended
+            assumptions: [],
+        };
+        self.context.contract_context = Some(contract_ctx);
+
+        // Analyze function body
+        self.analyze_block(&fn_def.body);
+
+        // Verify contracts
+        self.verify_contracts(fn_def);
+
+        // Check yield path
+        self.check_return_paths(&fn_def.body, &fn_def.return_ty);
+
+        self.context.contract_context = None;
+        self.context.current_function = None;
+    }
+
+    fn analyze_block(&var self, block: &Block) {
+        each stmt in &block.stmts {
+            self.analyze_stmt(stmt);
+        }
+    }
+
+    fn analyze_stmt(&var self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Let(let_stmt) => {
+                check let Some(init) = &let_stmt.init {
+                    self.analyze_expr(init);
+                }
+                // Check check pattern is used
+                check let Pattern::Bind(name) = &let_stmt.pattern {
+                    // Would check check 'name' is used later
+                }
+            }
+
+            Stmt::Var(var_stmt) => {
+                check let Some(init) = &var_stmt.init {
+                    self.analyze_expr(init);
+                }
+            }
+
+            Stmt::Expr(expr_stmt) => {
+                self.analyze_expr(&expr_stmt.expr);
+            }
+
+            Stmt::Yield(yield_stmt) => {
+                check let Some(expr) = &yield_stmt.value {
+                    self.analyze_expr(expr);
+                }
+            }
+
+            Stmt::Require(contract) | Stmt::Ensure(contract) | Stmt::Assert(contract) => {
+                self.analyze_expr(&contract.cond);
+            }
+
+            Stmt::Abort(_) | Stmt::Next(_) => {
+                check self.context.loop_depth == 0 {
+                    self.reporter.report_error(CompilerError::Semantic(
+                        SemanticError::new(SemanticErrorKind::DeadCode,
+                            "Control flow statement outside loop".into(), Span::zero())
+                    ));
+                }
+            }
+
+            Stmt::Match(match_stmt) => {
+                self.analyze_expr(&match_stmt.value);
+                each arm in &match_stmt.arms {
+                    check let Some(guard) = &arm.guard {
+                        self.analyze_expr(guard);
+                    }
+                    self.analyze_expr(&arm.body);
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    fn analyze_expr(&var self, expr: &Expr) {
+        match expr {
+            Expr::Binary(binary) => {
+                self.analyze_expr(&binary.left);
+                self.analyze_expr(&binary.right);
+
+                // Check for potential division by zero
+                check matches!(binary.op, BinOp::Div | BinOp::Rem) {
+                    check let Expr::Int(i) = &*binary.right {
+                        check i.value == 0 {
+                            self.reporter.report_warning(CompilerError::Semantic(
+                                SemanticError::new(SemanticErrorKind::ContractViolation,
+                                    "Potential division by zero".into(), binary.span)
+                            ));
+                        }
+                    }
+                }
+            }
+
+            Expr::Call(call) => {
+                self.analyze_expr(&call.callee);
+                each arg in &call.args {
+                    self.analyze_expr(arg);
+                }
+            }
+
+            Expr::Method(method) => {
+                self.analyze_expr(&method.receiver);
+                each arg in &method.args {
+                    self.analyze_expr(arg);
+                }
+            }
+
+            Expr::Index(index) => {
+                self.analyze_expr(&index.base);
+                each idx in &index.indices {
+                    self.analyze_expr(idx);
+                }
+            }
+
+            Expr::Field(field) => {
+                self.analyze_expr(&field.base);
+            }
+
+            Expr::Unary(unary) => {
+                self.analyze_expr(&unary.operand);
+            }
+
+            Expr::Block(block) => {
+                self.analyze_block(block);
+            }
+
+            Expr::Lambda(lambda) => {
+                each param in &lambda.params {
+                    // Could check parameter usage
+                }
+                self.analyze_expr(&lambda.body);
+            }
+
+            Expr::Pipe(pipe) => {
+                each stage in &pipe.stages {
+                    self.analyze_expr(stage);
+                }
+            }
+
+            Expr::Check(check) => {
+                self.analyze_expr(&check.cond);
+                self.analyze_expr(&check.then);
+                check let Some(els) = &check.els {
+                    self.analyze_expr(els);
+                }
+            }
+
+            Expr::Match(match_expr) => {
+                self.analyze_expr(&match_expr.value);
+                each arm in &match_expr.arms {
+                    check let Some(guard) = &arm.guard {
+                        self.analyze_expr(guard);
+                    }
+                    self.analyze_expr(&arm.body);
+                }
+            }
+
+            Expr::Each(each) => {
+                self.context.loop_depth += 1;
+                self.analyze_expr(&each.iterable);
+                self.analyze_block(&each.body);
+                self.context.loop_depth -= 1;
+            }
+
+            Expr::While(while_expr) => {
+                self.context.loop_depth += 1;
+                self.analyze_expr(&while_expr.cond);
+                self.analyze_block(&while_expr.body);
+                self.context.loop_depth -= 1;
+            }
+
+            Expr::Loop(loop_expr) => {
+                self.context.loop_depth += 1;
+                self.analyze_block(&loop_expr.body);
+                self.context.loop_depth -= 1;
+            }
+
+            Expr::Try(try_expr) => {
+                self.analyze_expr(try_expr);
+            }
+
+            Expr::Catch(catch) => {
+                self.analyze_block(&catch.body);
+                self.analyze_block(&catch.handler);
+            }
+
+            Expr::Math(math) => {
+                each arg in &math.args {
+                    self.analyze_expr(arg);
+                }
+                // Verify mathematical operation validity
+                self.verify_math_operation(math);
+            }
+
+            Expr::TensorInit(tensor_init) => {
+                // Verify tensor initialization
+                self.verify_tensor_initialization(tensor_init);
+            }
+
+            Expr::FlowExpr(flow_expr) => {
+                match &flow_expr {
+                    FlowConstruct::Signal(init) => {
+                        self.analyze_expr(init);
+                        self.context.flow_context.push(FlowBinding {
+                            name: "signal".into(), // Would need proper naming
+                            flow_type: FlowKind::Signal,
+                            span: Span::zero(),
+                        });
+                    }
+                    FlowConstruct::Stream(source) => {
+                        self.analyze_expr(source);
+                        self.context.flow_context.push(FlowBinding {
+                            name: "stream".into(),
+                            flow_type: FlowKind::Stream,
+                            span: Span::zero(),
+                        });
+                    }
+                    FlowConstruct::Spawn(body) => {
+                        self.analyze_block(body);
+                    }
+                    FlowConstruct::MakeChannel => {
+                        // Channel creation
+                    }
+                }
+            }
+
+            Expr::Chan(chan_expr) => {
+                match chan_expr {
+                    ChanExpr::Send(_, value) => {
+                        self.analyze_expr(value);
+                    }
+                    ChanExpr::Recv(_) => {}
+                    ChanExpr::TrySend(_, value) => {
+                        self.analyze_expr(value);
+                    }
+                    ChanExpr::TryRecv(_) => {}
+                }
+            }
+
+            Expr::UnitConvert(inner_expr, dim) => {
+                self.analyze_expr(inner_expr);
+                // Verify unit conversion is valid
+                self.verify_unit_conversion(&(inner_expr.clone(), dim.clone()));
+            }
+
+            Expr::Assert(cond, msg) => {
+                self.analyze_expr(cond);
+                check let Some(m) = msg {
+                    self.analyze_expr(m);
+                }
+            }
+
+            // Other expressions don't need deep analysis
+            _ => {}
+        }
+    }
+
+    fn check_infinite_loop(&var self, while_expr: &WhileExpr) {
+        // Simple heuristic: check check condition is always true
+        check let Expr::Bool(b) = &*while_expr.cond {
+            check b.value {
+                self.reporter.report_warning(CompilerError::Semantic(
+                    SemanticError::new(SemanticErrorKind::InfiniteLoop,
+                        "While loop with constant true condition".into(), while_expr.span)
+                ));
+            }
+        }
+    }
+
+    fn check_return_paths(&var self, block: &Block, return_ty: &Option<TypeExpr>) -> bool {
+        var has_return = false;
+
+        each stmt in &block.stmts {
+            match stmt {
+                Stmt::Yield(yield_stmt) => {
+                    has_return = true;
+                    check return_ty.is_none() && yield_stmt.value.is_some() {
+                        self.reporter.report_error(CompilerError::Semantic(
+                            SemanticError::new(SemanticErrorKind::MissingReturn,
+                                "Function should not yield a value".into(), yield_stmt.span)
+                        ));
+                    } else check return_ty.is_some() && yield_stmt.value.is_none() {
+                        self.reporter.report_error(CompilerError::Semantic(
+                            SemanticError::new(SemanticErrorKind::MissingReturn,
+                                "Function must yield a value".into(), yield_stmt.span)
+                        ));
+                    }
+                }
+                Stmt::Expr(expr_stmt) => {
+                    check let Expr::Block(inner_block) = &expr_stmt.expr {
+                        check self.check_return_paths(inner_block, return_ty) {
+                            has_return = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Check check function should yield but doesn't
+        check return_ty.is_some() && !has_return {
+            self.reporter.report_error(CompilerError::Semantic(
+                SemanticError::new(SemanticErrorKind::MissingReturn,
+                    "Function must yield a value".into(), block.span)
+            ));
+        }
+
+        has_return
+    }
+
+    fn verify_contracts(&var self, fn_def: &FnDef) {
+        check let Some(ctx) = &self.context.contract_context {
+            // Clone preconditions to avoid borrowing conflicts
+            let preconditions = ctx.preconditions.clone();
+            let postconditions = ctx.postconditions.clone();
+
+            // Check precondition consistency
+            each pre in preconditions {
+                self.analyze_expr(&pre);
+            }
+
+            // Check postcondition consistency
+            each post in postconditions {
+                self.analyze_expr(&post);
+            }
+        }
+    }
+
+    fn verify_math_operation(&var self, math: &MathExpr) {
+        match math.op {
+            MathOp::Grad | MathOp::Diff => {
+                // Parser removes the wrt variable from args, so we just need at least one arg (the function)
+                check math.args.is_empty() {
+                    self.reporter.report_error(CompilerError::Semantic(
+                        SemanticError::new(SemanticErrorKind::ContractViolation,
+                            "Gradient/differential operations require at least a function".into(), math.span)
+                    ));
+                }
+            }
+            MathOp::Integral => {
+                check math.bounds.is_none() {
+                    self.reporter.report_error(CompilerError::Semantic(
+                        SemanticError::new(SemanticErrorKind::ContractViolation,
+                            "Integral operations require bounds".into(), math.span)
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn verify_tensor_initialization(&var self, tensor_init: &TensorInitExpr) {
+        // Check tensor dimensions consistency
+        // This would verify that the initialization matches the declared data
+    }
+
+    fn verify_unit_conversion(&var self, convert: &(Box<Expr>, DimExpr)) {
+        // Check check unit conversion is valid using unit context
+        // This would verify dimensional consistency
+    }
+
+    fn analyze_data_type(&var self, data_def: &DataDef) {
+        // Check for unused fields, circular references, etc.
+    }
+
+    fn analyze_flow_type(&var self, flow_def: &FlowDef) {
+        // Validate flow alias semantics
+    }
+
+    fn analyze_unit_family(&var self, unit_def: &UnitFamilyDef) {
+        // Validate unit family consistency
+    }
+
+    fn analyze_quantity_type(&var self, qty_def: &QtyDef) {
+        // Validate quantity alias
+    }
+
+    fn analyze_tensor_type(&var self, tensor_def: &TensorDef) {
+        // Validate tensor alias
+    }
+
+    fn analyze_kernel(&var self, kernel_def: &KernelDef) {
+        // Validate GPU kernel semantics
+    }
+
+    fn cross_reference_analysis(&var self) {
+        // Check for unused functions, unreachable code, etc.
+        // This would run after all items are analyzed
+    }
+}
+
+/// Public interface for semantic analysis
+fn analyze_semantics(program: Program) -> (bool, Vec<Diagnostic>) {
+    var analyzer = SemanticAnalyzer::new(program);
+    let success = analyzer.analyze();
+    yield (success, analyzer.reporter.diagnostics)
+}

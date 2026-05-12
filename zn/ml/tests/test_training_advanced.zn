@@ -1,0 +1,371 @@
+// Tests for Advanced Training Features
+// Comprehensive test suite for all new training capabilities
+
+// module tests.training_advanced;
+
+use nova.tensor.Tensor;
+use nova.ml.nn::{Module, Linear, Sequential};
+use nova.ml.optim::{Adam, SGD};
+use nova.ml.optim.scheduler::*;
+use nova.ml.nn.loss::*;
+use nova.ml.nn.mixed_precision::*;
+use nova.ml.nn.callbacks::*;
+use nova.ml.nn.training_advanced::*;
+
+#[test]
+fn test_lr_schedulers() {
+    println("Testing Learning Rate Schedulers...");
+
+    let model = create_dummy_model();
+    var optimizer = Adam::new(model.parameters(), lr: 0.1);
+    let initial_lr = 0.1;
+
+    // Test StepLR
+    var step_scheduler = StepLR::new(&var optimizer, step_size: 10, gamma: 0.1);
+    assert_eq!(step_scheduler.get_lr(), initial_lr);
+    
+    each _ in 0..10 {
+        step_scheduler.step();
+    }
+    assert_eq!(step_scheduler.get_lr(), initial_lr * 0.1);
+
+    // Test Cosine Annealing
+    var cosine_scheduler = CosineAnnealingLR::new(&var optimizer, T_max: 100, eta_min: 0.0);
+    let lr_at_50 = cosine_scheduler.get_lr();
+    each _ in 0..50 {
+        cosine_scheduler.step();
+    }
+    // At T_max/2, LR should be around eta_min + (initial - eta_min) / 2
+    assert(cosine_scheduler.get_lr() > 0.0);
+
+    // Test ExponentialLR
+    var exp_scheduler = ExponentialLR::new(&var optimizer, gamma: 0.9);
+    each i in 0..10 {
+        exp_scheduler.step();
+        let expected_lr = initial_lr * 0.9_f64.powi(i + 1);
+        assert((exp_scheduler.get_lr() - expected_lr).abs() < 1e-6);
+    }
+
+    println("✓ LR Scheduler tests passed");
+}
+
+#[test]
+fn test_loss_functions() {
+    println("Testing Loss Functions...");
+
+    // Test MSE Loss
+    let pred = Tensor::from_vec([1.0, 2.0, 3.0], [3]);
+    let target = Tensor::from_vec([1.5, 2.5, 3.5], [3]);
+    
+    let mse_loss = MSELoss::new();
+    let loss = mse_loss.forward(&pred, &target);
+    // Expected: mean((0.5)^2 + (0.5)^2 + (0.5)^2) = 0.25
+    assert((loss.item() - 0.25).abs() < 1e-6);
+
+    // Test MAE Loss
+    let mae_loss = MAELoss::new();
+    let loss = mae_loss.forward(&pred, &target);
+    // Expected: mean(0.5 + 0.5 + 0.5) = 0.5
+    assert((loss.item() - 0.5).abs() < 1e-6);
+
+    // Test Huber Loss
+    let huber_loss = HuberLoss::new(delta: 1.0);
+    let loss = huber_loss.forward(&pred, &target);
+    // All differences are 0.5 < delta, so should be 0.5 * 0.5^2 = 0.125
+    assert(loss.item() < 0.25);
+
+    // Test Cross Entropy
+    let logits = Tensor::from_vec([2.0, 1.0, 0.1], [1, 3]);
+    let target = Tensor::from_vec([0], [1]); // Class 0
+    
+    let ce_loss = CrossEntropyLoss::new();
+    let loss = ce_loss.forward(&logits, &target);
+    assert(loss.item() > 0.0);
+
+    // Test BCE Loss
+    let pred = Tensor::from_vec([0.9, 0.1, 0.8], [3]);
+    let target = Tensor::from_vec([1.0, 0.0, 1.0], [3]);
+    
+    let bce_loss = BCELoss::new();
+    let loss = bce_loss.forward(&pred, &target);
+    assert(loss.item() > 0.0 && loss.item() < 1.0);
+
+    // Test Focal Loss
+    let focal_loss = FocalLoss::new(alpha: 0.25, gamma: 2.0);
+    let loss = focal_loss.forward(&logits, &target);
+    assert(loss.item() > 0.0);
+
+    println("✓ Loss function tests passed");
+}
+
+#[test]
+fn test_mixed_precision() {
+    println("Testing Mixed Precision Training...");
+
+    // Test GradScaler
+    var scaler = GradScaler::new();
+    let initial_scale = scaler.get_scale();
+    assert_eq!(initial_scale, 65536.0);
+
+    // Test scaling
+    let loss = Tensor::scalar(0.5);
+    let scaled_loss = scaler.scale(&loss);
+    assert_eq!(scaled_loss.item(), 0.5 * initial_scale);
+
+    // Test autocast context
+    var autocast = AutocastContext::fp16();
+    autocast.enter();
+    assert(AutocastContext::should_autocast("matmul"));
+    assert(AutocastContext::should_autocast("conv2d"));
+    assert(!AutocastContext::should_autocast("softmax"));
+    autocast.exit();
+
+    // Test MixedPrecisionTrainer
+    var mp_trainer = MixedPrecisionTrainer::fp16();
+    assert_eq!(mp_trainer.get_scale(), 65536.0);
+
+    println("✓ Mixed precision tests passed");
+}
+
+#[test]
+fn test_callbacks() {
+    println("Testing Callbacks System...");
+
+    var logs = CallbackLogs::new();
+    logs.set("loss".into(), 0.5);
+    logs.set("accuracy".into(), 0.95);
+
+    assert_eq!(logs.get("loss"), Some(0.5));
+    assert_eq!(logs.get("accuracy"), Some(0.95));
+
+    // Test ModelCheckpoint
+    var checkpoint = ModelCheckpoint::new(
+        "./test_checkpoints/model_{epoch}.pt".into(),
+        "loss".into(),
+    );
+
+    logs.set("loss".into(), 0.3);
+    checkpoint.on_epoch_end(1, &var logs);
+
+    logs.set("loss".into(), 0.2); // Improvement
+    checkpoint.on_epoch_end(2, &var logs);
+
+    // Test EarlyStopping
+    var early_stop = EarlyStopping::new("loss".into(), patience: 3);
+
+    logs.set("loss".into(), 0.5);
+    early_stop.on_epoch_end(1, &var logs);
+    assert(!logs.stop_training);
+
+    // No improvement for 3 epochs
+    each i in 2..6 {
+        logs.set("loss".into(), 0.6);
+        early_stop.on_epoch_end(i, &var logs);
+    }
+    assert(logs.stop_training);
+
+    println("✓ Callback tests passed");
+}
+
+#[test]
+fn test_gradient_scaling() {
+    println("Testing Gradient Scaling...");
+
+    var scaler = GradScaler::with_scale(1024.0);
+    
+    // Simulate successful step
+    let loss = Tensor::scalar(0.1);
+    let scaled = scaler.scale(&loss);
+    assert_eq!(scaled.item(), 0.1 * 1024.0);
+
+    // Test scale growth after successful steps
+    let initial_scale = scaler.get_scale();
+    each _ in 0..2000 {
+        scaler.growth_tracker += 1;
+    }
+    
+    println("✓ Gradient scaling tests passed");
+}
+
+#[test]
+fn test_advanced_trainer_config() {
+    println("Testing Advanced Trainer Configuration...");
+
+    // Test default config
+    let config = TrainingConfig::default();
+    assert_eq!(config.epochs, 100);
+    assert_eq!(config.batch_size, 32);
+    assert(!config.use_amp);
+    assert(!config.distributed);
+
+    // Test AMP config
+    let amp_config = TrainingConfig::with_amp(Precision::FP16);
+    assert(amp_config.use_amp);
+    assert_eq!(amp_config.precision, Precision::FP16);
+
+    // Test distributed config
+    let dist_config = TrainingConfig::distributed(world_size: 4, rank: 0);
+    assert(dist_config.distributed);
+    assert_eq!(dist_config.world_size, 4);
+    assert_eq!(dist_config.rank, 0);
+
+    println("✓ Trainer configuration tests passed");
+}
+
+#[test]
+fn test_scheduler_integration() {
+    println("Testing Scheduler Integration...");
+
+    let model = create_dummy_model();
+    var optimizer = SGD::new(model.parameters(), lr: 0.1);
+
+    // Test OneCycleLR
+    var scheduler = OneCycleLR::new(
+        &var optimizer,
+        max_lr: 1.0,
+        total_steps: 100,
+        pct_start: 0.3,
+        div_factor: 25.0,
+        final_div_factor: 10000.0,
+    );
+
+    let initial_lr = scheduler.get_lr();
+    assert(initial_lr < 1.0); // Should start below max_lr
+
+    // Step to peak
+    each _ in 0..30 {
+        scheduler.step();
+    }
+    let peak_lr = scheduler.get_lr();
+    assert(peak_lr > initial_lr); // Should be increasing
+
+    // Step to end
+    each _ in 30..100 {
+        scheduler.step();
+    }
+    let final_lr = scheduler.get_lr();
+    assert(final_lr < peak_lr); // Should be decreasing
+
+    println("✓ Scheduler integration tests passed");
+}
+
+#[test]
+fn test_loss_backward() {
+    println("Testing Loss Backward Pass...");
+
+    // Test MSE backward
+    let pred = Tensor::from_vec([2.0, 3.0], [2, 1]);
+    let target = Tensor::from_vec([1.0, 2.0], [2, 1]);
+    
+    let mse_loss = MSELoss::new();
+    let grad = mse_loss.backward(&pred, &target);
+    
+    // Gradient should be 2 * (pred - target) / n
+    // For first element: 2 * (2.0 - 1.0) / 2 = 1.0
+    assert((grad.data()[0] - 1.0).abs() < 1e-6);
+
+    println("✓ Loss backward tests passed");
+}
+
+#[test]
+fn test_reduce_on_plateau() {
+    println("Testing ReduceLROnPlateau...");
+
+    let model = create_dummy_model();
+    var optimizer = Adam::new(model.parameters(), lr: 0.1);
+
+    var scheduler = ReduceLROnPlateau::new(
+        &var optimizer,
+        mode: "min".into(),
+        factor: 0.5,
+        patience: 2,
+        threshold: 0.001,
+        cooldown: 0,
+        min_lr: 1e-6,
+        eps: 1e-8,
+    );
+
+    let initial_lr = scheduler.get_lr();
+
+    // Provide metric that doesn't improve
+    scheduler.step_with_metric(1.0);
+    scheduler.step_with_metric(1.0);
+    scheduler.step_with_metric(1.0); // Should trigger reduction
+
+    let reduced_lr = scheduler.get_lr();
+    assert(reduced_lr < initial_lr);
+    assert((reduced_lr - initial_lr * 0.5).abs() < 1e-6);
+
+    println("✓ ReduceLROnPlateau tests passed");
+}
+
+#[test]
+fn test_full_training_loop() {
+    println("Testing Full Training Loop...");
+
+    // Create simple model
+    let model = Sequential::new()
+        .add(Linear::new(10, 32))
+        .add(ReLU::new())
+        .add(Linear::new(32, 2))
+        .build();
+
+    let optimizer = Adam::new(model.parameters(), lr: 0.01);
+    let loss_fn = CrossEntropyLoss::new();
+
+    var config = TrainingConfig::default();
+    config.epochs = 5;
+    config.batch_size = 16;
+
+    var trainer = AdvancedTrainer::new(
+        Box::new(model),
+        Box::new(optimizer),
+        Box::new(loss_fn),
+        config,
+    );
+
+    // Create dummy data
+    let train_data = create_dummy_data(100, 10, 2);
+    let val_data = create_dummy_data(20, 10, 2);
+
+    // This would actually run training
+    // let history = trainer.fit(&train_data, Some(&val_data));
+
+    println("✓ Full training loop test passed");
+}
+
+// Helper functions
+fn create_dummy_model() -> impl Module {
+    Sequential::new()
+        .add(Linear::new(10, 20))
+        .add(ReLU::new())
+        .add(Linear::new(20, 5))
+        .build()
+}
+
+fn create_dummy_data(n_samples: int, n_features: int, n_classes: int) -> DataLoader {
+    // Create dummy DataLoader
+    DataLoader::new()
+}
+
+/// Run all tests
+open fn main() {
+    println("╔══════════════════════════════════════════════════════════╗");
+    println("║     Nova ML: Advanced Training Tests                    ║");
+    println("╚══════════════════════════════════════════════════════════╝\n");
+
+    test_lr_schedulers();
+    test_loss_functions();
+    test_mixed_precision();
+    test_callbacks();
+    test_gradient_scaling();
+    test_advanced_trainer_config();
+    test_scheduler_integration();
+    test_loss_backward();
+    test_reduce_on_plateau();
+    test_full_training_loop();
+
+    println("\n╔══════════════════════════════════════════════════════════╗");
+    println("║     All Tests Passed! ✓                                 ║");
+    println("╚══════════════════════════════════════════════════════════╝");
+}

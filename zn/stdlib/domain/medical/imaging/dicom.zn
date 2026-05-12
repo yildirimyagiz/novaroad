@@ -1,0 +1,134 @@
+// Nova Medical: DICOM Image Format
+// Medical imaging standard
+
+@module("medical::imaging::dicom")
+@reproducible
+@export
+
+use core::vec::Vec;
+use core::result::Result;
+
+// ============================================================================
+// DICOM Image
+// ============================================================================
+
+open data DicomImage {
+    patient_id: String,
+    study_date: DateTime,
+    modality: Modality,
+    width: u32,
+    height: u32,
+    pixels: Vec<u16>,
+    window_center: f64,
+    window_width: f64,
+    metadata: DicomHeader
+}
+
+open cases Modality {
+    CT,   // Computed Tomography
+    MRI,  // Magnetic Resonance Imaging
+    XR,   // X-Ray
+    US,   // Ultrasound
+    PET,  // Positron Emission Tomography
+    NM,   // Nuclear Medicine
+    CR,   // Computed Radiography
+    DX    // Digital Radiography
+}
+
+open data DicomHeader {
+    patient_name: String,
+    patient_id: String,
+    study_instance_uid: String,
+    series_instance_uid: String,
+    sop_instance_uid: String,
+    transfer_syntax: String
+}
+
+// ============================================================================
+// DICOM Parser
+// ============================================================================
+
+@reproducible
+open fn parse_dicom(path: &str) -> Result<DicomImage, DicomError> {
+    // Read file
+    let data = read_file(path)?;
+    
+    // Verify DICOM magic
+    check !data.starts_with(b"DICM") {
+        Err(DicomError::InvalidFormat);
+    }
+    
+    // Parse header
+    let header = parse_header(&data)?;
+    
+    // Extract pixel data
+    let pixels = extract_pixels(&data, &header)?;
+    
+    Ok(DicomImage {
+        patient_id: header.patient_id.clone(),
+        study_date: parse_date(&header.study_date)?,
+        modality: parse_modality(&header.modality)?,
+        width: header.columns,
+        height: header.rows,
+        pixels,
+        window_center: header.window_center.unwrap_or(0.0),
+        window_width: header.window_width.unwrap_or(4096.0),
+        metadata: header
+    })
+}
+
+open cases DicomError {
+    InvalidFormat,
+    IoError,
+    ParseError
+}
+
+// ============================================================================
+// Image Processing
+// ============================================================================
+
+@gpu_accelerated
+open fn apply_window_level(
+    image: &DicomImage,
+    window_center: f64,
+    window_width: f64
+) -> Vec<u8> {
+    var output = Vec::new();
+    
+    @parallel(gpu)
+    for &pixel in &image.pixels {
+        let value = pixel as f64;
+        let lower = window_center - window_width / 2.0;
+        let upper = window_center + window_width / 2.0;
+        
+        let normalized = check value <= lower {
+            0.0
+        } else check value >= upper {
+            255.0
+        } else {
+            yield ((value - lower) / window_width) * 255.0
+        };
+        
+        output.push(normalized as u8);
+    }
+    
+    output
+}
+
+@gpu_accelerated
+open fn segment_organs(image: &DicomImage) -> SegmentationMask {
+    // GPU-accelerated organ segmentation
+    // Would use deep learning model in practice
+    
+    SegmentationMask {
+        width: image.width,
+        height: image.height,
+        labels: [0; (image.width * image.height) as usize]
+    }
+}
+
+open data SegmentationMask {
+    width: u32,
+    height: u32,
+    labels: Vec<u8>
+}

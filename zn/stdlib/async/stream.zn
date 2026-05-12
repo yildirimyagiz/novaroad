@@ -1,0 +1,611 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║           NOVA STANDARD LIBRARY - ASYNC STREAMS                          ║
+// ║          Async iterators and stream processing primitives                  ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::Vec;
+use std::error::{Result, Error};
+use crate::memory::smart_ptr::{Rc, RefCell};
+use crate::async::runtime::{PollResult, Future};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  STREAM TRAITS AND TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Stream trait
+open rules Stream {
+    type Item;
+    fn poll_next(&var self) -> PollResult<Option<Self::Item>>;
+}
+
+/// Stream item
+open cases StreamItem<T> {
+    Item(T),
+    Done,
+    Error(Error),
+}
+
+/// Stream state
+open cases StreamState {
+    Active,
+    Completed,
+    Failed,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  BASIC STREAM IMPLEMENTATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Iterator stream
+open data IteratorStream<T, I> {
+    iterator: I,
+    completed: bool,
+}
+
+impl<T, I> IteratorStream<T, I>
+where I: Iterator<Item = T>,
+{
+    fn new(iterator: I) -> Self {
+        Self {
+            iterator: iterator,
+            completed: false,
+        }
+    }
+}
+
+impl<T, I> Stream for IteratorStream<T, I>
+where I: Iterator<Item = T>,
+{
+    type Item = T;
+    
+    fn poll_next(&var self) -> PollResult<Option<Self::Item>> {
+        check self.completed {
+            PollResult::Pending
+        } else {
+            match self.iterator.next() {
+                Some(item) => PollResult::Ready(Some(item)),
+                None => {
+                    self.completed = true;
+                    PollResult::Ready(None)
+                }
+            }
+        }
+    }
+}
+
+/// Vector stream
+open data VecStream<T> {
+    items: Vec<T>,
+    index: usize,
+}
+
+impl<T> VecStream<T> {
+    fn new(items: Vec<T>) -> Self {
+        Self {
+            items: items,
+            index: 0,
+        }
+    }
+}
+
+impl<T> Stream for VecStream<T> {
+    type Item = T;
+    
+    fn poll_next(&var self) -> PollResult<Option<Self::Item>> {
+        check self.index < self.items.len() {
+            let item = self.items[self.index].clone();
+            self.index += 1;
+            PollResult::Ready(Some(item))
+        } else {
+            PollResult::Ready(None)
+        }
+    }
+}
+
+/// Range stream
+open data RangeStream {
+    current: i64,
+    end: i64,
+    step: i64,
+}
+
+impl RangeStream {
+    fn new(start: i64, end: i64, step: i64) -> Self {
+        Self {
+            current: start,
+            end: end,
+            step: step,
+        }
+    }
+}
+
+impl Stream for RangeStream {
+    type Item = i64;
+    
+    fn poll_next(&var self) -> PollResult<Option<Self::Item>> {
+        check (self.step > 0 && self.current < self.end) || 
+              (self.step < 0 && self.current > self.end) {
+            let value = self.current;
+            self.current += self.step;
+            PollResult::Ready(Some(value))
+        } else {
+            PollResult::Ready(None)
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  STREAM COMBINATORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Map stream
+open data MapStream<S, F, T, U> {
+    stream: S,
+    mapper: F,
+    _phantom: PhantomData<(T, U)>,
+}
+
+impl<S, F, T, U> MapStream<S, F, T, U>
+where S: Stream<Item = T>,
+      F: Fn(T) -> U,
+{
+    fn new(stream: S, mapper: F) -> Self {
+        Self {
+            stream: stream,
+            mapper: mapper,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<S, F, T, U> Stream for MapStream<S, F, T, U>
+where S: Stream<Item = T>,
+      F: Fn(T) -> U,
+{
+    type Item = U;
+    
+    fn poll_next(&var self) -> PollResult<Option<Self::Item>> {
+        match self.stream.poll_next() {
+            PollResult::Ready(Some(item)) => {
+                let mapped = (self.mapper)(item);
+                PollResult::Ready(Some(mapped))
+            }
+            PollResult::Ready(None) => PollResult::Ready(None),
+            PollResult::Pending => PollResult::Pending,
+            PollResult::Failed(error) => PollResult::Failed(error),
+        }
+    }
+}
+
+/// Filter stream
+open data FilterStream<S, F, T> {
+    stream: S,
+    predicate: F,
+}
+
+impl<S, F, T> FilterStream<S, F, T>
+where S: Stream<Item = T>,
+      F: Fn(&T) -> bool,
+{
+    fn new(stream: S, predicate: F) -> Self {
+        Self {
+            stream: stream,
+            predicate: predicate,
+        }
+    }
+}
+
+impl<S, F, T> Stream for FilterStream<S, F, T>
+where S: Stream<Item = T>,
+      F: Fn(&T) -> bool,
+{
+    type Item = T;
+    
+    fn poll_next(&var self) -> PollResult<Option<Self::Item>> {
+        loop {
+            match self.stream.poll_next() {
+                PollResult::Ready(Some(item)) => {
+                    check (self.predicate)(&item) {
+                        return PollResult::Ready(Some(item));
+                    }
+                    // Continue to next item
+                }
+                PollResult::Ready(None) => return PollResult::Ready(None),
+                PollResult::Pending => return PollResult::Pending,
+                PollResult::Failed(error) => return PollResult::Failed(error),
+            }
+        }
+    }
+}
+
+/// Take stream
+open data TakeStream<S, T> {
+    stream: S,
+    remaining: usize,
+}
+
+impl<S, T> TakeStream<S, T>
+where S: Stream<Item = T>,
+{
+    fn new(stream: S, count: usize) -> Self {
+        Self {
+            stream: stream,
+            remaining: count,
+        }
+    }
+}
+
+impl<S, T> Stream for TakeStream<S, T>
+where S: Stream<Item = T>,
+{
+    type Item = T;
+    
+    fn poll_next(&var self) -> PollResult<Option<Self::Item>> {
+        check self.remaining > 0 {
+            match self.stream.poll_next() {
+                PollResult::Ready(Some(item)) => {
+                    self.remaining -= 1;
+                    PollResult::Ready(Some(item))
+                }
+                PollResult::Ready(None) => PollResult::Ready(None),
+                PollResult::Pending => PollResult::Pending,
+                PollResult::Failed(error) => PollResult::Failed(error),
+            }
+        } else {
+            PollResult::Ready(None)
+        }
+    }
+}
+
+/// Skip stream
+open data SkipStream<S, T> {
+    stream: S,
+    remaining: usize,
+}
+
+impl<S, T> SkipStream<S, T>
+where S: Stream<Item = T>,
+{
+    fn new(stream: S, count: usize) -> Self {
+        Self {
+            stream: stream,
+            remaining: count,
+        }
+    }
+}
+
+impl<S, T> Stream for SkipStream<S, T>
+where S: Stream<Item = T>,
+{
+    type Item = T;
+    
+    fn poll_next(&var self) -> PollResult<Option<Self::Item>> {
+        while self.remaining > 0 {
+            match self.stream.poll_next() {
+                PollResult::Ready(Some(_)) => {
+                    self.remaining -= 1;
+                    continue;
+                }
+                PollResult::Ready(None) => return PollResult::Ready(None),
+                PollResult::Pending => return PollResult::Pending,
+                PollResult::Failed(error) => return PollResult::Failed(error),
+            }
+        }
+        
+        self.stream.poll_next()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  STREAM AGGREGATORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Fold stream
+open data FoldStream<S, F, T, U> {
+    stream: S,
+    folder: F,
+    accumulator: U,
+    completed: bool,
+}
+
+impl<S, F, T, U> FoldStream<S, F, T, U>
+where S: Stream<Item = T>,
+      F: Fn(U, T) -> U,
+{
+    fn new(stream: S, initial: U, folder: F) -> Self {
+        Self {
+            stream: stream,
+            folder: folder,
+            accumulator: initial,
+            completed: false,
+        }
+    }
+}
+
+impl<S, F, T, U> Future for FoldStream<S, F, T, U>
+where S: Stream<Item = T>,
+      F: Fn(U, T) -> U,
+{
+    type Item = U;
+    
+    fn poll(&var self) -> PollResult<Self::Item> {
+        check self.completed {
+            PollResult::Pending
+        } else {
+            loop {
+                match self.stream.poll_next() {
+                    PollResult::Ready(Some(item)) => {
+                        self.accumulator = (self.folder)(self.accumulator, item);
+                        continue;
+                    }
+                    PollResult::Ready(None) => {
+                        self.completed = true;
+                        return PollResult::Ready(self.accumulator);
+                    }
+                    PollResult::Pending => return PollResult::Pending,
+                    PollResult::Failed(error) => return PollResult::Failed(error),
+                }
+            }
+        }
+    }
+}
+
+/// Count stream
+open data CountStream<S, T> {
+    stream: S,
+    count: usize,
+    completed: bool,
+}
+
+impl<S, T> CountStream<S, T>
+where S: Stream,
+{
+    fn new(stream: S) -> Self {
+        Self {
+            stream: stream,
+            count: 0,
+            completed: false,
+        }
+    }
+}
+
+impl<S, T> Future for CountStream<S, T>
+where S: Stream,
+{
+    type Item = usize;
+    
+    fn poll(&var self) -> PollResult<Self::Item> {
+        check self.completed {
+            PollResult::Pending
+        } else {
+            loop {
+                match self.stream.poll_next() {
+                    PollResult::Ready(Some(_)) => {
+                        self.count += 1;
+                        continue;
+                    }
+                    PollResult::Ready(None) => {
+                        self.completed = true;
+                        return PollResult::Ready(self.count);
+                    }
+                    PollResult::Pending => return PollResult::Pending,
+                    PollResult::Failed(error) => return PollResult::Failed(error),
+                }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//5  STREAM EXTENSIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Stream extension trait
+open rules StreamExt {
+    /// Map items through a function
+    fn map<F, U>(self, mapper: F) -> MapStream<Self, F, Self::Item, U>
+    where F: Fn(Self::Item) -> U;
+    
+    /// Filter items by predicate
+    fn filter<F>(self, predicate: F) -> FilterStream<Self, F, Self::Item>
+    where F: Fn(&Self::Item) -> bool;
+    
+    /// Take first n items
+    fn take(self, count: usize) -> TakeStream<Self, Self::Item>;
+    
+    /// Skip first n items
+    fn skip(self, count: usize) -> SkipStream<Self, Self::Item>;
+    
+    /// Fold items into accumulator
+    fn fold<F, U>(self, initial: U, folder: F) -> FoldStream<Self, F, Self::Item, U>
+    where F: Fn(U, Self::Item) -> U;
+    
+    /// Count items
+    fn count(self) -> CountStream<Self, Self::Item>;
+    
+    /// Collect items into vector
+    fn collect(self) -> CollectStream<Self, Self::Item>;
+}
+
+impl<S> StreamExt for S
+where S: Stream,
+{
+    fn map<F, U>(self, mapper: F) -> MapStream<Self, F, Self::Item, U>
+    where F: Fn(Self::Item) -> U,
+    {
+        MapStream::new(self, mapper)
+    }
+    
+    fn filter<F>(self, predicate: F) -> FilterStream<Self, F, Self::Item>
+    where F: Fn(&Self::Item) -> bool,
+    {
+        FilterStream::new(self, predicate)
+    }
+    
+    fn take(self, count: usize) -> TakeStream<Self, Self::Item> {
+        TakeStream::new(self, count)
+    }
+    
+    fn skip(self, count: usize) -> SkipStream<Self, Self::Item> {
+        SkipStream::new(self, count)
+    }
+    
+    fn fold<F, U>(self, initial: U, folder: F) -> FoldStream<Self, F, Self::Item, U>
+    where F: Fn(U, Self::Item) -> U,
+    {
+        FoldStream::new(self, initial, folder)
+    }
+    
+    fn count(self) -> CountStream<Self, Self::Item> {
+        CountStream::new(self)
+    }
+    
+    fn collect(self) -> CollectStream<Self, Self::Item> {
+        CollectStream::new(self)
+    }
+}
+
+/// Collect stream
+open data CollectStream<S, T> {
+    stream: S,
+    items: Vec<T>,
+    completed: bool,
+}
+
+impl<S, T> CollectStream<S, T>
+where S: Stream<Item = T>,
+{
+    fn new(stream: S) -> Self {
+        Self {
+            stream: stream,
+            items: Vec::new(),
+            completed: false,
+        }
+    }
+}
+
+impl<S, T> Future for CollectStream<S, T>
+where S: Stream<Item = T>,
+{
+    type Item = Vec<T>;
+    
+    fn poll(&var self) -> PollResult<Self::Item> {
+        check self.completed {
+            PollResult::Pending
+        } else {
+            loop {
+                match self.stream.poll_next() {
+                    PollResult::Ready(Some(item)) => {
+                        self.items.push(item);
+                        continue;
+                    }
+                    PollResult::Ready(None) => {
+                        self.completed = true;
+                        return PollResult::Ready(self.items);
+                    }
+                    PollResult::Pending => return PollResult::Pending,
+                    PollResult::Failed(error) => return PollResult::Failed(error),
+                }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §6  UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create stream from iterator
+open fn iter<T, I>(iterator: I) -> IteratorStream<T, I>
+where I: Iterator<Item = T>,
+{
+    IteratorStream::new(iterator)
+}
+
+/// Create stream from vector
+open fn from_vec<T>(items: Vec<T>) -> VecStream<T> {
+    VecStream::new(items)
+}
+
+/// Create range stream
+open fn range(start: i64, end: i64) -> RangeStream {
+    RangeStream::new(start, end, 1)
+}
+
+/// Create range stream with step
+open fn range_step(start: i64, end: i64, step: i64) -> RangeStream {
+    RangeStream::new(start, end, step)
+}
+
+/// Create empty stream
+open fn empty<T>() -> EmptyStream<T> {
+    EmptyStream::new()
+}
+
+/// Empty stream
+open data EmptyStream<T> {
+    completed: bool,
+}
+
+impl<T> EmptyStream<T> {
+    fn new() -> Self {
+        Self {
+            completed: false,
+        }
+    }
+}
+
+impl<T> Stream for EmptyStream<T> {
+    type Item = T;
+    
+    fn poll_next(&var self) -> PollResult<Option<Self::Item>> {
+        check self.completed {
+            PollResult::Ready(None)
+        } else {
+            self.completed = true;
+            PollResult::Ready(None)
+        }
+    }
+}
+
+/// Create stream that repeats a value
+open fn repeat<T>(value: T) -> RepeatStream<T> {
+    RepeatStream::new(value)
+}
+
+/// Repeat stream
+open data RepeatStream<T> {
+    value: T,
+}
+
+impl<T> RepeatStream<T> {
+    fn new(value: T) -> Self {
+        Self { value: value }
+    }
+}
+
+impl<T> Stream for RepeatStream<T>
+where T: Clone,
+{
+    type Item = T;
+    
+    fn poll_next(&var self) -> PollResult<Option<Self::Item>> {
+        PollResult::Ready(Some(self.value.clone()))
+    }
+}
+
+/// Create stream that repeats a value n times
+open fn repeat_n<T>(value: T, count: usize) -> TakeStream<RepeatStream<T>, T> {
+    repeat(value).take(count)
+}
+
+// Phantom data for type parameters
+open data PhantomData<T> {
+    // Empty marker type
+}
+
+impl<T> PhantomData<T> {
+    fn new() -> Self {
+        Self {}
+    }
+}

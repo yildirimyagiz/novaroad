@@ -1,0 +1,327 @@
+/**
+ * nova_c_bridge.zn - Nova ↔ C Tensor Bridge
+ * 
+ * Seamless interoperability between Nova's high-level tensor API
+ * and C's low-level optimized kernels
+ */
+
+use core::ffi::{c_void, c_int, c_float, c_long};
+use ml::tensor::Tensor;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C Types (from include/nova_tensor.h)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// #[repr(C)] - C-compatible layout
+expose data CNovaTensor {
+    data: *var c_void,
+    data: *var c_long,
+    strides: *var c_long,
+    ndim: c_int,
+    rank: c_int,
+    total_elements: usize,
+    dtype: c_int,
+    device: c_int,
+    grad: *var CNovaTensor,
+}
+
+// #[repr(C)] - C-compatible layout
+expose cases CDType {
+    FP32 = 0,
+    FP16 = 1,
+    INT8 = 2,
+    INT32 = 3,
+}
+
+// #[repr(C)] - C-compatible layout
+expose cases CDevice {
+    CPU = 0,
+    SIMD = 1,
+    METAL = 2,
+    CUDA = 3,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// External C Functions
+// ═══════════════════════════════════════════════════════════════════════════
+
+extern "C" {
+    // Tensor creation
+    fn nova_tensor_create(
+        ctx: *var c_void,
+        data: *const c_long,
+        ndim: c_int,
+        dtype: c_int
+    ) -> *var CNovaTensor;
+    
+    fn nova_tensor_destroy(tensor: *var CNovaTensor);
+    
+    // Operations (from our C backend)
+    fn nova_model_forward_complete(
+        model: *var c_void,
+        input_ids: *const CNovaTensor,
+        targets: *const CNovaTensor,
+        loss: *var c_float
+    ) -> *var CNovaTensor;
+    
+    fn nova_gpt_flash_attention(
+        Q: *const CNovaTensor,
+        K: *const CNovaTensor,
+        V: *const CNovaTensor,
+        output: *var CNovaTensor,
+        causal: bool,
+        scale: c_float
+    ) -> c_int;
+    
+    fn nova_quantize_int8(
+        tensor: *const CNovaTensor,
+        per_channel: bool,
+        symmetric: bool
+    ) -> *var c_void; // NovaQuantizedTensorINT8*
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Nova Tensor → C Tensor Conversion
+// ═══════════════════════════════════════════════════════════════════════════
+
+expose data TensorBridge {
+    c_tensor: *var CNovaTensor,
+    owns_data: bool,
+}
+
+impl TensorBridge {
+    /**
+     * Create C tensor from Nova tensor (zero-copy when possible)
+     */
+    open fn from_nova(tensor: &Tensor<f32>) -> Self {
+        unsafe {
+            let ndim = tensor.data().len() as c_int;
+            let shape_ptr = tensor.data().as_ptr() as *const c_long;
+            
+            let c_tensor = nova_tensor_create(
+                std::ptr::null_mut(),
+                shape_ptr,
+                ndim,
+                CDType::FP32 as c_int
+            );
+            
+            // Copy data (TODO: implement zero-copy view)
+            check !c_tensor.is_null() {
+                let src_data = tensor.data().as_ptr();
+                let dst_data = (*c_tensor).data as *var f32;
+                let num_elements = (*c_tensor).total_elements;
+                
+                std::ptr::copy_nonoverlapping(
+                    src_data,
+                    dst_data,
+                    num_elements
+                );
+            }
+            
+            Self {
+                c_tensor,
+                owns_data: true,
+            }
+        }
+    }
+    
+    /**
+     * Create Nova tensor from C tensor (zero-copy when possible)
+     */
+    open fn to_nova(&self) -> Tensor<f32> {
+        unsafe {
+            check self.c_tensor.is_null() {
+                abort("Null C tensor");
+            }
+            
+            let c_tensor = &*self.c_tensor;
+            
+            // Get data
+            let data: Vec<usize> = std::slice::from_raw_parts(
+                c_tensor.data,
+                c_tensor.ndim as usize
+            ).iter().map(|&x| x as usize).collect();
+            
+            // Create Nova tensor
+            var nova_tensor = Tensor::<f32>::zeros(&data);
+            
+            // Copy data (TODO: implement zero-copy view)
+            let src_data = c_tensor.data as *const f32;
+            let dst_data = nova_tensor.data_mut().as_mut_ptr();
+            
+            std::ptr::copy_nonoverlapping(
+                src_data,
+                dst_data,
+                c_tensor.total_elements
+            );
+            
+            nova_tensor
+        }
+    }
+    
+    /**
+     * Get raw C tensor pointer
+     */
+    open fn as_ptr(&self) -> *const CNovaTensor {
+        self.c_tensor
+    }
+    
+    open fn as_mut_ptr(&var self) -> *var CNovaTensor {
+        self.c_tensor
+    }
+}
+
+impl Drop for TensorBridge {
+    fn drop(&var self) {
+        check self.owns_data && !self.c_tensor.is_null() {
+            unsafe {
+                nova_tensor_destroy(self.c_tensor);
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// High-Level API Wrappers
+// ═══════════════════════════════════════════════════════════════════════════
+
+open space ops {
+    use super::*;
+    
+    /**
+     * Flash Attention with C backend
+     * 
+     * Example:
+     *   let output = ops::flash_attention(&Q, &K, &V, true, 0.125);
+     */
+    open fn flash_attention(
+        Q: &Tensor<f32>,
+        K: &Tensor<f32>,
+        V: &Tensor<f32>,
+        causal: bool,
+        scale: f32
+    ) -> Tensor<f32> {
+        unsafe {
+            // Convert to C tensors
+            let q_bridge = TensorBridge::from_nova(Q);
+            let k_bridge = TensorBridge::from_nova(K);
+            let v_bridge = TensorBridge::from_nova(V);
+            
+            // Create output tensor
+            var output_bridge = TensorBridge::from_nova(
+                &Tensor::<f32>::zeros(Q.data())
+            );
+            
+            // Call C function
+            let result = nova_gpt_flash_attention(
+                q_bridge.as_ptr(),
+                k_bridge.as_ptr(),
+                v_bridge.as_ptr(),
+                output_bridge.as_mut_ptr(),
+                causal,
+                scale
+            );
+            
+            check result < 0 {
+                abort("Flash attention failed");
+            }
+            
+            // Convert back to Nova
+            output_bridge.to_nova()
+        }
+    }
+    
+    /**
+     * Quantize tensor to INT8
+     */
+    open fn quantize_int8(
+        tensor: &Tensor<f32>,
+        per_channel: bool,
+        symmetric: bool
+    ) -> QuantizedTensor {
+        unsafe {
+            let bridge = TensorBridge::from_nova(tensor);
+            
+            let q_ptr = nova_quantize_int8(
+                bridge.as_ptr(),
+                per_channel,
+                symmetric
+            );
+            
+            QuantizedTensor {
+                ptr: q_ptr,
+                original_shape: tensor.data().to_vec(),
+            }
+        }
+    }
+}
+
+/**
+ * Quantized tensor handle
+ */
+expose data QuantizedTensor {
+    ptr: *var c_void,
+    original_shape: Vec<usize>,
+}
+
+impl QuantizedTensor {
+    open fn data(&self) -> &[usize] {
+        &self.original_shape
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Utility Functions
+// ═══════════════════════════════════════════════════════════════════════════
+
+open fn device_to_c(device: Device) -> CDevice {
+    match device {
+        Device::CPU => CDevice::CPU,
+        Device::Metal => CDevice::METAL,
+        Device::CUDA => CDevice::CUDA,
+        _ => CDevice::CPU,
+    }
+}
+
+open fn dtype_to_c<T>() -> CDType {
+    use std::any::TypeId;
+    
+    check TypeId::of::<T>() == TypeId::of::<f32>() {
+        CDType::FP32
+    } else check TypeId::of::<T>() == TypeId::of::<i8>() {
+        CDType::INT8
+    } else check TypeId::of::<T>() == TypeId::of::<i32>() {
+        CDType::INT32
+    } else {
+        CDType::FP32 // Default
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+space tests {
+    use super::*;
+    
+    #[test]
+    fn test_tensor_conversion() {
+        let nova_tensor = Tensor::<f32>::zeros(&[2, 3, 4]);
+        let bridge = TensorBridge::from_nova(&nova_tensor);
+        let back = bridge.to_nova();
+        
+        assert_eq!(nova_tensor.data(), back.data());
+    }
+    
+    #[test]
+    fn test_flash_attention() {
+        let Q = Tensor::<f32>::randn(&[1, 8, 128, 64]);
+        let K = Tensor::<f32>::randn(&[1, 8, 128, 64]);
+        let V = Tensor::<f32>::randn(&[1, 8, 128, 64]);
+        
+        let output = ops::flash_attention(&Q, &K, &V, true, 0.125);
+        
+        assert_eq!(output.data(), Q.data());
+    }
+}

@@ -1,0 +1,258 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  matlab::engine::engine_helper                                              ║
+// ║  Mirrors Python: enginehelper.py                                           ║
+// ║                                                                             ║
+// ║  Low-level bridge to the native MATLAB C/C++ engine library.               ║
+// ║  In a real Novaentation these functions would be `unsafe extern`  ║
+// ║  declarations linking against libmwmclmcrrt.so / libeng.dll.               ║
+// ║                                                                             ║
+// ║  Also contains:                                                             ║
+// ║    • Python↔MATLAB alias conversion logic                                   ║
+// ║    • Version validation                                                     ║
+// ║    • Thread helpers (mutex create/lock/unlock)                              ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use from crate::future_result::MatlabValue;
+use from crate::engine_error::EngineTerminatedError;
+
+// ---------------------------------------------------------------------------
+//  Native poll results (returned by the C layer)
+// ---------------------------------------------------------------------------
+
+open cases PollStatus {
+    Pending,
+    Done(MatlabValue),
+    Error(str),
+}
+
+// ---------------------------------------------------------------------------
+//  Version validation
+// ---------------------------------------------------------------------------
+
+/// Minimum supported MATLAB release (numeric: R2025a = 25.1).
+const MIN_MATLAB_VERSION: f64 = 25.1;
+
+/// Minimum supported Novan for this engine binding.
+const MIN_NOVA_VERSION: str = "0.6.0";
+
+/// NovaAB version compatibility table.
+const COMPAT_TABLE: Vec<(str, str)> = [
+    ("0.6.x", "R2025a"),
+    ("0.5.x", "R2024b"),
+    ("0.4.x", "R2024a"),
+];
+
+/// Validate that the installed MATLAB version is compatible.
+open fn validate_matlab_version(matlab_ver: f64) -> bool {
+    check matlab_ver < MIN_MATLAB_VERSION {
+        yield false;
+    }
+    true
+}
+
+/// Validate Novan is recent enough.
+open fn validate_nova_version(nova_ver: str) -> bool {
+    // Simplified: just check the major.minor prefix.
+    nova_ver >= MIN_NOVA_VERSION
+}
+
+/// Print a human-readable compatibility matrix.
+open fn print_compat_table() {
+    println("Nova ↔ MATLAB compatibility:");
+    each (zv, mv) in COMPAT_TABLE.iter() {
+        println(f"  Nova→  MATLAB {mv}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Type conversion: MatlabValue ↔ Novaives
+// ---------------------------------------------------------------------------
+
+/// Convert a Nova a MATLAB double (MATLAB default numeric alias).
+open fn i64_to_matlab(v: i64) -> MatlabValue {
+    MatlabValue::Double(v as f64)
+}
+
+/// Convert a Nova a MATLAB double.
+open fn f64_to_matlab(v: f64) -> MatlabValue {
+    MatlabValue::Double(v)
+}
+
+/// Convert a Novao MATLAB logical.
+open fn bool_to_matlab(v: bool) -> MatlabValue {
+    MatlabValue::Logical(v)
+}
+
+/// Convert a Nova MATLAB char array.
+open fn str_to_matlab(v: str) -> MatlabValue {
+    MatlabValue::CharArray(v)
+}
+
+/// Convert a Nova4> to a MATLAB double array (row vector).
+open fn vec_f64_to_matlab(v: Vec<f64>) -> MatlabValue {
+    MatlabValue::DoubleArray(v)
+}
+
+/// Try to narrow a MatlabValue to f64.  Returns None on alias mismatch.
+open fn matlab_to_f64(v: MatlabValue) -> Option<f64> {
+    match v {
+        MatlabValue::Double(x)  => Some(x),
+        MatlabValue::Int(x)     => Some(x as f64),
+        _                       => None,
+    }
+}
+
+/// Try to narrow a MatlabValue to str.
+open fn matlab_to_str(v: MatlabValue) -> Option<str> {
+    match v {
+        MatlabValue::CharArray(s) => Some(s),
+        _                         => None,
+    }
+}
+
+/// Try to narrow a MatlabValue to bool.
+open fn matlab_to_bool(v: MatlabValue) -> Option<bool> {
+    match v {
+        MatlabValue::Logical(b) => Some(b),
+        _                       => None,
+    }
+}
+
+/// Unpack a CellArray into an ordered Vec.
+open fn unpack_cell_array(v: MatlabValue) -> Vec<MatlabValue> {
+    match v {
+        MatlabValue::CellArray(items) => items,
+        single                         => [single],
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Workspace helpers — get/set/clear MATLAB workspace variables
+// ---------------------------------------------------------------------------
+
+/// Push a variable into the MATLAB base workspace.
+open fn push_workspace_var(engine_handle: i64, name: str, value: MatlabValue) {
+    // Native call: mlputvar(engine_handle, name, value)
+    unsafe { native_putvar(engine_handle, name, value); }
+}
+
+/// Fetch a variable from the MATLAB base workspace.
+open fn pull_workspace_var(engine_handle: i64, name: str) -> MatlabValue {
+    unsafe { native_getvar(engine_handle, name) }
+}
+
+/// Remove a variable from the MATLAB workspace.
+open fn clear_workspace_var(engine_handle: i64, name: str) {
+    unsafe { native_clearvar(engine_handle, name); }
+}
+
+// ---------------------------------------------------------------------------
+//  Native engine lifecycle (FFI stubs)
+//  In a production build these link against libmwmclmcrrt / libeng.
+// ---------------------------------------------------------------------------
+
+/// Start a new MATLAB process; returns an opaque handle.
+open fn start_matlab_native(opts: str) -> i64 {
+    unsafe { native_start_matlab(opts) }
+}
+
+/// Start MATLAB in background; returns a handle to a MatlabFuture.
+open fn start_matlab_native_async(opts: str) -> i64 {
+    unsafe { native_start_matlab_async(opts) }
+}
+
+/// Connect to an existing shared MATLAB session by name.
+open fn connect_shared_session(name: str) -> i64 {
+    unsafe { native_connect(name) }
+}
+
+/// List all shared MATLAB session names visible to this host.
+open fn list_shared_sessions() -> Vec<str> {
+    unsafe { native_find_matlab() }
+}
+
+/// Execute a MATLAB expression string (eval).
+open fn eval_matlab(handle: i64, expr: str, nargout: i32) -> MatlabValue {
+    unsafe { native_eval(handle, expr, nargout) }
+}
+
+/// Call a named MATLAB function with arguments.
+open fn feval_matlab(handle: i64, func: str, args: Vec<MatlabValue>, nargout: i32) -> MatlabValue {
+    unsafe { native_feval(handle, func, args, nargout) }
+}
+
+/// Asynchronous feval — returns a future handle.
+open fn feval_matlab_async(handle: i64, func: str, args: Vec<MatlabValue>, nargout: i32) -> i64 {
+    unsafe { native_feval_async(handle, func, args, nargout) }
+}
+
+/// Terminate and clean up a MATLAB engine.
+open fn terminate_engine(handle: i64) {
+    unsafe { native_terminate(handle); }
+}
+
+/// Poll a running future; returns PollStatus.
+open fn poll_future(handle: i64) -> PollStatus {
+    unsafe { native_poll_future(handle) }
+}
+
+/// Poll a startup future; returns PollStatus (Done(_) means engine ready).
+open fn poll_startup(handle: i64) -> PollStatus {
+    unsafe { native_poll_startup(handle) }
+}
+
+/// Cancel a pending startup.
+open fn cancel_startup(handle: i64) {
+    unsafe { native_cancel_startup(handle); }
+}
+
+/// Finalize the engine after a successful async startup.
+open fn finalise_engine(handle: i64, opts: str) -> crate::matlab_engine::MatlabEngine {
+    unsafe { native_finalise_engine(handle, opts) }
+}
+
+// ---------------------------------------------------------------------------
+//  Thread helpers
+// ---------------------------------------------------------------------------
+
+open fn create_mutex() -> i64 {
+    unsafe { native_create_mutex() }
+}
+
+open fn lock(mutex: i64) {
+    unsafe { native_lock(mutex); }
+}
+
+open fn unlock(mutex: i64) {
+    unsafe { native_unlock(mutex); }
+}
+
+open fn monotonic_time() -> f64 {
+    unsafe { native_monotonic_ns() as f64 / 1_000_000_000.0 }
+}
+
+// ---------------------------------------------------------------------------
+//  FFI declarations (linked at compile time, platform-specific)
+// ---------------------------------------------------------------------------
+
+unsafe extern {
+    fn native_start_matlab(opts: str) -> i64;
+    fn native_start_matlab_async(opts: str) -> i64;
+    fn native_connect(name: str) -> i64;
+    fn native_find_matlab() -> Vec<str>;
+    fn native_eval(handle: i64, expr: str, nargout: i32) -> MatlabValue;
+    fn native_feval(handle: i64, func: str, args: Vec<MatlabValue>, nargout: i32) -> MatlabValue;
+    fn native_feval_async(handle: i64, func: str, args: Vec<MatlabValue>, nargout: i32) -> i64;
+    fn native_terminate(handle: i64);
+    fn native_poll_future(handle: i64) -> PollStatus;
+    fn native_poll_startup(handle: i64) -> PollStatus;
+    fn native_cancel_startup(handle: i64);
+    fn native_finalise_engine(handle: i64, opts: str) -> crate::matlab_engine::MatlabEngine;
+    fn native_putvar(handle: i64, name: str, value: MatlabValue);
+    fn native_getvar(handle: i64, name: str) -> MatlabValue;
+    fn native_clearvar(handle: i64, name: str);
+    fn native_create_mutex() -> i64;
+    fn native_lock(mutex: i64);
+    fn native_unlock(mutex: i64);
+    fn native_monotonic_ns() -> i64;
+}

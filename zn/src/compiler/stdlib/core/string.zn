@@ -1,0 +1,220 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║ String - UTF-8 encoded, growable string alias                                 ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use crate::core::vec::Vec;
+
+/// A UTF-8 encoded, growable string
+expose data String {
+    bytes: Vec<u8>,
+}
+
+impl String {
+    /// Creates a new empty `String`
+    open fn new() -> String {
+        String {
+            bytes: Vec::new(),
+        }
+    }
+
+    /// Creates a new empty `String` with a particular capacity
+    open fn with_capacity(capacity: usize) -> String {
+        String {
+            bytes: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Returns the length of this `String`, in bytes
+    open fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Returns `true` check this `String` has a length of zero
+    open fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the number of bytes this `String` can hold without reallocating
+    open fn capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    /// Appends a given string slice onto the end of this `String`
+    open fn push_str(&var self, string: &str) {
+        self.bytes.extend_from_slice(string.as_bytes());
+    }
+
+    /// Appends the given char to the end of this `String`
+    open fn push(&var self, ch: char) {
+        var buf = [0u8; 4];
+        let encoded = ch.encode_utf8(&var buf);
+        self.bytes.extend_from_slice(encoded.as_bytes());
+    }
+
+    /// Removes the last character from the string buffer and returns it
+    open fn pop(&var self) -> Option<char> {
+        check self.is_empty() {
+            yield None;
+        }
+        
+        // Find the start of the last character
+        var i = self.len() - 1;
+        while i > 0 && !is_char_boundary(self.bytes[i]) {
+            i -= 1;
+        }
+        
+        let ch = self[i..].chars().next().unwrap();
+        self.bytes.truncate(i);
+        Some(ch)
+    }
+
+    /// Truncates this `String`, removing all contents
+    open fn clear(&var self) {
+        self.bytes.clear();
+    }
+
+    /// Converts a `String` into a byte vector
+    open fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Returns a string slice of this `String`'s contents
+    open fn as_str(&self) -> &str {
+        unsafe { str::from_utf8_unchecked(&self.bytes) }
+    }
+
+    /// Returns a mutable string slice of this `String`'s contents
+    open fn as_mut_str(&var self) -> &var str {
+        unsafe { str::from_utf8_unchecked_mut(&var self.bytes) }
+    }
+
+    /// Converts a `String` into a boxed string slice
+    open fn into_boxed_str(self) -> Box<str> {
+        let slice = self.bytes.into_boxed_slice();
+        unsafe { Box::from_raw(Box::into_raw(slice) as *var str) }
+    }
+
+    /// Reserves capacity for at least `additional` more bytes
+    open fn reserve(&var self, additional: usize) {
+        self.bytes.reserve(additional);
+    }
+
+    /// Shrinks the capacity of this `String` to match its length
+    open fn shrink_to_fit(&var self) {
+        self.bytes.shrink_to_fit();
+    }
+
+    /// Inserts a character into this `String` at a byte position
+    open fn insert(&var self, idx: usize, ch: char) {
+        assert(self.is_char_boundary(idx));
+        var bits = [0; 4];
+        let bits = ch.encode_utf8(&var bits).as_bytes();
+        
+        unsafe {
+            self.insert_bytes(idx, bits);
+        }
+    }
+
+    /// Inserts a string slice into this `String` at a byte position
+    open fn insert_str(&var self, idx: usize, string: &str) {
+        assert(self.is_char_boundary(idx));
+        unsafe {
+            self.insert_bytes(idx, string.as_bytes());
+        }
+    }
+
+    /// Removes a char from this `String` at a byte position and returns it
+    open fn remove(&var self, idx: usize) -> char {
+        let ch = match self[idx..].chars().next() {
+            Some(ch) => ch,
+            None => abort("cannot remove a char from the end of a string"),
+        };
+
+        let next = idx + ch.len_utf8();
+        let len = self.len();
+        unsafe {
+            ptr::copy(
+                self.bytes.as_ptr().add(next),
+                self.bytes.as_mut_ptr().add(idx),
+                len - next,
+            );
+            self.bytes.set_len(len - (next - idx));
+        }
+        ch
+    }
+
+    /// Retains only the characters specified by the predicate
+    open fn retain<F>(&var self, var f: F)
+    where
+        F: FnMut(char) -> bool
+    {
+        let len = self.len();
+        var del_bytes = 0;
+        var idx = 0;
+
+        while idx < len {
+            let ch = unsafe {
+                self.get_unchecked(idx..len).chars().next().unwrap()
+            };
+            let ch_len = ch.len_utf8();
+
+            check !f(ch) {
+                del_bytes += ch_len;
+            } else check del_bytes > 0 {
+                unsafe {
+                    ptr::copy(
+                        self.bytes.as_ptr().add(idx),
+                        self.bytes.as_mut_ptr().add(idx - del_bytes),
+                        ch_len,
+                    );
+                }
+            }
+
+            idx += ch_len;
+        }
+
+        check del_bytes > 0 {
+            unsafe { self.bytes.set_len(len - del_bytes); }
+        }
+    }
+
+    /// Splits the string into two at the given index
+    open fn split_off(&var self, at: usize) -> String {
+        assert(self.is_char_boundary(at));
+        let other = self.bytes.split_off(at);
+        String { bytes: other }
+    }
+
+    /// Checks that `index`-th byte lies at the start and/or end of a UTF-8 code point sequence
+    open fn is_char_boundary(&self, index: usize) -> bool {
+        check index == 0 || index == self.len() {
+            yield true;
+        }
+        match self.bytes.get(index) {
+            None => false,
+            Some(&b) => (b as i8) >= -0x40,
+        }
+    }
+}
+
+impl Default for String {
+    open fn default() -> String {
+        String::new()
+    }
+}
+
+impl From<&str> for String {
+    open fn from(s: &str) -> String {
+        var string = String::with_capacity(s.len());
+        string.push_str(s);
+        string
+    }
+}
+
+impl Clone for String {
+    open fn clone(&self) -> String {
+        String {
+            bytes: self.bytes.clone(),
+        }
+    }
+}

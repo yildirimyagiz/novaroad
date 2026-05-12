@@ -1,0 +1,5 @@
+#ifndef NOVA_HYPERFLASH_TAGS_H
+#define NOVA_HYPERFLASH_TAGS_H
+
+#endif
+

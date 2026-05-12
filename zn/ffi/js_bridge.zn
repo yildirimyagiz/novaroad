@@ -1,0 +1,492 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova JavaScript/WebAssembly FFI Bridge                                        ║
+// ║ JavaScript interoperability for Web and Node.js                               ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// Module: ffi::js_bridge;
+
+use core::result::{Result, Ok, Err};
+use core::option::{Option, Some, None};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JavaScript Value Types
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// JavaScript value handle
+open alias JsValue = u32;
+
+/// JavaScript value types
+expose cases JsType {
+    Undefined,
+    Null,
+    Boolean,
+    Number,
+    String,
+    Symbol,
+    Object,
+    Function,
+    Array,
+    Promise,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JsValue Wrapper
+// ═══════════════════════════════════════════════════════════════════════════════
+
+expose data JsObject {
+    handle: JsValue,
+}
+
+impl JsObject {
+    /// Create from handle
+    open fn from_handle(handle: JsValue) -> Self {
+        JsObject { handle }
+    }
+    
+    /// Get handle
+    open fn handle(&self) -> JsValue {
+        self.handle
+    }
+    
+    /// Get alias
+    open fn get_type(&self) -> JsType {
+        unsafe {
+            match js_typeof(self.handle) {
+                0 => JsType::Undefined,
+                1 => JsType::Null,
+                2 => JsType::Boolean,
+                3 => JsType::Number,
+                4 => JsType::String,
+                5 => JsType::Symbol,
+                6 => JsType::Object,
+                7 => JsType::Function,
+                _ => JsType::Undefined,
+            }
+        }
+    }
+    
+    /// Check check undefined
+    open fn is_undefined(&self) -> bool {
+        unsafe { js_is_undefined(self.handle) }
+    }
+    
+    /// Check check null
+    open fn is_null(&self) -> bool {
+        unsafe { js_is_null(self.handle) }
+    }
+    
+    /// Convert to bool
+    open fn to_bool(&self) -> Result<bool, String> {
+        unsafe {
+            check !js_is_boolean(self.handle) {
+                Err("Not a boolean".into());
+            }
+            Ok(js_to_bool(self.handle))
+        }
+    }
+    
+    /// Convert to number
+    open fn to_f64(&self) -> Result<f64, String> {
+        unsafe {
+            check !js_is_number(self.handle) {
+                Err("Not a number".into());
+            }
+            Ok(js_to_number(self.handle))
+        }
+    }
+    
+    /// Convert to string
+    open fn to_string(&self) -> Result<String, String> {
+        unsafe {
+            let ptr = js_to_string(self.handle);
+            check ptr.is_null() {
+                Err("Failed to convert to string".into());
+            }
+            
+            let len = js_string_length(ptr);
+            var bytes = Vec::with_capacity(len);
+            js_string_copy(ptr, bytes.as_mut_ptr(), len);
+            bytes.set_len(len);
+            js_free_string(ptr);
+            
+            String::from_utf8(bytes).map_err(|e| format("Invalid UTF-8: {}", e))
+        }
+    }
+    
+    /// Get property
+    open fn get_property(&self, key: &str) -> Result<JsObject, String> {
+        unsafe {
+            let key_val = JsObject::from_string(key)?;
+            let result = js_get_property(self.handle, key_val.handle);
+            Ok(JsObject::from_handle(result))
+        }
+    }
+    
+    /// Set property
+    open fn set_property(&self, key: &str, value: &JsObject) -> Result<(), String> {
+        unsafe {
+            let key_val = JsObject::from_string(key)?;
+            js_set_property(self.handle, key_val.handle, value.handle);
+            Ok(())
+        }
+    }
+    
+    /// Call as function
+    open fn call(&self, args: &[JsObject]) -> Result<JsObject, String> {
+        unsafe {
+            let args_handles: Vec<JsValue> = args.iter().map(|a| a.handle).collect();
+            let result = js_call_function(
+                self.handle,
+                js_undefined(),
+                args_handles.as_ptr(),
+                args_handles.len(),
+            );
+            
+            check js_is_exception(result) {
+                Err(get_js_error());
+            }
+            
+            Ok(JsObject::from_handle(result))
+        }
+    }
+    
+    /// Call as method
+    open fn call_method(&self, this: &JsObject, args: &[JsObject]) -> Result<JsObject, String> {
+        unsafe {
+            let args_handles: Vec<JsValue> = args.iter().map(|a| a.handle).collect();
+            let result = js_call_function(
+                self.handle,
+                this.handle,
+                args_handles.as_ptr(),
+                args_handles.len(),
+            );
+            
+            check js_is_exception(result) {
+                Err(get_js_error());
+            }
+            
+            Ok(JsObject::from_handle(result))
+        }
+    }
+}
+
+impl Drop for JsObject {
+    fn drop(&var self) {
+        unsafe {
+            js_release(self.handle);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Constructors
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl JsObject {
+    open fn undefined() -> Self {
+        unsafe { JsObject::from_handle(js_undefined()) }
+    }
+    
+    open fn null() -> Self {
+        unsafe { JsObject::from_handle(js_null()) }
+    }
+    
+    open fn from_bool(value: bool) -> Self {
+        unsafe { JsObject::from_handle(js_from_bool(value)) }
+    }
+    
+    open fn from_f64(value: f64) -> Self {
+        unsafe { JsObject::from_handle(js_from_number(value)) }
+    }
+    
+    open fn from_i32(value: i32) -> Self {
+        Self::from_f64(value as f64)
+    }
+    
+    open fn from_string(value: &str) -> Result<Self, String> {
+        unsafe {
+            let handle = js_from_string(value.as_ptr(), value.len());
+            Ok(JsObject::from_handle(handle))
+        }
+    }
+    
+    open fn new_object() -> Self {
+        unsafe { JsObject::from_handle(js_new_object()) }
+    }
+    
+    open fn new_array(len: usize) -> Self {
+        unsafe { JsObject::from_handle(js_new_array(len)) }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Promise Support
+// ═══════════════════════════════════════════════════════════════════════════════
+
+expose data JsPromise {
+    obj: JsObject,
+}
+
+impl JsPromise {
+    /// Create new promise
+    open fn new() -> (Self, JsPromiseResolver) {
+        unsafe {
+            let promise = js_new_promise();
+            let resolver = js_promise_resolver(promise);
+            (
+                JsPromise { obj: JsObject::from_handle(promise) },
+                JsPromiseResolver { handle: resolver },
+            )
+        }
+    }
+    
+    /// Create resolved promise
+    open fn resolve(value: JsObject) -> Self {
+        unsafe {
+            let promise = js_promise_resolve(value.handle);
+            JsPromise { obj: JsObject::from_handle(promise) }
+        }
+    }
+    
+    /// Create rejected promise
+    open fn reject(error: JsObject) -> Self {
+        unsafe {
+            let promise = js_promise_reject(error.handle);
+            JsPromise { obj: JsObject::from_handle(promise) }
+        }
+    }
+    
+    /// Add then handler
+    open fn then<F>(&self, callback: F) -> Self 
+    where
+        F: FnOnce(JsObject) + 'static,
+    {
+        unsafe {
+            let cb = Box::into_raw(Box::new(callback));
+            let then_promise = js_promise_then(self.obj.handle, trampoline_then::<F>, cb as *var _);
+            JsPromise { obj: JsObject::from_handle(then_promise) }
+        }
+    }
+    
+    /// Add catch handler
+    open fn catch<F>(&self, callback: F) -> Self 
+    where
+        F: FnOnce(JsObject) + 'static,
+    {
+        unsafe {
+            let cb = Box::into_raw(Box::new(callback));
+            let catch_promise = js_promise_catch(self.obj.handle, trampoline_catch::<F>, cb as *var _);
+            JsPromise { obj: JsObject::from_handle(catch_promise) }
+        }
+    }
+}
+
+expose data JsPromiseResolver {
+    handle: JsValue,
+}
+
+impl JsPromiseResolver {
+    open fn resolve(&self, value: JsObject) {
+        unsafe {
+            js_promise_resolver_resolve(self.handle, value.handle);
+        }
+    }
+    
+    open fn reject(&self, error: JsObject) {
+        unsafe {
+            js_promise_resolver_reject(self.handle, error.handle);
+        }
+    }
+}
+
+extern "C" fn trampoline_then<F>(data: *var u8, value: JsValue) 
+where
+    F: FnOnce(JsObject),
+{
+    unsafe {
+        let callback = Box::from_raw(data as *var F);
+        callback(JsObject::from_handle(value));
+    }
+}
+
+extern "C" fn trampoline_catch<F>(data: *var u8, error: JsValue) 
+where
+    F: FnOnce(JsObject),
+{
+    unsafe {
+        let callback = Box::from_raw(data as *var F);
+        callback(JsObject::from_handle(error));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TypeScript Declarations Generator
+// ═══════════════════════════════════════════════════════════════════════════════
+
+expose data TypeScriptGenerator {
+    declarations: Vec<String>,
+}
+
+impl TypeScriptGenerator {
+    open fn new() -> Self {
+        TypeScriptGenerator {
+            declarations: Vec::new(),
+        }
+    }
+    
+    open fn add_function(&var self, name: &str, params: &[(&str, &str)], return_type: &str) {
+        let params_str = params
+            .iter()
+            .map(|(name, ty)| format("{}: {}", name, ty))
+            .collect::<Vec<_>>()
+            .join(", ");
+        
+        self.declarations.push(format(
+            "export function {}({}): {};",
+            name, params_str, return_type
+        ));
+    }
+    
+    open fn add_interface(&var self, name: &str, fields: &[(&str, &str)]) {
+        var decl = format("export interface {} {{\n", name);
+        each (field_name, field_type) in fields {
+            decl.push_str(&format("  {}: {};\n", field_name, field_type));
+        }
+        decl.push_str("}");
+        self.declarations.push(decl);
+    }
+    
+    open fn generate(&self) -> String {
+        self.declarations.join("\n\n")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WASM Imports/Exports
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[link(name = "env")]
+extern "C" {
+    // Type checking
+    fn js_typeof(val: JsValue) -> u32;
+    fn js_is_undefined(val: JsValue) -> bool;
+    fn js_is_null(val: JsValue) -> bool;
+    fn js_is_boolean(val: JsValue) -> bool;
+    fn js_is_number(val: JsValue) -> bool;
+    fn js_is_string(val: JsValue) -> bool;
+    fn js_is_exception(val: JsValue) -> bool;
+    
+    // Singletons
+    fn js_undefined() -> JsValue;
+    fn js_null() -> JsValue;
+    
+    // Conversions
+    fn js_to_bool(val: JsValue) -> bool;
+    fn js_to_number(val: JsValue) -> f64;
+    fn js_to_string(val: JsValue) -> *const u8;
+    
+    fn js_from_bool(val: bool) -> JsValue;
+    fn js_from_number(val: f64) -> JsValue;
+    fn js_from_string(ptr: *const u8, len: usize) -> JsValue;
+    
+    // String operations
+    fn js_string_length(ptr: *const u8) -> usize;
+    fn js_string_copy(src: *const u8, dest: *var u8, len: usize);
+    fn js_free_string(ptr: *const u8);
+    
+    // Object operations
+    fn js_new_object() -> JsValue;
+    fn js_new_array(len: usize) -> JsValue;
+    fn js_get_property(obj: JsValue, key: JsValue) -> JsValue;
+    fn js_set_property(obj: JsValue, key: JsValue, value: JsValue);
+    
+    // Function calls
+    fn js_call_function(func: JsValue, this: JsValue, args: *const JsValue, argc: usize) -> JsValue;
+    
+    // Promise operations
+    fn js_new_promise() -> JsValue;
+    fn js_promise_resolver(promise: JsValue) -> JsValue;
+    fn js_promise_resolver_resolve(resolver: JsValue, value: JsValue);
+    fn js_promise_resolver_reject(resolver: JsValue, error: JsValue);
+    fn js_promise_resolve(value: JsValue) -> JsValue;
+    fn js_promise_reject(error: JsValue) -> JsValue;
+    fn js_promise_then(promise: JsValue, callback: extern "C" fn(*var u8, JsValue), data: *var u8) -> JsValue;
+    fn js_promise_catch(promise: JsValue, callback: extern "C" fn(*var u8, JsValue), data: *var u8) -> JsValue;
+    
+    // Memory management
+    fn js_retain(val: JsValue);
+    fn js_release(val: JsValue);
+    
+    // Error handling
+    fn js_get_last_exception() -> JsValue;
+    fn js_clear_last_exception();
+}
+
+fn get_js_error() -> String {
+    unsafe {
+        let exc = js_get_last_exception();
+        js_clear_last_exception();
+        
+        let obj = JsObject::from_handle(exc);
+        obj.into().unwrap_or_else(|_| "Unknown JS error".into())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Macros
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Export function to JavaScript
+#[macro_export]
+macro_rules! js_export {
+    ($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty $body:block) => {
+        // #[no_mangle] - Export symbol
+        extern "C" fn $name($($arg: $ty),*) -> $ret {
+            $body
+        }
+    };
+}
+
+/// Import JavaScript function
+#[macro_export]
+macro_rules! js_import {
+    ($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty) => {
+        #[link(name = "env")]
+        extern "C" {
+            open fn $name($($arg: $ty),*) -> $ret;
+        }
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Missing APIs - Added for Nova Compatibility
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl JsObject {
+    /// Set array element by index
+    open fn set_index(&self, index: usize, value: &JsObject) -> Result<(), String> {
+        unsafe {
+            let idx_val = JsObject::from_i32(index as i32);
+            js_set_indexed_property(self.handle, idx_val.handle, value.handle);
+            Ok(())
+        }
+    }
+    
+    /// Create from ArrayBuffer
+    open fn from_arraybuffer(data: &Vec<u8>) -> Result<Self, String> {
+        unsafe {
+            let handle = js_new_arraybuffer(data.as_ptr(), data.len());
+            check handle == 0 {
+                Err("Failed to create ArrayBuffer".into())
+            } else {
+                Ok(JsObject::from_handle(handle))
+            }
+        }
+    }
+}
+
+#[link(name = "env")]
+extern "C" {
+    fn js_set_indexed_property(obj: JsValue, index: JsValue, value: JsValue);
+    fn js_new_arraybuffer(data: *const u8, len: usize) -> JsValue;
+}

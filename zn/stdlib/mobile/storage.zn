@@ -1,0 +1,153 @@
+// 💾 Nova Mobile — Storage — v10.0
+// Multi-tier persistent storage: Preferences, FileSystem, Secure KeyChain,
+// SQLite, and Cache layers with encryption support.
+//
+// Syntax: data / cases / flow / yield / check / each / match / @extern
+
+use std::collections::{HashMap, Vec};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  STORAGE TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open cases StorageError {
+    NotFound(String),
+    PermissionDenied,
+    StorageFull,
+    EncryptionError(String),
+    DatabaseError(String),
+    SerializationError,
+    Unknown(String),
+}
+
+open cases StorageKind {
+    Preferences, // SharedPreferences / UserDefaults
+    FileSystem,  // App data directory
+    Secure,      // KeyChain / Keystore
+    Cache,       // Volatile fast storage
+    Database,    // SQLite-backed
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  MOBILE STORAGE MANAGER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data MobileStorage {
+    open kind:      StorageKind,
+    open encrypted: bool,
+}
+
+impl MobileStorage {
+    open fn new(kind: StorageKind) -> MobileStorage {
+        MobileStorage { 
+            kind, 
+            encrypted: match kind {
+                StorageKind::Secure => true,
+                _ => false,
+            },
+        };
+    }
+
+    open fn encrypted(kind: StorageKind) -> MobileStorage {
+        MobileStorage { kind, encrypted: true };
+    }
+
+    // ── String Operations ─────────────────────────────────────────────
+
+    open fn set_string(&self, key: &str, value: &str) -> Result<(), StorageError> {
+        let payload = check self.encrypted {
+            @extern("nova_crypto_encrypt_aes256", value)
+        } else { value.into() };
+
+        let status = @extern("nova_mobile_storage_set", self.kind, key, &payload);
+        check status != 0 {
+            Err(StorageError::Unknown("Write failed".into()));
+        }
+        Ok(());
+    }
+
+    open fn get_string(&self, key: &str) -> Result<String, StorageError> {
+        let raw = @extern("nova_mobile_storage_get", self.kind, key);
+        check raw == "" { yield Err(StorageError::NotFound(key.into())); }
+
+        check self.encrypted {
+            let decrypted = @extern("nova_crypto_decrypt_aes256", &raw);
+            Ok(decrypted);
+        }
+        Ok(raw);
+    }
+
+    // ── Object Operations ─────────────────────────────────────────────
+
+    open fn set_object<T>(&self, key: &str, obj: &T) -> Result<(), StorageError> {
+        let json = @extern("nova_json_serialize", obj);
+        yield self.set_string(key, &json);
+    }
+
+    open fn get_object<T>(&self, key: &str) -> Result<T, StorageError> {
+        let json = self.get_string(key)?;
+        let obj = @extern("nova_json_deserialize", &json);
+        Ok(obj);
+    }
+
+    // ── Batch Operations ──────────────────────────────────────────────
+
+    open fn set_batch(&self, pairs: &Vec<(String, String)>) -> Result<(), StorageError> {
+        each (key, value) in pairs {
+            self.set_string(key, value)?;
+        }
+        Ok(());
+    }
+
+    // ── Key Management ────────────────────────────────────────────────
+
+    open fn delete(&self, key: &str) -> Result<(), StorageError> {
+        @extern("nova_mobile_storage_delete", self.kind, key);
+        Ok(());
+    }
+
+    open fn exists(&self, key: &str) -> bool {
+        yield @extern("nova_mobile_storage_exists", self.kind, key);
+    }
+
+    open fn clear(&self) -> Result<(), StorageError> {
+        @extern("nova_mobile_storage_clear", self.kind);
+        Ok(());
+    }
+
+    open fn all_keys(&self) -> Vec<String> {
+        yield @extern("nova_mobile_storage_keys", self.kind);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  SQLITE DATABASE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data MobileDatabase {
+    open name: String,
+    open path: String,
+}
+
+impl MobileDatabase {
+    open fn open(name: &str) -> Result<MobileDatabase, StorageError> {
+        let path = @extern("nova_mobile_db_open", name);
+        check path == "" {
+            Err(StorageError::DatabaseError("Failed to open database".into()));
+        }
+        Ok(MobileDatabase { name: name.into(), path });
+    }
+
+    open fn execute(&self, query: &str, params: &Vec<String>) -> Result<i64, StorageError> {
+        let rows_affected = @extern("nova_mobile_db_execute", &self.path, query, params);
+        Ok(rows_affected);
+    }
+
+    open fn query(&self, query: &str, params: &Vec<String>) -> Result<Vec<HashMap<String, String>>, StorageError> {
+        Ok(@extern("nova_mobile_db_query", &self.path, query, params));
+    }
+
+    open fn close(&self) {
+        @extern("nova_mobile_db_close", &self.path);
+    }
+}

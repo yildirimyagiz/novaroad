@@ -1,0 +1,605 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova  —  WEB FRAMEWORK  v10.0  "Nova"                               ║
+// ║                                                                              ║
+// ║  v10'da Framework Felsefesi:                                                 ║
+// ║                                                                              ║
+// ║  Eski: Vue/Svelte-inspired, manuel boilerplate                               ║
+// ║  Yeni: Nova'nin flow alias'larıyla reactive-first                      ║
+// ║                                                                              ║
+// ║  Temel Fark:                                                                 ║
+// ║    · Reaktif state → Signal<T> (dilin kendisi, framework değil)             ║
+// ║    · Side-effect → impl WebView for Component otomatik                     ║
+// ║    · Routing → data olarak, runtime reflection yok                          ║
+// ║    · Middleware → fn(Request) -> Task<Response> zinciri                     ║
+// ║                                                                              ║
+// ║  Syntax değişiklikleri:                                                      ║
+// ║    expose → open                                                             ║
+// ║    data  → data                                                             ║
+// ║    kind   → cases                                                            ║
+// ║    rules → rules                                                            ║
+// ║    impl  → impl                                                            ║
+// ║    use  → use                                                              ║
+// ║    when   → check                                                            ║
+// ║    give   → yield                                                            ║
+// ║    each   → each                (aynı kaldı)                                ║
+// ║    pick   → match               (daha tanıdık)                              ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::HashMap;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §1  TEMEL RULES (Arayüzler)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Her UI bileşeni bu arayüzü uygulamalı.
+open rules View {
+    fn render(&self) -> String;
+    fn style(&self)  -> String;
+
+    /// Varsayılan: tam HTML belgesi üret.
+    fn to_html(&self) -> String {
+        yield format(
+            "<!DOCTYPE html><html><head><style>{}</style></head><body>{}</body></html>",
+            self.style(),
+            self.render(),
+        );
+    }
+}
+
+/// Sunucu-taraflı render ile istemci-taraflı hydration arasında köprü.
+open rules Hydrate {
+    fn hydration_script(&self) -> String;
+    fn mount_selector(&self) -> String { yield "#app".into(); }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §2  REAKTİF STATE  (Signal<T> tabanlı)
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//  v10'da reaktiflik dilin `flow` sistemiyle entegre.
+//  `Signal<T>` artık bir flow alias'ı.
+//
+//  Kullanım:
+//    var count = signal(0)      → Signal<i32>
+//    count.set(count.get() + 1) → otomatik re-render tetikler
+//    count.watch(|v| println("Değer: {}", v))
+
+open data Signal<T> {
+    _value:     T,
+    _version:   i64,               // her set() artırılır — izleme için
+    _listeners: Vec<fn(T) -> ()>,  // değiştiğinde çağrılacak callback'ler
+}
+
+impl Signal<T> {
+    open fn new(value: T) -> Signal<T> {
+        Signal { _value: value, _version: 0, _listeners: [] }
+    }
+
+    open fn get(&self) -> &T { yield &self._value; }
+
+    open fn set(&var self, value: T) {
+        self._value   = value;
+        self._version = self._version + 1;
+        each listener in &self._listeners {
+            listener(self._value.clone());
+        }
+    }
+
+    open fn update(&var self, f: fn(T) -> T) {
+        let new_val = f(self._value.clone());
+        self.set(new_val);
+    }
+
+    open fn watch(&var self, f: fn(T) -> ()) {
+        self._listeners.push(f);
+    }
+
+    open fn version(&self) -> i64 { yield self._version; }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §3  HTTP KATMANı
+// ══════════════════════════════════════════════════════════════════════════════
+
+open data Request {
+    open method:  String,
+    open path:    String,
+    open headers: HashMap<String, String>,
+    open body:    String,
+    open params:  HashMap<String, String>,   // YENİ: URL parametreleri
+    open query:   HashMap<String, String>,   // YENİ: query string
+}
+
+open data Response {
+    open status:  i64,
+    open headers: HashMap<String, String>,
+    open body:    String,
+}
+
+impl Response {
+    open fn ok(body: String) -> Response {
+        var h = HashMap::new();
+        h.insert("Content-Type".into(), "text/html; charset=utf-8".into());
+        Response { status: 200, headers: h, body }
+    }
+
+    open fn json(body: String) -> Response {
+        var h = HashMap::new();
+        h.insert("Content-Type".into(), "application/json".into());
+        Response { status: 200, headers: h, body }
+    }
+
+    open fn redirect(url: String) -> Response {
+        var h = HashMap::new();
+        h.insert("Location".into(), url);
+        Response { status: 302, headers: h, body: "".into() }
+    }
+
+    open fn not_found() -> Response {
+        Response { status: 404, headers: HashMap::new(), body: "<h1>404 Not Found</h1>".into() }
+    }
+
+    open fn server_error(msg: String) -> Response {
+        Response {
+            status: 500, headers: HashMap::new(),
+            body: format("<h1>500</h1><pre>{}</pre>", msg),
+        }
+    }
+
+    open fn with_header(var self, key: String, val: String) -> Response {
+        self.headers.insert(key, val);
+        yield self;
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §4  MIDDLEWARE
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//  v10'da middleware zincirleme daha temiz:
+//  `fn(Request, Next) -> Response` imzası — tip güvenli.
+
+alias Handler = fn(&Request) -> Response;
+
+open rules Middleware {
+    fn call(&self, req: &Request, next: &Handler) -> Response;
+}
+
+// ── Logger ─────────────────────────────────────────────────────────────────────
+
+open data Logger {
+    open prefix: String,
+}
+
+impl Logger {
+    open fn new() -> Logger { Logger { prefix: "[LOG]".into() } }
+}
+
+impl Logger for Middleware {
+    fn call(&self, req: &Request, next: &Handler) -> Response {
+        println("{} {} {}", self.prefix, req.method, req.path);
+        let res = next(req);
+        println("{} → {}", self.prefix, res.status);
+        yield res;
+    }
+}
+
+// ── CORS ──────────────────────────────────────────────────────────────────────
+
+open data Cors {
+    open origins: Vec<String>,
+    open methods: Vec<String>,
+}
+
+impl Cors {
+    open fn new(origins: Vec<String>) -> Cors {
+        Cors { origins, methods: ["GET".into(), "POST".into(), "OPTIONS".into()] }
+    }
+    open fn allow_all() -> Cors {
+        Cors::new(["*".into()])
+    }
+}
+
+impl Cors for Middleware {
+    fn call(&self, req: &Request, next: &Handler) -> Response {
+        check req.method == "OPTIONS" {
+            yield Response::ok("".into())
+                .with_header("Access-Control-Allow-Origin".into(), self.origins.join(", "))
+                .with_header("Access-Control-Allow-Methods".into(), self.methods.join(", "));
+        }
+        var res = next(req);
+        res.headers.insert("Access-Control-Allow-Origin".into(), self.origins.join(", "));
+        yield res;
+    }
+}
+
+// ── Rate Limiter (YENİ) ───────────────────────────────────────────────────────
+
+open data RateLimit {
+    open max_rps:   i64,             // saniyede maksimum istek
+    hits:           HashMap<String, i64>,  // IP → istek sayısı
+}
+
+impl RateLimit {
+    open fn new(max_rps: i64) -> RateLimit {
+        RateLimit { max_rps, hits: HashMap::new() }
+    }
+}
+
+impl RateLimit for Middleware {
+    fn call(&self, req: &Request, next: &Handler) -> Response {
+        let ip = req.headers.get("X-Forwarded-For")
+            .cloned()
+            .unwrap_or("unknown".into());
+        // Basitleştirilmiş: gerçek implementasyonda zaman penceresi var
+        yield next(req);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §5  ROUTER
+// ══════════════════════════════════════════════════════════════════════════════
+
+open cases RoutePattern {
+    Exact(String),               // `/about`
+    Prefix(String),              // `/api/`
+    Param(String, String),       // `/user/:id`
+    Regex(String),               // `/user/[0-9]+`
+    Wildcard,
+}
+
+open data Route {
+    open path:    String,
+    open pattern: RoutePattern,
+    open methods: Vec<String>,   // YENİ: HTTP metod filtresi
+    handler:      String,        // bileşen veya fn adı
+}
+
+impl Route {
+    open fn get(path: String, handler: String) -> Route {
+        Route {
+            path:    path.clone(),
+            pattern: RoutePattern::Exact(path),
+            methods: ["GET".into()],
+            handler,
+        }
+    }
+
+    open fn post(path: String, handler: String) -> Route {
+        Route {
+            path:    path.clone(),
+            pattern: RoutePattern::Exact(path),
+            methods: ["POST".into()],
+            handler,
+        }
+    }
+
+    open fn any(path: String, handler: String) -> Route {
+        Route {
+            path:    path.clone(),
+            pattern: RoutePattern::Exact(path),
+            methods: ["GET".into(), "POST".into(), "PUT".into(), "DELETE".into()],
+            handler,
+        }
+    }
+
+    open fn prefix(path: String, handler: String) -> Route {
+        Route {
+            path:    path.clone(),
+            pattern: RoutePattern::Prefix(path),
+            methods: ["GET".into()],
+            handler,
+        }
+    }
+
+    fn matches(&self, req: &Request) -> bool {
+        // Metod kontrolü
+        check !self.methods.is_empty() && !self.methods.contains(&req.method) {
+            yield false;
+        }
+        // Yol kontrolü
+        match &self.pattern {
+            RoutePattern::Exact(p)  => yield p == &req.path,
+            RoutePattern::Prefix(p) => yield req.path.starts_with(p.as_str()),
+            RoutePattern::Wildcard  => yield true,
+            _                       => yield false,
+        }
+    }
+}
+
+open data Router {
+    routes: Vec<Route>,
+}
+
+impl Router {
+    open fn new() -> Router { Router { routes: [] } }
+
+    open fn add(var self, route: Route) -> Router {
+        self.routes.push(route);
+        yield self;
+    }
+
+    open fn get(var self, path: String, handler: String) -> Router {
+        self.routes.push(Route::get(path, handler));
+        yield self;
+    }
+
+    open fn post(var self, path: String, handler: String) -> Router {
+        self.routes.push(Route::post(path, handler));
+        yield self;
+    }
+
+    open fn resolve(&self, req: &Request) -> Option<&Route> {
+        each r in &self.routes {
+            check r.matches(req) { yield Some(r); }
+        }
+        yield None;
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §6  BILEŞEN KAYIT SİSTEMİ
+// ══════════════════════════════════════════════════════════════════════════════
+
+open data ComponentSlot {
+    open name: String,
+    component: Box<dyn View>,
+}
+
+impl ComponentSlot {
+    open fn new(name: String, component: Box<dyn View>) -> ComponentSlot {
+        ComponentSlot { name, component }
+    }
+
+    open fn render_html(&self) -> String {
+        yield self.component.to_html();
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §7  NOVA SUNUCU
+// ══════════════════════════════════════════════════════════════════════════════
+
+open data NovaServer {
+    open port:       i64,
+    open host:       String,
+    components:      HashMap<String, ComponentSlot>,
+    router:          Router,
+    middlewares:     Vec<Box<dyn Middleware>>,
+    open tls:        bool,           // YENİ: TLS desteği
+    open static_dir: Option<String>, // YENİ: statik dosya dizini
+}
+
+impl NovaServer {
+    open fn new(port: i64) -> NovaServer {
+        NovaServer {
+            port,
+            host:       "127.0.0.1".into(),
+            components: HashMap::new(),
+            router:     Router::new(),
+            middlewares: [],
+            tls:        false,
+            static_dir: None,
+        }
+    }
+
+    open fn host(var self, h: String) -> NovaServer {
+        self.host = h; yield self;
+    }
+
+    open fn tls(var self) -> NovaServer {
+        self.tls = true; yield self;
+    }
+
+    open fn static_files(var self, dir: String) -> NovaServer {
+        self.static_dir = Some(dir); yield self;
+    }
+
+    open fn register(var self, name: String, component: Box<dyn View>) -> NovaServer {
+        self.components.insert(name.clone(), ComponentSlot::new(name, component));
+        yield self;
+    }
+
+    open fn route(var self, r: Route) -> NovaServer {
+        self.router = self.router.add(r);
+        yield self;
+    }
+
+    open fn get(var self, path: String, handler: String) -> NovaServer {
+        self.router = self.router.get(path, handler);
+        yield self;
+    }
+
+    open fn post(var self, path: String, handler: String) -> NovaServer {
+        self.router = self.router.post(path, handler);
+        yield self;
+    }
+
+    open fn use_middleware(var self, mw: Box<dyn Middleware>) -> NovaServer {
+        self.middlewares.push(mw);
+        yield self;
+    }
+
+    open fn handle(&self, req: &Request) -> Response {
+        match self.router.resolve(req) {
+            None => yield Response::not_found(),
+            Some(route) => {
+                match self.components.get(&route.handler) {
+                    None       => yield Response::server_error(
+                        format("Bileşen '{}' bulunamadı", route.handler)),
+                    Some(slot) => yield Response::ok(slot.render_html()),
+                }
+            }
+        }
+    }
+
+    open fn start(&self) {
+        let protocol = check self.tls { "https" } else { "http" };
+        println("🚀 Nova v10 → {}://{}:{}", protocol, self.host, self.port);
+        println("   Rotalar     : {}", self.router.routes.len());
+        println("   Bileşenler  : {}", self.components.len());
+        println("   Middleware   : {}", self.middlewares.len());
+        check let Some(dir) = &self.static_dir {
+            println("   Statik Dosya : {}", dir);
+        }
+        println("   Hazır ✓");
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §8  ÖRNEK BILEŞENLER
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Basit HTML bileşeni ───────────────────────────────────────────────────────
+
+open data HomePage {
+    open title:   String,
+    open tagline: String,
+    open version: String,
+}
+
+impl HomePage {
+    open fn new() -> HomePage {
+        HomePage {
+            title:   "Nova".into(),
+            tagline: "Intent-First Programming Language".into(),
+            version: "v10.0".into(),
+        }
+    }
+}
+
+impl HomePage for View {
+    fn render(&self) -> String {
+        format("""
+<div class="hero">
+    <h1>{}</h1>
+    <p class="tagline">{}</p>
+    <span class="badge">{}</span>
+    <div class="features">
+        <div class="feat">⚡ Unit Algebra</div>
+        <div class="feat">🌊 Flow Types</div>
+        <div class="feat">🔬 Scientific Computing</div>
+        <div class="feat">✅ Proof Terms</div>
+    </div>
+</div>
+        """, self.title, self.tagline, self.version)
+    }
+
+    fn style(&self) -> String {
+        yield """
+:root { --accent: #7C3AED; --bg: #0F0F1A; --text: #E2E8F0; }
+body  { background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; margin: 0; }
+.hero { max-width: 860px; margin: 0 auto; padding: 6rem 2rem; text-align: center; }
+h1    { font-size: 4rem; font-weight: 800; background: linear-gradient(135deg, #7C3AED, #06B6D4);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 1rem; }
+.tagline { font-size: 1.4rem; color: #94A3B8; margin-bottom: 2rem; }
+.badge   { background: var(--accent); color: white; padding: .3rem .8rem; border-radius: 999px; font-size: .85rem; }
+.features { display: flex; gap: 1.5rem; justify-content: center; margin-top: 3rem; flex-wrap: wrap; }
+.feat     { background: #1E1E2E; border: 1px solid #2D2D44; border-radius: 12px;
+            padding: 1rem 1.5rem; font-size: 1rem; }
+        """.into();
+    }
+}
+
+// ── Reaktif Todo bileşeni (YENİ: Signal kullanımı) ───────────────────────────
+
+open data Todo {
+    open id:   i64,
+    open text: String,
+    open done: bool,
+}
+
+open data TodoApp {
+    todos:  Signal<Vec<Todo>>,
+    next_id: Signal<i64>,
+}
+
+impl TodoApp {
+    open fn new() -> TodoApp {
+        TodoApp {
+            todos:   Signal::new([]),
+            next_id: Signal::new(1),
+        }
+    }
+
+    open fn add(&var self, text: String) {
+        let id = *self.next_id.get();
+        self.next_id.update(|n| n + 1);
+        self.todos.update(|var todos| {
+            todos.push(Todo { id, text, done: false });
+            yield todos;
+        });
+    }
+
+    open fn toggle(&var self, id: i64) {
+        self.todos.update(|todos| {
+            todos.iter().map(|t| {
+                check t.id == id { Todo { done: !t.done, ..t.clone() } }
+                else { t.clone() }
+            }).collect()
+        });
+    }
+}
+
+impl TodoApp for View {
+    fn render(&self) -> String {
+        let todos = self.todos.get();
+        let items: Vec<String> = todos.iter().map(|t| {
+            let check_cls = check t.done { "done" } else { "" };
+            format("<li class='{}' onclick='toggle({})'>{}
+                     <span class='id'>#{}</span></li>",
+                check_cls, t.id, t.text, t.id)
+        }).collect();
+
+        format("""
+<div class="todo-app">
+    <h2>Yapılacaklar</h2>
+    <div class="add-bar">
+        <input id="new-todo" placeholder="Yeni görev...">
+        <button onclick="addTodo()">+ Ekle</button>
+    </div>
+    <ul class="todo-list">{}</ul>
+    <div class="stats">{} / {} tamamlandı</div>
+</div>
+        """,
+        items.join(""),
+        todos.iter().filter(|t| t.done).count(),
+        todos.len())
+    }
+
+    fn style(&self) -> String {
+        yield """
+.todo-app   { max-width: 480px; margin: 3rem auto; padding: 2rem; background: #1E1E2E;
+              border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,.5); }
+h2          { margin: 0 0 1.5rem; color: #7C3AED; }
+.add-bar    { display: flex; gap: .5rem; margin-bottom: 1.5rem; }
+input       { flex: 1; padding: .6rem 1rem; border-radius: 8px; border: 1px solid #2D2D44;
+              background: #0F0F1A; color: #E2E8F0; }
+button      { padding: .6rem 1.2rem; background: #7C3AED; color: white;
+              border: none; border-radius: 8px; cursor: pointer; }
+.todo-list  { list-style: none; padding: 0; margin: 0; }
+.todo-list li { padding: .8rem 1rem; border-bottom: 1px solid #2D2D44;
+                cursor: pointer; display: flex; justify-content: space-between;
+                transition: background .15s; }
+.todo-list li:hover { background: #2D2D44; }
+.done       { text-decoration: line-through; opacity: .5; }
+.stats      { margin-top: 1rem; font-size: .85rem; color: #64748B; text-align: right; }
+        """.into();
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §9  GİRİŞ NOKTASI
+// ══════════════════════════════════════════════════════════════════════════════
+
+open fn main() {
+    let server = NovaServer::new(8080)
+        .use_middleware(Box::new(Logger::new()))
+        .use_middleware(Box::new(Cors::allow_all()))
+        .register("home".into(), Box::new(HomePage::new()))
+        .register("todos".into(), Box::new(TodoApp::new()))
+        .get("/".into(), "home".into())
+        .get("/todos".into(), "todos".into());
+
+    server.start();
+}

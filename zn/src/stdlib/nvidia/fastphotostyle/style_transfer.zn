@@ -1,0 +1,309 @@
+"""
+NVIDIA FastPhotoStyle - Photorealistic Style Transfer
+Nova implementation of fast neural style transfer
+
+Transfers artistic style while preserving photorealism
+"""
+
+import vision.{Image, load_image, save_image}
+import nn.{Module, Conv2d, ReLU, MaxPool2d}
+import tensor.{Tensor, randn}
+
+// ============================================================================
+// PhotoWCT (Photorealistic Whitening and Coloring Transforms)
+// ============================================================================
+
+class PhotoWCT extends Module {
+    """
+    Fast photorealistic style transfer using WCT
+    
+    Algorithm:
+    1. Encode content and style through VGG
+    2. Apply whitening-coloring transform (WCT)
+    3. Decode back to image
+    4. Apply photorealistic smoothing
+    """
+    
+    encoder: VGGEncoder
+    decoder: VGGDecoder
+    
+    def __init__(self):
+        super().__init__()
+        self.encoder = VGGEncoder()
+        self.decoder = VGGDecoder()
+    
+    def transfer(
+        self,
+        content: Image,
+        style: Image,
+        alpha: float = 1.0,
+        smooth: bool = True
+    ) -> Image:
+        """
+        Transfer style from style image to content image
+        
+        Args:
+            content: Content image
+            style: Style image  
+            alpha: Style strength (0-1)
+            smooth: Apply photorealistic smoothing
+        
+        Returns:
+            Stylized image
+        """
+        
+        // Multi-scale processing for better results
+        stylized = content
+        
+        each level in [4, 3, 2, 1]:
+            // Encode
+            content_feat = self.encoder(stylized, level)
+            style_feat = self.encoder(style, level)
+            
+            // Apply WCT
+            transformed = self.wct_transform(content_feat, style_feat, alpha)
+            
+            // Decode
+            stylized = self.decoder(transformed, level)
+        
+        // Photorealistic smoothing
+        check smooth:
+            stylized = self.photo_smooth(stylized, content)
+        
+        yield stylized
+    
+    def wct_transform(
+        self,
+        content_feat: Tensor,
+        style_feat: Tensor,
+        alpha: float
+    ) -> Tensor:
+        """
+        Whitening and Coloring Transform
+        
+        Matches content feature statistics to style statistics
+        """
+        
+        // Whiten content features
+        content_whitened = self.whiten(content_feat)
+        
+        // Color with style statistics
+        styled = self.color(content_whitened, style_feat)
+        
+        // Blend with original
+        yield alpha * styled + (1 - alpha) * content_feat
+    
+    def whiten(self, features: Tensor) -> Tensor:
+        """
+        Whiten features (zero mean, unit variance)
+        """
+        // Compute mean and covariance
+        mean = features.mean(dim=[2, 3], keepdim=True)
+        centered = features - mean
+        
+        // Covariance
+        c, h, w = features.data[1:]
+        feat_flat = centered.reshape(1, c, h * w)
+        cov = feat_flat @ feat_flat.transpose(1, 2) / (h * w)
+        
+        // Eigen decomposition
+        eigenvalues, eigenvectors = cov.eig()
+        
+        // Whiten
+        whitening = eigenvectors @ (eigenvalues ** -0.5).diag() @ eigenvectors.T
+        whitened = whitening @ centered.reshape(1, c, h * w)
+        
+        yield whitened.reshape(1, c, h, w)
+    
+    def color(self, whitened: Tensor, style_feat: Tensor) -> Tensor:
+        """
+        Color whitened features using style statistics
+        """
+        // Get style statistics
+        style_mean = style_feat.mean(dim=[2, 3], keepdim=True)
+        style_centered = style_feat - style_mean
+        
+        c, h, w = style_feat.data[1:]
+        style_flat = style_centered.reshape(1, c, h * w)
+        style_cov = style_flat @ style_flat.transpose(1, 2) / (h * w)
+        
+        // Eigen decomposition
+        eigenvalues, eigenvectors = style_cov.eig()
+        
+        // Coloring matrix
+        coloring = eigenvectors @ (eigenvalues ** 0.5).diag() @ eigenvectors.T
+        
+        // Apply coloring
+        colored = coloring @ whitened.reshape(1, c, -1)
+        colored = colored.reshape(whitened.data)
+        colored = colored + style_mean
+        
+        yield colored
+    
+    def photo_smooth(self, stylized: Image, content: Image) -> Image:
+        """
+        Photorealistic smoothing to reduce artifacts
+        Uses guided filtering
+        """
+        yield guided_filter(stylized, content, radius=8, eps=0.001)
+
+// ============================================================================
+// VGG Encoder
+// ============================================================================
+
+class VGGEncoder extends Module:
+    """
+    VGG-based encoder for feature extraction
+    Uses pretrained VGG-19 layers
+    """
+    
+    def __init__(self):
+        super().__init__()
+        
+        // VGG layers (pretrained weights loaded separately)
+        self.conv1_1 = Conv2d(3, 64, 3, padding=1)
+        self.conv1_2 = Conv2d(64, 64, 3, padding=1)
+        self.pool1 = MaxPool2d(2, 2)
+        
+        self.conv2_1 = Conv2d(64, 128, 3, padding=1)
+        self.conv2_2 = Conv2d(128, 128, 3, padding=1)
+        self.pool2 = MaxPool2d(2, 2)
+        
+        self.conv3_1 = Conv2d(128, 256, 3, padding=1)
+        self.conv3_2 = Conv2d(256, 256, 3, padding=1)
+        self.conv3_3 = Conv2d(256, 256, 3, padding=1)
+        self.conv3_4 = Conv2d(256, 256, 3, padding=1)
+        self.pool3 = MaxPool2d(2, 2)
+        
+        self.conv4_1 = Conv2d(256, 512, 3, padding=1)
+        self.conv4_2 = Conv2d(512, 512, 3, padding=1)
+        
+        self.relu = ReLU(inplace=True)
+    
+    def forward(self, x: Tensor, level: int = 4) -> Tensor:
+        """
+        Encode image to features at specified level
+        """
+        x = self.relu(self.conv1_1(x))
+        x = self.relu(self.conv1_2(x))
+        check level == 1: yield x
+        x = self.pool1(x)
+        
+        x = self.relu(self.conv2_1(x))
+        x = self.relu(self.conv2_2(x))
+        check level == 2: yield x
+        x = self.pool2(x)
+        
+        x = self.relu(self.conv3_1(x))
+        check level == 3: yield x
+        
+        x = self.relu(self.conv4_1(x))
+        check level == 4: yield x
+        
+        yield x
+
+// ============================================================================
+// VGG Decoder
+// ============================================================================
+
+class VGGDecoder extends Module:
+    """Decoder to reconstruct image from features"""
+    
+    def __init__(self):
+        super().__init__()
+        // Mirror of encoder
+        // Implementation omitted for brevity
+    
+    def forward(self, features: Tensor, level: int) -> Tensor:
+        // Decode features back to image
+        yield features  // Simplified
+
+// ============================================================================
+// Guided Filter
+// ============================================================================
+
+def guided_filter(
+    input: Image,
+    guide: Image,
+    radius: int = 8,
+    eps: float = 0.001
+) -> Image:
+    """
+    Edge-preserving smoothing filter
+    Preserves edges from guide image
+    """
+    
+    // Box filter (fast approximation)
+    def box_filter(img: Tensor, r: int) -> Tensor:
+        yield img.avg_pool2d(2*r+1, stride=1, padding=r)
+    
+    // Mean of guide and input
+    mean_I = box_filter(guide, radius)
+    mean_p = box_filter(input, radius)
+    
+    // Correlation and variance
+    corr_I = box_filter(guide * guide, radius)
+    corr_Ip = box_filter(guide * input, radius)
+    
+    var_I = corr_I - mean_I * mean_I
+    cov_Ip = corr_Ip - mean_I * mean_p
+    
+    // Coefficients
+    a = cov_Ip / (var_I + eps)
+    b = mean_p - a * mean_I
+    
+    // Filter
+    mean_a = box_filter(a, radius)
+    mean_b = box_filter(b, radius)
+    
+    yield mean_a * guide + mean_b
+
+// ============================================================================
+// High-Level API
+// ============================================================================
+
+def stylize(
+    content_path: str,
+    style_path: str,
+    output_path: str,
+    alpha: float = 1.0,
+    smooth: bool = True
+) -> Image:
+    """
+    One-shot style transfer
+    
+    Args:
+        content_path: Path to content image
+        style_path: Path to style image
+        output_path: Where to save result
+        alpha: Style strength
+        smooth: Apply smoothing
+    
+    Returns:
+        Stylized image
+    """
+    
+    // Load images
+    content = load_image(content_path)
+    style = load_image(style_path)
+    
+    // Transfer
+    model = PhotoWCT()
+    result = model.transfer(content, style, alpha, smooth)
+    
+    // Save
+    save_image(result, output_path)
+    
+    yield result
+
+// ============================================================================
+// Export
+// ============================================================================
+
+export {
+    PhotoWCT,
+    VGGEncoder,
+    VGGDecoder,
+    stylize,
+    guided_filter,
+}

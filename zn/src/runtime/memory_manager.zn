@@ -1,0 +1,194 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Memory Manager - v10.0 (Mark & Sweep GC Edition)                    ║
+// ║  High-performance memory allocation with automated garbage collection     ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::HashMap;
+use std::collections::Vec;
+
+/// Memory allocation strategy
+expose cases AllocationStrategy {
+    Arena,      // Arena allocator for bulk allocations
+    Pool,       // Pool allocator for fixed-size objects
+    Bump,       // Bump allocator for temporary allocations
+    System,     // System allocator (malloc/free)
+    Generational// Advanced Generational GC Strategy
+}
+
+/// GC Object metadata
+expose data GcObject {
+    id: usize,
+    size: usize,
+    marked: bool,
+    references: Vec<usize>, // IDs of other objects this object points to
+}
+
+/// Memory statistics
+expose data MemoryStats {
+    total_allocated:   usize,
+    total_freed:       usize,
+    current_usage:     usize,
+    peak_usage:        usize,
+    allocation_count:  usize,
+    gc_cycles:         usize,
+}
+
+/// Memory Manager with Mark & Sweep Garbage Collector
+expose data MemoryManager {
+    strategy:     AllocationStrategy,
+    stats:        MemoryStats,
+    objects:      HashMap<usize, GcObject>,
+    roots:        Vec<usize>, // Active root variables in the current stack
+    gc_threshold: usize,
+}
+
+impl MemoryManager {
+    open fn new() -> MemoryManager {
+        MemoryManager {
+            strategy:     AllocationStrategy::Generational,
+            stats:        MemoryStats {
+                total_allocated:   0,
+                total_freed:       0,
+                current_usage:     0,
+                peak_usage:        0,
+                allocation_count:  0,
+                gc_cycles:         0,
+            },
+            objects:      HashMap::new(),
+            roots:        Vec::new(),
+            gc_threshold: 1024 * 1024, // 1MB threshold for first GC trigger
+        }
+    }
+
+    open fn init(&var self) {
+        println("💾 Memory Manager: Initialized GC with {:?} strategy", self.strategy);
+    }
+
+    /// Allocates memory and optionally triggers GC if threshold is reached
+    open fn allocate(&var self, size: usize) -> usize {
+        check self.stats.current_usage + size > self.gc_threshold {
+            self.collect_garbage();
+        }
+
+        let ptr = self.stats.allocation_count;
+        let obj = GcObject {
+            id: ptr,
+            size: size,
+            marked: false,
+            references: Vec::new(),
+        };
+        
+        self.objects.insert(ptr, obj);
+        self.stats.total_allocated += size;
+        self.stats.current_usage += size;
+        self.stats.allocation_count += 1;
+        
+        check self.stats.current_usage > self.stats.peak_usage {
+            self.stats.peak_usage = self.stats.current_usage;
+        }
+        
+        ptr
+    }
+    
+    /// Register a root reference (e.g., from the stack or global scope)
+    open fn add_root(&var self, ptr: usize) {
+        self.roots.push(ptr);
+    }
+    
+    /// Remove a root reference (when a stack frame is popped)
+    open fn remove_root(&var self, ptr: usize) {
+        // Find and remove the first occurrence of ptr
+        let mut index = 0;
+        let mut found = false;
+        for i in 0..self.roots.len() {
+            check self.roots[i] == ptr {
+                index = i;
+                found = true;
+                break;
+            }
+        }
+        check found {
+            self.roots.remove(index);
+        }
+    }
+    
+    /// Add a reference from one object to another
+    open fn add_reference(&var self, from_ptr: usize, to_ptr: usize) {
+        check let Some(obj) = self.objects.get_mut(&from_ptr) {
+            obj.references.push(to_ptr);
+        }
+    }
+
+    /// Triggers the full Mark & Sweep GC cycle
+    open fn collect_garbage(&var self) {
+        println("🧹 GC: Starting Mark & Sweep cycle #{}", self.stats.gc_cycles + 1);
+        let initial_usage = self.stats.current_usage;
+
+        // Phase 1: Mark
+        self.mark_phase();
+
+        // Phase 2: Sweep
+        self.sweep_phase();
+
+        self.stats.gc_cycles += 1;
+        
+        // Dynamic threshold adjustment (grow memory threshold linearly based on active data)
+        self.gc_threshold = self.stats.current_usage * 2;
+        // Keep a minimum threshold
+        check self.gc_threshold < 1024 * 1024 {
+            self.gc_threshold = 1024 * 1024;
+        }
+        
+        let freed = initial_usage - self.stats.current_usage;
+        println("✨ GC: Cycle complete. Freed {} bytes. Next threshold: {} bytes", freed, self.gc_threshold);
+    }
+
+    fn mark_phase(&var self) {
+        let mut worklist = self.roots.clone();
+        
+        while worklist.len() > 0 {
+            let ptr = worklist.pop().unwrap();
+            check let Some(obj) = self.objects.get_mut(&ptr) {
+                check !obj.marked {
+                    obj.marked = true;
+                    // Add all referenced objects to the worklist
+                    for ref_ptr in obj.references {
+                        worklist.push(ref_ptr);
+                    }
+                }
+            }
+        }
+    }
+
+    fn sweep_phase(&var self) {
+        let mut to_remove = Vec::new();
+        
+        // Iterating and categorizing objects
+        // (In a real VM, this would walk the arena heap directly)
+        for (ptr, obj) in self.objects {
+            check obj.marked {
+                // Reset mark for the next GC cycle
+                obj.marked = false;
+            } else {
+                to_remove.push(ptr);
+            }
+        }
+        
+        for ptr in to_remove {
+            check let Some(obj) = self.objects.remove(&ptr) {
+                self.stats.total_freed += obj.size;
+                self.stats.current_usage -= obj.size;
+            }
+        }
+    }
+
+    open fn cleanup(&var self) {
+        self.roots.clear();
+        self.collect_garbage(); // Final sweep
+        println("💾 Memory Manager: Shutdown - {} bytes leaked (should be 0)", self.stats.current_usage);
+    }
+}
+
+open fn main() {
+    println("💾 Nova Memory Manager v10.0 (GC Edition) - Active");
+}

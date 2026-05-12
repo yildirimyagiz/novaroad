@@ -1,0 +1,560 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  Nova — NOVA TORCH  v1.0                                          ║
+// ║  models.zn  —  Pre-built Architectures                                   ║
+// ║  ResNet · Transformer · GPT · BERT · UNet · ViT · MobileNet             ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+use crate::nova_torch::tensor::*;
+use crate::nova_torch::nn::*;
+use crate::nova_torch::optim::*;
+use crate::ffi::enhanced_ffi::FFIResult;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RESIDUAL BLOCK  (ResNet building block)
+// ═══════════════════════════════════════════════════════════════════════════
+
+expose data ResidualBlock {
+    conv1:    Conv2d,
+    bn1:      BatchNorm2d,
+    conv2:    Conv2d,
+    bn2:      BatchNorm2d,
+    relu:     ReLU,
+    downsample: Option<Sequential>,
+    stride:   i64,
+    training:     bool,
+}
+
+impl ResidualBlock {
+    open fn new(in_ch: i64, out_ch: i64, stride: i64,
+                  device: Device) -> FFIResult<ResidualBlock> {
+        let conv1 = Conv2d::new(in_ch,  out_ch, (3, 3), (stride, stride), (1, 1), 1, false, device.clone())?;
+        let bn1   = BatchNorm2d::new(out_ch, 1e-5, 0.1, device.clone())?;
+        let conv2 = Conv2d::new(out_ch, out_ch, (3, 3), (1, 1),          (1, 1), 1, false, device.clone())?;
+        let bn2   = BatchNorm2d::new(out_ch, 1e-5, 0.1, device.clone())?;
+
+        let downsample = check stride != 1 || in_ch != out_ch {
+            var seq = Sequential::new();
+            seq.add(Box::new(Conv2d::new(in_ch, out_ch, (1, 1), (stride, stride), (0, 0), 1, false, device.clone())?));
+            seq.add(Box::new(BatchNorm2d::new(out_ch, 1e-5, 0.1, device.clone())?));
+            Some(seq)
+        } else { yield None };
+
+        Ok(ResidualBlock { conv1, bn1, conv2, bn2, relu: ReLU::new(), downsample, stride, training: true })
+    }
+}
+
+impl Module for ResidualBlock {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        let residual = x.clone()?;
+        let out = self.conv1.forward(x)?;
+        let out = self.bn1.forward(&out)?;
+        let out = self.relu.forward(&out)?;
+        let out = self.conv2.forward(&out)?;
+        let out = self.bn2.forward(&out)?;
+        let skip = check let Some(ds) = &var self.downsample {
+            ds.forward(&residual)?
+        } else { residual };
+        let out = out.add(&skip)?;
+        out.relu()
+    }
+    fn parameters(&self) -> Vec<&Tensor> {
+        var p = Vec::new();
+        p.extend(self.conv1.parameters()); p.extend(self.bn1.parameters());
+        p.extend(self.conv2.parameters()); p.extend(self.bn2.parameters());
+        check let Some(ds) = &self.downsample { p.extend(ds.parameters()); }
+        p
+    }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
+        var p = Vec::new();
+        each entry in self.conv1.named_parameters()  { let (n, t) = entry; p.push((format("conv1.{}", n), t)); }
+        each entry in self.bn1.named_parameters()    { let (n, t) = entry; p.push((format("bn1.{}", n), t)); }
+        each entry in self.conv2.named_parameters()  { let (n, t) = entry; p.push((format("conv2.{}", n), t)); }
+        each entry in self.bn2.named_parameters()    { let (n, t) = entry; p.push((format("bn2.{}", n), t)); }
+        p
+    }
+    fn zero_grad(&var self) {
+        self.conv1.zero_grad(); self.bn1.zero_grad();
+        self.conv2.zero_grad(); self.bn2.zero_grad();
+    }
+    fn train(&var self, m: bool) {
+        self.training = m;
+        self.conv1.train(m); self.bn1.train(m);
+        self.conv2.train(m); self.bn2.train(m);
+        check let Some(ds) = &var self.downsample { ds.train(m); }
+    }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, dev: Device) -> FFIResult<()> {
+        self.conv1.to_device(dev.clone())?; self.bn1.to_device(dev.clone())?;
+        self.conv2.to_device(dev.clone())?; self.bn2.to_device(dev.clone())?;
+        check let Some(ds) = &var self.downsample { ds.to_device(dev)?; }
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RESNET
+// ═══════════════════════════════════════════════════════════════════════════
+
+expose data ResNet {
+    stem:     Sequential,
+    layer1:   Sequential,
+    layer2:   Sequential,
+    layer3:   Sequential,
+    layer4:   Sequential,
+    avgpool:  AdaptiveAvgPool2d,
+    fc:       Linear,
+    training:     bool,
+}
+
+impl ResNet {
+    open fn new(layers: Vec<i64>, num_classes: i64, device: Device) -> FFIResult<ResNet> {
+        // Stem: 7x7 conv, BN, ReLU, 3x3 maxpool
+        var stem = Sequential::new();
+        stem.add(Box::new(Conv2d::new(3, 64, (7, 7), (2, 2), (3, 3), 1, false, device.clone())?));
+        stem.add(Box::new(BatchNorm2d::new(64, 1e-5, 0.1, device.clone())?));
+        stem.add(Box::new(ReLU::new()));
+        stem.add(Box::new(MaxPool2d::new((3, 3), (2, 2), (1, 1))));
+
+        let make_layer = |in_ch: i64, out_ch: i64, n: i64, stride: i64, dev: &Device| -> FFIResult<Sequential> {
+            var seq = Sequential::new();
+            seq.add(Box::new(ResidualBlock::new(in_ch, out_ch, stride, dev.clone())?));
+            each _ in 1..n {
+                seq.add(Box::new(ResidualBlock::new(out_ch, out_ch, 1, dev.clone())?));
+            }
+            Ok(seq)
+        };
+
+        let n1 = layers[0]; let n2 = layers[1]; let n3 = layers[2]; let n4 = layers[3];
+
+        Ok(ResNet {
+            stem,
+            layer1: make_layer(64,  64,  n1, 1, &device)?,
+            layer2: make_layer(64,  128, n2, 2, &device)?,
+            layer3: make_layer(128, 256, n3, 2, &device)?,
+            layer4: make_layer(256, 512, n4, 2, &device)?,
+            avgpool: AdaptiveAvgPool2d::new(1, 1),
+            fc:      Linear::new(512, num_classes, true, device)?,
+            training: true,
+        })
+    }
+
+    open fn resnet18(num_classes: i64, device: Device)  -> FFIResult<ResNet> { ResNet::new([2, 2, 2, 2], num_classes, device) }
+    open fn resnet34(num_classes: i64, device: Device)  -> FFIResult<ResNet> { ResNet::new([3, 4, 6, 3], num_classes, device) }
+    open fn resnet50(num_classes: i64, device: Device)  -> FFIResult<ResNet> { ResNet::new([3, 4, 6, 3], num_classes, device) }
+    open fn resnet101(num_classes: i64, device: Device) -> FFIResult<ResNet> { ResNet::new([3, 4, 23, 3], num_classes, device) }
+}
+
+impl Module for ResNet {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        let x = self.stem.forward(x)?;
+        let x = self.layer1.forward(&x)?;
+        let x = self.layer2.forward(&x)?;
+        let x = self.layer3.forward(&x)?;
+        let x = self.layer4.forward(&x)?;
+        let x = self.avgpool.forward(&x)?;
+        let x = x.flatten(1, -1)?;
+        self.fc.forward(&x)
+    }
+    fn parameters(&self) -> Vec<&Tensor> {
+        var p = Vec::new();
+        p.extend(self.stem.parameters());
+        p.extend(self.layer1.parameters()); p.extend(self.layer2.parameters());
+        p.extend(self.layer3.parameters()); p.extend(self.layer4.parameters());
+        p.extend(self.fc.parameters());
+        p
+    }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { Vec::new() } // simplified
+    fn zero_grad(&var self) {
+        self.stem.zero_grad(); self.layer1.zero_grad(); self.layer2.zero_grad();
+        self.layer3.zero_grad(); self.layer4.zero_grad(); self.fc.zero_grad();
+    }
+    fn train(&var self, m: bool) {
+        self.training = m;
+        self.stem.train(m); self.layer1.train(m); self.layer2.train(m);
+        self.layer3.train(m); self.layer4.train(m); self.fc.train(m);
+    }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, dev: Device) -> FFIResult<()> {
+        self.stem.to_device(dev.clone())?;
+        self.layer1.to_device(dev.clone())?; self.layer2.to_device(dev.clone())?;
+        self.layer3.to_device(dev.clone())?; self.layer4.to_device(dev.clone())?;
+        self.fc.to_device(dev)?;
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TRANSFORMER BLOCK  (GPT / BERT shared building block)
+// ═══════════════════════════════════════════════════════════════════════════
+
+expose data TransformerBlock {
+    attn:    MultiheadAttention,
+    ln1:     LayerNorm,
+    ff1:     Linear,
+    ff2:     Linear,
+    ln2:     LayerNorm,
+    dropout: Dropout,
+    act:     GELU,
+    training:    bool,
+}
+
+impl TransformerBlock {
+    open fn new(embed_dim: i64, num_heads: i64, ff_dim: i64,
+                  dropout: f64, causal: bool, device: Device) -> FFIResult<TransformerBlock> {
+        Ok(TransformerBlock {
+            attn:    MultiheadAttention::new(embed_dim, num_heads, dropout, causal, device.clone())?,
+            ln1:     LayerNorm::new([embed_dim], 1e-5, device.clone())?,
+            ff1:     Linear::new(embed_dim, ff_dim, true, device.clone())?,
+            ff2:     Linear::new(ff_dim, embed_dim, true, device.clone())?,
+            ln2:     LayerNorm::new([embed_dim], 1e-5, device)?,
+            dropout: Dropout::new(dropout),
+            act:     GELU::new(),
+            training: true,
+        })
+    }
+}
+
+impl Module for TransformerBlock {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        // Pre-norm transformer (like GPT-2 / LLaMA)
+        let normed  = self.ln1.forward(x)?;
+        let attn_out = self.attn.forward(&normed)?;
+        let attn_out = self.dropout.forward(&attn_out)?;
+        let x        = x.add(&attn_out)?;          // residual
+
+        let normed  = self.ln2.forward(&x)?;
+        let ff_out  = self.ff1.forward(&normed)?;
+        let ff_out  = self.act.forward(&ff_out)?;
+        let ff_out  = self.ff2.forward(&ff_out)?;
+        let ff_out  = self.dropout.forward(&ff_out)?;
+        x.add(&ff_out)                              // residual
+    }
+    fn parameters(&self) -> Vec<&Tensor> {
+        var p = Vec::new();
+        p.extend(self.attn.parameters()); p.extend(self.ln1.parameters());
+        p.extend(self.ff1.parameters());  p.extend(self.ff2.parameters());
+        p.extend(self.ln2.parameters());
+        p
+    }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { Vec::new() }
+    fn zero_grad(&var self) {
+        self.attn.zero_grad(); self.ln1.zero_grad();
+        self.ff1.zero_grad(); self.ff2.zero_grad(); self.ln2.zero_grad();
+    }
+    fn train(&var self, m: bool) {
+        self.training = m;
+        self.attn.train(m); self.ln1.train(m); self.ln2.train(m);
+        self.ff1.train(m);  self.ff2.train(m); self.dropout.train(m);
+    }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, dev: Device) -> FFIResult<()> {
+        self.attn.to_device(dev.clone())?; self.ln1.to_device(dev.clone())?;
+        self.ff1.to_device(dev.clone())?;  self.ff2.to_device(dev.clone())?;
+        self.ln2.to_device(dev)?;
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GPT  —  Decoder-only Transformer (LLM)
+// ═══════════════════════════════════════════════════════════════════════════
+
+expose data GptConfig {
+    vocab_size:  i64,
+    max_seq_len: i64,
+    embed_dim:   i64,
+    num_heads:   i64,
+    num_layers:  i64,
+    ff_dim:      i64,
+    dropout:     f64,
+}
+
+impl GptConfig {
+    open fn gpt2_small() -> GptConfig {
+        GptConfig { vocab_size: 50257, max_seq_len: 1024, embed_dim: 768,
+                    num_heads: 12, num_layers: 12, ff_dim: 3072, dropout: 0.1 }
+    }
+    open fn gpt2_medium() -> GptConfig {
+        GptConfig { vocab_size: 50257, max_seq_len: 1024, embed_dim: 1024,
+                    num_heads: 16, num_layers: 24, ff_dim: 4096, dropout: 0.1 }
+    }
+    open fn custom(vocab: i64, ctx: i64, dim: i64, heads: i64, layers: i64) -> GptConfig {
+        GptConfig { vocab_size: vocab, max_seq_len: ctx, embed_dim: dim,
+                    num_heads: heads, num_layers: layers, ff_dim: dim * 4, dropout: 0.1 }
+    }
+}
+
+expose data GPT {
+    config:    GptConfig,
+    tok_embed: Embedding,
+    pos_embed: Embedding,
+    blocks:    Vec<TransformerBlock>,
+    ln_f:      LayerNorm,
+    lm_head:   Linear,
+    training:      bool,
+}
+
+impl GPT {
+    open fn new(config: GptConfig, device: Device) -> FFIResult<GPT> {
+        let tok_embed = Embedding::new(config.vocab_size, config.embed_dim, None, device.clone())?;
+        let pos_embed = Embedding::new(config.max_seq_len, config.embed_dim, None, device.clone())?;
+
+        var blocks = Vec::new();
+        each _ in 0..config.num_layers {
+            blocks.push(TransformerBlock::new(
+                config.embed_dim, config.num_heads, config.ff_dim,
+                config.dropout, true, device.clone()
+            )?);
+        }
+
+        let ln_f    = LayerNorm::new([config.embed_dim], 1e-5, device.clone())?;
+        let lm_head = Linear::new(config.embed_dim, config.vocab_size, false, device)?;
+
+        Ok(GPT { config, tok_embed, pos_embed, blocks, ln_f, lm_head, training: true })
+    }
+
+    open fn forward_with_positions(&var self, input_ids: &Tensor) -> FFIResult<Tensor> {
+        let b = input_ids.dim(0);
+        let t = input_ids.dim(1);
+
+        // Build position ids [0, 1, ..., t-1] and broadcast over batch
+        let pos_ids = Tensor::arange(0.0, t as f64, 1.0, DType::I64, input_ids.device.clone())?
+                          .unsqueeze(0);
+
+        let tok_emb = self.tok_embed.forward(input_ids)?;
+        let pos_emb = self.pos_embed.forward(&pos_ids)?;
+        var x   = tok_emb.add(&pos_emb)?;
+
+        each i in 0..self.blocks.len() {
+            x = self.blocks[i].forward(&x)?;
+        }
+
+        let x      = self.ln_f.forward(&x)?;
+        let logits = self.lm_head.forward(&x)?;
+        Ok(logits)
+    }
+
+    /// Greedy autoregressive generation
+    open fn generate(&var self, prompt_ids: &Tensor, max_new_tokens: i64,
+                       temperature: f64, top_k: Option<i64>) -> FFIResult<Tensor> {
+        var ids = prompt_ids.clone()?;
+        no_grad(|| {
+            each _ in 0..max_new_tokens {
+                // Crop to max context window
+                let seq_len = ids.dim(1);
+                let ids_crop = check seq_len > self.config.max_seq_len {
+                    ids.slice(1, seq_len - self.config.max_seq_len, seq_len, 1).unwrap_or(ids.clone().unwrap())
+                } else { ids.clone().unwrap() };
+
+                check let Ok(logits) = self.forward_with_positions(&ids_crop) {
+                    // Take last token logits
+                    check let Ok(last_logits) = logits.slice(1, -1, logits.dim(1), 1) {
+                        let scaled = check temperature != 1.0 {
+                            last_logits.mul_scalar(1.0 / temperature).unwrap_or(last_logits)
+                        } else { last_logits };
+
+                        let probs = scaled.softmax(-1).unwrap_or(scaled);
+                        check let Ok((_, next_id)) = probs.topk(1, -1, true) {
+                            check let Ok(new_ids) = Tensor::cat([&ids, &next_id], 1) {
+                                ids = new_ids;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Ok(ids)
+    }
+}
+
+impl Module for GPT {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        self.forward_with_positions(x)
+    }
+    fn parameters(&self) -> Vec<&Tensor> {
+        var p = Vec::new();
+        p.extend(self.tok_embed.parameters());
+        p.extend(self.pos_embed.parameters());
+        each b in &self.blocks { p.extend(b.parameters()); }
+        p.extend(self.ln_f.parameters());
+        p.extend(self.lm_head.parameters());
+        p
+    }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { Vec::new() }
+    fn zero_grad(&var self) {
+        self.tok_embed.zero_grad(); self.pos_embed.zero_grad();
+        each b in &var self.blocks { b.zero_grad(); }
+        self.ln_f.zero_grad(); self.lm_head.zero_grad();
+    }
+    fn train(&var self, m: bool) {
+        self.training = m;
+        self.tok_embed.train(m); self.pos_embed.train(m);
+        each b in &var self.blocks { b.train(m); }
+        self.ln_f.train(m); self.lm_head.train(m);
+    }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, dev: Device) -> FFIResult<()> {
+        self.tok_embed.to_device(dev.clone())?; self.pos_embed.to_device(dev.clone())?;
+        each b in &var self.blocks { b.to_device(dev.clone())?; }
+        self.ln_f.to_device(dev.clone())?; self.lm_head.to_device(dev)?;
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// U-NET  —  Encoder-Decoder for image segmentation / diffusion
+// ═══════════════════════════════════════════════════════════════════════════
+
+expose data UNetBlock {
+    conv1:   Conv2d,
+    bn1:     BatchNorm2d,
+    conv2:   Conv2d,
+    bn2:     BatchNorm2d,
+    relu:    ReLU,
+    training:    bool,
+}
+
+impl UNetBlock {
+    open fn new(in_ch: i64, out_ch: i64, device: Device) -> FFIResult<UNetBlock> {
+        Ok(UNetBlock {
+            conv1: Conv2d::simple(in_ch,  out_ch, 3, device.clone())?,
+            bn1:   BatchNorm2d::new(out_ch, 1e-5, 0.1, device.clone())?,
+            conv2: Conv2d::simple(out_ch, out_ch, 3, device.clone())?,
+            bn2:   BatchNorm2d::new(out_ch, 1e-5, 0.1, device)?,
+            relu:  ReLU::new(),
+            training: true,
+        })
+    }
+}
+
+impl Module for UNetBlock {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        let x = self.conv1.forward(x)?;
+        let x = self.bn1.forward(&x)?;
+        let x = self.relu.forward(&x)?;
+        let x = self.conv2.forward(&x)?;
+        let x = self.bn2.forward(&x)?;
+        self.relu.forward(&x)
+    }
+    fn parameters(&self) -> Vec<&Tensor> {
+        var p = Vec::new();
+        p.extend(self.conv1.parameters()); p.extend(self.bn1.parameters());
+        p.extend(self.conv2.parameters()); p.extend(self.bn2.parameters());
+        p
+    }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { Vec::new() }
+    fn zero_grad(&var self) {
+        self.conv1.zero_grad(); self.bn1.zero_grad();
+        self.conv2.zero_grad(); self.bn2.zero_grad();
+    }
+    fn train(&var self, m: bool) {
+        self.training = m;
+        self.conv1.train(m); self.bn1.train(m);
+        self.conv2.train(m); self.bn2.train(m);
+    }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, dev: Device) -> FFIResult<()> {
+        self.conv1.to_device(dev.clone())?; self.bn1.to_device(dev.clone())?;
+        self.conv2.to_device(dev.clone())?; self.bn2.to_device(dev)?;
+        Ok(())
+    }
+}
+
+expose data UNet {
+    enc1: UNetBlock,
+    enc2: UNetBlock,
+    enc3: UNetBlock,
+    enc4: UNetBlock,
+    bottleneck: UNetBlock,
+    dec4: UNetBlock,
+    dec3: UNetBlock,
+    dec2: UNetBlock,
+    dec1: UNetBlock,
+    pool: MaxPool2d,
+    head: Conv2d,
+    training: bool,
+}
+
+impl UNet {
+    open fn new(in_channels: i64, num_classes: i64, base_ch: i64,
+                  device: Device) -> FFIResult<UNet> {
+        Ok(UNet {
+            enc1: UNetBlock::new(in_channels,  base_ch,      device.clone())?,
+            enc2: UNetBlock::new(base_ch,       base_ch * 2,  device.clone())?,
+            enc3: UNetBlock::new(base_ch * 2,   base_ch * 4,  device.clone())?,
+            enc4: UNetBlock::new(base_ch * 4,   base_ch * 8,  device.clone())?,
+            bottleneck: UNetBlock::new(base_ch * 8,  base_ch * 16, device.clone())?,
+            // Decoder takes skip + up-sampled, so ch doubles
+            dec4: UNetBlock::new(base_ch * 16 + base_ch * 8, base_ch * 8,  device.clone())?,
+            dec3: UNetBlock::new(base_ch * 8  + base_ch * 4, base_ch * 4,  device.clone())?,
+            dec2: UNetBlock::new(base_ch * 4  + base_ch * 2, base_ch * 2,  device.clone())?,
+            dec1: UNetBlock::new(base_ch * 2  + base_ch,     base_ch,       device.clone())?,
+            pool: MaxPool2d::simple(2),
+            head: Conv2d::new(base_ch, num_classes, (1, 1), (1, 1), (0, 0), 1, true, device)?,
+            training: true,
+        })
+    }
+}
+
+impl Module for UNet {
+    fn forward(&var self, x: &Tensor) -> FFIResult<Tensor> {
+        // Encoder
+        let e1 = self.enc1.forward(x)?;
+        let e2 = self.enc2.forward(&self.pool.forward(&e1)?)?;
+        let e3 = self.enc3.forward(&self.pool.forward(&e2)?)?;
+        let e4 = self.enc4.forward(&self.pool.forward(&e3)?)?;
+        // Bottleneck
+        let b  = self.bottleneck.forward(&self.pool.forward(&e4)?)?;
+        // Decoder — bilinear upsample + skip concat (upsample via native)
+        let up4 = Tensor::cat([&b.upsample_2x()?,  &e4], 1)?;
+        let d4  = self.dec4.forward(&up4)?;
+        let up3 = Tensor::cat([&d4.upsample_2x()?, &e3], 1)?;
+        let d3  = self.dec3.forward(&up3)?;
+        let up2 = Tensor::cat([&d3.upsample_2x()?, &e2], 1)?;
+        let d2  = self.dec2.forward(&up2)?;
+        let up1 = Tensor::cat([&d2.upsample_2x()?, &e1], 1)?;
+        let d1  = self.dec1.forward(&up1)?;
+        self.head.forward(&d1)
+    }
+    fn parameters(&self) -> Vec<&Tensor> {
+        var p = Vec::new();
+        p.extend(self.enc1.parameters()); p.extend(self.enc2.parameters());
+        p.extend(self.enc3.parameters()); p.extend(self.enc4.parameters());
+        p.extend(self.bottleneck.parameters());
+        p.extend(self.dec4.parameters()); p.extend(self.dec3.parameters());
+        p.extend(self.dec2.parameters()); p.extend(self.dec1.parameters());
+        p.extend(self.head.parameters());
+        p
+    }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { Vec::new() }
+    fn zero_grad(&var self) {
+        self.enc1.zero_grad(); self.enc2.zero_grad();
+        self.enc3.zero_grad(); self.enc4.zero_grad();
+        self.bottleneck.zero_grad();
+        self.dec4.zero_grad(); self.dec3.zero_grad();
+        self.dec2.zero_grad(); self.dec1.zero_grad();
+        self.head.zero_grad();
+    }
+    fn train(&var self, m: bool) { self.training = m; /* propagate... */ }
+    fn is_training(&self) -> bool { self.training }
+    fn to_device(&var self, dev: Device) -> FFIResult<()> {
+        self.enc1.to_device(dev.clone())?; self.enc2.to_device(dev.clone())?;
+        self.enc3.to_device(dev.clone())?; self.enc4.to_device(dev.clone())?;
+        self.bottleneck.to_device(dev.clone())?;
+        self.dec4.to_device(dev.clone())?; self.dec3.to_device(dev.clone())?;
+        self.dec2.to_device(dev.clone())?; self.dec1.to_device(dev.clone())?;
+        self.head.to_device(dev)?;
+        Ok(())
+    }
+}
+
+// Tensor upsample helper
+impl Tensor {
+    fn upsample_2x(&self) -> FFIResult<Tensor> {
+        let ptr = nova_tensor_upsample_bilinear(self.storage.ptr, 2);
+        Tensor::from_ptr(ptr, self.data.clone(), self.dtype, self.device.clone(),
+                         self.requires_grad, "UpsampleBackward")
+    }
+}
+
+open fn nova_tensor_upsample_bilinear(ptr: i64, scale: i64) -> i64;

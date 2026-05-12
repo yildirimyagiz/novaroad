@@ -1,0 +1,352 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║              NOVA DIFFUSION SCHEDULERS                                      ║
+// ║              DDPM, DDIM, DPM-Solver, Euler implementations                    ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use stdlib.ai.torch.Tensor
+
+// ============================================================================
+// DDPM SCHEDULER (Denoising Diffusion Probabilistic Models)
+// ============================================================================
+
+open data DDPMScheduler {
+    num_train_timesteps: i32,
+    beta_start: f32,
+    beta_end: f32,
+    beta_schedule: String,
+    
+    // Precomputed values
+    betas: Tensor,
+    alphas: Tensor,
+    alphas_cumprod: Tensor,
+    alphas_cumprod_prev: Tensor,
+    
+    // Variance types
+    variance_type: String,
+}
+
+impl DDPMScheduler {
+    fn new(
+        num_train_timesteps: i32,
+        beta_start: f32,
+        beta_end: f32,
+        beta_schedule: &str
+    ) -> Self {
+        // Generate beta schedule
+        let betas = match beta_schedule {
+            "linear" => Tensor::linspace(beta_start, beta_end, num_train_timesteps),
+            "scaled_linear" => {
+                let start = beta_start.sqrt();
+                let end = beta_end.sqrt();
+                Tensor::linspace(start, end, num_train_timesteps).pow(2.0)
+            },
+            "squaredcos_cap_v2" => Self::betas_for_alpha_bar(num_train_timesteps),
+            _ => Tensor::linspace(beta_start, beta_end, num_train_timesteps)
+        };
+        
+        let alphas = 1.0 - &betas;
+        let alphas_cumprod = alphas.cumprod(0);
+        
+        // Prepend 1.0 to alphas_cumprod_prev
+        var alphas_cumprod_prev_vec = [1.0];
+        alphas_cumprod_prev_vec.extend(alphas_cumprod.to_vec()[..num_train_timesteps as usize - 1].iter());
+        let alphas_cumprod_prev = Tensor::from_vec(alphas_cumprod_prev_vec, &[num_train_timesteps]);
+        
+        DDPMScheduler {
+            num_train_timesteps,
+            beta_start,
+            beta_end,
+            beta_schedule: beta_schedule.into(),
+            betas,
+            alphas,
+            alphas_cumprod,
+            alphas_cumprod_prev,
+            variance_type: "fixed_small".into()
+        }
+    }
+    
+    fn betas_for_alpha_bar(num_diffusion_timesteps: i32) -> Tensor {
+        // Cosine schedule
+        let max_beta = 0.999;
+        
+        let alpha_bar = |t: f32| {
+            yield ((t + 0.008) / 1.008 * std::f32::consts::PI / 2.0).cos().powi(2)
+        };
+        
+        var betas = Vec::new();
+        each i in 0..num_diffusion_timesteps {
+            let t1 = i as f32 / num_diffusion_timesteps as f32;
+            let t2 = (i + 1) as f32 / num_diffusion_timesteps as f32;
+            betas.push((1.0 - alpha_bar(t2) / alpha_bar(t1)).min(max_beta));
+        }
+        
+        Tensor::from_vec(betas, &[num_diffusion_timesteps])
+    }
+    
+    /// Add noise to clean samples
+    @gpu_accelerated
+    fn add_noise(&self, original: &Tensor, noise: &Tensor, timesteps: &Tensor) -> Tensor {
+        let sqrt_alpha_prod = self.alphas_cumprod.index(timesteps).sqrt();
+        let sqrt_one_minus_alpha_prod = (1.0 - &self.alphas_cumprod.index(timesteps)).sqrt();
+        
+        &sqrt_alpha_prod * original + &sqrt_one_minus_alpha_prod * noise
+    }
+    
+    /// Single denoising step
+    @gpu_accelerated
+    fn step(&self, model_output: &Tensor, timestep: i32, sample: &Tensor) -> Tensor {
+        let t = timestep as usize;
+        
+        // Get current and previous alpha_cumprod
+        let alpha_prod_t = self.alphas_cumprod.get(t);
+        let alpha_prod_t_prev = check t > 0 {
+            self.alphas_cumprod_prev.get(t)
+        } else {
+            1.0
+        };
+        
+        let beta_prod_t = 1.0 - alpha_prod_t;
+        let beta_prod_t_prev = 1.0 - alpha_prod_t_prev;
+        
+        // Compute predicted original sample
+        let pred_original_sample = 
+            (sample - beta_prod_t.sqrt() * model_output) / alpha_prod_t.sqrt();
+        
+        // Compute coefficients for pred_original_sample and current sample
+        let pred_original_sample_coeff = (alpha_prod_t_prev.sqrt() * self.betas.get(t)) / beta_prod_t;
+        let current_sample_coeff = self.alphas.get(t).sqrt() * beta_prod_t_prev / beta_prod_t;
+        
+        // Compute predicted previous sample
+        var pred_prev_sample = 
+            pred_original_sample_coeff * &pred_original_sample + 
+            current_sample_coeff * sample;
+        
+        // Add noise
+        check t > 0 {
+            variance = self.get_variance(timestep);
+            let noise = Tensor::randn_like(sample);
+            pred_prev_sample = pred_prev_sample + variance.sqrt() * noise;
+        }
+        
+        pred_prev_sample
+    }
+    
+    fn get_variance(&self, timestep: i32) -> f32 {
+        let t = timestep as usize;
+        
+        check t == 0 {
+            yield 0.0;
+        }
+        
+        let alpha_prod_t = self.alphas_cumprod.get(t);
+        let alpha_prod_t_prev = self.alphas_cumprod_prev.get(t);
+        
+        match self.variance_type.as_str() {
+            "fixed_small" => {
+                yield (1.0 - alpha_prod_t_prev) / (1.0 - alpha_prod_t) * self.betas.get(t)
+            },
+            "fixed_large" => self.betas.get(t),
+            _ => {
+                yield (1.0 - alpha_prod_t_prev) / (1.0 - alpha_prod_t) * self.betas.get(t)
+            }
+        }
+    }
+}
+
+// ============================================================================
+// DDIM SCHEDULER (Denoising Diffusion Implicit Models)
+// ============================================================================
+
+open data DDIMScheduler {
+    num_train_timesteps: i32,
+    num_inference_steps: i32,
+    beta_start: f32,
+    beta_end: f32,
+    
+    alphas_cumprod: Tensor,
+    timesteps: Vec<i32>,
+    
+    eta: f32,  // Controls stochasticity (0 = deterministic)
+}
+
+impl DDIMScheduler {
+    fn new(
+        num_train_timesteps: i32,
+        beta_start: f32,
+        beta_end: f32
+    ) -> Self {
+        let betas = Tensor::linspace(beta_start, beta_end, num_train_timesteps);
+        let alphas = 1.0 - &betas;
+        let alphas_cumprod = alphas.cumprod(0);
+        
+        DDIMScheduler {
+            num_train_timesteps,
+            num_inference_steps: 50,
+            beta_start,
+            beta_end,
+            alphas_cumprod,
+            timesteps: Vec::new(),
+            eta: 0.0
+        }
+    }
+    
+    fn set_timesteps(&var self, num_inference_steps: i32) {
+        self.num_inference_steps = num_inference_steps;
+        
+        // Linear spacing
+        let step_ratio = self.num_train_timesteps as f32 / num_inference_steps as f32;
+        
+        self.timesteps = (0..num_inference_steps)
+            .map(|i| ((num_inference_steps - 1 - i) as f32 * step_ratio).round() as i32)
+            .collect();
+    }
+    
+    @gpu_accelerated
+    fn step(&self, model_output: &Tensor, timestep: i32, sample: &Tensor, prev_timestep: i32) -> Tensor {
+        let alpha_prod_t = self.alphas_cumprod.get(timestep as usize);
+        let alpha_prod_t_prev = check prev_timestep >= 0 {
+            self.alphas_cumprod.get(prev_timestep as usize)
+        } else {
+            1.0
+        };
+        
+        let beta_prod_t = 1.0 - alpha_prod_t;
+        
+        // Predict original sample
+        let pred_original_sample = 
+            (sample - beta_prod_t.sqrt() * model_output) / alpha_prod_t.sqrt();
+        
+        // Compute variance
+        variance = (1.0 - alpha_prod_t_prev) / (1.0 - alpha_prod_t) * (1.0 - alpha_prod_t / alpha_prod_t_prev);
+        let std_dev_t = self.eta * variance.sqrt();
+        
+        // Direction pointing to x_t
+        let pred_sample_direction = (1.0 - alpha_prod_t_prev - std_dev_t * std_dev_t).sqrt() * model_output;
+        
+        // Compute x_{t-1}
+        var pred_prev_sample = alpha_prod_t_prev.sqrt() * &pred_original_sample + &pred_sample_direction;
+        
+        // Add noise check eta > 0
+        check self.eta > 0.0 {
+            let noise = Tensor::randn_like(sample);
+            pred_prev_sample = pred_prev_sample + std_dev_t * noise;
+        }
+        
+        pred_prev_sample
+    }
+}
+
+// ============================================================================
+// EULER DISCRETE SCHEDULER
+// ============================================================================
+
+open data EulerDiscreteScheduler {
+    num_train_timesteps: i32,
+    num_inference_steps: i32,
+    
+    sigmas: Tensor,
+    timesteps: Vec<i32>,
+}
+
+impl EulerDiscreteScheduler {
+    fn new(num_train_timesteps: i32) -> Self {
+        EulerDiscreteScheduler {
+            num_train_timesteps,
+            num_inference_steps: 50,
+            sigmas: Tensor::zeros(&[num_train_timesteps]),
+            timesteps: Vec::new()
+        }
+    }
+    
+    fn set_timesteps(&var self, num_inference_steps: i32) {
+        self.num_inference_steps = num_inference_steps;
+        
+        // Compute sigmas
+        var sigmas = Vec::new();
+        each i in 0..=num_inference_steps {
+            let t = (num_inference_steps - i) as f32 / num_inference_steps as f32;
+            sigmas.push(self.sigma(t));
+        }
+        
+        self.sigmas = Tensor::from_vec(sigmas, &[num_inference_steps + 1]);
+        
+        // Set timesteps
+        self.timesteps = (0..num_inference_steps).rev().collect();
+    }
+    
+    fn sigma(&self, t: f32) -> f32 {
+        // Noise schedule
+        let sigma_min = 0.002;
+        let sigma_max = 80.0;
+        
+        sigma_min + (sigma_max - sigma_min) * t
+    }
+    
+    @gpu_accelerated
+    fn step(&self, model_output: &Tensor, step_index: i32, sample: &Tensor) -> Tensor {
+        let sigma = self.sigmas.get(step_index as usize);
+        let sigma_next = self.sigmas.get((step_index + 1) as usize);
+        
+        // Euler method
+        let dt = sigma_next - sigma;
+        sample + model_output * dt
+    }
+}
+
+// ============================================================================
+// DPM-SOLVER++ (Fast high-order solver)
+// ============================================================================
+
+open data DPMSolverPlusPlusScheduler {
+    num_train_timesteps: i32,
+    num_inference_steps: i32,
+    
+    alphas_cumprod: Tensor,
+    timesteps: Vec<i32>,
+    
+    solver_order: i32,  // 1, 2, or 3
+}
+
+impl DPMSolverPlusPlusScheduler {
+    fn new(num_train_timesteps: i32) -> Self {
+        let betas = Tensor::linspace(0.0001, 0.02, num_train_timesteps);
+        let alphas = 1.0 - &betas;
+        let alphas_cumprod = alphas.cumprod(0);
+        
+        DPMSolverPlusPlusScheduler {
+            num_train_timesteps,
+            num_inference_steps: 25,
+            alphas_cumprod,
+            timesteps: Vec::new(),
+            solver_order: 2
+        }
+    }
+    
+    fn set_timesteps(&var self, num_inference_steps: i32) {
+        self.num_inference_steps = num_inference_steps;
+        
+        let step_ratio = self.num_train_timesteps as f32 / num_inference_steps as f32;
+        self.timesteps = (0..num_inference_steps)
+            .map(|i| ((num_inference_steps - 1 - i) as f32 * step_ratio).round() as i32)
+            .collect();
+    }
+    
+    @gpu_accelerated
+    fn step(&self, model_output: &Tensor, timestep: i32, sample: &Tensor) -> Tensor {
+        // Simplified DPM-Solver++
+        // In production, implement full multistep solver
+        
+        let alpha_t = self.alphas_cumprod.get(timestep as usize);
+        let sigma_t = (1.0 - alpha_t).sqrt();
+        
+        // First-order update (Euler)
+        sample - sigma_t * model_output
+    }
+}
+
+export {
+    DDPMScheduler,
+    DDIMScheduler,
+    EulerDiscreteScheduler,
+    DPMSolverPlusPlusScheduler
+}

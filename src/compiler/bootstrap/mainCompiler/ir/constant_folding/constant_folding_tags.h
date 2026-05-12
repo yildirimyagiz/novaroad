@@ -1,0 +1,5 @@
+#ifndef NOVA_CONSTANT_FOLDING_TAGS_H
+#define NOVA_CONSTANT_FOLDING_TAGS_H
+
+#endif
+

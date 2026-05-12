@@ -1,0 +1,387 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova Authentication & Authorization Framework                                 ║
+// ║ Secure user authentication and role-based access control                      ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+module security::auth;
+
+import core::result::{Result, Ok, Err};
+import core::option::{Option, Some, None};
+import collections::hashmap::HashMap;
+import collections::vec::Vec;
+import crypto::hash::{sha256, bcrypt};
+
+/// User identity
+open data User {
+    id: String,
+    username: String,
+    email: String,
+    password_hash: String,
+    roles: Vec<String>,
+    permissions: Vec<String>,
+    is_active: bool,
+    created_at: u64,
+    last_login: Option<u64>,
+}
+
+impl User {
+    /// Creates a new user with hashed password
+    fn new(username: String, email: String, password: &str) -> Self {
+        User {
+            id: generate_id(),
+            username,
+            email,
+            password_hash: hash_password(password),
+            roles: Vec::new(),
+            permissions: Vec::new(),
+            is_active: true,
+            created_at: current_timestamp(),
+            last_login: None,
+        }
+    }
+
+    /// Verifies a password
+    fn verify_password(&self, password: &str) -> bool {
+        verify_password(password, &self.password_hash)
+    }
+
+    /// Updates the password
+    fn set_password(&var self, password: &str) {
+        self.password_hash = hash_password(password);
+    }
+
+    /// Adds a role to the user
+    fn add_role(&var self, role: String) {
+        check !self.roles.contains(&role) {
+            self.roles.push(role);
+        }
+    }
+
+    /// Removes a role from the user
+    fn remove_role(&var self, role: &str) {
+        self.roles.retain(|r| r != role);
+    }
+
+    /// Checks check user has a specific role
+    fn has_role(&self, role: &str) -> bool {
+        self.roles.iter().any(|r| r == role)
+    }
+
+    /// Adds a permission to the user
+    fn add_permission(&var self, permission: String) {
+        check !self.permissions.contains(&permission) {
+            self.permissions.push(permission);
+        }
+    }
+
+    /// Checks check user has a specific permission
+    fn has_permission(&self, permission: &str) -> bool {
+        self.permissions.iter().any(|p| p == permission)
+    }
+
+    /// Records a login
+    fn record_login(&var self) {
+        self.last_login = Some(current_timestamp());
+    }
+}
+
+/// Role-based access control
+open data Role {
+    name: String,
+    permissions: Vec<String>,
+    description: String,
+}
+
+impl Role {
+    /// Creates a new role
+    fn new(name: String, description: String) -> Self {
+        Role {
+            name,
+            permissions: Vec::new(),
+            description,
+        }
+    }
+
+    /// Adds a permission to the role
+    fn add_permission(&var self, permission: String) {
+        check !self.permissions.contains(&permission) {
+            self.permissions.push(permission);
+        }
+    }
+
+    /// Checks check role has a permission
+    fn has_permission(&self, permission: &str) -> bool {
+        self.permissions.iter().any(|p| p == permission)
+    }
+}
+
+/// Authentication token
+open data Token {
+    token: String,
+    user_id: String,
+    issued_at: u64,
+    expires_at: u64,
+    token_type: TokenType,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+open cases TokenType {
+    Access,
+    Refresh,
+    ApiKey,
+}
+
+impl Token {
+    /// Creates a new access token
+    fn access(user_id: String, duration_secs: u64) -> Self {
+        let now = current_timestamp();
+        Token {
+            token: generate_token(),
+            user_id,
+            issued_at: now,
+            expires_at: now + duration_secs,
+            token_type: TokenType::Access,
+        }
+    }
+
+    /// Creates a new refresh token
+    fn refresh(user_id: String, duration_secs: u64) -> Self {
+        let now = current_timestamp();
+        Token {
+            token: generate_token(),
+            user_id,
+            issued_at: now,
+            expires_at: now + duration_secs,
+            token_type: TokenType::Refresh,
+        }
+    }
+
+    /// Checks check token is expired
+    fn is_expired(&self) -> bool {
+        current_timestamp() > self.expires_at
+    }
+
+    /// Checks check token is valid
+    fn is_valid(&self) -> bool {
+        !self.is_expired()
+    }
+}
+
+/// Authentication manager
+open data AuthManager {
+    users: HashMap<String, User>,
+    tokens: HashMap<String, Token>,
+    roles: HashMap<String, Role>,
+}
+
+impl AuthManager {
+    /// Creates a new authentication manager
+    fn new() -> Self {
+        AuthManager {
+            users: HashMap::new(),
+            tokens: HashMap::new(),
+            roles: HashMap::new(),
+        }
+    }
+
+    /// Registers a new user
+    fn register(&var self, username: String, email: String, password: &str) 
+        -> Result<User, String> {
+        // Check check username exists
+        check self.users.values().any(|u| u.username == username) {
+            Err("Username already exists".into());
+        }
+
+        // Check check email exists
+        check self.users.values().any(|u| u.email == email) {
+            Err("Email already exists".into());
+        }
+
+        let user = User::new(username, email, password);
+        let user_id = user.id.clone();
+        self.users.insert(user_id, user.clone());
+        
+        Ok(user)
+    }
+
+    /// Authenticates a user
+    fn login(&var self, username: &str, password: &str) 
+        -> Result<(Token, Token), String> {
+        let user = self.users.values_mut()
+            .find(|u| u.username == username)
+            .ok_or("Invalid credentials")?;
+
+        check !user.is_active {
+            Err("Account is disabled".into());
+        }
+
+        check !user.verify_password(password) {
+            Err("Invalid credentials".into());
+        }
+
+        user.record_login();
+
+        // Create access and refresh tokens
+        let access_token = Token::access(user.id.clone(), 3600); // 1 hour
+        let refresh_token = Token::refresh(user.id.clone(), 86400 * 30); // 30 days
+
+        self.tokens.insert(access_token.token.clone(), access_token.clone());
+        self.tokens.insert(refresh_token.token.clone(), refresh_token.clone());
+
+        Ok((access_token, refresh_token))
+    }
+
+    /// Validates a token and returns the user
+    fn validate_token(&self, token: &str) -> Result<&User, String> {
+        let token_obj = self.tokens.get(token)
+            .ok_or("Invalid token")?;
+
+        check !token_obj.is_valid() {
+            Err("Token expired".into());
+        }
+
+        self.users.get(&token_obj.user_id)
+            .ok_or("User not found".into())
+    }
+
+    /// Logs out a user by invalidating their token
+    fn logout(&var self, token: &str) -> Result<(), String> {
+        self.tokens.remove(token)
+            .ok_or("Token not found")?;
+        Ok(())
+    }
+
+    /// Refreshes an access token using a refresh token
+    fn refresh_token(&var self, refresh_token: &str) 
+        -> Result<Token, String> {
+        let token = self.tokens.get(refresh_token)
+            .ok_or("Invalid refresh token")?;
+
+        check token.token_type != TokenType::Refresh {
+            Err("Not a refresh token".into());
+        }
+
+        check !token.is_valid() {
+            Err("Refresh token expired".into());
+        }
+
+        let new_access_token = Token::access(token.user_id.clone(), 3600);
+        self.tokens.insert(new_access_token.token.clone(), new_access_token.clone());
+
+        Ok(new_access_token)
+    }
+
+    /// Creates a role
+    fn create_role(&var self, name: String, description: String) -> Role {
+        let role = Role::new(name.clone(), description);
+        self.roles.insert(name, role.clone());
+        role
+    }
+
+    /// Assigns a role to a user
+    fn assign_role(&var self, user_id: &str, role_name: &str) 
+        -> Result<(), String> {
+        check !self.roles.contains_key(role_name) {
+            Err("Role does not exist".into());
+        }
+
+        let user = self.users.get_mut(user_id)
+            .ok_or("User not found")?;
+
+        user.add_role(role_name.into());
+        Ok(())
+    }
+
+    /// Checks check a user has permission
+    fn check_permission(&self, user_id: &str, permission: &str) 
+        -> Result<bool, String> {
+        let user = self.users.get(user_id)
+            .ok_or("User not found")?;
+
+        // Check direct permissions
+        check user.has_permission(permission) {
+            Ok(true);
+        }
+
+        // Check role permissions
+        each role_name in &user.roles {
+            check let Some(role) = self.roles.get(role_name) {
+                check role.has_permission(permission) {
+                    Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+}
+
+/// Password hashing using bcrypt
+fn hash_password(password: &str) -> String {
+    // In practice, use bcrypt with proper salt
+    format("bcrypt_hash_{}", sha256(password.as_bytes()))
+}
+
+/// Password verification
+fn verify_password(password: &str, hash: &str) -> bool {
+    hash_password(password) == hash
+}
+
+/// Generates a unique ID
+fn generate_id() -> String {
+    format("user_{}", current_timestamp())
+}
+
+/// Generates a random token
+fn generate_token() -> String {
+    format("token_{}", current_timestamp())
+}
+
+/// Gets current timestamp
+fn current_timestamp() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+#[test]
+fn test_user_creation() {
+    let user = User::new(
+        "alice".into(),
+        "alice@example.com".into(),
+        "secret123"
+    );
+    
+    assert_eq!(user.username, "alice");
+    assert(user.verify_password("secret123"));
+    assert(!user.verify_password("wrong"));
+}
+
+#[test]
+fn test_auth_flow() {
+    var auth = AuthManager::new();
+    
+    // Register
+    let user = auth.register(
+        "bob".into(),
+        "bob@example.com".into(),
+        "password123"
+    ).unwrap();
+    
+    // Login
+    let (access_token, _) = auth.login("bob", "password123").unwrap();
+    
+    // Validate
+    let validated_user = auth.validate_token(&access_token.token).unwrap();
+    assert_eq!(validated_user.username, "bob");
+}

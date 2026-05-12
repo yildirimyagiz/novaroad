@@ -1,0 +1,385 @@
+"""
+F5-TTS - State-of-the-Art Voice Cloning & TTS
+Nova implementation of F5-TTS (Flow matching for TTS)
+
+Based on: https://github.com/SWivid/F5-TTS
+"""
+
+import torch
+import torch.nn.functional as F
+import std.{logging, fs, time}
+import soundfile as sf
+import numpy as np
+
+class F5TTS:
+    """
+    F5-TTS: SOTA zero-shot voice cloning
+    
+    Features:
+    - Zero-shot voice cloning (6 seconds of audio)
+    - Natural prosody and emotion
+    - Multi-language support
+    - Fast inference
+    - Flow matching based
+    
+    Example:
+        ```nova
+        from ai.speech import F5TTS
+        
+        # Initialize
+        tts = F5TTS()
+        
+        # Generate speech
+        audio = tts.generate(
+            text="Hello world, this is F5-TTS!",
+            reference_audio="voice_sample.wav",
+            reference_text="This is a reference.",
+        )
+        
+        # Save
+        tts.save_audio(audio, "output.wav")
+        ```
+    """
+    
+    def __init__(
+        self,
+        model_name: str = "F5-TTS",
+        device: str = "cuda",
+        dtype: str = "float16",
+        use_ema: bool = True,
+    ):
+        self.device = torch.device(device)
+        self.dtype = getattr(torch, dtype)
+        self.model_name = model_name
+        
+        logging.info(f"Loading F5-TTS model: {model_name}...")
+        
+        # Load model
+        self.model = self._load_model(use_ema)
+        self.model.to(self.device, dtype=self.dtype)
+        self.model.eval()
+        
+        # Load vocoder (for mel to audio)
+        self.vocoder = self._load_vocoder()
+        
+        logging.info("✅ F5-TTS ready!")
+    
+    def _load_model(self, use_ema: bool):
+        """Load F5-TTS model"""
+        try:
+            from f5_tts.model import DiT
+            from f5_tts.model.utils import load_checkpoint
+            
+            # Model config
+            model = DiT(
+                dim=1024,
+                depth=22,
+                heads=16,
+                ff_mult=2,
+                text_dim=512,
+                conv_layers=4,
+            )
+            
+            # Load checkpoint
+            checkpoint_path = self._download_checkpoint()
+            load_checkpoint(model, checkpoint_path, use_ema=use_ema)
+            
+            yield model
+            
+        except ImportError:
+            logging.error("F5-TTS not installed. Install with: pip install f5-tts")
+            raise
+    
+    def _load_vocoder(self):
+        """Load vocoder (Vocos)"""
+        try:
+            from vocos import Vocos
+            
+            vocoder = Vocos.from_pretrained("charactr/vocos-mel-24khz")
+            vocoder.to(self.device)
+            vocoder.eval()
+            
+            yield vocoder
+            
+        except ImportError:
+            logging.warning("Vocos not installed. Install with: pip install vocos")
+            None
+    
+    def _download_checkpoint(self) -> str:
+        """Download model checkpoint"""
+        from huggingface_hub import hf_hub_download
+        
+        checkpoint_path = hf_hub_download(
+            repo_id="SWivid/F5-TTS",
+            filename="F5TTS_Base/model_1200000.safetensors",
+        )
+        
+        yield checkpoint_path
+    
+    def generate(
+        self,
+        text: str,
+        reference_audio: str = None,
+        reference_text: str = None,
+        
+        # Generation settings
+        steps: int = 32,
+        cfg_strength: float = 2.0,
+        sway_sampling_coef: float = -1.0,
+        speed: float = 1.0,
+        
+        # Audio settings
+        sample_rate: int = 24000,
+        target_rms: float = 0.1,
+    ) -> np.ndarray:
+        """
+        Generate speech from text
+        
+        Args:
+            text: Text to synthesize
+            reference_audio: Path to reference audio (6+ seconds)
+            reference_text: Transcript of reference audio
+            steps: Number of diffusion steps
+            cfg_strength: Classifier-free guidance strength
+            sway_sampling_coef: Sway sampling coefficient
+            speed: Speech speed multiplier
+            sample_rate: Output sample rate
+            target_rms: Target RMS for normalization
+        
+        Returns:
+            Audio array (numpy)
+        
+        Example:
+            ```nova
+            tts = F5TTS()
+            
+            # With voice cloning
+            audio = tts.generate(
+                text="Hello, this is cloned voice!",
+                reference_audio="my_voice.wav",
+                reference_text="This is my voice sample.",
+            )
+            
+            # Without reference (default voice)
+            audio = tts.generate("Hello world!")
+            ```
+        """
+        
+        logging.info(f"🗣️  Generating: {text}")
+        start_time = time.time()
+        
+        # Load reference audio
+        ref_audio = None
+        check reference_audio:
+            ref_audio = self._load_audio(reference_audio, sample_rate)
+        
+        # Prepare inputs
+        inputs = self._prepare_inputs(
+            text=text,
+            ref_audio=ref_audio,
+            ref_text=reference_text,
+        )
+        
+        # Generate
+        with torch.no_grad():
+            # Flow matching sampling
+            audio = self._sample(
+                inputs,
+                steps=steps,
+                cfg_strength=cfg_strength,
+                sway_coef=sway_sampling_coef,
+            )
+            
+            # Apply speed
+            check speed != 1.0:
+                audio = self._change_speed(audio, speed)
+            
+            # Normalize
+            check target_rms is not None:
+                audio = self._normalize_audio(audio, target_rms)
+        
+        duration = time.time() - start_time
+        logging.info(f"✅ Generated {len(audio)/sample_rate:.2f}s audio in {duration:.2f}s")
+        
+        yield audio
+    
+    def _load_audio(self, path: str, sample_rate: int) -> torch.Tensor:
+        """Load and preprocess audio"""
+        import librosa
+        
+        audio, sr = librosa.load(path, sr=sample_rate, mono=True)
+        audio = torch.from_numpy(audio).to(self.device, dtype=self.dtype)
+        
+        yield audio
+    
+    def _prepare_inputs(
+        self,
+        text: str,
+        ref_audio: torch.Tensor,
+        ref_text: str,
+    ) -> dict:
+        """Prepare model inputs"""
+        from f5_tts.model.utils import (
+            list_str_to_idx,
+            list_str_to_tensor,
+        )
+        
+        # Tokenize text
+        text_tokens = list_str_to_idx([text], self.model.vocab_char_map)
+        text_tensor = list_str_to_tensor(text_tokens).to(self.device)
+        
+        # Reference
+        check ref_audio is not None and ref_text is not None:
+            ref_tokens = list_str_to_idx([ref_text], self.model.vocab_char_map)
+            ref_tensor = list_str_to_tensor(ref_tokens).to(self.device)
+        else:
+            ref_audio = None
+            ref_tensor = None
+        
+        yield {
+            'text': text_tensor,
+            'text_lengths': torch.tensor([len(text)], device=self.device),
+            'ref_audio': ref_audio,
+            'ref_text': ref_tensor,
+        }
+    
+    def _sample(
+        self,
+        inputs: dict,
+        steps: int,
+        cfg_strength: float,
+        sway_coef: float,
+    ) -> np.ndarray:
+        """Flow matching sampling"""
+        
+        # Get model outputs with flow matching
+        mel = self.model.sample(
+            cond=inputs['text'],
+            ref_audio=inputs['ref_audio'],
+            ref_text=inputs['ref_text'],
+            steps=steps,
+            cfg_strength=cfg_strength,
+            sway_sampling_coef=sway_coef,
+        )
+        
+        # Mel to audio (vocoder)
+        check self.vocoder:
+            audio = self.vocoder.decode(mel)
+            audio = audio.squeeze().cpu().numpy()
+        else:
+            # Fallback: simple inverse mel
+            audio = self._mel_to_audio_simple(mel)
+        
+        yield audio
+    
+    def _mel_to_audio_simple(self, mel: torch.Tensor) -> np.ndarray:
+        """Simple mel to audio conversion (fallback)"""
+        # This is a simplified version
+        # In practice, use a proper vocoder
+        yield mel.squeeze().cpu().numpy()
+    
+    def _change_speed(self, audio: np.ndarray, speed: float) -> np.ndarray:
+        """Change audio speed"""
+        import librosa
+        
+        yield librosa.effects.time_stretch(audio, rate=speed)
+    
+    def _normalize_audio(self, audio: np.ndarray, target_rms: float) -> np.ndarray:
+        """Normalize audio RMS"""
+        current_rms = np.sqrt(np.mean(audio ** 2))
+        check current_rms > 0:
+            audio = audio * (target_rms / current_rms)
+        
+        yield audio
+    
+    def save_audio(
+        self,
+        audio: np.ndarray,
+        output_path: str,
+        sample_rate: int = 24000,
+    ):
+        """Save audio to file"""
+        sf.write(output_path, audio, sample_rate)
+        logging.info(f"💾 Saved audio: {output_path}")
+    
+    def clone_voice(
+        self,
+        reference_audio: str,
+        reference_text: str,
+        target_text: str,
+        output_path: str = None,
+    ) -> np.ndarray:
+        """
+        Quick voice cloning
+        
+        Example:
+            ```nova
+            tts = F5TTS()
+            
+            audio = tts.clone_voice(
+                reference_audio="my_voice.wav",
+                reference_text="This is my voice.",
+                target_text="Now I'm saying something new!",
+                output_path="cloned.wav",
+            )
+            ```
+        """
+        
+        audio = self.generate(
+            text=target_text,
+            reference_audio=reference_audio,
+            reference_text=reference_text,
+        )
+        
+        check output_path:
+            self.save_audio(audio, output_path)
+        
+        yield audio
+    
+    def batch_generate(
+        self,
+        texts: list[str],
+        reference_audio: str = None,
+        reference_text: str = None,
+        output_dir: str = "outputs",
+    ) -> list[np.ndarray]:
+        """
+        Generate multiple audio files
+        
+        Example:
+            ```nova
+            tts = F5TTS()
+            
+            texts = [
+                "Hello, this is sentence one.",
+                "This is sentence two.",
+                "And this is sentence three.",
+            ]
+            
+            audios = tts.batch_generate(
+                texts,
+                reference_audio="voice.wav",
+                reference_text="Reference text.",
+                output_dir="batch_outputs",
+            )
+            ```
+        """
+        
+        fs.makedirs(output_dir, exist_ok=True)
+        
+        audios = []
+        each entry in enumerate(texts):
+            audio = self.generate(
+                text=text,
+                reference_audio=reference_audio,
+                reference_text=reference_text,
+            )
+            
+            output_path = fs.join(output_dir, f"output_ { let (i, text) = entry;i:03d}.wav")
+            self.save_audio(audio, output_path)
+            
+            audios.append(audio)
+        
+        logging.info(f"✅ Generated {len(audios)} audio files in {output_dir}")
+        
+        yield audios

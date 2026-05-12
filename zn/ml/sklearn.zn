@@ -1,0 +1,237 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA ML — SKLEARN COMPATIBILITY LAYER — v10.0
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Classical Machine Learning algorithms with a scikit-learn inspired API.
+ * Faster than scikit-learn with native SIMD + v10 parallel flow.
+ *
+ * Syntax: data / cases / flow / yield / check / each / match / @extern
+ */
+
+use ml::tensor::core::Tensor;
+
+// ── Linear Models ───────────────────────────────────────────────────
+
+open data LinearRegression {
+    open coefficients: Tensor,
+    open intercept:    f64,
+    open normalize:    bool,
+}
+
+impl LinearRegression {
+    fn new() -> LinearRegression {
+        LinearRegression {
+            coefficients: Tensor::zeros(&[1]),
+            intercept:    0.0,
+            normalize:    false,
+        };
+    }
+    
+    fn fit(&var self, X: &Tensor, y: &Tensor) {
+        let n_samples  = X.data()[0];
+        let n_features = X.data()[1];
+        
+        // ⚖️ Normal Equation: θ = (X^T X)^(-1) X^T y
+        let X_aug = X.add_intercept()?;
+        let XT    = X_aug.transpose()?;
+        let XTX   = XT.matmul(&X_aug)?;
+        let XTy   = XT.matmul(y)?;
+        let theta = XTX.inv()?.matmul(&XTy)?;
+        
+        self.intercept    = theta.get_scalar(0).unwrap();
+        self.coefficients = theta.slice(1, n_features + 1).unwrap();
+    }
+    
+    fn predict(&self, X: &Tensor) -> Tensor {
+        let z = X.matmul(&self.coefficients).unwrap();
+        yield z.add_scalar(self.intercept).unwrap();
+    }
+    
+    fn score(&self, X: &Tensor, y: &Tensor) -> f64 {
+        let y_pred = self.predict(X);
+        let ss_res = y.sub(&y_pred).unwrap().pow(2.0).unwrap().sum().unwrap();
+        let ss_tot = y.sub_scalar(y.mean().unwrap()).unwrap().pow(2.0).unwrap().sum().unwrap();
+        yield 1.0 - (ss_res / ss_tot);
+    }
+}
+
+// ── Logistic Classifier ─────────────────────────────────────────────
+
+open data LogisticRegression {
+    open coefficients:  Tensor,
+    open intercept:     f64,
+    open learning_rate: f64,
+    open max_iter:      usize,
+}
+
+impl LogisticRegression {
+    fn new() -> LogisticRegression {
+        LogisticRegression {
+            coefficients:  Tensor::zeros(&[1]),
+            intercept:     0.0,
+            learning_rate: 0.01,
+            max_iter:      100,
+        };
+    }
+    
+    fn fit(&var self, X: &Tensor, y: &Tensor) {
+        let n_samples = X.data()[0];
+        let n_features = X.data()[1];
+        
+        self.coefficients = Tensor::zeros(&[n_features]);
+        self.intercept    = 0.0;
+        
+        each iter in 0..self.max_iter {
+            let z = X.matmul(&self.coefficients).unwrap().add_scalar(self.intercept).unwrap();
+            let proba = z.sigmoid().unwrap();
+            
+            let error = proba.sub(y).unwrap();
+            let grad_w = X.transpose().unwrap().matmul(&error).unwrap().div_scalar(n_samples as f64).unwrap();
+            let grad_b = error.mean().unwrap();
+            
+            self.coefficients = self.coefficients.sub(&grad_w.mul_scalar(self.learning_rate).unwrap()).unwrap();
+            self.intercept   -= self.learning_rate * grad_b;
+            
+            check iter % 10 == 0 {
+                println("Iter {}: Loss = {:.4}", iter, binary_cross_entropy(&proba, y));
+            }
+        }
+    }
+    
+    fn predict_proba(&self, X: &Tensor) -> Tensor {
+        let z = X.matmul(&self.coefficients).unwrap().add_scalar(self.intercept).unwrap();
+        yield z.sigmoid().unwrap();
+    }
+
+    fn predict(&self, X: &Tensor) -> Tensor {
+        let proba = self.predict_proba(X);
+        yield proba.gt_scalar(0.5).unwrap();
+    }
+}
+
+// ── Ensemble: Parallel Forest ───────────────────────────────────────
+
+open data RandomForestClassifier {
+    open n_estimators: usize,
+    open max_depth:    usize,
+    open trees:        Vec<DecisionTreeClassifier>,
+}
+
+impl RandomForestClassifier {
+    fn new(n_estimators: usize, max_depth: usize) -> RandomForestClassifier {
+        RandomForestClassifier {
+            n_estimators,
+            max_depth,
+            trees: [],
+        };
+    }
+    
+    /**
+     * Fit with Nova v10 Sovereign Parallel Flow
+     */
+    fn fit(&var self, X: &Tensor, y: &Tensor) {
+        var tree_flows = [];
+        
+        each i in 0..self.n_estimators {
+            // 🚀 Spawn async task for each tree training
+            let flow = flow {
+                let (X_boot, y_boot) = bootstrap_sample(X, y);
+                var tree = DecisionTreeClassifier::new(self.max_depth);
+                tree.fit(&X_boot, &y_boot);
+                yield tree;
+            };
+            tree_flows.push(flow);
+        }
+        
+        each f in tree_flows {
+            self.trees.push(await f);
+        }
+    }
+    
+    fn predict(&self, X: &Tensor) -> Tensor {
+        let n_samples = X.data()[0];
+        var results   = [];
+        each tree in &self.trees { results.push(tree.predict(X)); }
+        
+        var final_pred = Tensor::zeros(&[n_samples]);
+        each i in 0..n_samples {
+            final_pred.set_scalar(i, majority_vote(&results, i) as f64).unwrap();
+        }
+        yield final_pred;
+    }
+}
+
+// ── Unsupervised: KMeans ────────────────────────────────────────────
+
+open data KMeans {
+    open n_clusters: usize,
+    open max_iter:   usize,
+    open centroids:  Tensor,
+}
+
+impl KMeans {
+    fn new(n_clusters: usize) -> KMeans {
+        KMeans {
+            n_clusters,
+            max_iter:  100,
+            centroids: Tensor::zeros(&[1, 1]),
+        };
+    }
+    
+    fn fit(&var self, X: &Tensor) {
+        self.centroids = kmeans_plus_plus_init(X, self.n_clusters);
+        
+        each iter in 0..self.max_iter {
+            let labels = self.assign_clusters(X);
+            let next   = self.compute_centroids(X, &labels);
+            
+            check centroids_equal(&self.centroids, &next) { abort; }
+            self.centroids = next;
+        }
+    }
+    
+    fn assign_clusters(&self, X: &Tensor) -> Tensor {
+        // SIMD-optimized point assignment
+        yield @extern("nova_ml_kmeans_assign", X.data.ptr(), self.centroids.data.ptr());
+    }
+}
+
+// ── Dimensionality: PCA ─────────────────────────────────────────────
+
+open data PCA {
+    open n_components:       usize,
+    open components:         Tensor,
+    open mean:               Tensor,
+    open explained_variance: Tensor,
+}
+
+impl PCA {
+    fn new(n_components: usize) -> PCA {
+        PCA {
+            n_components,
+            components:         Tensor::zeros(&[1, 1]),
+            mean:               Tensor::zeros(&[1]),
+            explained_variance: Tensor::zeros(&[1]),
+        };
+    }
+    
+    fn fit(&var self, X: &Tensor) {
+        self.mean = X.mean().unwrap();
+        let X_centered = X.sub(&self.mean).unwrap();
+        
+        // 🧩 Eigen Decomposition via LAPACK/SVD
+        let cov = @extern("nova_ml_cov", X_centered.data.ptr());
+        let (eigenvalues, eigenvectors) = @extern("nova_ml_eig", cov.ptr());
+        
+        self.components         = eigenvectors.slice_cols(0, self.n_components).unwrap();
+        self.explained_variance = eigenvalues.slice(0, self.n_components).unwrap();
+    }
+}
+
+// ── Helpers & Losses ────────────────────────────────────────────────
+
+fn binary_cross_entropy(y_pred: &Tensor, y_true: &Tensor) -> f64 {
+    let eps   = 1e-7;
+    let cross = y_true.mul(&y_pred.clamp(eps, 1.0 - eps).log().unwrap()).unwrap();
+    yield cross.mean().unwrap().neg().item();
+}

@@ -1,0 +1,434 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════════════════════╗
+ * ║                    NOVA NATIVE PYTHON INTEROP                               ║
+ * ║                                                                               ║
+ * ║  Seamless, zero-copy Python integration                                      ║
+ * ║  Week 23-24: Native Python Interop                                           ║
+ * ╚═══════════════════════════════════════════════════════════════════════════════╝
+ */
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PYTHON IMPORT SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Import Python module directly
+ * 
+ * Example:
+ *   let np = Python.import("numpy");
+ *   let arr = np.array([1, 2, 3]);
+ */
+data Python {
+    /**
+     * Import a Python module
+     */
+    @python_native
+    fn import(module_name: &str) -> PyModule {
+        __python_import(module_name)
+    }
+    
+    /**
+     * Execute Python code
+     */
+    @python_native
+    fn eval(code: &str) -> PyObject {
+        __python_eval(code)
+    }
+    
+    /**
+     * Run Python file
+     */
+    @python_native
+    fn run_file(path: &str) -> Result<(), PyError> {
+        __python_run_file(path)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PYTHON OBJECTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Generic Python object wrapper
+ */
+@python_object
+data PyObject {
+    ptr: *var c_void,  // PyObject*
+    
+    /**
+     * Call the object as a function
+     */
+    fn call(self, args: &[PyObject]) -> PyObject {
+        __python_call(self.ptr, args)
+    }
+    
+    /**
+     * Get attribute
+     */
+    fn getattr(self, name: &str) -> PyObject {
+        __python_getattr(self.ptr, name)
+    }
+    
+    /**
+     * Set attribute
+     */
+    fn setattr(self, name: &str, value: PyObject) {
+        __python_setattr(self.ptr, name, value)
+    }
+    
+    /**
+     * Convert to Nova alias
+     */
+    fn to_i64(self) -> Result<i64, PyError> {
+        __python_to_i64(self.ptr)
+    }
+    
+    fn to_f64(self) -> Result<f64, PyError> {
+        __python_to_f64(self.ptr)
+    }
+    
+    fn to_string(self) -> Result<String, PyError> {
+        __python_to_string(self.ptr)
+    }
+}
+
+impl Drop for PyObject {
+    fn drop(&var self) {
+        __python_decref(self.ptr);
+    }
+}
+
+/**
+ * Python module
+ */
+@python_object
+data PyModule {
+    obj: PyObject,
+    
+    /**
+     * Get function from module
+     */
+    fn get_function(self, name: &str) -> PyFunction {
+        PyFunction { obj: self.obj.getattr(name) }
+    }
+    
+    /**
+     * Get class from module
+     */
+    fn get_class(self, name: &str) -> PyClass {
+        PyClass { obj: self.obj.getattr(name) }
+    }
+}
+
+/**
+ * Python function
+ */
+@python_object
+data PyFunction {
+    obj: PyObject,
+    
+    /**
+     * Call with arguments
+     */
+    fn call(self, args: &[PyObject]) -> PyObject {
+        self.obj.call(args)
+    }
+}
+
+/**
+ * Python class
+ */
+@python_object
+data PyClass {
+    obj: PyObject,
+    
+    /**
+     * Instantiate class
+     */
+    fn new(self, args: &[PyObject]) -> PyObject {
+        self.obj.call(args)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ZERO-COPY ARRAY INTEROP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * NumPy array wrapper with zero-copy access
+ */
+@python_object
+data PyArray<T> {
+    obj: PyObject,
+    data: *var T,
+    data: Vec<usize>,
+    strides: Vec<isize>,
+    
+    /**
+     * Create from Nova slice (zero-copy!)
+     */
+    fn from_slice(data: &[T]) -> Self {
+        __python_array_from_slice(data)
+    }
+    
+    /**
+     * Create from Nova slice (mutable, zero-copy!)
+     */
+    fn from_slice_mut(data: &var [T]) -> Self {
+        __python_array_from_slice_mut(data)
+    }
+    
+    /**
+     * Get as Nova slice (zero-copy!)
+     */
+    fn as_slice(&self) -> &[T] {
+        unsafe {
+            std::slice::from_raw_parts(self.data, self.len())
+        }
+    }
+    
+    /**
+     * Get as mutable Nova slice (zero-copy!)
+     */
+    fn as_slice_mut(&var self) -> &var [T] {
+        unsafe {
+            std::slice::from_raw_parts_mut(self.data, self.len())
+        }
+    }
+    
+    /**
+     * Total number of elements
+     */
+    fn len(&self) -> usize {
+        self.data.iter().product()
+    }
+    
+    /**
+     * Get element at index
+     */
+    fn get(&self, index: &[usize]) -> Option<&T> {
+        let offset = self.compute_offset(index)?;
+        unsafe {
+            Some(&*self.data.offset(offset))
+        }
+    }
+    
+    fn compute_offset(&self, index: &[usize]) -> Option<isize> {
+        check index.len() != self.data.len() {
+            yield None;
+        }
+        
+        var offset: isize = 0;
+        each i in 0..index.len() {
+            check index[i] >= self.data[i] {
+                yield None;
+            }
+            offset += (index[i] as isize) * self.strides[i];
+        }
+        
+        Some(offset)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONVERSION TRAITS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Convert Nova types to Python
+ */
+rules ToPython {
+    fn to_python(self) -> PyObject;
+}
+
+impl ToPython for i64 {
+    fn to_python(self) -> PyObject {
+        __python_from_i64(self)
+    }
+}
+
+impl ToPython for f64 {
+    fn to_python(self) -> PyObject {
+        __python_from_f64(self)
+    }
+}
+
+impl ToPython for String {
+    fn to_python(self) -> PyObject {
+        __python_from_string(&self)
+    }
+}
+
+impl<T> ToPython for Vec<T> where T: ToPython {
+    fn to_python(self) -> PyObject {
+        let py_list = __python_list_new();
+        each item in self {
+            __python_list_append(py_list, item.to_python());
+        }
+        py_list
+    }
+}
+
+/**
+ * Convert Python types to Nova
+ */
+rules FromPython: Sized {
+    fn from_python(obj: PyObject) -> Result<Self, PyError>;
+}
+
+impl FromPython for i64 {
+    fn from_python(obj: PyObject) -> Result<Self, PyError> {
+        obj.to_i64()
+    }
+}
+
+impl FromPython for f64 {
+    fn from_python(obj: PyObject) -> Result<Self, PyError> {
+        obj.to_f64()
+    }
+}
+
+impl FromPython for String {
+    fn from_python(obj: PyObject) -> Result<Self, PyError> {
+        obj.into()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXAMPLES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Example 1: Use NumPy from Nova
+ */
+fn use_numpy() {
+    // Import numpy
+    let np = Python.import("numpy");
+    
+    // Create array
+    let arr = np.array([1.0, 2.0, 3.0, 4.0]);
+    
+    // Call numpy functions
+    let mean = np.mean(arr);
+    let std = np.std(arr);
+    
+    println("Mean: {}, Std: {}", mean, std);
+}
+
+/**
+ * Example 2: Zero-copy array sharing
+ */
+fn zero_copy_example() {
+    // Nova array
+    var data = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+    
+    // Share with Python (zero-copy!)
+    let py_array = PyArray::from_slice_mut(&var data);
+    
+    // Python can now modify the array
+    let np = Python.import("numpy");
+    np.multiply(py_array, 2.0, out=py_array);  // In-place multiply
+    
+    // Changes visible in Nova!
+    println("Modified data: {:?}", data);  // [2.0, 4.0, 6.0, 8.0, 10.0]
+}
+
+/**
+ * Example 3: Call Python ML library
+ */
+fn call_sklearn() {
+    use std::python::*;
+    
+    // Import scikit-learn
+    let sklearn = Python.import("sklearn.linear_model");
+    
+    // Create model
+    let LinearRegression = sklearn.get_class("LinearRegression");
+    let model = LinearRegression.new(&[]);
+    
+    // Training data (zero-copy!)
+    let X = [[1.0], [2.0], [3.0], [4.0]];
+    let y = [2.0, 4.0, 6.0, 8.0];
+    
+    let X_py = PyArray::from_slice(&X);
+    let y_py = PyArray::from_slice(&y);
+    
+    // Train model
+    model.call("fit", &[X_py.obj, y_py.obj]);
+    
+    // Predict
+    let X_test = PyArray::from_slice(&[[5.0]]);
+    let prediction = model.call("predict", &[X_test.obj]);
+    
+    println("Prediction: {}", prediction);
+}
+
+/**
+ * Example 4: Matplotlib visualization
+ */
+fn plot_with_matplotlib() {
+    let plt = Python.import("matplotlib.pyplot");
+    
+    // Generate data in Nova
+    let x: Vec<f64> = (0..100).map(|i| i as f64 * 0.1).collect();
+    let y: Vec<f64> = x.iter().map(|&xi| xi.sin()).collect();
+    
+    // Plot (zero-copy!)
+    plt.plot(PyArray::from_slice(&x), PyArray::from_slice(&y));
+    plt.title("Sine Wave");
+    plt.show();
+}
+
+/**
+ * Example 5: Pandas DataFrame
+ */
+fn use_pandas() {
+    let pd = Python.import("pandas");
+    
+    // Create DataFrame from Nova data
+    let data = hashmap! {
+        "name" => ["Alice", "Bob", "Charlie"],
+        "age" => [25, 30, 35],
+        "salary" => [50000, 60000, 70000]
+    };
+    
+    let df = pd.DataFrame(data.to_python());
+    
+    // Pandas operations
+    let mean_salary = df["salary"].mean();
+    println("Mean salary: {}", mean_salary);
+    
+    // Filter
+    let high_earners = df[df["salary"] > 55000];
+    println("{}", high_earners);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PERFORMANCE COMPARISON
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Benchmark: Nova vs Python vs NumPy
+ */
+fn benchmark_array_ops() {
+    let size = 1_000_000;
+    
+    // Nova native
+    let start = Instant::now();
+    let a: Vec<f64> = (0..size).map(|i| i as f64).collect();
+    let b: Vec<f64> = (0..size).map(|i| (i * 2) as f64).collect();
+    let c: Vec<f64> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
+    let nova_time = start.elapsed();
+    
+    // NumPy (via Nova)
+    let np = Python.import("numpy");
+    let start = Instant::now();
+    let a_np = np.arange(size);
+    let b_np = np.arange(0, size * 2, 2);
+    let c_np = a_np + b_np;
+    let numpy_time = start.elapsed();
+    
+    println("Nova: {:?}", nova_time);
+    println("NumPy:  {:?}", numpy_time);
+    println("Speedup: {:.2}x", numpy_time.as_secs_f64() / nova_time.as_secs_f64());
+}

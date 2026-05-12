@@ -1,0 +1,670 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova  —  LEXER  v10.1  (Stage-0 Compatible)                               ║
+// ║                                                                              ║
+// ║  Stage-0 uyumluluk notları:                                                 ║
+// ║    · Char literal ('x') yerine codepoint sabitleri kullanılır               ║
+// ║    · Closure (|c| ...) yerine match + imperative blok kullanılır            ║
+// ║    · .map().unwrap_or() zinciri açık match bloklarına çevrildi              ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use crate::frontend::tokens::{Token, TokenKind, build_keyword_map};
+use crate::frontend::errors::LexError;
+use std::collections::HashMap;
+
+// ── Char codepoint sabitleri (Stage-0 char literal yerine) ───────────────────
+// Stage-0 C lexer'ı .zn dosyasındaki 'x' char literallarını TOKEN_UNKNOWN
+// olarak ürettiği için, tüm karakter karşılaştırmalarını u32 codepoint ile yapıyoruz.
+
+const CP_NL:     u32 = 10;   // '\n'
+const CP_TAB:    u32 = 9;    // '\t'
+const CP_CR:     u32 = 13;   // '\r'
+const CP_SPACE:  u32 = 32;   // ' '
+const CP_BANG:   u32 = 33;   // '!'
+const CP_QUOT:   u32 = 34;   // '"'
+const CP_HASH:   u32 = 35;   // '#'
+const CP_PRCNT:  u32 = 37;   // '%'
+const CP_AMP:    u32 = 38;   // '&'
+const CP_APOS:   u32 = 39;   // '\''  (tek tırnak)
+const CP_LPAREN: u32 = 40;   // '('
+const CP_RPAREN: u32 = 41;   // ')'
+const CP_STAR:   u32 = 42;   // '*'
+const CP_PLUS:   u32 = 43;   // '+'
+const CP_COMMA:  u32 = 44;   // ','
+const CP_MINUS:  u32 = 45;   // '-'
+const CP_DOT:    u32 = 46;   // '.'
+const CP_SLASH:  u32 = 47;   // '/'
+const CP_0:      u32 = 48;   // '0'
+const CP_9:      u32 = 57;   // '9'
+const CP_COLON:  u32 = 58;   // ':'
+const CP_SEMI:   u32 = 59;   // ';'
+const CP_LT:     u32 = 60;   // '<'
+const CP_EQ:     u32 = 61;   // '='
+const CP_GT:     u32 = 62;   // '>'
+const CP_QUEST:  u32 = 63;   // '?'
+const CP_AT:     u32 = 64;   // '@'
+const CP_A_UP:   u32 = 65;   // 'A'
+const CP_B_UP:   u32 = 66;   // 'B'
+const CP_E_UP:   u32 = 69;   // 'E'
+const CP_F_UP:   u32 = 70;   // 'F'
+const CP_X_UP:   u32 = 88;   // 'X'
+const CP_Z_UP:   u32 = 90;   // 'Z'
+const CP_LBRACK: u32 = 91;   // '['
+const CP_BSLASH: u32 = 92;   // '\\'
+const CP_RBRACK: u32 = 93;   // ']'
+const CP_CARET:  u32 = 94;   // '^'
+const CP_UNDER:  u32 = 95;   // '_'
+const CP_a:      u32 = 97;   // 'a'
+const CP_b:      u32 = 98;   // 'b'
+const CP_e:      u32 = 101;  // 'e'
+const CP_f:      u32 = 102;  // 'f'
+const CP_n:      u32 = 110;  // 'n'
+const CP_r:      u32 = 114;  // 'r'
+const CP_t:      u32 = 116;  // 't'
+const CP_x:      u32 = 120;  // 'x'
+const CP_z:      u32 = 122;  // 'z'
+const CP_LBRACE: u32 = 123;  // '{'
+const CP_PIPE:   u32 = 124;  // '|'
+const CP_RBRACE: u32 = 125;  // '}'
+const CP_TILDE:  u32 = 126;  // '~'
+
+// Unicode özel semboller
+const CP_DEG:    u32 = 0x00B0;  // °
+const CP_SUP2:   u32 = 0x00B2;  // ²
+const CP_SUP3:   u32 = 0x00B3;  // ³
+const CP_MICRO:  u32 = 0x03BC;  // μ
+const CP_OHM:    u32 = 0x03A9;  // Ω
+const CP_ANGST:  u32 = 0x212B;  // Å
+const CP_INTEG:  u32 = 0x222B;  // ∫
+const CP_PARTIAL:u32 = 0x2202;  // ∂
+const CP_SIGMA:  u32 = 0x2211;  // ∑
+const CP_PI:     u32 = 0x220F;  // ∏
+const CP_NABLA:  u32 = 0x2207;  // ∇
+const CP_APPROX: u32 = 0x2248;  // ≈
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §1  LEXER DURUMU
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data Lexer {
+    source:   Vec<char>,
+    pos:      i64,
+    line:     i64,
+    col:      i64,
+    keywords: HashMap<String, TokenKind>,
+}
+
+impl Lexer {
+
+    open fn new(source: String) -> Lexer {
+        Lexer {
+            source:   source.chars().collect(),
+            pos:      0,
+            line:     1,
+            col:      1,
+            keywords: build_keyword_map(),
+        }
+    }
+
+    // ── Temel İmleç Yardımcıları ─────────────────────────────────────────────
+
+    fn cur(&self) -> Option<char> {
+        check (self.pos as usize) < self.source.len() {
+            Some(self.source[self.pos as usize]);
+        }
+        yield None;
+    }
+
+    fn peek(&self) -> Option<char> {
+        let next = (self.pos + 1) as usize;
+        check next < self.source.len() {
+            Some(self.source[next]);
+        }
+        yield None;
+    }
+
+    fn peek2(&self) -> Option<char> {
+        let next = (self.pos + 2) as usize;
+        check next < self.source.len() {
+            Some(self.source[next]);
+        }
+        yield None;
+    }
+
+    fn advance(&var self) -> Option<char> {
+        let ch = self.cur()?;
+        check (ch as u32) == CP_NL {
+            self.line = self.line + 1;
+            self.col  = 1;
+        } else {
+            self.col = self.col + 1;
+        }
+        self.pos = self.pos + 1;
+        Some(ch);
+    }
+
+    fn advance_if(&var self, expected: u32) -> bool {
+        match self.cur() {
+            Some(ch) => {
+                check (ch as u32) == expected {
+                    self.advance();
+                    yield true;
+                }
+            }
+            None => {}
+        }
+        yield false;
+    }
+
+    fn span(&self) -> (i64, i64) { yield (self.line, self.col); }
+
+    // ── Boşluk & Yorum ───────────────────────────────────────────────────────
+
+    fn skip_whitespace(&var self) {
+        while let Some(ch) = self.cur() {
+            check ch.is_whitespace() { self.advance(); }
+            else { abort; }
+        }
+    }
+
+    fn skip_line_comment(&var self) {
+        while let Some(ch) = self.cur() {
+            self.advance();
+            check (ch as u32) == CP_NL { abort; }
+        }
+    }
+
+    fn skip_block_comment(&var self) -> Result<(), LexError> {
+        let (line, col) = self.span();
+        var depth: i64 = 1;
+        while let Some(ch) = self.cur() {
+            self.advance();
+            check (ch as u32) == CP_SLASH {
+                match self.cur() {
+                    Some(nx) => {
+                        check (nx as u32) == CP_STAR {
+                            self.advance(); depth = depth + 1;
+                        }
+                    }
+                    None => {}
+                }
+            } else check (ch as u32) == CP_STAR {
+                match self.cur() {
+                    Some(nx) => {
+                        check (nx as u32) == CP_SLASH {
+                            self.advance(); depth = depth - 1;
+                            check depth == 0 { yield Ok(()); }
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+        Err(LexError::new("Bitmemiş blok yorum".into(), line, col));
+    }
+
+    // ── Tanımlayıcı / Keyword ─────────────────────────────────────────────────
+
+    fn read_ident(&var self) -> String {
+        var buf = String::new();
+        while let Some(ch) = self.cur() {
+            check is_ident_continue(ch) {
+                buf.push(ch); self.advance();
+            } else { abort; }
+        }
+        yield buf;
+    }
+
+    // ── Birimli Literal  5.kg  3.14.m/s²  ───────────────────────────────────
+
+    fn try_read_unit(&var self) -> Option<String> {
+        // Şu anki pozisyon '.' olmalı
+        match self.cur() {
+            Some(ch) => {
+                check (ch as u32) != CP_DOT { yield None; }
+            }
+            None => { yield None; }
+        }
+        // Dot'tan sonra identifier başlamalı
+        match self.peek() {
+            Some(nx) => {
+                check !is_ident_start(nx) && (nx as u32) != CP_DEG { yield None; }
+            }
+            None => { yield None; }
+        }
+        // Dot'u tüket
+        self.advance();
+        var unit = String::new();
+        while let Some(ch) = self.cur() {
+            check is_unit_char(ch) {
+                unit.push(ch); self.advance();
+            } else { abort; }
+        }
+        check unit.is_empty() { yield None; }
+        Some(unit);
+    }
+
+    // ── Sayı Literalleri ─────────────────────────────────────────────────────
+
+    fn read_number(&var self, first: char) -> Result<Token, LexError> {
+        let (line, col) = (self.line, self.col - 1);
+        var buf = first.into();
+        var is_float = false;
+        let first_cp = first as u32;
+
+        // Hex  0x... / 0X...
+        check first_cp == CP_0 {
+            match self.cur() {
+                Some(nx) => {
+                    check (nx as u32) == CP_x || (nx as u32) == CP_X {
+                        buf.push(self.advance().unwrap());
+                        while let Some(ch) = self.cur() {
+                            check ch.is_ascii_hexdigit() || (ch as u32) == CP_UNDER {
+                                buf.push(ch); self.advance();
+                            } else { abort; }
+                        }
+                        Ok(Token::new(TokenKind::LitInt, buf, line, col));
+                    }
+                    // Binary  0b... / 0B...
+                    check (nx as u32) == CP_b || (nx as u32) == CP_B {
+                        buf.push(self.advance().unwrap());
+                        while let Some(ch) = self.cur() {
+                            let cp = ch as u32;
+                            check cp == 48 || cp == 49 || cp == CP_UNDER {
+                                buf.push(ch); self.advance();
+                            } else { abort; }
+                        }
+                        Ok(Token::new(TokenKind::LitInt, buf, line, col));
+                    }
+                }
+                None => {}
+            }
+        }
+
+        // Decimal / float
+        while let Some(ch) = self.cur() {
+            let cp = ch as u32;
+            check ch.is_ascii_digit() || cp == CP_UNDER {
+                buf.push(ch); self.advance();
+            } else check cp == CP_DOT && !is_float {
+                // Peek: sonraki karakter rakam mı?
+                var is_decimal = false;
+                match self.peek() {
+                    Some(nx) => {
+                        check nx.is_ascii_digit() { is_decimal = true; }
+                    }
+                    None => {}
+                }
+                check is_decimal {
+                    is_float = true;
+                    buf.push(ch); self.advance();
+                } else { abort; }
+            } else check cp == CP_e || cp == CP_E {
+                is_float = true;
+                buf.push(ch); self.advance();
+                match self.cur() {
+                    Some(sign) => {
+                        let scp = sign as u32;
+                        check scp == CP_PLUS || scp == CP_MINUS {
+                            buf.push(self.advance().unwrap());
+                        }
+                    }
+                    None => {}
+                }
+            } else { abort; }
+        }
+
+        // Birimli literal kontrolü: sayının ardından '.' ve identifier
+        match self.try_read_unit() {
+            Some(unit) => {
+                let combined = format("{}:{}", buf, unit);
+                Ok(Token::new(TokenKind::LitFloat, combined, line, col));
+            }
+            None => {}
+        }
+
+        check is_float {
+            Ok(Token::new(TokenKind::LitFloat, buf, line, col));
+        }
+        Ok(Token::new(TokenKind::LitInt, buf, line, col));
+    }
+
+    // ── String Literalleri ────────────────────────────────────────────────────
+
+    fn read_string(&var self) -> Result<Token, LexError> {
+        let (line, col) = self.span();
+
+        // Çok satırlı string  """..."""
+        var is_triple = false;
+        match self.cur() {
+            Some(c1) => {
+                check (c1 as u32) == CP_QUOT {
+                    match self.peek() {
+                        Some(c2) => {
+                            check (c2 as u32) == CP_QUOT {
+                                is_triple = true;
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+            None => {}
+        }
+        check is_triple {
+            self.advance(); self.advance();
+            yield self.read_multiline_string(line, col);
+        }
+
+        var buf = String::new();
+        loop {
+            match self.cur() {
+                None => { yield Err(LexError::new("Bitmemiş string".into(), line, col)); }
+                Some(ch) => {
+                    let cp = ch as u32;
+                    check cp == CP_QUOT { self.advance(); abort; }
+                    else check cp == CP_BSLASH {
+                        self.advance();
+                        match self.advance() {
+                            Some(esc) => {
+                                let ecp = esc as u32;
+                                check ecp == CP_n    { buf.push_cp(CP_NL); }
+                                else check ecp == CP_t    { buf.push_cp(CP_TAB); }
+                                else check ecp == CP_r    { buf.push_cp(CP_CR); }
+                                else check ecp == CP_BSLASH { buf.push(esc); }
+                                else check ecp == CP_QUOT { buf.push(esc); }
+                                else check ecp == CP_0    { buf.push_cp(0); }
+                                else { buf.push(esc); }
+                            }
+                            None => {
+                                Err(LexError::new("Beklenmeyen EOF".into(), line, col));
+                            }
+                        }
+                    }
+                    else { buf.push(ch); self.advance(); }
+                }
+            }
+        }
+        Ok(Token::new(TokenKind::LitStr, buf, line, col));
+    }
+
+    fn read_multiline_string(&var self, line: i64, col: i64) -> Result<Token, LexError> {
+        var buf = String::new();
+        loop {
+            // """  kapanışını kontrol et
+            var is_close = false;
+            match self.cur() {
+                Some(c1) => {
+                    check (c1 as u32) == CP_QUOT {
+                        match self.peek() {
+                            Some(c2) => {
+                                check (c2 as u32) == CP_QUOT {
+                                    match self.peek2() {
+                                        Some(c3) => {
+                                            check (c3 as u32) == CP_QUOT {
+                                                is_close = true;
+                                            }
+                                        }
+                                        None => {}
+                                    }
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                None => {}
+            }
+            check is_close {
+                self.advance(); self.advance(); self.advance();
+                abort;
+            }
+            match self.advance() {
+                None    => { yield Err(LexError::new("Bitmemiş çok satırlı string".into(), line, col)); }
+                Some(c) => { buf.push(c); }
+            }
+        }
+        Ok(Token::new(TokenKind::LitStr, buf, line, col));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // §2  ANA TOKENİZATÖR
+    // ══════════════════════════════════════════════════════════════════════════
+
+    open fn tokenize(&var self) -> Result<Vec<Token>, LexError> {
+        var tokens: Vec<Token> = [];
+
+        loop {
+            self.skip_whitespace();
+            check self.cur().is_none() { abort; }
+
+            let (line, col) = self.span();
+            let ch = self.cur().unwrap();
+            let cp = ch as u32;
+
+            // ── Yorumlar ──────────────────────────────────────────────────────
+            check cp == CP_SLASH {
+                match self.peek() {
+                    Some(nx) => {
+                        check (nx as u32) == CP_SLASH {
+                            self.advance(); self.advance();
+                            self.skip_line_comment();
+                            next;
+                        }
+                        check (nx as u32) == CP_STAR {
+                            self.advance(); self.advance();
+                            self.skip_block_comment()?;
+                            next;
+                        }
+                    }
+                    None => {}
+                }
+            }
+
+            // ── Unicode Matematik Semboller ───────────────────────────────────
+            check cp == CP_INTEG {
+                self.advance();
+                tokens.push(Token::new(TokenKind::Integral, "∫".into(), line, col));
+                next;
+            }
+            check cp == CP_PARTIAL {
+                self.advance();
+                tokens.push(Token::new(TokenKind::Diff, "∂".into(), line, col));
+                next;
+            }
+            check cp == CP_SIGMA {
+                self.advance();
+                tokens.push(Token::new(TokenKind::Sum, "∑".into(), line, col));
+                next;
+            }
+            check cp == CP_PI {
+                self.advance();
+                tokens.push(Token::new(TokenKind::Prod, "∏".into(), line, col));
+                next;
+            }
+            check cp == CP_NABLA {
+                self.advance();
+                tokens.push(Token::new(TokenKind::Grad, "∇".into(), line, col));
+                next;
+            }
+            check cp == CP_APPROX {
+                self.advance();
+                tokens.push(Token::new(TokenKind::Tilde, "≈".into(), line, col));
+                next;
+            }
+
+            // ── String ────────────────────────────────────────────────────────
+            check cp == CP_QUOT {
+                self.advance();
+                tokens.push(self.read_string()?);
+                next;
+            }
+
+            // ── Tanımlayıcı & Keyword ─────────────────────────────────────────
+            check is_ident_start(ch) {
+                self.advance();
+                var ident = ch.into();
+                ident.push_str(&self.read_ident());
+                // keyword lookup — closure olmadan
+                var kind = TokenKind::Ident;
+                match self.keywords.get(&ident) {
+                    Some(k) => { kind = *k; }
+                    None    => {}
+                }
+                tokens.push(Token::new(kind, ident, line, col));
+                next;
+            }
+
+            // ── Sayı ──────────────────────────────────────────────────────────
+            check ch.is_ascii_digit() {
+                self.advance();
+                tokens.push(self.read_number(ch)?);
+                next;
+            }
+
+            // ── Operatörler & Noktalama ───────────────────────────────────────
+            self.advance();
+
+            let tok = match cp {
+
+                CP_EQ => {
+                    check self.advance_if(CP_EQ)  { Token::new(TokenKind::EqEq,     "==".into(), line, col) }
+                    else check self.advance_if(CP_GT)  { Token::new(TokenKind::FatArrow, "=>".into(), line, col) }
+                    else { Token::new(TokenKind::Assign, "=".into(), line, col) }
+                },
+
+                CP_BANG => {
+                    check self.advance_if(CP_EQ) { Token::new(TokenKind::NotEq, "!=".into(), line, col) }
+                    else { Token::new(TokenKind::Not, "!".into(), line, col) }
+                },
+
+                CP_LT => {
+                    check self.advance_if(CP_EQ) { Token::new(TokenKind::Lte, "<=".into(), line, col) }
+                    else check self.advance_if(CP_LT) { Token::new(TokenKind::Shl, "<<".into(), line, col) }
+                    else { Token::new(TokenKind::Lt, "<".into(), line, col) }
+                },
+
+                CP_GT => {
+                    check self.advance_if(CP_EQ) { Token::new(TokenKind::Gte, ">=".into(), line, col) }
+                    else check self.advance_if(CP_GT) { Token::new(TokenKind::Shr, ">>".into(), line, col) }
+                    else { Token::new(TokenKind::Gt, ">".into(), line, col) }
+                },
+
+                CP_PLUS => {
+                    check self.advance_if(CP_EQ) { Token::new(TokenKind::PlusEq, "+=".into(), line, col) }
+                    else { Token::new(TokenKind::Plus, "+".into(), line, col) }
+                },
+
+                CP_MINUS => {
+                    check self.advance_if(CP_EQ) { Token::new(TokenKind::MinusEq, "-=".into(), line, col) }
+                    else check self.advance_if(CP_GT) { Token::new(TokenKind::Arrow, "->".into(), line, col) }
+                    else { Token::new(TokenKind::Minus, "-".into(), line, col) }
+                },
+
+                CP_STAR => {
+                    check self.advance_if(CP_EQ)   { Token::new(TokenKind::StarEq, "*=".into(), line, col) }
+                    else check self.advance_if(CP_STAR) { Token::new(TokenKind::Power, "**".into(), line, col) }
+                    else { Token::new(TokenKind::Star, "*".into(), line, col) }
+                },
+
+                CP_SLASH => {
+                    check self.advance_if(CP_EQ) { Token::new(TokenKind::SlashEq, "/=".into(), line, col) }
+                    else { Token::new(TokenKind::Slash, "/".into(), line, col) }
+                },
+
+                CP_AT     => Token::new(TokenKind::At,      "@".into(), line, col),
+                CP_PRCNT  => Token::new(TokenKind::Percent,  "%".into(), line, col),
+                CP_TILDE  => Token::new(TokenKind::Tilde,   "~".into(), line, col),
+
+                CP_AMP => {
+                    check self.advance_if(CP_AMP) { Token::new(TokenKind::And,    "&&".into(), line, col) }
+                    else { Token::new(TokenKind::BitAnd, "&".into(), line, col) }
+                },
+
+                CP_PIPE => {
+                    check self.advance_if(CP_PIPE) { Token::new(TokenKind::Or,   "||".into(), line, col) }
+                    else check self.advance_if(CP_GT) { Token::new(TokenKind::Pipe, "|>".into(), line, col) }
+                    else { Token::new(TokenKind::BitOr, "|".into(), line, col) }
+                },
+
+                CP_CARET => Token::new(TokenKind::BitXor, "^".into(), line, col),
+
+                CP_COLON => {
+                    check self.advance_if(CP_COLON) { Token::new(TokenKind::ColonColon, "::".into(), line, col) }
+                    else check self.advance_if(CP_EQ) { Token::new(TokenKind::Walrus, ":=".into(), line, col) }
+                    else { Token::new(TokenKind::Colon, ":".into(), line, col) }
+                },
+
+                CP_DOT => {
+                    check self.advance_if(CP_DOT) {
+                        check self.advance_if(CP_EQ) { Token::new(TokenKind::DotDotEq, "..=".into(), line, col) }
+                        else { Token::new(TokenKind::DotDot, "..".into(), line, col) }
+                    }
+                    else { Token::new(TokenKind::Dot, ".".into(), line, col) }
+                },
+
+                CP_LPAREN => Token::new(TokenKind::LParen,  "(".into(),  line, col),
+                CP_RPAREN => Token::new(TokenKind::RParen,  ")".into(),  line, col),
+                CP_LBRACE => Token::new(TokenKind::LBrace,  "{".into(),  line, col),
+                CP_RBRACE => Token::new(TokenKind::RBrace,  "}".into(),  line, col),
+                CP_LBRACK => Token::new(TokenKind::LBrack,  "[".into(),  line, col),
+                CP_RBRACK => Token::new(TokenKind::RBrack,  "]".into(),  line, col),
+                CP_COMMA  => Token::new(TokenKind::Comma,   ",".into(),  line, col),
+                CP_SEMI   => Token::new(TokenKind::Semi,    ";".into(),  line, col),
+                CP_QUEST  => Token::new(TokenKind::Question,"?".into(),  line, col),
+                CP_HASH   => Token::new(TokenKind::Hash,    "#".into(),  line, col),
+
+                other => {
+                    Err(LexError::new(
+                        format("Beklenmeyen karakter (cp={})", other), line, col));
+                }
+            };
+
+            tokens.push(tok);
+        }
+
+        tokens.push(Token::eof(self.line, self.col));
+        Ok(tokens);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §3  UNICODE TANIMLAYICI KURALLARI
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn is_ident_start(ch: char) -> bool {
+    check ch.is_alphabetic() || (ch as u32) == CP_UNDER { yield true; }
+    let cp = ch as u32;
+    check cp >= 0x1F300 { yield true; }
+    check (cp >= 0x0370 && cp <= 0x03FF)
+       || (cp >= 0x2200 && cp <= 0x22FF)
+       || (cp >= 0x1D400 && cp <= 0x1D7FF)
+    { yield true; }
+    yield false;
+}
+
+fn is_ident_continue(ch: char) -> bool {
+    check ch.is_alphanumeric() || (ch as u32) == CP_UNDER { yield true; }
+    yield is_ident_start(ch);
+}
+
+fn is_unit_char(ch: char) -> bool {
+    check ch.is_alphabetic() || (ch as u32) == CP_UNDER { yield true; }
+    let cp = ch as u32;
+    check cp == CP_DEG
+       || cp == CP_SUP2
+       || cp == CP_SUP3
+       || cp == CP_MICRO
+       || cp == CP_OHM
+       || cp == CP_ANGST
+       || cp == CP_SLASH
+    { yield true; }
+    yield false;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §4  GİRİŞ NOKTASI
+// ══════════════════════════════════════════════════════════════════════════════
+
+open fn lex(source: String) -> Result<Vec<Token>, LexError> {
+    Lexer::new(source).tokenize()
+}

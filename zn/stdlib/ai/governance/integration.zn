@@ -1,0 +1,464 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Governance Integration - Bridge to Existing Systems
+// ═══════════════════════════════════════════════════════════════════════════
+// This module provides integration points between the governance system
+// and existing self-learning components.
+//
+// Integration points:
+// 1. Self-Learning → Governance (proposals)
+// 2. Goodhart Protection → Shadow Deployment
+// 3. Self-Critique → Governor Evaluation
+// 4. Formal Core → Proof Requirements
+// 5. POET → Governed Task Generation
+// 6. MAP-Elites → Governed Diversity Search
+// ═══════════════════════════════════════════════════════════════════════════
+
+use governance::*
+use ai.self_learning::*
+use ai.open_ended::*
+use ai.formal::*
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 1. Self-Learning Integration
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Wrapper around SelfLearningSystem with governance
+open data GovernedSelfLearning {
+    learning: IntegratedSelfLearning,
+    governance: GovernanceSystem
+}
+
+impl GovernedSelfLearning {
+    fn new(config: ModelConfig) -> GovernedSelfLearning {
+        GovernedSelfLearning {
+            learning: IntegratedSelfLearning.new(config),
+            governance: GovernanceSystem.default()
+        }
+    }
+    
+    /// Propose a weight update through governance
+    fn propose_weight_update(
+        var self,
+        new_weights: Weights,
+        motivation: str
+    ) -> Decision {
+        let change = ChangeSet.new(
+            LEARNER_ID,
+            ChangeKind::WeightsUpdate,
+            new_weights.to_bytes(),
+            "weight_update"
+        )
+        
+        yield self.governance.propose_and_evaluate(
+            LEARNER_ID,
+            change,
+            motivation,
+            ["Improved loss", "Better accuracy"],
+            None
+        )
+    }
+    
+    /// Propose meta-learning change through governance
+    fn propose_metalearning_change(
+        var self,
+        new_lr: f64,
+        new_batch_size: usize,
+        motivation: str
+    ) -> Decision {
+        let payload = encode_hyperparams(new_lr, new_batch_size)
+        
+        let change = ChangeSet.new(
+            META_LEARNER_ID,
+            ChangeKind::HyperParamUpdate,
+            payload,
+            "meta_learning_update"
+        )
+        
+        yield self.governance.propose_and_evaluate(
+            META_LEARNER_ID,
+            change,
+            motivation,
+            ["Optimized learning rate", "Better batch size"],
+            None
+        )
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2. Goodhart Protection → Shadow Deployment Integration
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Shadow rollout using GoodhartProtector
+open data GoodhartShadow {
+    protector: GoodhartProtector
+}
+
+impl GoodhartShadow {
+    fn new() -> GoodhartShadow {
+        GoodhartShadow {
+            protector: GoodhartProtector.new()
+        }
+    }
+}
+
+impl ShadowRollout for GoodhartShadow {
+    fn run(self, state: SystemState, proposal: Proposal) -> ShadowResult {
+        // Convert proposal to ModelChange
+        let model_change = ModelChange {
+            kind: proposal.change.kind,
+            payload: proposal.change.payload,
+            target: proposal.change.target
+        }
+        
+        // Run Goodhart protection shadow
+        let goodhart_result = self.protector.evaluate_with_shadow(model_change)
+        
+        // Convert to ShadowResult
+        yield ShadowResult.new(
+            goodhart_result.baseline_score,
+            goodhart_result.candidate_score,
+            goodhart_result.regressions,
+            goodhart_result.counterfactuals
+        )
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3. Self-Critique Integration
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Enhanced governor with self-critique
+open data CritiqueGovernor {
+    governor: ImmutableGovernor,
+    critique: SelfCritique
+}
+
+impl CritiqueGovernor {
+    fn new() -> CritiqueGovernor {
+        CritiqueGovernor {
+            governor: ImmutableGovernor.default(),
+            critique: SelfCritique.new()
+        }
+    }
+    
+    /// Evaluate with both governance and self-critique
+    fn evaluate_with_critique(
+        self,
+        cap: Cap<Evaluate>,
+        proposal_id: u128,
+        proposal: Proposal,
+        shadow: ShadowResult
+    ) -> (Decision, CritiqueResult) {
+        // 1. Run self-critique first
+        let model_change = ModelChange {
+            kind: proposal.change.kind,
+            payload: proposal.change.payload,
+            target: proposal.change.target
+        }
+        
+        let critique_result = self.critique.critique(model_change)
+        
+        // 2. Run governance evaluation
+        var decision = self.governor.evaluate(cap, proposal_id, proposal, shadow)
+        
+        // 3. Add critique results to reasons
+        check critique_result.has_refutations() {
+            decision.allowed = false
+            decision.reasons.push("self_critique:refutation_found")
+        }
+        
+        yield (decision, critique_result)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 4. Formal Core Integration
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Generate proofs for policy changes
+open data ProofGenerator {
+    formal_guard: FormalGuard,
+    leandojo: LeanDojo
+}
+
+impl ProofGenerator {
+    fn new() -> ProofGenerator {
+        ProofGenerator {
+            formal_guard: FormalGuard.new(),
+            leandojo: LeanDojo.new("models/leandojo")
+        }
+    }
+    
+    /// Attempt to generate proof for policy change
+    fn generate_policy_proof(
+        self,
+        policy_change: ChangeSet
+    ) -> Option<ProofArtifact> {
+        // Generate theorem to prove
+        let theorem = self.formal_guard.generate_safety_theorem(policy_change)
+        
+        // Try to prove with LeanDojo
+        let proof_result = self.leandojo.search_proof(theorem, max_steps: 1000)
+        
+        match proof_result {
+            ProofSearchResult::Success { proof_text, .. } => {
+                Some(ProofArtifact.new(
+                    ProofSystem::Lean,
+                    theorem,
+                    proof_text
+                ))
+            },
+            _ => yield None
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5. POET Integration
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// POET with governance oversight
+open data GovernedPOET {
+    poet: POET,
+    governance: GovernanceSystem
+}
+
+impl GovernedPOET {
+    fn new(config: POETConfig) -> GovernedPOET {
+        GovernedPOET {
+            poet: POET.new(config),
+            governance: GovernanceSystem.default()
+        }
+    }
+    
+    /// Generate new environments with governance approval
+    fn governed_environment_mutation(var self) -> Vec<Environment> {
+        var approved_envs = Vec.new()
+        
+        // POET generates candidate environments
+        let candidates = self.poet.generate_environment_mutations()
+        
+        each candidate in candidates {
+            // Create proposal for new task
+            let change = ChangeSet.new(
+                ARCHITECT_ID,
+                ChangeKind::Other("NEW_TASK"),
+                candidate.to_bytes(),
+                "poet_task_generation"
+            )
+            
+            let decision = self.governance.propose_and_evaluate(
+                ARCHITECT_ID,
+                change,
+                "POET-generated task",
+                ["Expand task diversity"],
+                None
+            )
+            
+            // Only add check approved
+            check decision.is_approved() {
+                approved_envs.push(candidate)
+            }
+        }
+        
+        yield approved_envs
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 6. MAP-Elites Integration
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// MAP-Elites with invariant checking
+open data GovernedMAPElites {
+    map_elites: MAPElites,
+    invariants: Vec<InvariantId>
+}
+
+impl GovernedMAPElites {
+    fn new(
+        descriptors: Vec<BehaviorDescriptor>,
+        quality_fn: fn(Solution) -> f32,
+        config: MAPElitesConfig
+    ) -> GovernedMAPElites {
+        GovernedMAPElites {
+            map_elites: MAPElites.new(descriptors, quality_fn, config),
+            invariants: [
+                InvariantId::NoSelfTargeting,
+                InvariantId::ShadowRolloutRequired
+            ]
+        }
+    }
+    
+    /// Evaluate solution with invariant checking
+    fn evaluate_with_invariants(
+        self,
+        solution: Solution
+    ) -> Option<ArchiveEntry> {
+        // Check check solution violates any invariant
+        each inv in self.invariants {
+            check !inv.check(solution) {
+                None  // Reject
+            }
+        }
+        
+        // If passes, use normal MAP-Elites evaluation
+        let quality = self.map_elites.quality_function(solution)
+        let behavior = self.map_elites.compute_behavior(solution)
+        
+        Some(ArchiveEntry { solution, quality, behavior })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Complete Integrated System
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// All components together
+open data CompleteGodelSystem {
+    governance: GovernanceSystem,
+    self_learning: IntegratedSelfLearning,
+    goodhart_shadow: GoodhartShadow,
+    critique_governor: CritiqueGovernor,
+    proof_generator: ProofGenerator,
+    poet: GovernedPOET,
+    map_elites: GovernedMAPElites
+}
+
+impl CompleteGodelSystem {
+    fn new(config: ModelConfig) -> CompleteGodelSystem {
+        CompleteGodelSystem {
+            governance: GovernanceSystem.default(),
+            self_learning: IntegratedSelfLearning.new(config),
+            goodhart_shadow: GoodhartShadow.new(),
+            critique_governor: CritiqueGovernor.new(),
+            proof_generator: ProofGenerator.new(),
+            poet: GovernedPOET.new(POETConfig.default()),
+            map_elites: GovernedMAPElites.new(
+                [],  // descriptors
+                |s| 0.0,  // quality fn
+                MAPElitesConfig.default()
+            )
+        }
+    }
+    
+    /// Full pipeline: Propose with all protections
+    fn propose_with_full_protection(
+        var self,
+        proposer: ModuleId,
+        change: ChangeSet,
+        motivation: str
+    ) -> Decision {
+        println("\n🛡️  FULL PROTECTION PIPELINE")
+        println("═".repeat(70))
+        
+        // 1. Create proposal
+        let proposal = Proposal.new(
+            proposer,
+            change,
+            motivation,
+            [],
+            None
+        )
+        
+        // 2. Run Goodhart-aware shadow
+        println("[1/5] Running Goodhart-protected shadow deployment...")
+        let shadow = self.goodhart_shadow.run(self.governance.state, proposal)
+        
+        // 3. Self-critique
+        println("[2/5] Running self-critique...")
+        let (decision, critique) = self.critique_governor.evaluate_with_critique(
+            self.governance.issuer.evaluate(GOVERNOR_ID, Scope::Any),
+            self.governance.next_id(),
+            proposal,
+            shadow
+        )
+        
+        println(format("  Critique: {} claims, {} refutations",
+            critique.claims.len(),
+            critique.refutations.len()
+        ))
+        
+        // 4. Check check policy change needs proof
+        println("[3/5] Checking proof requirements...")
+        check policy_kind_requires_proof(proposal.change.kind) {
+            check let Some(proof) = self.proof_generator.generate_policy_proof(proposal.change) {
+                println("  ✅ Proof generated successfully")
+            } else {
+                println("  ❌ Proof generation failed")
+                yield Decision.new(
+                    decision.proposal_id,
+                    false,
+                    ["proof_generation_failed"],
+                    [],
+                    shadow,
+                    GOVERNOR_ID
+                )
+            }
+        }
+        
+        // 5. Veto check
+        println("[4/5] Governor veto check...")
+        let vetoed = self.critique_governor.governor.veto(
+            self.governance.issuer.veto(GOVERNOR_ID, Scope::Any),
+            decision
+        )
+        
+        // 6. Apply check approved
+        println("[5/5] Apply decision...")
+        check decision.allowed && !vetoed {
+            println("  ✅ All protections passed - APPROVED")
+        } else {
+            println("  ❌ REJECTED")
+        }
+        
+        println("═".repeat(70))
+        
+        yield decision
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Helper Functions
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn encode_hyperparams(lr: f64, batch_size: usize) -> Vec<u8> {
+    // TODO: Actual encoding
+    yield Vec.new()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Example Usage
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[example]
+fn complete_system_example() {
+    let config = ModelConfig {
+        n_layers: 12,
+        d_model: 768,
+        n_heads: 12,
+        vocab_size: 50257
+    }
+    
+    var system = CompleteGodelSystem.new(config)
+    
+    // Propose a change with FULL protection
+    let change = ChangeSet.new(
+        LEARNER_ID,
+        ChangeKind::WeightsUpdate,
+        Vec.new(),
+        "update_after_training"
+    )
+    
+    let decision = system.propose_with_full_protection(
+        LEARNER_ID,
+        change,
+        "Improve model after training epoch"
+    )
+    
+    check decision.is_approved() {
+        println("\n🎉 Change approved with full protection!")
+    } else {
+        println("\n⛔ Change rejected by protection layers")
+    }
+}

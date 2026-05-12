@@ -1,0 +1,5 @@
+#ifndef NOVA_POLYMORPHISM_TAGS_H
+#define NOVA_POLYMORPHISM_TAGS_H
+
+#endif
+

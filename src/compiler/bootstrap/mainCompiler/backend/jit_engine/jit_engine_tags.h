@@ -1,0 +1,11 @@
+#ifndef NOVA_JIT_ENGINE_TAGS_H
+#define NOVA_JIT_ENGINE_TAGS_H
+
+/* OptLevel definition */
+#define NOVA_JIT_ENGINE_OPTLEVEL_O0 0
+#define NOVA_JIT_ENGINE_OPTLEVEL_O1 1
+#define NOVA_JIT_ENGINE_OPTLEVEL_O2 2
+#define NOVA_JIT_ENGINE_OPTLEVEL_O3 3
+
+#endif
+

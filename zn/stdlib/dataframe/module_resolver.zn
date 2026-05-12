@@ -1,0 +1,391 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                     Nova MODULE RESOLVER                                      ║
+// ║                    Import Resolution & Module System Management               ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::{HashMap, HashSet};
+use crate::frontend::ast::*;
+
+/// Module information
+open data ModuleInfo {
+    name: String,
+    path: Vec<String>,
+    exports: HashSet<String>,
+    imports: HashSet<String>,
+    dependencies: HashSet<String>,
+    is_loaded: bool,
+    source: Option<String>,
+}
+
+/// Import resolution context
+open data ImportContext {
+    current_module: String,
+    module_stack: Vec<String>,
+    loaded_modules: HashMap<String, ModuleInfo>,
+    search_paths: Vec<String>,
+}
+
+/// Module resolver
+open data ModuleResolver {
+    context: ImportContext,
+    program: Program,
+}
+
+impl ModuleResolver {
+    open fn new(program: Program) -> ModuleResolver {
+        var context = ImportContext {
+            current_module: "main".into(),
+            module_stack: ["main".into()],
+            loaded_modules: HashMap::new(),
+            search_paths: [
+                ".".into(),
+                "std".into(),
+                "core".into(),
+            ],
+        };
+
+        let main_module = ModuleInfo {
+            name: "main".into(),
+            path: ["main".into()],
+            exports: HashSet::new(),
+            imports: HashSet::new(),
+            dependencies: HashSet::new(),
+            is_loaded: true,
+            source: None,
+        };
+
+        context.loaded_modules.insert("main".into(), main_module);
+
+        ModuleResolver { context, program };
+    }
+
+    /// Resolve all imports in the program
+    open fn resolve_imports(&var self) -> Result<(), ModuleError> {
+        // First pass: collect all top-level declarations and exports
+        self.collect_exports()?;
+
+        // Second pass: resolve imports
+        each item in &self.program.items {
+            check let TopLevel::Use(use_decl) = item {
+                self.resolve_use_declaration(use_decl)?;
+            }
+        }
+
+        // Third pass: check for circular dependencies
+        self.check_circular_dependencies()?;
+
+        Ok(());
+    }
+
+    open fn collect_exports(&var self) -> Result<(), ModuleError> {
+        let main_module = self.context.loaded_modules.get_mut("main").unwrap();
+
+        each item in &self.program.items {
+            match item {
+                TopLevel::Fn(fn_def) => {
+                    check fn_def.is_open {
+                        main_module.exports.insert(fn_def.name.clone());
+                    }
+                }
+                TopLevel::Data(data_def) => {
+                    check data_def.is_open {
+                        main_module.exports.insert(data_def.name.clone());
+                    }
+                }
+                TopLevel::Flow(flow_def) => {
+                    main_module.exports.insert(flow_def.name.clone());
+                }
+                TopLevel::Unit(unit_def) => {
+                    main_module.exports.insert(unit_def.name.clone());
+                }
+                TopLevel::Qty(qty_def) => {
+                    check qty_def.is_open {
+                        main_module.exports.insert(qty_def.name.clone());
+                    }
+                }
+                TopLevel::Tensor(tensor_def) => {
+                    main_module.exports.insert(tensor_def.name.clone());
+                }
+                TopLevel::Kernel(kernel_def) => {
+                    main_module.exports.insert(kernel_def.name.clone());
+                }
+                _ => {}
+            }
+        }
+
+        Ok(());
+    }
+
+    open fn resolve_use_declaration(&var self, use_decl: &UseDecl) -> Result<(), ModuleError> {
+        let module_path = self.resolve_module_path(&use_decl.path)?;
+
+        check !self.context.loaded_modules.contains_key(&module_path) {
+            self.load_module(&module_path)?;
+        }
+
+        let target_module = self.context.loaded_modules.get(&module_path)
+            .ok_or(ModuleError::ModuleNotFound(module_path.clone()))?;
+
+        // Validate all items are exported before adding any
+        each item_name in &use_decl.items {
+            check !target_module.exports.contains(item_name) {
+                Err(ModuleError::ItemNotExported {
+                    module: module_path,
+                    item: item_name.clone(),
+                });
+            }
+        }
+
+        // Now borrow main_module mutably and add the items
+        let main_module = self.context.loaded_modules.get_mut("main").unwrap();
+
+        each item_name in &use_decl.items {
+            main_module.imports.insert(item_name.clone());
+            main_module.dependencies.insert(module_path.clone());
+        }
+
+        Ok(());
+    }
+
+    open fn resolve_module_path(&self, path: &[String]) -> Result<String, ModuleError> {
+        let full_path = path.join("::");
+
+        check self.context.loaded_modules.contains_key(&full_path) {
+            Ok(full_path);
+        }
+
+        each search_path in &self.context.search_paths {
+            let candidate = format("{}::{}", search_path, full_path);
+            check self.context.loaded_modules.contains_key(&candidate) {
+                Ok(candidate);
+            }
+
+            check self.is_standard_module(&candidate) {
+                Ok(candidate);
+            }
+        }
+
+        Err(ModuleError::ModuleNotFound(full_path));
+    }
+
+    open fn load_module(&var self, module_path: &str) -> Result<(), ModuleError> {
+        check module_path.starts_with("std::") {
+            let module_info = ModuleInfo {
+                name: module_path.into(),
+                path: module_path.split("::").map(|s| s.into()).collect(),
+                exports: self.get_std_exports(module_path),
+                imports: HashSet::new(),
+                dependencies: HashSet::new(),
+                is_loaded: true,
+                source: None,
+            };
+
+            self.context.loaded_modules.insert(module_path.into(), module_info);
+            Ok(());
+        }
+
+        // Handle local modules
+        let module_info = ModuleInfo {
+            name: module_path.into(),
+            path: module_path.split("::").map(|s| s.into()).collect(),
+            exports: self.get_local_module_exports(module_path),
+            imports: HashSet::new(),
+            dependencies: HashSet::new(),
+            is_loaded: true,
+            source: None,
+        };
+
+        self.context.loaded_modules.insert(module_path.into(), module_info);
+        Ok(());
+    }
+
+    open fn get_std_exports(&self, module_path: &str) -> HashSet<String> {
+        match module_path {
+            "std::collections::HashMap" => {
+                var exports = HashSet::new();
+                exports.insert("HashMap".into());
+                exports.insert("new".into());
+                exports.insert("insert".into());
+                exports.insert("get".into());
+                yield exports;
+            }
+            "std::collections::HashSet" => {
+                var exports = HashSet::new();
+                exports.insert("HashSet".into());
+                exports.insert("new".into());
+                exports.insert("insert".into());
+                exports.insert("contains".into());
+                yield exports;
+            }
+            _ => yield HashSet::new(),
+        }
+    }
+
+    open fn get_local_module_exports(&self, module_path: &str) -> HashSet<String> {
+        match module_path {
+            "lexer" => {
+                var exports = HashSet::new();
+                exports.insert("Token".into());
+                exports.insert("tokenize".into());
+                yield exports;
+            }
+            "parser" => {
+                var exports = HashSet::new();
+                exports.insert("Parser".into());
+                exports.insert("parse".into());
+                exports.insert("ASTNode".into());
+                yield exports;
+            }
+            "semantic" => {
+                var exports = HashSet::new();
+                exports.insert("analyze".into());
+                exports.insert("check_types".into());
+                yield exports;
+            }
+            _ => yield HashSet::new(),
+        }
+    }
+
+    open fn is_standard_module(&self, module_path: &str) -> bool {
+        yield matches!(module_path,
+            "std::collections::HashMap" |
+            "std::collections::HashSet" |
+            "std::io" |
+            "std::fs" |
+            "core::alloc" |
+            "core::mem"
+        );
+    }
+
+    open fn check_circular_dependencies(&self) -> Result<(), ModuleError> {
+        var visiting = HashSet::new();
+        var visited  = HashSet::new();
+
+        each module_name in self.context.loaded_modules.keys() {
+            check !visited.contains(module_name) {
+                self.check_circular_from(module_name, &var visiting, &var visited)?;
+            }
+        }
+
+        Ok(());
+    }
+
+    open fn check_circular_from(
+        &self,
+        module_name: &str,
+        visiting: &var HashSet<String>,
+        visited: &var HashSet<String>
+    ) -> Result<(), ModuleError> {
+        check visiting.contains(module_name) {
+            Err(ModuleError::CircularDependency(module_name.into()));
+        }
+
+        check visited.contains(module_name) {
+            Ok(());
+        }
+
+        visiting.insert(module_name.into());
+
+        check let Some(module) = self.context.loaded_modules.get(module_name) {
+            each dep in &module.dependencies {
+                self.check_circular_from(dep, visiting, visited)?;
+            }
+        }
+
+        visiting.remove(module_name);
+        visited.insert(module_name.into());
+
+        Ok(());
+    }
+
+    /// Get all resolved modules
+    open fn get_resolved_modules(&self) -> &HashMap<String, ModuleInfo> {
+        yield &self.context.loaded_modules;
+    }
+
+    /// Check check a symbol is accessible from current module
+    open fn is_symbol_accessible(&self, module_path: &str, symbol_name: &str) -> bool {
+        check let Some(module) = self.context.loaded_modules.get(module_path) {
+            yield module.exports.contains(symbol_name);
+        }
+        yield false;
+    }
+
+    /// Get module dependencies in topological order
+    open fn get_dependency_order(&self) -> Result<Vec<String>, ModuleError> {
+        var result   = [];
+        var visited  = HashSet::new();
+        var visiting = HashSet::new();
+
+        each module_name in self.context.loaded_modules.keys() {
+            check !visited.contains(module_name) {
+                self.visit_module(module_name, &var result, &var visited, &var visiting)?;
+            }
+        }
+
+        Ok(result);
+    }
+
+    open fn visit_module(
+        &self,
+        module_name: &str,
+        order: &var Vec<String>,
+        visited: &var HashSet<String>,
+        visiting: &var HashSet<String>
+    ) -> Result<(), ModuleError> {
+        check visiting.contains(module_name) {
+            Err(ModuleError::CircularDependency(module_name.into()));
+        }
+
+        check visited.contains(module_name) {
+            Ok(());
+        }
+
+        visiting.insert(module_name.into());
+
+        check let Some(module) = self.context.loaded_modules.get(module_name) {
+            each dep in &module.dependencies {
+                self.visit_module(dep, order, visited, visiting)?;
+            }
+        }
+
+        visiting.remove(module_name);
+        visited.insert(module_name.into());
+        order.push(module_name.into());
+
+        Ok(());
+    }
+}
+
+/// Module resolution errors
+open cases ModuleError {
+    ModuleNotFound(String),
+    ItemNotExported { module: String, item: String },
+    CircularDependency(String),
+    DuplicateModule(String),
+    InvalidModulePath(String),
+}
+
+impl ModuleError {
+    open fn fmt(&self) -> String {
+        yield match self {
+            ModuleError::ModuleNotFound(name) =>
+                format("Module not found: {}", name),
+            ModuleError::ItemNotExported { module, item } =>
+                format("Item '{}' is not exported from module '{}'", item, module),
+            ModuleError::CircularDependency(name) =>
+                format("Circular dependency detected involving module '{}'", name),
+            ModuleError::DuplicateModule(name) =>
+                format("Duplicate module definition: {}", name),
+            ModuleError::InvalidModulePath(path) =>
+                format("Invalid module path: {}", path),
+        };
+    }
+}
+
+/// Public interface for module resolution
+open fn resolve_modules(program: Program) -> Result<ModuleResolver, ModuleError> {
+    var resolver = ModuleResolver::new(program);
+    resolver.resolve_imports()?;
+    Ok(resolver);
+}

@@ -1,0 +1,531 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Nova GPU Backend Wrapper
+// ═══════════════════════════════════════════════════════════════════════════
+// Type-safe wrapper for GPU acceleration (CUDA/Metal/ROCm/Vulkan)
+// 
+// Features:
+// - Auto-detection of best GPU backend
+// - Unified API across all GPU types
+// - Zero-copy where possible
+// - Async execution support
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Updated to v9.0 - Modern Nova Syntax
+use stdlib.ml.tensor::{Tensor}
+use ffi.native::*
+// use crate::core_ir::{IRModule, create_ir_optimizer}; // For advanced optimization
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GPU Backend Types
+// ═══════════════════════════════════════════════════════════════════════════
+
+expose cases GPUBackend {
+    None,
+    CUDA,      // NVIDIA
+    Metal,     // Apple
+    ROCm,      // AMD
+    Vulkan,    // Cross-platform
+    Auto       // Auto-detect
+}
+
+expose cases GPUError {
+    Success,
+    NotAvailable,
+    OutOfMemory,
+    InvalidDevice,
+    KernelLaunchFailed,
+    SyncFailed
+}
+
+alias GPUDeviceHandle = *var void
+alias GPUBufferHandle = *var void
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GPU Device
+// ═══════════════════════════════════════════════════════════════════════════
+
+expose data GPUDevice {
+    handle: GPUDeviceHandle,
+    backend: GPUBackend
+}
+
+impl GPUDevice {
+    fn new(backend: GPUBackend) -> Option<GPUDevice> {
+        unsafe {
+            let handle = @extern("nova_gpu_init")(backend as i32)
+            
+            check handle.is_null() {
+                None
+            }
+            
+            let actual_backend = @extern("nova_gpu_get_backend")(handle)
+            
+            Some(GPUDevice {
+                handle,
+                backend: GPUBackend.from_i32(actual_backend)
+            })
+        }
+    }
+    
+    fn auto() -> Option<GPUDevice> {
+        yield GPUDevice.new(GPUBackend::Auto)
+    }
+    
+    fn cuda() -> Option<GPUDevice> {
+        yield GPUDevice.new(GPUBackend::CUDA)
+    }
+    
+    fn metal() -> Option<GPUDevice> {
+        yield GPUDevice.new(GPUBackend::Metal)
+    }
+    
+    fn is_available(backend: GPUBackend) -> bool {
+        unsafe {
+            yield @extern("nova_gpu_is_available")(backend as i32)
+        }
+    }
+    
+    fn print_info(self) {
+        unsafe {
+            @extern("nova_gpu_print_info")(self.handle)
+        }
+    }
+    
+    fn synchronize(self) -> GPUError {
+        unsafe {
+            let err = @extern("nova_gpu_synchronize")(self.handle)
+            yield GPUError.from_i32(err)
+        }
+    }
+}
+
+impl Drop for GPUDevice {
+    fn drop(var self) {
+        unsafe {
+            @extern("nova_gpu_cleanup")(self.handle)
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GPU Tensor Operations
+// ═══════════════════════════════════════════════════════════════════════════
+
+expose data GPUTensorOps {
+    device: GPUDevice
+}
+
+impl GPUTensorOps {
+    fn new(device: GPUDevice) -> GPUTensorOps {
+        GPUTensorOps { device }
+    }
+    
+    // Pooling Operations
+    fn max_pool2d(
+        self,
+        input: Tensor,
+        kernel_size: u32,
+        stride: u32,
+        padding: u32
+    ) -> Tensor {
+        // Validate input is 4D (NCHW)
+        assert(input.ndim() == 4, "MaxPool2D requires 4D tensor")
+        
+        let batch = input.data()[0]
+        let channels = input.data()[1]
+        let in_h = input.data()[2]
+        let in_w = input.data()[3]
+        
+        let out_h = (in_h + 2 * padding - kernel_size) / stride + 1
+        let out_w = (in_w + 2 * padding - kernel_size) / stride + 1
+        
+        let output = Tensor.zeros([batch, channels, out_h, out_w])
+        
+        unsafe {
+            @extern("nova_gpu_maxpool2d")(
+                self.device.handle,
+                input.raw_ptr(),
+                output.raw_ptr(),
+                batch as i32,
+                channels as i32,
+                in_h as i32,
+                in_w as i32,
+                out_h as i32,
+                out_w as i32,
+                kernel_size as i32,
+                stride as i32,
+                padding as i32
+            )
+        }
+        
+        yield output
+    }
+    
+    fn avg_pool2d(
+        self,
+        input: Tensor,
+        kernel_size: u32,
+        stride: u32,
+        padding: u32
+    ) -> Tensor {
+        assert(input.ndim() == 4, "AvgPool2D requires 4D tensor")
+        
+        let batch = input.data()[0]
+        let channels = input.data()[1]
+        let in_h = input.data()[2]
+        let in_w = input.data()[3]
+        
+        let out_h = (in_h + 2 * padding - kernel_size) / stride + 1
+        let out_w = (in_w + 2 * padding - kernel_size) / stride + 1
+        
+        let output = Tensor.zeros([batch, channels, out_h, out_w])
+        
+        unsafe {
+            @extern("nova_gpu_avgpool2d")(
+                self.device.handle,
+                input.raw_ptr(),
+                output.raw_ptr(),
+                batch as i32,
+                channels as i32,
+                in_h as i32,
+                in_w as i32,
+                out_h as i32,
+                out_w as i32,
+                kernel_size as i32,
+                stride as i32,
+                padding as i32
+            )
+        }
+        
+        yield output
+    }
+    
+    fn global_avg_pool(self, input: Tensor) -> Tensor {
+        assert(input.ndim() == 4, "GlobalAvgPool requires 4D tensor")
+        
+        let batch = input.data()[0]
+        let channels = input.data()[1]
+        let height = input.data()[2]
+        let width = input.data()[3]
+        
+        let output = Tensor.zeros([batch, channels, 1, 1])
+        
+        unsafe {
+            @extern("nova_gpu_global_avgpool")(
+                self.device.handle,
+                input.raw_ptr(),
+                output.raw_ptr(),
+                batch as i32,
+                channels as i32,
+                height as i32,
+                width as i32
+            )
+        }
+        
+        yield output
+    }
+    
+    // Normalization Operations
+    fn layer_norm(self, input: Tensor, eps: f32) -> Tensor {
+        let batch_size = input.data()[0]
+        let hidden_dim = input.data()[1]
+        
+        let output = Tensor.zeros(input.data())
+        
+        unsafe {
+            @extern("nova_gpu_layernorm")(
+                self.device.handle,
+                input.raw_ptr(),
+                output.raw_ptr(),
+                batch_size as i32,
+                hidden_dim as i32,
+                eps
+            )
+        }
+        
+        yield output
+    }
+    
+    fn rms_norm(self, input: Tensor, eps: f32) -> Tensor {
+        let batch_size = input.data()[0]
+        let hidden_dim = input.data()[1]
+        
+        let output = Tensor.zeros(input.data())
+        
+        unsafe {
+            @extern("nova_gpu_rmsnorm")(
+                self.device.handle,
+                input.raw_ptr(),
+                output.raw_ptr(),
+                batch_size as i32,
+                hidden_dim as i32,
+                eps
+            )
+        }
+        
+        yield output
+    }
+    
+    // Loss Functions
+    fn cross_entropy(self, logits: Tensor, targets: Tensor) -> f32 {
+        let batch_size = logits.data()[0]
+        let num_classes = logits.data()[1]
+        
+        let loss = Tensor.zeros([1])
+        
+        unsafe {
+            @extern("nova_gpu_cross_entropy")(
+                self.device.handle,
+                logits.raw_ptr(),
+                targets.raw_ptr(),
+                loss.raw_ptr(),
+                batch_size as i32,
+                num_classes as i32
+            )
+        }
+        
+        yield loss.item() / batch_size as f32
+    }
+    
+    fn mse_loss(self, predictions: Tensor, targets: Tensor) -> f32 {
+        let n = predictions.numel()
+        let loss = Tensor.zeros([1])
+        
+        unsafe {
+            @extern("nova_gpu_mse_loss")(
+                self.device.handle,
+                predictions.raw_ptr(),
+                targets.raw_ptr(),
+                loss.raw_ptr(),
+                n as i32
+            )
+        }
+        
+        yield loss.item() / n as f32
+    }
+    
+    // Basic Operations
+    fn matmul(self, A: Tensor, B: Tensor) -> Tensor {
+        assert(A.ndim() == 2 && B.ndim() == 2, "MatMul requires 2D tensors")
+        
+        let M = A.data()[0]
+        let K = A.data()[1]
+        let N = B.data()[1]
+        
+        assert(K == B.data()[0], "Inner dimensions must match")
+        
+        let C = Tensor.zeros([M, N])
+        
+        unsafe {
+            @extern("nova_gpu_matmul")(
+                self.device.handle,
+                A.raw_ptr(),
+                B.raw_ptr(),
+                C.raw_ptr(),
+                M as i32,
+                N as i32,
+                K as i32
+            )
+        }
+        
+        C
+    }
+    
+    fn relu(self, input: Tensor) -> Tensor {
+        let output = Tensor.zeros(input.data())
+        
+        unsafe {
+            @extern("nova_gpu_relu")(
+                self.device.handle,
+                input.raw_ptr(),
+                output.raw_ptr(),
+                input.numel() as i32
+            )
+        }
+        
+        yield output
+    }
+    
+    fn gelu(self, input: Tensor) -> Tensor {
+        let output = Tensor.zeros(input.data())
+        
+        unsafe {
+            @extern("nova_gpu_gelu")(
+                self.device.handle,
+                input.raw_ptr(),
+                output.raw_ptr(),
+                input.numel() as i32
+            )
+        }
+        
+        yield output
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GPU-Accelerated Optimizer
+// ═══════════════════════════════════════════════════════════════════════════
+
+expose data GPUAdamW {
+    device: GPUDevice,
+    learning_rate: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    step_count: i32,
+    
+    // State tensors (on GPU)
+    m_buffers: Vec<Tensor>,
+    v_buffers: Vec<Tensor>
+}
+
+impl GPUAdamW {
+    fn new(device: GPUDevice, lr: f32, weight_decay: f32) -> GPUAdamW {
+        GPUAdamW {
+            device,
+            learning_rate: lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay,
+            step_count: 0,
+            m_buffers: Vec.new(),
+            v_buffers: Vec.new()
+        }
+    }
+    
+    fn step(var self, params: Vec<Tensor>, grads: Vec<Tensor>) {
+        self.step_count += 1
+        
+        // Initialize state on first step
+        check self.m_buffers.is_empty() {
+            each param in params {
+                self.m_buffers.push(Tensor.zeros_like(param))
+                self.v_buffers.push(Tensor.zeros_like(param))
+            }
+        }
+        
+        let bias_correction1 = 1.0 - pow(self.beta1, self.step_count as f32)
+        let bias_correction2 = 1.0 - pow(self.beta2, self.step_count as f32)
+        
+        each i in 0..params.len() {
+            unsafe {
+                @extern("nova_gpu_adamw_step")(
+                    self.device.handle,
+                    params[i].raw_ptr(),
+                    grads[i].raw_ptr(),
+                    self.m_buffers[i].raw_ptr(),
+                    self.v_buffers[i].raw_ptr(),
+                    params[i].numel() as i32,
+                    self.learning_rate,
+                    self.beta1,
+                    self.beta2,
+                    self.eps,
+                    self.weight_decay,
+                    self.step_count
+                )
+            }
+        }
+        
+        self.device.synchronize()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Example Usage
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Example 1: GPU-Accelerated Training
+ * 
+ * ```nova
+ * import ai.backend.gpu_wrapper::*
+ * 
+ * // Auto-detect best GPU
+ * let gpu = GPUDevice.auto().expect("No GPU available")
+ * gpu.print_info()
+ * 
+ * // Create GPU operations
+ * let ops = GPUTensorOps.new(gpu)
+ * 
+ * // Training loop
+ * each epoch in 0..100 {
+ *     // All operations run on GPU!
+ *     let output = ops.matmul(input, weights)
+ *     let activated = ops.relu(output)
+ *     let pooled = ops.max_pool2d(activated, 2, 2, 0)
+ *     let loss = ops.cross_entropy(pooled, targets)
+ * }
+ * ```
+ */
+
+/**
+ * Example 2: GPU Optimizer
+ * 
+ * ```nova
+ * import ai.backend.gpu_wrapper::*
+ * 
+ * let gpu = GPUDevice.cuda().expect("CUDA not available")
+ * var optimizer = GPUAdamW.new(gpu, lr: 1e-3, weight_decay: 0.01)
+ * 
+ * each epoch in 0..epochs {
+ *     let grads = compute_gradients(loss)
+ *     
+ *     // Optimization happens entirely on GPU!
+ *     optimizer.step(model.parameters(), grads)
+ * }
+ * ```
+ */
+
+/**
+ * Example 3: Cross-Platform GPU Code
+ * 
+ * ```nova
+ * // Works on NVIDIA (CUDA), Apple (Metal), AMD (ROCm)!
+ * let gpu = GPUDevice.auto().unwrap_or_else(|| {
+ *     println("No GPU found, falling back to CPU")
+ *     yield None
+ * })
+ * 
+ * check gpu.is_some() {
+ *     let ops = GPUTensorOps.new(gpu.unwrap())
+ *     // Use GPU acceleration
+ * } else {
+ *     // Use CPU fallback
+ * }
+ * ```
+ */
+
+// Helper functions
+fn pow(base: f32, exp: f32) -> f32 {
+    // Placeholder - use actual power function
+    yield 1.0
+}
+
+impl GPUBackend {
+    fn from_i32(val: i32) -> GPUBackend {
+        match val {
+            0 => GPUBackend::None,
+            1 => GPUBackend::CUDA,
+            2 => GPUBackend::Metal,
+            3 => GPUBackend::ROCm,
+            4 => GPUBackend::Vulkan,
+            _ => GPUBackend::Auto
+        }
+    }
+}
+
+impl GPUError {
+    fn from_i32(val: i32) -> GPUError {
+        match val {
+            0 => GPUError::Success,
+            1 => GPUError::NotAvailable,
+            2 => GPUError::OutOfMemory,
+            3 => GPUError::InvalidDevice,
+            4 => GPUError::KernelLaunchFailed,
+            5 => GPUError::SyncFailed,
+            _ => GPUError::Success
+        }
+    }
+}

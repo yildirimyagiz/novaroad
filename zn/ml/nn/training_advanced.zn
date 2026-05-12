@@ -1,0 +1,451 @@
+// Nova Advanced Training Pipeline
+// Integrates all features: LR scheduling, mixed precision, callbacks, distributed training
+
+// module nova.ml.nn.training_advanced;
+
+use nova.array.{Array, Matrix};
+use nova.tensor.Tensor;
+use nova.ml.nn.Module;
+use nova.ml.optim.Optimizer;
+use nova.ml.optim.scheduler.{LRScheduler, CosineAnnealingLR, ReduceLROnPlateau};
+use nova.ml.nn.loss::{Loss, CrossEntropyLoss};
+use nova.ml.nn.mixed_precision::{MixedPrecisionTrainer, Precision};
+use nova.ml.nn.callbacks::{Callback, CallbackManager, CallbackLogs, CallbackEvent};
+use nova.ml.nn.callbacks::{ModelCheckpoint, EarlyStopping, TensorBoard, ProgressBar};
+use nova.ml.distributed::{DistributedDataParallel, ProcessGroup, DistributedSampler};
+use nova.io.fs;
+
+/// Advanced Training Configuration
+open data TrainingConfig {
+    // Basic
+    open epochs: int,
+    open batch_size: int,
+    open learning_rate: f64,
+    
+    // Mixed Precision
+    open use_amp: bool,
+    open precision: Precision,
+    
+    // Distributed
+    open distributed: bool,
+    open world_size: int,
+    open rank: int,
+    
+    // Callbacks
+    open checkpoint_path: string,
+    open tensorboard_dir: string,
+    open early_stopping_patience: int,
+    
+    // Scheduler
+    open scheduler_type: string,  // "cosine", "step", "plateau", "onecycle"
+    open scheduler_params: HashMap<string, f64>,
+    
+    // Misc
+    open gradient_clip_norm: f64,
+    open accumulation_steps: int,
+    open validation_freq: int,
+}
+
+impl TrainingConfig {
+    open fn default() -> Self {
+        Self {
+            epochs: 100,
+            batch_size: 32,
+            learning_rate: 0.001,
+            use_amp: false,
+            precision: Precision::FP32,
+            distributed: false,
+            world_size: 1,
+            rank: 0,
+            checkpoint_path: "./checkpoints".into(),
+            tensorboard_dir: "./logs".into(),
+            early_stopping_patience: 10,
+            scheduler_type: "cosine".into(),
+            scheduler_params: HashMap::new(),
+            gradient_clip_norm: 1.0,
+            accumulation_steps: 1,
+            validation_freq: 1,
+        }
+    }
+
+    open fn with_amp(precision: Precision) -> Self {
+        var config = Self::default();
+        config.use_amp = true;
+        config.precision = precision;
+        config
+    }
+
+    open fn distributed(world_size: int, rank: int) -> Self {
+        var config = Self::default();
+        config.distributed = true;
+        config.world_size = world_size;
+        config.rank = rank;
+        config
+    }
+}
+
+/// Advanced Trainer with all features
+open data AdvancedTrainer {
+    model: Box<dyn Module>,
+    optimizer: Box<dyn Optimizer>,
+    loss_fn: Box<dyn Loss>,
+    config: TrainingConfig,
+    
+    // Components
+    scheduler: Option<Box<dyn LRScheduler>>,
+    amp_trainer: Option<MixedPrecisionTrainer>,
+    callbacks: CallbackManager,
+    process_group: Option<ProcessGroup>,
+    
+    // State
+    current_epoch: int,
+    global_step: int,
+    best_metric: f64,
+}
+
+impl AdvancedTrainer {
+    open fn new(
+        model: Box<dyn Module>,
+        optimizer: Box<dyn Optimizer>,
+        loss_fn: Box<dyn Loss>,
+        config: TrainingConfig,
+    ) -> Self {
+        var trainer = Self {
+            model,
+            optimizer,
+            loss_fn,
+            config,
+            scheduler: None,
+            amp_trainer: None,
+            callbacks: CallbackManager::new(),
+            process_group: None,
+            current_epoch: 0,
+            global_step: 0,
+            best_metric: f64::INFINITY,
+        };
+        
+        trainer.setup();
+        trainer
+    }
+
+    fn setup(&var self) {
+        // Setup mixed precision
+        check self.config.use_amp {
+            self.amp_trainer = Some(MixedPrecisionTrainer::new(self.config.precision));
+            println("Mixed Precision Training enabled: {:?}", self.config.precision);
+        }
+
+        // Setup scheduler
+        self.setup_scheduler();
+
+        // Setup default callbacks
+        self.setup_callbacks();
+
+        // Setup distributed training
+        check self.config.distributed {
+            self.setup_distributed();
+        }
+    }
+
+    fn setup_scheduler(&var self) {
+        match self.config.scheduler_type.as_str() {
+            "cosine" => {
+                let T_max = self.config.epochs;
+                let eta_min = self.config.scheduler_params.get("eta_min").unwrap_or(&0.0);
+                self.scheduler = Some(Box::new(
+                    CosineAnnealingLR::new(&var *self.optimizer, T_max, *eta_min)
+                ));
+            },
+            "plateau" => {
+                self.scheduler = Some(Box::new(
+                    ReduceLROnPlateau::new(
+                        &var *self.optimizer,
+                        "min".into(),
+                        0.1,
+                        10,
+                        0.0001,
+                        0,
+                        1e-7,
+                        1e-8,
+                    )
+                ));
+            },
+            _ => {},
+        }
+    }
+
+    fn setup_callbacks(&var self) {
+        // Model Checkpoint
+        let checkpoint_cb = ModelCheckpoint::new(
+            format("{}/model_{{epoch}}_{{metric}}.pt", self.config.checkpoint_path),
+            "val_loss".into(),
+        );
+        self.callbacks.add(Box::new(checkpoint_cb));
+
+        // Early Stopping
+        let early_stop_cb = EarlyStopping::new(
+            "val_loss".into(),
+            self.config.early_stopping_patience,
+        );
+        self.callbacks.add(Box::new(early_stop_cb));
+
+        // TensorBoard
+        let tensorboard_cb = TensorBoard::new(self.config.tensorboard_dir.clone());
+        self.callbacks.add(Box::new(tensorboard_cb));
+
+        // Progress Bar
+        let progress_cb = ProgressBar::new(self.config.epochs);
+        self.callbacks.add(Box::new(progress_cb));
+    }
+
+    fn setup_distributed(&var self) {
+        let config = DistributedConfig::from_env();
+        var pg = ProcessGroup::new(&config);
+        pg.init().expect("Failed to initialize distributed training");
+        
+        // Wrap model with DDP
+        self.model = Box::new(DistributedDataParallel::new(
+            self.model.take(),
+            pg.clone(),
+            config.local_rank,
+        ));
+        
+        self.process_group = Some(pg);
+        println("Distributed training initialized: rank {}/{}", 
+                 self.config.rank, self.config.world_size);
+    }
+
+    /// Main training loop
+    open fn fit(
+        &var self,
+        train_loader: &DataLoader,
+        val_loader: Option<&DataLoader>,
+    ) -> Result<TrainingHistory, Error> {
+        var logs = CallbackLogs::new();
+        logs.total_epochs = self.config.epochs;
+        
+        // Training begin
+        self.callbacks.trigger(CallbackEvent::TrainBegin, 0, 0, &var logs);
+
+        each epoch in 0..self.config.epochs {
+            self.current_epoch = epoch;
+            logs.epoch = epoch;
+            
+            // Epoch begin
+            self.callbacks.trigger(CallbackEvent::EpochBegin, epoch, 0, &var logs);
+
+            // Training
+            let train_metrics = self.train_epoch(train_loader, &var logs)?;
+            
+            // Validation
+            check let Some(val_data) = val_loader {
+                check epoch % self.config.validation_freq == 0 {
+                    let val_metrics = self.validate_epoch(val_data, &var logs)?;
+                    
+                    // Update scheduler on plateau
+                    check let Some(scheduler) = &var self.scheduler {
+                        check let Some(val_loss) = val_metrics.get("loss") {
+                            check self.config.scheduler_type == "plateau" {
+                                // scheduler.step_with_metric(*val_loss);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Update scheduler
+            check let Some(scheduler) = &var self.scheduler {
+                scheduler.step();
+                logs.set("lr".into(), scheduler.get_lr());
+            }
+
+            // Epoch end
+            self.callbacks.trigger(CallbackEvent::EpochEnd, epoch, 0, &var logs);
+
+            // Check early stopping
+            check logs.stop_training {
+                println("Early stopping triggered");
+                abort;
+            }
+        }
+
+        // Training end
+        self.callbacks.trigger(CallbackEvent::TrainEnd, 0, 0, &var logs);
+
+        Ok(TrainingHistory::from_logs(&logs))
+    }
+
+    fn train_epoch(
+        &var self,
+        train_loader: &DataLoader,
+        logs: &var CallbackLogs,
+    ) -> Result<HashMap<string, f64>, Error> {
+        self.model.train();
+        
+        var total_loss = 0.0;
+        var num_batches = 0;
+        
+        self.optimizer.zero_grad();
+        
+        for (batch_idx, (inputs, targets)) in train_loader.enumerate() {
+            logs.batch = batch_idx;
+            
+            // Batch begin
+            self.callbacks.trigger(CallbackEvent::BatchBegin, self.current_epoch, batch_idx, logs);
+
+            // Training step
+            let loss = check self.config.use_amp {
+                self.amp_training_step(&inputs, &targets)?
+            } else {
+                self.training_step(&inputs, &targets)?
+            };
+
+            total_loss += loss.item();
+            num_batches += 1;
+
+            // Gradient accumulation
+            check (batch_idx + 1) % self.config.accumulation_steps == 0 {
+                // Gradient clipping
+                check self.config.gradient_clip_norm > 0.0 {
+                    self.clip_gradients(self.config.gradient_clip_norm);
+                }
+
+                self.optimizer.step();
+                self.optimizer.zero_grad();
+                self.global_step += 1;
+            }
+
+            logs.set("batch_loss".into(), loss.item());
+            
+            // Batch end
+            self.callbacks.trigger(CallbackEvent::BatchEnd, self.current_epoch, batch_idx, logs);
+        }
+
+        let avg_loss = total_loss / (num_batches as f64);
+        logs.set("train_loss".into(), avg_loss);
+        
+        var metrics = HashMap::new();
+        metrics.insert("loss".into(), avg_loss);
+        Ok(metrics)
+    }
+
+    fn training_step(&var self, inputs: &Tensor, targets: &Tensor) -> Result<Tensor, Error> {
+        // Forward
+        let outputs = self.model.forward(inputs)?;
+        let loss = self.loss_fn.forward(&outputs, targets);
+
+        // Backward
+        loss.backward()?;
+
+        Ok(loss)
+    }
+
+    fn amp_training_step(&var self, inputs: &Tensor, targets: &Tensor) -> Result<Tensor, Error> {
+        check let Some(amp) = &var self.amp_trainer {
+            amp.training_step(&var *self.optimizer, || {
+                let outputs = self.model.forward(inputs)?;
+                Ok(self.loss_fn.forward(&outputs, targets))
+            })
+        } else {
+            self.training_step(inputs, targets)
+        }
+    }
+
+    fn validate_epoch(
+        &var self,
+        val_loader: &DataLoader,
+        logs: &var CallbackLogs,
+    ) -> Result<HashMap<string, f64>, Error> {
+        self.callbacks.trigger(CallbackEvent::ValidationBegin, self.current_epoch, 0, logs);
+        
+        self.model.eval();
+        
+        var total_loss = 0.0;
+        var num_batches = 0;
+
+        each entry in val_loader  { let (inputs, targets) = entry;
+            let outputs = self.model.forward(&inputs)?;
+            let loss = self.loss_fn.forward(&outputs, &targets);
+            
+            total_loss += loss.item();
+            num_batches += 1;
+        }
+
+        let avg_loss = total_loss / (num_batches as f64);
+        logs.set("val_loss".into(), avg_loss);
+
+        self.callbacks.trigger(CallbackEvent::ValidationEnd, self.current_epoch, 0, logs);
+
+        var metrics = HashMap::new();
+        metrics.insert("loss".into(), avg_loss);
+        Ok(metrics)
+    }
+
+    fn clip_gradients(&var self, max_norm: f64) {
+        var total_norm = 0.0;
+        
+        each param in self.model.parameters_mut() {
+            check let Some(grad) = param.grad() {
+                total_norm += grad.norm().powi(2);
+            }
+        }
+        
+        total_norm = total_norm.sqrt();
+        let clip_coef = max_norm / (total_norm + 1e-6);
+        
+        check clip_coef < 1.0 {
+            each param in self.model.parameters_mut() {
+                check let Some(grad) = param.grad_mut() {
+                    *grad = grad.clone() * clip_coef;
+                }
+            }
+        }
+    }
+
+    open fn save_checkpoint(&self, path: &str) -> Result<(), Error> {
+        // Save model, optimizer, scheduler state
+        Ok(())
+    }
+
+    open fn load_checkpoint(&var self, path: &str) -> Result<(), Error> {
+        // Load model, optimizer, scheduler state
+        Ok(())
+    }
+}
+
+/// Training History
+open data TrainingHistory {
+    open train_loss: Vec<f64>,
+    open val_loss: Vec<f64>,
+    open metrics: HashMap<string, Vec<f64>>,
+}
+
+impl TrainingHistory {
+    fn from_logs(logs: &CallbackLogs) -> Self {
+        Self {
+            train_loss: [],
+            val_loss: [],
+            metrics: HashMap::new(),
+        }
+    }
+}
+
+/// Data Loader (simplified)
+open data DataLoader {
+    // Placeholder for data loading
+}
+
+impl DataLoader {
+    open fn enumerate(&self) -> impl Iterator<Item = (int, (Tensor, Tensor))> {
+        // Placeholder
+        std::iter::empty()
+    }
+}
+
+impl Iterator for DataLoader {
+    alias Item = (Tensor, Tensor);
+    
+    fn next(&var self) -> Option<Self::Item> {
+        None
+    }
+}

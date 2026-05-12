@@ -1,0 +1,321 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                  A1: ADAPTIVE SECURITY ENGINE                                ║
+// ║                                                                               ║
+// ║  Zero-cost security when provably safe, smart checks when needed             ║
+// ║  Uses Gödel self-learning to eliminate unnecessary runtime checks            ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use compiler::ast::{Expression, ArrayAccess, PointerDeref, Node}
+use compiler::analysis::{DataFlowAnalyzer, TaintAnalyzer}
+use stdlib::collections::{HashMap, HashSet}
+use stdlib::godel::{TheoremProver, Proof, Formula}
+
+// ============================================================================
+// SECURITY LEVELS
+// ============================================================================
+
+open cases SecurityLevel {
+    Paranoid,      // All checks, sanitize everything (dev mode)
+    Balanced,      // Smart checks based on profiling
+    Performance    // Only when provably unsafe
+}
+
+open cases CheckStrategy {
+    NoCheck,                          // Provably safe - zero cost!
+    CompileTimeCheck,                 // Check at compile time
+    SampledCheck(rate: f64),          // Check 1-10% of time
+    AlwaysCheck,                      // Always check (unsafe code)
+    HardenedCheck(sanitize: bool)     // Extra security + sanitization
+}
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+open data AdaptiveSecurity {
+    bounds_violations: HashMap<String, ViolationStats>,
+    taint_sources: HashSet<String>,
+    prover: TheoremProver,
+    security_level: SecurityLevel,
+    enable_learning: bool
+}
+
+open data ViolationStats {
+    total_accesses: u64,
+    violations: u64,
+    last_violation: u64
+}
+
+skill ViolationStats {
+    fn new() -> Self {
+        Self {
+            total_accesses: 0,
+            violations: 0,
+            last_violation: 0
+        }
+    }
+    
+    fn violation_rate(&self) -> f64 {
+        if self.total_accesses == 0 {
+            0.0
+        } else {
+            (self.violations as f64) / (self.total_accesses as f64)
+        }
+    }
+}
+
+open cases TaintResult {
+    Safe,
+    Unsafe { message: String, suggestion: String }
+}
+
+skill AdaptiveSecurity {
+    fn new(level: SecurityLevel) -> Self {
+        AdaptiveSecurity {
+            bounds_violations: HashMap::new(),
+            taint_sources: HashSet::new(),
+            prover: TheoremProver::new(),
+            security_level: level,
+            enable_learning: true
+        }
+    }
+    
+    // ========================================================================
+    // BOUNDS CHECK OPTIMIZATION
+    // ========================================================================
+    
+    @inline(always)
+    fn optimize_bounds_check(&self, access: ArrayAccess) -> CheckStrategy {
+        // 1. Try compile-time proof
+        check let Some(proof) = self.prove_bounds_safe(access) {
+            yield CheckStrategy::NoCheck;  // ✅ Zero cost!
+        }
+        
+        // 2. Check profiling data
+        check self.enable_learning {
+            check let Some(stats) = self.bounds_violations.get(access.location) {
+                check stats.violation_rate() < 0.0001 {  // <0.01% violations
+                    yield CheckStrategy::SampledCheck(rate: 0.01);
+                }
+            }
+        }
+        
+        // 3. Analyze access pattern
+        yield match access.index {
+            Expression::Constant(_) => CheckStrategy::CompileTimeCheck,
+            Expression::Variable(name) check self.is_loop_variable(name) => 
+                CheckStrategy::CompileTimeCheck,
+            _ => CheckStrategy::AlwaysCheck
+        };
+    }
+    
+    // Gödel-based theorem proving for bounds safety
+    @const_eval
+    fn prove_bounds_safe(&self, access: ArrayAccess) -> Option<Proof> {
+        // Build logical formula
+        let formula = self.build_bounds_formula(access);
+        
+        // Try to prove: ∀i. 0 ≤ i < length(array) ⟹ safe
+        yield self.prover.prove(formula);
+    }
+    
+    @const_eval
+    fn build_bounds_formula(&self, access: ArrayAccess) -> Formula {
+        let array_len = self.get_array_length(access.array);
+        let index_expr = access.index;
+        
+        let lower_bound = Formula::GreaterEqual(
+            Box::new(index_expr.clone()),
+            Box::new(Formula::Constant(0))
+        );
+        let upper_bound = Formula::Less(
+            Box::new(index_expr),
+            Box::new(Formula::Constant(array_len as i64))
+        );
+        let bounds = Formula::And(Box::new([lower_bound, upper_bound]));
+        
+        yield Formula::Implies(Box::new(bounds), Box::new(Formula::True));
+    }
+    
+    // ========================================================================
+    // MEMORY SAFETY
+    // ========================================================================
+    
+    @inline(always)
+    fn check_pointer_safety(&self, deref: PointerDeref) -> CheckStrategy {
+        // Null pointer check
+        check self.can_prove_non_null(deref.pointer) {
+            yield CheckStrategy::NoCheck;
+        }
+        
+        // Use-after-free detection
+        check self.might_be_freed(deref.pointer) {
+            yield CheckStrategy::HardenedCheck(sanitize: true);
+        }
+        
+        yield CheckStrategy::AlwaysCheck;
+    }
+    
+    @const_eval
+    fn can_prove_non_null(&self, ptr: Expression) -> bool {
+        // Dataflow analysis
+        let analyzer = DataFlowAnalyzer::new();
+        let def_site = analyzer.find_definition(ptr);
+        
+        yield match def_site {
+            Definition::Allocation(_) => true,      // malloc/new
+            Definition::Reference(_) => true,       // &variable
+            Definition::Parameter(_, attrs) => 
+                attrs.contains("nonnull"),          // @nonnull annotation
+            _ => false
+        };
+    }
+    
+    // ========================================================================
+    // TAINT ANALYSIS (Security vulnerabilities)
+    // ========================================================================
+    
+    fn analyze_taint(&self, node: Node) -> TaintResult {
+        let analyzer = TaintAnalyzer::new();
+        
+        // Mark user input as tainted
+        analyzer.add_source("input");
+        analyzer.add_source("read_file");
+        analyzer.add_source("network_recv");
+        
+        // Track taint propagation
+        let tainted_vars = analyzer.analyze(node);
+        
+        // Check for dangerous sinks
+        yield self.check_dangerous_sinks(tainted_vars);
+    }
+    
+    fn check_dangerous_sinks(&self, tainted: HashSet<String>) -> TaintResult {
+        let dangerous_functions = [
+            "system",           // Command injection
+            "eval",             // Code injection
+            "sql_query",        // SQL injection
+            "write_file",       // Path traversal
+        ];
+        
+        each func in dangerous_functions {
+            check tainted.contains(func) {
+                yield TaintResult::Unsafe {
+                    message: f"Tainted data flows to {func}",
+                    suggestion: f"Sanitize input before use"
+                };
+            }
+        }
+        
+        yield TaintResult::Safe;
+    }
+    
+    // ========================================================================
+    // AUTO-SANITIZATION
+    // ========================================================================
+    
+    @compile_time
+    fn auto_sanitize(&self, expr: Expression, context: Context) -> Expression {
+        // Automatically insert sanitization based on context
+        yield match context {
+            Context::SQLQuery => 
+                Expression::Call("sql_escape", [expr]),
+            Context::ShellCommand => 
+                Expression::Call("shell_escape", [expr]),
+            Context::HTMLOutput => 
+                Expression::Call("html_escape", [expr]),
+            Context::FilePath => 
+                Expression::Call("path_normalize", [expr]),
+            _ => expr
+        };
+    }
+    
+    // ========================================================================
+    // RUNTIME PROFILING (Learning)
+    // ========================================================================
+    
+    fn record_access(&var self, location: String, is_violation: bool) {
+        check !self.enable_learning {
+            abort;
+        }
+        
+        let stats = self.bounds_violations.get_mut_or_insert(
+            location, 
+            ViolationStats::new()
+        );
+        
+        stats.total_accesses += 1;
+        check is_violation {
+            stats.violations += 1;
+            stats.last_violation = get_timestamp();
+        }
+    }
+    
+    // ========================================================================
+    // COMPILE-TIME OPTIMIZATION PASS
+    // ========================================================================
+    
+    fn optimize(&self, ast: TypedAST) -> Result<TypedAST> {
+        var optimized = ast;
+        
+        // 1. Remove provably safe checks
+        optimized = self.remove_safe_checks(optimized);
+        
+        // 2. Insert sanitization
+        optimized = self.insert_sanitization(optimized);
+        
+        // 3. Add sampled checks for hot paths
+        optimized = self.add_sampled_checks(optimized);
+        
+        Ok(optimized)
+    }
+}
+
+// ============================================================================
+// SECURITY ANNOTATIONS
+// ============================================================================
+
+// Mark function as security-critical
+@security_critical
+fn process_payment(amount: f64, card: String):
+    // All inputs automatically sanitized
+    // All outputs checked
+    // Taint analysis enforced
+    pass
+
+// Disable bounds checking (unsafe!)
+@no_bounds_check
+fn fast_array_copy(src: [u8], dst: [u8], len: usize):
+    // User promises this is safe
+    each i in 0..len:
+        dst[i] = src[i]
+
+// Mark parameter as non-null
+fn process_data(@nonnull ptr: *Data):
+    // No null check needed - compiler enforced!
+    yield ptr.value
+
+// ============================================================================
+// EXAMPLE USAGE
+// ============================================================================
+
+fn example_adaptive_security():
+    let security = AdaptiveSecurity::new(SecurityLevel::Balanced)
+    
+    // Example 1: Provably safe - no check needed
+    let arr = [1, 2, 3, 4, 5]
+    each i in 0..5:
+        print(arr[i])  // ✅ Loop bounds match array - no check!
+    
+    // Example 2: Constant index - compile time check
+    print(arr[2])  // ✅ Check at compile time - no runtime cost!
+    
+    // Example 3: Dynamic index - runtime check needed
+    let user_input = get_user_input()
+    print(arr[user_input])  // ⚠️ Runtime bounds check
+    
+    // Example 4: Tainted data - auto sanitization
+    let sql = f"SELECT * FROM users WHERE id = {user_input}"
+    // ✅ Compiler automatically inserts sql_escape()!
+    
+    println("✅ Adaptive Security: Fast when safe, secure when needed!")

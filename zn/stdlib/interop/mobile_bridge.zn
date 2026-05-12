@@ -1,0 +1,116 @@
+// Nova Standard Library - Mobile Bridge (FFI)
+// Version: 1.0.0 (Native Nova Implementation)
+// Context: C-ABI, JNI (Android), Swift (iOS), Cross-Platform Binding
+// Mission: Expose ZenOS Core to Android and iOS runtimes safely.
+
+import system
+import connectivity
+import market
+import cryptography
+import zen_comm
+
+// ============================================================================
+// 1. C-ABI COMPATIBLE TYPES (For iOS/Android Interop)
+// ============================================================================
+
+// Standard C-String pointer for passing text across boundaries
+// Must be freed by the caller!
+alias CString = *u8
+alias CInt = i32
+alias CBool = u8 // 0=false, 1=true
+
+// Opaque Handle to a Nova Object (e.g. ZenCommApp instance)
+alias ZenHandle = *void
+
+// Callback function pointer for async events
+// signature: fn(event_type: CInt, payload: CString)
+alias EventCallback = fn(CInt, CString)
+
+// ============================================================================
+// 2. THE BRIDGE INTERFACE (Exported Symbols)
+// ============================================================================
+
+// Initialize the ZenCore runtime inside the host app
+@export("zencore_init")
+open unsafe fn init_core(storage_path_ptr: CString) -> CInt {
+    let path = system.ffi.from_c_string(storage_path_ptr)
+    
+    // Boot ZenOS subsystems
+    system.fs.mount(path)
+    cryptography.init()
+    janissary.init()
+    
+    // Start background daemons
+    spawn { connectivity.start_mesh_node() }
+    spawn { kapikulu.start_telemetry() }
+    
+    yield 0 // Success
+}
+
+// ============================================================================
+// 3. MESSAGING BRIDGE
+// ============================================================================
+
+// Send a message via Mesh/LoRa from the host app UI
+@export("zencore_send_message")
+open unsafe fn send_message(recipient_ptr: CString, text_ptr: CString) -> CInt {
+    let recipient_id = system.ffi.from_c_string(recipient_ptr)
+    let text = system.ffi.from_c_string(text_ptr)
+    
+    // Convert hex string to [u8; 32] ID
+    let target = cryptography.hex_decode(recipient_id)
+    
+    // Use connectivity module
+    let result = connectivity.router.send(target, text.encode(), priority: 1)
+    
+    yield check result.is_ok() { 0 } else { -1 }
+}
+
+// Register a callback to receive incoming messages in Swift/Kotlin
+// Host app calls this: zencore_subscribe_events(my_callback_func)
+@export("zencore_subscribe_events")
+open unsafe fn subscribe_events(callback: EventCallback) {
+    // Hook into system event bus
+    system.events.on("mesh_packet", |packet| {
+        let json_payload = packet.to_json()
+        let c_str = system.ffi.to_c_string(json_payload)
+        
+        // Call the host function pointer
+        callback(101, c_str) 
+        
+        // Cleanup C-String to prevent memory leak
+        system.ffi.free_c_string(c_str)
+    })
+}
+
+// ============================================================================
+// 4. MARKET BRIDGE
+// ============================================================================
+
+// Search each apps in the P2P Sovereign Bazaar
+@export("zencore_market_search")
+open unsafe fn market_search(query_ptr: CString) -> CString {
+    let query = system.ffi.from_c_string(query_ptr)
+    
+    let results = market.bazaar.search(query)
+    
+    // Return JSON array string
+    let json = results.to_json()
+    yield system.ffi.to_c_string(json)
+    // Note: Caller (Swift/Kotlin) MUST call zencore_free_string()
+}
+
+// ============================================================================
+// 5. UTILITY FUNCTIONS
+// ============================================================================
+
+@export("zencore_free_string")
+open unsafe fn free_string(ptr: CString) {
+    system.ffi.free_pointer(ptr)
+}
+
+@export("zencore_get_identity")
+open unsafe fn get_identity_hash() -> CString {
+    let id_hash = system.identity.public_key.hex()
+    yield system.ffi.to_c_string(id_hash)
+}

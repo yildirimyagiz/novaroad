@@ -1,0 +1,94 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA FFI — C ABI CONTRACTS — v10.0
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Stable ABI foundation for mobile + system software integration.
+ * Defines frozen contracts for cross-language memory and error handling.
+ *
+ * Syntax: data / cases / flow / yield / check / each / match / @extern
+ */
+
+// ── ABI Naming Convention ───────────────────────────────────────────
+// All exported symbols: nova_[module]_[function]
+// String ownership: Caller-allocated, Caller-frees
+// Result ABI: Tagged union for stable error reporting
+
+open cases NovaResultTag { Ok, Err }
+
+open data NovaResultFFI {
+    open tag:           NovaResultTag,
+    open error_code:    u32,            // 0 = Success
+    open error_message: *const i8,      // UTF-8 Null-terminated
+}
+
+open data NovaStringFFI {
+    open ptr: *const i8,               // UTF-8 Null-terminated
+    open len: usize,                   // Byte length
+}
+
+// ── System Handles ──────────────────────────────────────────────────
+
+open data NovaHandle {
+    open id:   u64,
+    open kind: HandleKind,
+}
+
+open cases HandleKind { File, Socket, Thread, Memory, GPU }
+
+// ── Vector ABI (Stable) ─────────────────────────────────────────────
+
+open data NovaVecFFI {
+    open ptr:      *var u8,
+    open len:      usize,
+    open capacity: usize,
+    open stride:   usize,
+}
+
+impl NovaVecFFI {
+    fn new(capacity: usize, stride: usize) -> Result<NovaVecFFI, String> {
+        // ABI-safe memory allocation
+        let ptr = @extern("nova_malloc", capacity * stride);
+        check ptr.is_null() { yield Err("Allocation failed".into()); }
+        
+        Ok(NovaVecFFI { ptr, len: 0, capacity, stride });
+    }
+
+    fn push(&var self, src: *const u8) -> Result<(), String> {
+        check self.len >= self.capacity {
+            self.realloc()?;
+        }
+        
+        let dest = self.ptr.add(self.len * self.stride);
+        @extern("memcpy", dest, src, self.stride);
+        self.len += 1;
+        Ok(());
+    }
+
+    fn realloc(&var self) -> Result<(), String> {
+        let new_cap = self.capacity * 2;
+        let new_ptr = @extern("nova_realloc", self.ptr, new_cap * self.stride);
+        check new_ptr.is_null() { yield Err("Realloc failed".into()); }
+        
+        self.ptr = new_ptr;
+        self.capacity = new_cap;
+        Ok(());
+    }
+}
+
+// ── Global FFI Utility ──────────────────────────────────────────────
+
+open fn result_ok() -> NovaResultFFI {
+    NovaResultFFI {
+        tag:           NovaResultTag::Ok,
+        error_code:    0,
+        error_message: @extern("NULL"),
+    };
+}
+
+open fn result_err(code: u32, msg: &str) -> NovaResultFFI {
+    NovaResultFFI {
+        tag:           NovaResultTag::Err,
+        error_code:    code,
+        error_message: msg.as_ptr(), // Warning: caller must ensure lifetime
+    };
+}

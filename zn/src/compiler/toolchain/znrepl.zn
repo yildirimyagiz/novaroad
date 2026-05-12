@@ -1,0 +1,149 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║ znrepl - Nova Interactive REPL                                               ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use crate::frontend::core::{Lexer, Parser, TypeChecker};
+use crate::backend::jit::JITEngine;
+use crate::core::{String, HashMap, Result};
+use std::io::{self, Write};
+
+expose data REPL {
+    jit: JITEngine,
+    type_checker: TypeChecker,
+    context: HashMap<String, Value>,
+    history: Vec<String>,
+}
+
+impl REPL {
+    open fn new() -> Self {
+        REPL {
+            jit: JITEngine::new(),
+            type_checker: TypeChecker::new(),
+            context: HashMap::new(),
+            history: Vec::new(),
+        }
+    }
+    
+    open fn run(&var self) {
+        println("╔══════════════════════════════════════════════════════════╗");
+        println("║          Nova Interactive REPL v1.0                      ║");
+        println("║          Type 'exit' to quit, ':help' for help           ║");
+        println("╚══════════════════════════════════════════════════════════╝\n");
+        
+        loop {
+            print!("nova> ");
+            io::stdout().flush().unwrap();
+            
+            var input = String::new();
+            io::stdin().read_line(&var input).unwrap();
+            let input = input.trim();
+            
+            check input.is_empty() {
+                next;
+            }
+            
+            check input == "exit" || input == "quit" {
+                println("Goodbye! 👋");
+                abort;
+            }
+            
+            check input.starts_with(':') {
+                self.handle_command(input);
+                next;
+            }
+            
+            self.history.push(input.into());
+            
+            match self.eval(input) {
+                Ok(value) => {
+                    println("=> {:?}", value);
+                }
+                Err(e) => {
+                    eprintln("Error: {}", e);
+                }
+            }
+        }
+    }
+    
+    fn eval(&var self, input: &str) -> Result<Value, String> {
+        // Lex
+        var lexer = Lexer::new(input);
+        let tokens = lexer.tokenize()?;
+        
+        // Parse
+        var parser = Parser::new(tokens);
+        let expr = parser.parse_expression()?;
+        
+        // Type check
+        self.type_checker.check_expr(&expr)?;
+        
+        // JIT compile and execute
+        let result = self.jit.eval_expr(&expr, &self.context)?;
+        
+        Ok(result)
+    }
+    
+    fn handle_command(&var self, cmd: &str) {
+        match cmd {
+            ":help" => {
+                println("Available commands:");
+                println("  :help       Show this help");
+                println("  :vars       Show all variables");
+                println("  :history    Show command history");
+                println("  :clear      Clear context");
+                println("  :alias <e>   Show alias of expression");
+                println("  exit/quit   Exit REPL");
+            }
+            ":vars" => {
+                check self.context.is_empty() {
+                    println("No variables defined");
+                } else {
+                    each entry in &self.context  { let (name, value) = entry;
+                        println("{} = {:?}", name, value);
+                    }
+                }
+            }
+            ":history" => {
+                each entry in self.history.iter().enumerate()  { let (i, line) = entry;
+                    println("{}: {}", i + 1, line);
+                }
+            }
+            ":clear" => {
+                self.context.clear();
+                println("Context cleared");
+            }
+            _ check cmd.starts_with(":alias ") => {
+                let expr = &cmd[6..];
+                match self.infer_type(expr) {
+                    Ok(ty) => println("{}", ty),
+                    Err(e) => eprintln("Error: {}", e),
+                }
+            }
+            _ => {
+                eprintln("Unknown command: {}", cmd);
+                eprintln("Type ':help' for available commands");
+            }
+        }
+    }
+    
+    fn infer_type(&var self, expr: &str) -> Result<String, String> {
+        var lexer = Lexer::new(expr);
+        let tokens = lexer.tokenize()?;
+        var parser = Parser::new(tokens);
+        let expr = parser.parse_expression()?;
+        self.type_checker.infer(&expr)
+    }
+}
+
+expose cases Value {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    String(String),
+    Unit,
+}
+
+open fn main() {
+    var repl = REPL::new();
+    repl.run();
+}

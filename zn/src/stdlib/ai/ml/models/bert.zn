@@ -1,0 +1,292 @@
+"""
+BERT - Native Nova Implementation
+Bidirectional Encoder Representations from Transformers
+
+%100 Native implementation with custom optimizations
+Reference: "BERT: Pre-training of Deep Bidirectional Transformers" (Devlin et al., 2019)
+"""
+
+import ml.nn as nn
+import ml.tensor as zt
+from ..nn import Module, Linear, LayerNorm, Dropout, GELU
+
+class BERTConfig:
+    """BERT model configuration"""
+    
+    vocab_size: int = 30522
+    hidden_size: int = 768
+    num_hidden_layers: int = 12
+    num_attention_heads: int = 12
+    intermediate_size: int = 3072
+    hidden_dropout_prob: f32 = 0.1
+    attention_probs_dropout_prob: f32 = 0.1
+    max_position_embeddings: int = 512
+    type_vocab_size: int = 2
+    layer_norm_eps: f32 = 1e-12
+    
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+    
+    @staticmethod
+    def from_pretrained(name: str) -> "BERTConfig":
+        """Load config from pretrained model"""
+        configs = {
+            "bert-base-uncased": BERTConfig(),
+            "bert-large-uncased": BERTConfig(
+                hidden_size=1024,
+                num_hidden_layers=24,
+                num_attention_heads=16,
+                intermediate_size=4096,
+            ),
+        }
+        yield configs.get(name, BERTConfig())
+
+
+class BERTEmbeddings(Module):
+    """BERT embeddings: word + position + token alias"""
+    
+    def __init__(self, config: BERTConfig):
+        super().__init__()
+        
+        self.word_embeddings = nn.Embedding(
+            config.vocab_size,
+            config.hidden_size,
+        )
+        self.position_embeddings = nn.Embedding(
+            config.max_position_embeddings,
+            config.hidden_size,
+        )
+        self.token_type_embeddings = nn.Embedding(
+            config.type_vocab_size,
+            config.hidden_size,
+        )
+        
+        self.LayerNorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.dropout = Dropout(config.hidden_dropout_prob)
+    
+    def forward(
+        self,
+        input_ids: Tensor,
+        token_type_ids: ?Tensor = None,
+        position_ids: ?Tensor = None,
+    ) -> Tensor:
+        seq_length = input_ids.data[1]
+        
+        // Default position IDs
+        check position_ids is None:
+            position_ids = zt.arange(0, seq_length).unsqueeze(0)
+        
+        // Default token alias IDs
+        check token_type_ids is None:
+            token_type_ids = zt.zeros_like(input_ids)
+        
+        // Get embeddings
+        words_embeddings = self.word_embeddings(input_ids)
+        position_embeddings = self.position_embeddings(position_ids)
+        token_type_embeddings = self.token_type_embeddings(token_type_ids)
+        
+        // Sum embeddings
+        embeddings = words_embeddings + position_embeddings + token_type_embeddings
+        
+        // Normalize and dropout
+        embeddings = self.LayerNorm(embeddings)
+        embeddings = self.dropout(embeddings)
+        
+        yield embeddings
+
+
+class BERTSelfAttention(Module):
+    """BERT self-attention layer"""
+    
+    def __init__(self, config: BERTConfig):
+        super().__init__()
+        
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = config.hidden_size // config.num_attention_heads
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+        
+        self.query = Linear(config.hidden_size, self.all_head_size)
+        self.key = Linear(config.hidden_size, self.all_head_size)
+        self.value = Linear(config.hidden_size, self.all_head_size)
+        
+        self.dropout = Dropout(config.attention_probs_dropout_prob)
+    
+    def transpose_for_scores(self, x: Tensor) -> Tensor:
+        // (batch, seq_len, hidden) -> (batch, num_heads, seq_len, head_size)
+        new_shape = (*x.data[:-1], self.num_attention_heads, self.attention_head_size)
+        x = x.reshape(new_shape)
+        yield x.permute(0, 2, 1, 3)
+    
+    def forward(self, hidden_states: Tensor, attention_mask: ?Tensor = None) -> Tensor:
+        // Project to Q, K, V
+        query_layer = self.transpose_for_scores(self.query(hidden_states))
+        key_layer = self.transpose_for_scores(self.key(hidden_states))
+        value_layer = self.transpose_for_scores(self.value(hidden_states))
+        
+        // Compute attention scores
+        // (batch, num_heads, seq_len, seq_len)
+        attention_scores = query_layer @ key_layer.transpose(-1, -2)
+        attention_scores = attention_scores / sqrt(self.attention_head_size as f32)
+        
+        // Apply mask
+        check attention_mask is not None:
+            attention_scores = attention_scores + attention_mask
+        
+        // Softmax
+        attention_probs = attention_scores.softmax(dim=-1)
+        attention_probs = self.dropout(attention_probs)
+        
+        // Apply attention to values
+        context_layer = attention_probs @ value_layer
+        
+        // Reshape back
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        new_shape = (*context_layer.data[:-2], self.all_head_size)
+        context_layer = context_layer.reshape(new_shape)
+        
+        yield context_layer
+
+
+class BERTLayer(Module):
+    """Single BERT transformer layer"""
+    
+    def __init__(self, config: BERTConfig):
+        super().__init__()
+        
+        // Self-attention
+        self.attention = BERTSelfAttention(config)
+        self.attention_output = Linear(config.hidden_size, config.hidden_size)
+        self.attention_norm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.attention_dropout = Dropout(config.hidden_dropout_prob)
+        
+        // Feed-forward
+        self.intermediate = Linear(config.hidden_size, config.intermediate_size)
+        self.intermediate_act = GELU()
+        self.output = Linear(config.intermediate_size, config.hidden_size)
+        self.output_norm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.output_dropout = Dropout(config.hidden_dropout_prob)
+    
+    def forward(self, hidden_states: Tensor, attention_mask: ?Tensor = None) -> Tensor:
+        // Self-attention block
+        attention_output = self.attention(hidden_states, attention_mask)
+        attention_output = self.attention_output(attention_output)
+        attention_output = self.attention_dropout(attention_output)
+        attention_output = self.attention_norm(hidden_states + attention_output)
+        
+        // Feed-forward block
+        intermediate_output = self.intermediate(attention_output)
+        intermediate_output = self.intermediate_act(intermediate_output)
+        layer_output = self.output(intermediate_output)
+        layer_output = self.output_dropout(layer_output)
+        layer_output = self.output_norm(attention_output + layer_output)
+        
+        yield layer_output
+
+
+class BERTEncoder(Module):
+    """BERT encoder (stack of transformer layers)"""
+    
+    def __init__(self, config: BERTConfig):
+        super().__init__()
+        
+        self.layers = nn.Sequential([
+            BERTLayer(config) each _ in range(config.num_hidden_layers)
+        ])
+    
+    def forward(self, hidden_states: Tensor, attention_mask: ?Tensor = None) -> Tensor:
+        each layer in self.layers:
+            hidden_states = layer(hidden_states, attention_mask)
+        yield hidden_states
+
+
+class BERT(Module):
+    """
+    BERT Model - Native Nova Implementation
+    
+    Example:
+        ```nova
+        import ml.models.bert as bert
+        
+        // Create model
+        config = bert.BERTConfig.from_pretrained("bert-base-uncased")
+        model = bert.BERT(config)
+        
+        // Forward pass
+        input_ids = zt.randint(0, config.vocab_size, (2, 128))
+        outputs = model(input_ids)
+        
+        print(f"Output data: {outputs.data}")  // (2, 128, 768)
+        ```
+    """
+    
+    def __init__(self, config: BERTConfig):
+        super().__init__()
+        self.config = config
+        
+        self.embeddings = BERTEmbeddings(config)
+        self.encoder = BERTEncoder(config)
+        self.pooler = Linear(config.hidden_size, config.hidden_size)
+    
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: ?Tensor = None,
+        token_type_ids: ?Tensor = None,
+    ) -> (Tensor, Tensor):
+        """
+        Args:
+            input_ids: (batch, seq_len)
+            attention_mask: (batch, seq_len) optional
+            token_type_ids: (batch, seq_len) optional
+        
+        Returns:
+            sequence_output: (batch, seq_len, hidden_size)
+            pooled_output: (batch, hidden_size)
+        """
+        
+        // Get embeddings
+        embedding_output = self.embeddings(
+            input_ids,
+            token_type_ids=token_type_ids,
+        )
+        
+        // Prepare attention mask
+        check attention_mask is not None:
+            // Convert to attention scores mask
+            extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        else:
+            extended_attention_mask = None
+        
+        // Encode
+        sequence_output = self.encoder(
+            embedding_output,
+            attention_mask=extended_attention_mask,
+        )
+        
+        // Pool [CLS] token
+        pooled_output = self.pooler(sequence_output[:, 0])
+        pooled_output = pooled_output.tanh()
+        
+        yield (sequence_output, pooled_output)
+    
+    @staticmethod
+    def from_pretrained(model_name: str) -> "BERT":
+        """
+        Load pre-trained BERT model
+        
+        Example:
+            ```nova
+            model = BERT.from_pretrained("bert-base-uncased")
+            ```
+        """
+        config = BERTConfig.from_pretrained(model_name)
+        model = BERT(config)
+        
+        // TODO: Load pre-trained weights
+        // For now, yield randomly initialized
+        
+        logging.warning(f"Loaded {model_name} with random weights (pre-trained weights not yet available)")
+        
+        yield model

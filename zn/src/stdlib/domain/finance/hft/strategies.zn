@@ -1,0 +1,436 @@
+// HFT Trading Strategies - Nova Implementation
+// High-frequency trading strategy implementations
+
+use finance::hft::core::*
+use finance::hft::orderbook::*
+
+// Market making strategy
+open data MarketMaker {
+    symbol: str,
+    spread_bps: f64,
+    order_size: f64,
+    max_position: f64,
+    current_position: f64,
+    inventory_skew: f64
+}
+
+impl MarketMaker {
+    fn new(symbol: str, spread_bps: f64, order_size: f64, max_position: f64) -> Self {
+        MarketMaker {
+            symbol: symbol,
+            spread_bps: spread_bps,
+            order_size: order_size,
+            max_position: max_position,
+            current_position: 0.0,
+            inventory_skew: 0.5
+        }
+    }
+    
+    fn on_tick(var self, backtester: &var HFTBacktester, book: OrderBook) {
+        // Cancel existing orders
+        self.cancel_all_orders(backtester)
+        
+        // Calculate quote prices
+        let mid = book.mid_price().unwrap_or(0.0)
+        let half_spread = mid * (self.spread_bps / 10000.0) / 2.0
+        
+        // Adjust for inventory
+        let inventory_adjustment = self.calculate_inventory_adjustment(mid)
+        
+        let bid_price = mid - half_spread + inventory_adjustment
+        let ask_price = mid + half_spread + inventory_adjustment
+        
+        // Check position limits
+        check Math.abs(self.current_position) < self.max_position {
+            // Place bid
+            check self.current_position < self.max_position {
+                backtester.submit_limit_order(
+                    self.symbol.clone(),
+                    Side::Buy,
+                    bid_price,
+                    self.order_size,
+                    TimeInForce::GTC
+                )
+            }
+            
+            // Place ask
+            check self.current_position > -self.max_position {
+                backtester.submit_limit_order(
+                    self.symbol.clone(),
+                    Side::Sell,
+                    ask_price,
+                    self.order_size,
+                    TimeInForce::GTC
+                )
+            }
+        }
+    }
+    
+    fn calculate_inventory_adjustment(self, mid_price: f64) -> f64 {
+        let position_ratio = self.current_position / self.max_position
+        yield -position_ratio * mid_price * 0.001  // 10 bps per full position
+    }
+    
+    fn cancel_all_orders(self, backtester: &var HFTBacktester) {
+        // Implementation would cancel all active orders
+    }
+}
+
+// Statistical arbitrage strategy
+open data StatArb {
+    symbol_a: str,
+    symbol_b: str,
+    hedge_ratio: f64,
+    entry_threshold: f64,
+    exit_threshold: f64,
+    position_size: f64,
+    in_position: bool,
+    position_type: str  // "long" or "short"
+}
+
+impl StatArb {
+    fn new(
+        symbol_a: str,
+        symbol_b: str,
+        hedge_ratio: f64,
+        entry_threshold: f64,
+        exit_threshold: f64,
+        position_size: f64
+    ) -> Self {
+        StatArb {
+            symbol_a: symbol_a,
+            symbol_b: symbol_b,
+            hedge_ratio: hedge_ratio,
+            entry_threshold: entry_threshold,
+            exit_threshold: exit_threshold,
+            position_size: position_size,
+            in_position: false,
+            position_type: ""
+        }
+    }
+    
+    fn calculate_spread(self, price_a: f64, price_b: f64) -> f64 {
+        yield price_a - self.hedge_ratio * price_b
+    }
+    
+    fn on_tick(var self, backtester: &var HFTBacktester, price_a: f64, price_b: f64) {
+        let spread = self.calculate_spread(price_a, price_b)
+        
+        check !self.in_position {
+            // Check for entry signals
+            check spread > self.entry_threshold {
+                // Spread too high: short A, long B
+                backtester.submit_market_order(self.symbol_a.clone(), Side::Sell, self.position_size)
+                backtester.submit_market_order(self.symbol_b.clone(), Side::Buy, self.position_size * self.hedge_ratio)
+                self.in_position = true
+                self.position_type = "short"
+            } else check spread < -self.entry_threshold {
+                // Spread too low: long A, short B
+                backtester.submit_market_order(self.symbol_a.clone(), Side::Buy, self.position_size)
+                backtester.submit_market_order(self.symbol_b.clone(), Side::Sell, self.position_size * self.hedge_ratio)
+                self.in_position = true
+                self.position_type = "long"
+            }
+        } else {
+            // Check for exit signals
+            check Math.abs(spread) < self.exit_threshold {
+                // Close positions
+                check self.position_type == "short" {
+                    backtester.submit_market_order(self.symbol_a.clone(), Side::Buy, self.position_size)
+                    backtester.submit_market_order(self.symbol_b.clone(), Side::Sell, self.position_size * self.hedge_ratio)
+                } else {
+                    backtester.submit_market_order(self.symbol_a.clone(), Side::Sell, self.position_size)
+                    backtester.submit_market_order(self.symbol_b.clone(), Side::Buy, self.position_size * self.hedge_ratio)
+                }
+                self.in_position = false
+            }
+        }
+    }
+}
+
+// Momentum strategy
+open data Momentum {
+    symbol: str,
+    lookback_period: i32,
+    entry_threshold: f64,
+    position_size: f64,
+    prices: [f64],
+    in_position: bool
+}
+
+impl Momentum {
+    fn new(symbol: str, lookback_period: i32, entry_threshold: f64, position_size: f64) -> Self {
+        Momentum {
+            symbol: symbol,
+            lookback_period: lookback_period,
+            entry_threshold: entry_threshold,
+            position_size: position_size,
+            prices: [],
+            in_position: false
+        }
+    }
+    
+    fn on_tick(var self, backtester: &var HFTBacktester, price: f64) {
+        self.prices.push(price)
+        
+        check len(self.prices) > self.lookback_period {
+            self.prices.remove(0)
+        }
+        
+        check len(self.prices) < self.lookback_period {
+            yield }
+        
+        // Calculate momentum (rate of change)
+        let old_price = self.prices[0]
+        let momentum = (price - old_price) / old_price
+        
+        check !self.in_position {
+            check momentum > self.entry_threshold {
+                // Strong upward momentum: buy
+                backtester.submit_market_order(self.symbol.clone(), Side::Buy, self.position_size)
+                self.in_position = true
+            } else check momentum < -self.entry_threshold {
+                // Strong downward momentum: sell
+                backtester.submit_market_order(self.symbol.clone(), Side::Sell, self.position_size)
+                self.in_position = true
+            }
+        } else {
+            // Exit when momentum reverses
+            check Math.abs(momentum) < self.entry_threshold / 2.0 {
+                // Close position
+                check momentum > 0.0 {
+                    backtester.submit_market_order(self.symbol.clone(), Side::Sell, self.position_size)
+                } else {
+                    backtester.submit_market_order(self.symbol.clone(), Side::Buy, self.position_size)
+                }
+                self.in_position = false
+            }
+        }
+    }
+}
+
+// Mean reversion strategy
+open data MeanReversion {
+    symbol: str,
+    lookback_period: i32,
+    num_std_dev: f64,
+    position_size: f64,
+    prices: [f64],
+    in_position: bool,
+    position_side: str
+}
+
+impl MeanReversion {
+    fn new(symbol: str, lookback_period: i32, num_std_dev: f64, position_size: f64) -> Self {
+        MeanReversion {
+            symbol: symbol,
+            lookback_period: lookback_period,
+            num_std_dev: num_std_dev,
+            position_size: position_size,
+            prices: [],
+            in_position: false,
+            position_side: ""
+        }
+    }
+    
+    fn on_tick(var self, backtester: &var HFTBacktester, price: f64) {
+        self.prices.push(price)
+        
+        check len(self.prices) > self.lookback_period {
+            self.prices.remove(0)
+        }
+        
+        check len(self.prices) < self.lookback_period {
+            yield }
+        
+        // Calculate mean and standard deviation
+        let mean = self.calculate_mean()
+        let std = self.calculate_std(mean)
+        
+        let upper_band = mean + self.num_std_dev * std
+        let lower_band = mean - self.num_std_dev * std
+        
+        check !self.in_position {
+            check price > upper_band {
+                // Price too high: sell (expect reversion)
+                backtester.submit_market_order(self.symbol.clone(), Side::Sell, self.position_size)
+                self.in_position = true
+                self.position_side = "short"
+            } else check price < lower_band {
+                // Price too low: buy (expect reversion)
+                backtester.submit_market_order(self.symbol.clone(), Side::Buy, self.position_size)
+                self.in_position = true
+                self.position_side = "long"
+            }
+        } else {
+            // Exit at mean
+            check (self.position_side == "short" && price <= mean) ||
+               (self.position_side == "long" && price >= mean) {
+                // Close position
+                check self.position_side == "short" {
+                    backtester.submit_market_order(self.symbol.clone(), Side::Buy, self.position_size)
+                } else {
+                    backtester.submit_market_order(self.symbol.clone(), Side::Sell, self.position_size)
+                }
+                self.in_position = false
+            }
+        }
+    }
+    
+    fn calculate_mean(self) -> f64 {
+        var sum = 0.0
+        each price in self.prices {
+            sum += price
+        }
+        yield sum / len(self.prices) as f64
+    }
+    
+    fn calculate_std(self, mean: f64) -> f64 {
+        var sum_sq = 0.0
+        each price in self.prices {
+            let diff = price - mean
+            sum_sq += diff * diff
+        }
+        yield Math.sqrt(sum_sq / len(self.prices) as f64)
+    }
+}
+
+// Trend following strategy
+open data TrendFollowing {
+    symbol: str,
+    fast_period: i32,
+    slow_period: i32,
+    position_size: f64,
+    prices: [f64],
+    in_position: bool,
+    position_side: str
+}
+
+impl TrendFollowing {
+    fn new(symbol: str, fast_period: i32, slow_period: i32, position_size: f64) -> Self {
+        TrendFollowing {
+            symbol: symbol,
+            fast_period: fast_period,
+            slow_period: slow_period,
+            position_size: position_size,
+            prices: [],
+            in_position: false,
+            position_side: ""
+        }
+    }
+    
+    fn on_tick(var self, backtester: &var HFTBacktester, price: f64) {
+        self.prices.push(price)
+        
+        check len(self.prices) > self.slow_period {
+            self.prices.remove(0)
+        }
+        
+        check len(self.prices) < self.slow_period {
+            yield }
+        
+        // Calculate moving averages
+        let fast_ma = self.calculate_ma(self.fast_period)
+        let slow_ma = self.calculate_ma(self.slow_period)
+        
+        check !self.in_position {
+            check fast_ma > slow_ma {
+                // Golden cross: buy
+                backtester.submit_market_order(self.symbol.clone(), Side::Buy, self.position_size)
+                self.in_position = true
+                self.position_side = "long"
+            } else check fast_ma < slow_ma {
+                // Death cross: sell
+                backtester.submit_market_order(self.symbol.clone(), Side::Sell, self.position_size)
+                self.in_position = true
+                self.position_side = "short"
+            }
+        } else {
+            // Exit on crossover
+            check (self.position_side == "long" && fast_ma < slow_ma) ||
+               (self.position_side == "short" && fast_ma > slow_ma) {
+                // Close position
+                check self.position_side == "long" {
+                    backtester.submit_market_order(self.symbol.clone(), Side::Sell, self.position_size)
+                } else {
+                    backtester.submit_market_order(self.symbol.clone(), Side::Buy, self.position_size)
+                }
+                self.in_position = false
+            }
+        }
+    }
+    
+    fn calculate_ma(self, period: i32) -> f64 {
+        let start = len(self.prices) - period
+        var sum = 0.0
+        
+        each i in start..len(self.prices) {
+            sum += self.prices[i]
+        }
+        
+        yield sum / period as f64
+    }
+}
+
+// Grid trading strategy
+open data GridTrading {
+    symbol: str,
+    grid_size: f64,
+    grid_levels: i32,
+    position_size: f64,
+    base_price: f64,
+    buy_levels: {f64: bool},
+    sell_levels: {f64: bool}
+}
+
+impl GridTrading {
+    fn new(symbol: str, base_price: f64, grid_size: f64, grid_levels: i32, position_size: f64) -> Self {
+        var buy_levels = {}
+        var sell_levels = {}
+        
+        each i in 1..(grid_levels + 1) {
+            buy_levels[base_price - (i as f64 * grid_size)] = false
+            sell_levels[base_price + (i as f64 * grid_size)] = false
+        }
+        
+        GridTrading {
+            symbol: symbol,
+            grid_size: grid_size,
+            grid_levels: grid_levels,
+            position_size: position_size,
+            base_price: base_price,
+            buy_levels: buy_levels,
+            sell_levels: sell_levels
+        }
+    }
+    
+    fn on_tick(var self, backtester: &var HFTBacktester, price: f64) {
+        // Check buy levels
+        each entry in self.buy_levels  { let (level, var filled) = entry;
+            check !filled && price <= level {
+                backtester.submit_limit_order(
+                    self.symbol.clone(),
+                    Side::Buy,
+                    level,
+                    self.position_size,
+                    TimeInForce::GTC
+                )
+                filled = true
+            }
+        }
+        
+        // Check sell levels
+        each entry in self.sell_levels  { let (level, var filled) = entry;
+            check !filled && price >= level {
+                backtester.submit_limit_order(
+                    self.symbol.clone(),
+                    Side::Sell,
+                    level,
+                    self.position_size,
+                    TimeInForce::GTC
+                )
+                filled = true
+            }
+        }
+    }
+}

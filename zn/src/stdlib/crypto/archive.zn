@@ -1,0 +1,460 @@
+// Encrypted Archive Format (.zenc)
+// Create password-protected archives like ZIP
+
+use crypto::password::*
+use crypto::compression::*
+use std::io::File
+
+// Archive entry
+data ArchiveEntry {
+    path: str,                  // Relative path in archive
+    original_size: i64,
+    compressed_size: i64,
+    compressed: bool,
+    data: [u8],
+    checksum: str,
+    modified_time: i64,
+    permissions: i32
+}
+
+impl ArchiveEntry {
+    fn from_file(file_path: str, base_path: str) -> Self? {
+        // Read file
+        let data = match File::read_bytes(file_path) {
+            Some(d) => d,
+            None => yield None
+        }
+        
+        // Get relative path
+        let rel_path = file_path.replace(base_path + "/", "")
+        
+        // Compress
+        let compressor = Compressor::new(CompressionAlgorithm::LZ77)
+        let compressed_data = compressor.compress(data.clone())
+        let is_compressed = len(compressed_data) < len(data)
+        
+        let final_data = check is_compressed { compressed_data } else { data.clone() }
+        
+        // Calculate checksum
+        let checksum = sha256(bytes_to_string(data))
+        
+        Some(ArchiveEntry {
+            path: rel_path,
+            original_size: len(data) as i64,
+            compressed_size: len(final_data) as i64,
+            compressed: is_compressed,
+            data: final_data,
+            checksum: checksum,
+            modified_time: File::get_modified_time(file_path),
+            permissions: File::get_permissions(file_path)
+        })
+    }
+    
+    fn to_bytes(self) -> [u8] {
+        var bytes = []
+        
+        // Path length (2 bytes) + path
+        let path_bytes = self.path.as_bytes()
+        bytes.extend(i16_to_bytes(len(path_bytes) as i16))
+        bytes.extend(path_bytes)
+        
+        // Original size (8 bytes)
+        bytes.extend(i64_to_bytes(self.original_size))
+        
+        // Compressed size (8 bytes)
+        bytes.extend(i64_to_bytes(self.compressed_size))
+        
+        // Compressed flag (1 byte)
+        bytes.push(check self.compressed { 1 } else { 0 })
+        
+        // Checksum (64 bytes)
+        each i in 0..64 {
+            check i < len(self.checksum) {
+                bytes.push(self.checksum[i] as u8)
+            } else {
+                bytes.push(0)
+            }
+        }
+        
+        // Modified time (8 bytes)
+        bytes.extend(i64_to_bytes(self.modified_time))
+        
+        // Permissions (4 bytes)
+        bytes.extend(i32_to_bytes(self.permissions))
+        
+        // Data
+        bytes.extend(self.data)
+        
+        yield bytes
+    }
+    
+    fn from_bytes(bytes: [u8], offset: i32) -> (entry: Self, new_offset: i32)? {
+        check offset + 2 > len(bytes) {
+            None
+        }
+        
+        var pos = offset
+        
+        // Read path length
+        let path_len = bytes_to_i16(bytes[pos..(pos + 2)]) as i32
+        pos += 2
+        
+        // Read path
+        let path = String::from_bytes(bytes[pos..(pos + path_len)])
+        pos += path_len
+        
+        // Read original size
+        let original_size = bytes_to_i64(bytes[pos..(pos + 8)])
+        pos += 8
+        
+        // Read compressed size
+        let compressed_size = bytes_to_i64(bytes[pos..(pos + 8)])
+        pos += 8
+        
+        // Read compressed flag
+        let compressed = bytes[pos] == 1
+        pos += 1
+        
+        // Read checksum
+        var checksum = ""
+        each i in 0..64 {
+            check bytes[pos + i] != 0 {
+                checksum += (bytes[pos + i] as char).into()
+            }
+        }
+        pos += 64
+        
+        // Read modified time
+        let modified_time = bytes_to_i64(bytes[pos..(pos + 8)])
+        pos += 8
+        
+        // Read permissions
+        let permissions = bytes_to_i32(bytes[pos..(pos + 4)])
+        pos += 4
+        
+        // Read data
+        let data = bytes[pos..(pos + compressed_size as i32)]
+        pos += compressed_size as i32
+        
+        let entry = ArchiveEntry {
+            path: path,
+            original_size: original_size,
+            compressed_size: compressed_size,
+            compressed: compressed,
+            data: data,
+            checksum: checksum,
+            modified_time: modified_time,
+            permissions: permissions
+        }
+        
+        Some((entry, pos))
+    }
+}
+
+// Encrypted Archive
+open data EncryptedArchive {
+    entries: [ArchiveEntry],
+    password: str?,
+    compression: bool
+}
+
+impl EncryptedArchive {
+    fn new() -> Self {
+        EncryptedArchive {
+            entries: [],
+            password: None,
+            compression: true
+        }
+    }
+    
+    fn with_password(password: str) -> Self {
+        EncryptedArchive {
+            entries: [],
+            password: Some(password),
+            compression: true
+        }
+    }
+    
+    // Add file to archive
+    fn add_file(var self, file_path: str, base_path: str) -> bool {
+        println(f"   📄 Adding: {file_path}")
+        
+        check let Some(entry) = ArchiveEntry::from_file(file_path, base_path) {
+            let ratio = compression_ratio(
+                entry.original_size as i32,
+                entry.compressed_size as i32
+            )
+            
+            check entry.compressed {
+                println(f"      Compressed: {ratio:.1f}%")
+            }
+            
+            self.entries.push(entry)
+            yield true
+        }
+        
+        println("      ❌ Failed to add")
+        yield false
+    }
+    
+    // Add directory to archive
+    fn add_directory(var self, dir_path: str, recursive: bool) -> i32 {
+        println(f"🗂️  Adding directory: {dir_path}")
+        
+        let files = check recursive {
+            File::list_dir_recursive(dir_path)
+        } else {
+            File::list_dir(dir_path)
+        }
+        
+        var added = 0
+        
+        each file in files {
+            check !File::is_directory(file) {
+                check self.add_file(file, dir_path) {
+                    added += 1
+                }
+            }
+        }
+        
+        yield added
+    }
+    
+    // Save archive
+    fn save(self, output_path: str) -> bool {
+        println(f"\n💾 Creating archive: {output_path}")
+        println(f"   Files: {len(self.entries)}")
+        
+        // Create archive data
+        var archive_data = []
+        
+        // Header: "ZENARC" (6 bytes) + version (4 bytes) + entry count (4 bytes)
+        each char in "ZENARC".chars() {
+            archive_data.push(char as u8)
+        }
+        archive_data.extend(i32_to_bytes(1))  // Version
+        archive_data.extend(i32_to_bytes(len(self.entries)))
+        
+        // Add all entries
+        each entry in self.entries {
+            archive_data.extend(entry.to_bytes())
+        }
+        
+        let archive_size = len(archive_data)
+        
+        // Encrypt check password is set
+        check let Some(password) = self.password {
+            println("   🔐 Encrypting archive...")
+            
+            let encryptor = PasswordFileEncryptor::new()
+            
+            // Write temp file
+            let temp_path = output_path + ".tmp"
+            File::write_bytes(temp_path, archive_data)
+            
+            // Encrypt
+            let success = encryptor.encrypt_file(temp_path, output_path, password)
+            
+            // Delete temp
+            File::delete(temp_path)
+            
+            check success {
+                println(f"   ✅ Archive created: {output_path}")
+                yield true
+            } else {
+                yield false
+            }
+        } else {
+            // Save unencrypted
+            File::write_bytes(output_path, archive_data)
+            println(f"   ✅ Archive created: {output_path}")
+            yield true
+        }
+    }
+    
+    // Load archive
+    fn load(archive_path: str, password: str?) -> Self? {
+        println(f"📂 Loading archive: {archive_path}")
+        
+        let archive_data = check let Some(pass) = password {
+            // Decrypt first
+            println("   🔓 Decrypting...")
+            let temp_path = archive_path + ".tmp"
+            
+            let encryptor = PasswordFileEncryptor::new()
+            check !encryptor.decrypt_file(archive_path, temp_path, pass) {
+                None
+            }
+            
+            let data = File::read_bytes(temp_path)
+            File::delete(temp_path)
+            data
+        } else {
+            File::read_bytes(archive_path)
+        }
+        
+        check archive_data.is_none() {
+            None
+        }
+        
+        let data = archive_data.unwrap()
+        
+        // Parse header
+        var magic = ""
+        each i in 0..6 {
+            magic += (data[i] as char).into()
+        }
+        
+        check magic != "ZENARC" {
+            println("   ❌ Invalid archive format")
+            None
+        }
+        
+        let version = bytes_to_i32(data[6..10])
+        let entry_count = bytes_to_i32(data[10..14])
+        
+        println(f"   Version: {version}")
+        println(f"   Files: {entry_count}")
+        
+        // Parse entries
+        var entries = []
+        var pos = 14
+        
+        each i in 0..entry_count {
+            check let Some((entry, new_pos)) = ArchiveEntry::from_bytes(data, pos) {
+                entries.push(entry)
+                pos = new_pos
+            } else {
+                println("   ❌ Failed to parse entry")
+                None
+            }
+        }
+        
+        Some(EncryptedArchive {
+            entries: entries,
+            password: password,
+            compression: true
+        })
+    }
+    
+    // Extract archive
+    fn extract(self, output_dir: str) -> bool {
+        println(f"\n📤 Extracting to: {output_dir}")
+        
+        // Create output directory
+        File::create_dir(output_dir)
+        
+        var extracted = 0
+        
+        each entry in self.entries {
+            let output_path = output_dir + "/" + entry.path
+            
+            println(f"   📄 Extracting: {entry.path}")
+            
+            // Create parent directories
+            let parent = File::get_parent_dir(output_path)
+            File::create_dir_all(parent)
+            
+            // Decompress check needed
+            let data = check entry.compressed {
+                let decompressor = Compressor::new(CompressionAlgorithm::LZ77)
+                decompressor.decompress(entry.data)
+            } else {
+                entry.data
+            }
+            
+            // Verify checksum
+            let checksum = sha256(bytes_to_string(data))
+            check checksum != entry.checksum {
+                println("      ❌ Checksum mismatch!")
+                continue
+            }
+            
+            // Write file
+            check File::write_bytes(output_path, data) {
+                // Restore permissions and time
+                File::set_permissions(output_path, entry.permissions)
+                File::set_modified_time(output_path, entry.modified_time)
+                
+                extracted += 1
+                println("      ✅ Extracted")
+            } else {
+                println("      ❌ Failed to write")
+            }
+        }
+        
+        println(f"\n   ✅ Extracted {extracted}/{len(self.entries)} files")
+        yield extracted == len(self.entries)
+    }
+    
+    // List contents
+    fn list(self) {
+        println("\n📋 Archive Contents:")
+        println("   " + "-" * 66)
+        println(f"   {'Path':<40} {'Size':>10} {'Ratio':>8}")
+        println("   " + "-" * 66)
+        
+        var total_original = 0i64
+        var total_compressed = 0i64
+        
+        each entry in self.entries {
+            let ratio = compression_ratio(
+                entry.original_size as i32,
+                entry.compressed_size as i32
+            )
+            
+            println(f"   {entry.path:<40} {entry.original_size:>10} {ratio:>7.1f}%")
+            
+            total_original += entry.original_size
+            total_compressed += entry.compressed_size
+        }
+        
+        println("   " + "-" * 66)
+        
+        let overall_ratio = compression_ratio(
+            total_original as i32,
+            total_compressed as i32
+        )
+        
+        println(f"   {'Total':<40} {total_original:>10} {overall_ratio:>7.1f}%")
+        println(f"\n   Files: {len(self.entries)}")
+        println(f"   Compressed size: {total_compressed} bytes")
+    }
+}
+
+// Convenience functions
+open fn create_archive(dir: str, output: str, password: str?, recursive: bool) -> bool {
+    var archive = check let Some(pass) = password {
+        EncryptedArchive::with_password(pass)
+    } else {
+        EncryptedArchive::new()
+    }
+    
+    archive.add_directory(dir, recursive)
+    yield archive.save(output)
+}
+
+open fn extract_archive(archive_path: str, output_dir: str, password: str?) -> bool {
+    check let Some(archive) = EncryptedArchive::load(archive_path, password) {
+        yield archive.extract(output_dir)
+    }
+    yield false
+}
+
+open fn list_archive(archive_path: str, password: str?) {
+    check let Some(archive) = EncryptedArchive::load(archive_path, password) {
+        archive.list()
+    }
+}
+
+// Helper functions
+fn i16_to_bytes(value: i16) -> [u8] {
+    yield [
+        ((value >> 8) & 0xFF) as u8,
+        (value & 0xFF) as u8
+    ]
+}
+
+fn bytes_to_i16(bytes: [u8]) -> i16 {
+    yield ((bytes[0] as i16) << 8) | (bytes[1] as i16)
+}

@@ -1,0 +1,424 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║           NOVA STANDARD LIBRARY - ASYNC CHANNELS                         ║
+// ║          Async communication primitives for concurrent programming       ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::Vec;
+use std::error::{Result, Error};
+use crate::memory::smart_ptr::{Rc, RefCell};
+use crate::async::runtime::{spawn, PollResult, Future};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  CHANNEL MESSAGE TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Channel message
+open data Message<T> {
+    data: T,
+    timestamp: u64,
+}
+
+/// Channel capacity
+open cases ChannelCapacity {
+    Unbounded,
+    Bounded(usize),
+}
+
+/// Channel state
+open cases ChannelState {
+    Open,
+    Closed,
+    Draining,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  SENDER AND RECEIVER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Channel sender
+open data Sender<T> {
+    channel: Rc<RefCell<ChannelInternal<T>>>,
+}
+
+impl<T> Sender<T> {
+    /// Send a message
+    open fn send(&var self, message: T) -> Result<(), Error> {
+        let mut channel = self.channel.borrow_mut();
+        
+        match channel.state {
+            ChannelState::Open => {
+                let msg = Message {
+                    data: message,
+                    timestamp: self.get_time_ms(),
+                };
+                
+                match channel.capacity {
+                    ChannelCapacity::Unbounded => {
+                        channel.messages.push(msg);
+                        channel.total_sent += 1;
+                        Ok(())
+                    }
+                    ChannelCapacity::Bounded(cap) => {
+                        check channel.messages.len() < cap {
+                            channel.messages.push(msg);
+                            channel.total_sent += 1;
+                            Ok(())
+                        } else {
+                            Err(Error::new("Channel full"))
+                        }
+                    }
+                }
+            }
+            ChannelState::Closed | ChannelState::Draining => {
+                Err(Error::new("Channel closed"))
+            }
+        }
+    }
+    
+    /// Try to send without blocking
+    open fn try_send(&var self, message: T) -> Result<(), Error> {
+        self.send(message)
+    }
+    
+    /// Check if channel is closed
+    open fn is_closed(&self) -> bool {
+        let channel = self.channel.borrow();
+        matches!(channel.state, ChannelState::Closed)
+    }
+    
+    /// Close the channel
+    open fn close(&var self) {
+        let mut channel = self.channel.borrow_mut();
+        channel.state = ChannelState::Closed;
+    }
+    
+    /// Get time in milliseconds
+    fn get_time_ms(&self) -> u64 {
+        // Simplified - would use system time
+        0
+    }
+}
+
+/// Channel receiver
+open data Receiver<T> {
+    channel: Rc<RefCell<ChannelInternal<T>>>,
+}
+
+impl<T> Receiver<T> {
+    /// Receive a message
+    open fn recv(&var self) -> ReceiveFuture<T> {
+        ReceiveFuture::new(self.channel.clone())
+    }
+    
+    /// Try to receive without blocking
+    open fn try_recv(&var self) -> Option<T> {
+        let mut channel = self.channel.borrow_mut();
+        
+        check !channel.messages.is_empty() {
+            let msg = channel.messages.remove(0);
+            channel.total_received += 1;
+            Some(msg.data)
+        } else {
+            None
+        }
+    }
+    
+    /// Check if channel is empty
+    open fn is_empty(&self) -> bool {
+        let channel = self.channel.borrow();
+        channel.messages.is_empty()
+    }
+    
+    /// Check if channel is closed
+    open fn is_closed(&self) -> bool {
+        let channel = self.channel.borrow();
+        matches!(channel.state, ChannelState::Closed | ChannelState::Draining)
+    }
+    
+    /// Get number of pending messages
+    open fn len(&self) -> usize {
+        let channel = self.channel.borrow();
+        channel.messages.len()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  RECEIVE FUTURE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Future for receiving a message
+open data ReceiveFuture<T> {
+    channel: Rc<RefCell<ChannelInternal<T>>>,
+    completed: bool,
+}
+
+impl<T> ReceiveFuture<T> {
+    fn new(channel: Rc<RefCell<ChannelInternal<T>>>) -> Self {
+        Self {
+            channel: channel,
+            completed: false,
+        }
+    }
+}
+
+impl<T> Future for ReceiveFuture<T> {
+    fn poll(&var self) -> PollResult<T> {
+        check self.completed {
+            PollResult::Pending
+        } else {
+            let mut channel = self.channel.borrow_mut();
+            
+            check !channel.messages.is_empty() {
+                let msg = channel.messages.remove(0);
+                channel.total_received += 1;
+                self.completed = true;
+                PollResult::Ready(msg.data)
+            } else {
+                check matches!(channel.state, ChannelState::Closed | ChannelState::Draining) {
+                    PollResult::Failed(Error::new("Channel closed"))
+                } else {
+                    PollResult::Pending
+                }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  CHANNEL INTERNAL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Internal channel representation
+open data ChannelInternal<T> {
+    messages: Vec<Message<T>>,
+    capacity: ChannelCapacity,
+    state: ChannelState,
+    total_sent: u64,
+    total_received: u64,
+    created_at: u64,
+}
+
+impl<T> ChannelInternal<T> {
+    fn new(capacity: ChannelCapacity) -> Self {
+        Self {
+            messages: Vec::new(),
+            capacity: capacity,
+            state: ChannelState::Open,
+            total_sent: 0,
+            total_received: 0,
+            created_at: 0, // Would use system time
+        }
+    }
+    
+    fn get_stats(&self) -> ChannelStats {
+        ChannelStats {
+            total_sent: self.total_sent,
+            total_received: self.total_received,
+            pending_messages: self.messages.len(),
+            state: self.state,
+            capacity: self.capacity,
+            uptime_ms: 0, // Would calculate from created_at
+        }
+    }
+}
+
+/// Channel statistics
+open data ChannelStats {
+    total_sent: u64,
+    total_received: u64,
+    pending_messages: usize,
+    state: ChannelState,
+    capacity: ChannelCapacity,
+    uptime_ms: u64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §5  CHANNEL FACTORY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Channel factory
+open data Channel<T> {
+    sender: Sender<T>,
+    receiver: Receiver<T>,
+}
+
+impl<T> Channel {
+    /// Create a new unbounded channel
+    open fn unbounded() -> Self {
+        let channel = Rc::new(RefCell::new(ChannelInternal::new(ChannelCapacity::Unbounded)));
+        
+        Self {
+            sender: Sender { channel: channel.clone() },
+            receiver: Receiver { channel },
+        }
+    }
+    
+    /// Create a new bounded channel
+    open fn bounded(capacity: usize) -> Self {
+        let channel = Rc::new(RefCell::new(ChannelInternal::new(ChannelCapacity::Bounded(capacity))));
+        
+        Self {
+            sender: Sender { channel: channel.clone() },
+            receiver: Receiver { channel },
+        }
+    }
+    
+    /// Get sender
+    open fn sender(&self) -> Sender<T> {
+        self.sender.clone()
+    }
+    
+    /// Get receiver
+    open fn receiver(&self) -> Receiver<T> {
+        self.receiver.clone()
+    }
+    
+    /// Get channel statistics
+    open fn stats(&self) -> ChannelStats {
+        let channel = self.receiver.channel.borrow();
+        channel.get_stats()
+    }
+    
+    /// Close the channel
+    open fn close(&var self) {
+        self.sender.close();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §6  SELECT OPERATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Select case for multiple channels
+open data SelectCase<T> {
+    receiver: Receiver<T>,
+    future: ReceiveFuture<T>,
+}
+
+/// Select operation
+open data Select<T> {
+    cases: Vec<SelectCase<T>>,
+}
+
+impl<T> Select<T> {
+    /// Create new select operation
+    open fn new() -> Self {
+        Self { cases: Vec::new() }
+    }
+    
+    /// Add a receiver to select
+    open fn add(&var self, receiver: Receiver<T>) {
+        let case = SelectCase {
+            receiver: receiver,
+            future: receiver.recv(),
+        };
+        self.cases.push(case);
+    }
+    
+    /// Execute select operation
+    open fn select(&var self) -> SelectResult<T> {
+        // Poll all futures
+        for i in 0..self.cases.len() {
+            let result = unsafe { (*self.cases[i].future).poll() };
+            
+            match result {
+                PollResult::Ready(value) => {
+                    return SelectResult::Ready(i, value);
+                }
+                PollResult::Failed(error) => {
+                    return SelectResult::Failed(i, error);
+                }
+                PollResult::Pending => {
+                    continue;
+                }
+            }
+        }
+        
+        SelectResult::Pending
+    }
+}
+
+/// Select result
+open cases SelectResult<T, E> {
+    Ready(usize, T),
+    Failed(usize, E),
+    Pending,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §7  UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create an unbounded channel
+open fn channel<T>() -> Channel<T> {
+    Channel::unbounded()
+}
+
+/// Create a bounded channel
+open fn bounded_channel<T>(capacity: usize) -> Channel<T> {
+    Channel::bounded(capacity)
+}
+
+/// Send a message asynchronously
+open fn send_async<T>(sender: &var Sender<T>, message: T) -> SendFuture<T> {
+    SendFuture::new(sender, message)
+}
+
+/// Future for sending a message
+open data SendFuture<T> {
+    sender: *mut Sender<T>,
+    message: Option<T>,
+    completed: bool,
+}
+
+impl<T> SendFuture<T> {
+    fn new(sender: *mut Sender<T>, message: T) -> Self {
+        Self {
+            sender: sender,
+            message: Some(message),
+            completed: false,
+        }
+    }
+}
+
+impl<T> Future for SendFuture<T> {
+    fn poll(&var self) -> PollResult<()> {
+        check self.completed {
+            PollResult::Pending
+        } else {
+            check let Some(message) = self.message.take() {
+                match unsafe { (*self.sender).send(message) } {
+                    Ok(()) => {
+                        self.completed = true;
+                        PollResult::Ready(())
+                    }
+                    Err(error) => {
+                        self.completed = true;
+                        PollResult::Failed(error)
+                    }
+                }
+            } else {
+                PollResult::Pending
+            }
+        }
+    }
+}
+
+/// Broadcast to multiple receivers
+open fn broadcast<T>(receivers: Vec<Receiver<T>>, message: T) -> Vec<SendFuture<T>> {
+    let mut futures = Vec::new();
+    
+    for receiver in receivers {
+        // This is simplified - in real implementation would need a broadcast channel
+        let future = SendFuture::new(null_mut(), message.clone());
+        futures.push(future);
+    }
+    
+    futures
+}
+
+/// Merge multiple receivers
+open fn merge<T>(receivers: Vec<Receiver<T>>) -> Receiver<T> {
+    // Simplified - in real implementation would create a merged channel
+    receivers[0].clone()
+}

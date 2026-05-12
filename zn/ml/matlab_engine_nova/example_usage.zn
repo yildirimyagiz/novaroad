@@ -1,0 +1,260 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  MATLAB Engine for Novaple_usage.zn                               ║
+// ║  Full API demo.  Mirrors the Python README examples from:                  ║
+// ║    github.com/mathworks/matlab-engine-for-python                           ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use from matlab::engine::{
+    start_matlab, start_matlab_async, connect_matlab, connect_or_start, find_matlab,
+    MatlabEngine, MatlabFuture, FevalFuture, MatlabValue,
+    Engine, StartFuture, CallFuture,
+};
+use from matlab::engine::engine_helper::{
+    f64_to_matlab, i64_to_matlab, bool_to_matlab, str_to_matlab,
+    vec_f64_to_matlab, matlab_to_f64, matlab_to_str,
+};
+
+// ============================================================================
+//  Example 1 — basic synchronous usage
+// ============================================================================
+
+fn example_basic() {
+    println("── Example 1: Basic Synchronous Usage ──");
+
+    // Start MATLAB (blocks until ready, ~15s on first call)
+    let eng = start_matlab("-nodesktop -nosplash");
+    defer { eng.quit(); }   // quit when this block exits — like Python's `with`
+
+    // Run an expression
+    eng.eval("a = [1 2 3 4; 5 6 7 8; 9 10 11 12]");
+
+    // Call a MATLAB function with a yield value
+    let result = eng.feval("sqrt", [f64_to_matlab(4.0)], 1);
+    let val    = matlab_to_f64(result).unwrap_or(0.0);
+    println(f"  sqrt(4.0) = {val}");          // → 2.0
+
+    // Convenience wrapper
+    println(f"  sqrt(9.0) = {eng.sqrt(9.0)}");  // → 3.0
+
+    // Multiple yield values — nargout = 3
+    let svd_result = eng.feval(
+        "svd",
+        [MatlabValue::DoubleArray([1.0,2.0,3.0,4.0])],
+        3
+    );
+    println(f"  svd result: {svd_result.display()}");
+}
+
+// ============================================================================
+//  Example 2 — asynchronous function calls
+// ============================================================================
+
+fn example_async_calls() {
+    println("── Example 2: Asynchronous Calls ──");
+
+    let eng = start_matlab("");
+    defer { eng.quit(); }
+
+    // Launch two MATLAB calls in the background
+    let fut1: CallFuture = eng.feval_background(
+        "sqrt",
+        [f64_to_matlab(16.0)],
+        1
+    );
+    let fut2: CallFuture = eng.feval_background(
+        "factorial",
+        [i64_to_matlab(10)],
+        1
+    );
+
+    // Do other work while MATLAB computes …
+    println("  MATLAB is computing in background …");
+
+    // Collect results (blocks only as long as necessary)
+    let r1 = matlab_to_f64(fut1.result()).unwrap_or(0.0);
+    let r2 = matlab_to_f64(fut2.result()).unwrap_or(0.0);
+    println(f"  sqrt(16) = {r1}");       // → 4.0
+    println(f"  10!      = {r2}");       // → 3628800.0
+
+    // Cancel a background call
+    let fut3: CallFuture = eng.feval_background("pause", [f64_to_matlab(30.0)], 0);
+    let cancelled = fut3.cancel();
+    println(f"  pause(30) cancelled: {cancelled}");  // → true
+}
+
+// ============================================================================
+//  Example 3 — async engine startup
+// ============================================================================
+
+fn example_async_startup() {
+    println("── Example 3: Async Engine Startup ──");
+
+    // Start MATLAB in background; returns immediately
+    let startup: StartFuture = start_matlab_async("-nodesktop");
+
+    // Do other Novahile MATLAB boots …
+    println("  MATLAB is starting in background …");
+    let computed_locally = heavy_local_computation();
+    println(f"  Local result ready: {computed_locally}");
+
+    // Now wait for MATLAB (with optional timeout)
+    let eng = startup.result_with_timeout(60.0);
+    defer { eng.quit(); }
+
+    let result = eng.sqrt(computed_locally);
+    println(f"  sqrt({computed_locally}) in MATLAB = {result}");
+}
+
+fn heavy_local_computation() -> f64 {
+    // Simulate some work in NovaMATLAB starts
+    var sum = 0.0;
+    each i in 0..1000000 {
+        sum += (i as f64) * 0.000001;
+    }
+    sum
+}
+
+// ============================================================================
+//  Example 4 — workspace variable exchange
+// ============================================================================
+
+fn example_workspace() {
+    println("── Example 4: Workspace Variable Exchange ──");
+
+    let eng = start_matlab("");
+    defer { eng.quit(); }
+
+    // Push a matrix into MATLAB's workspace
+    let matrix_data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+    eng.push_var("M", MatlabValue::DoubleArray(matrix_data));
+
+    // Operate on it in MATLAB
+    eng.eval("result = sum(M)");
+
+    // Pull the result back
+    let result = eng.pull_var("result");
+    let scalar = matlab_to_f64(result).unwrap_or(0.0);
+    println(f"  sum([1..9]) = {scalar}");  // → 45.0
+
+    // Workspace proxy syntax (equivalent to above)
+    eng.workspace.set("x", MatlabValue::Double(42.0));
+    let x = eng.workspace.get("x");
+    println(f"  workspace['x'] = {x.display()}");
+
+    // Clear a workspace variable
+    eng.workspace.clear("x");
+}
+
+// ============================================================================
+//  Example 5 — session sharing (multi-process)
+// ============================================================================
+
+fn example_session_sharing() {
+    println("── Example 5: Session Sharing ──");
+
+    // Process A: start and share a session
+    let eng_a = start_matlab("");
+    eng_a.share("NovaSession");
+    eng_a.eval("shared_data = magic(4)");
+    println(f"  Session '{eng_a.session_name()}' shared.");
+
+    // Discover it from another context (would normally be another process)
+    let sessions = find_matlab();
+    println(f"  Visible sessions: {sessions}");
+
+    // Process B: connect to the existing session
+    let eng_b = connect_matlab("NovaSession");
+    let val = eng_b.pull_var("shared_data");
+    println(f"  Pulled shared_data from session B: {val.display()}");
+
+    eng_a.quit();
+    // eng_b shares the same MATLAB process — quitting a shared connection
+    // does not kill the process; only the engine that owns it can do that.
+}
+
+// ============================================================================
+//  Example 6 — error handling
+// ============================================================================
+
+fn example_error_handling() {
+    println("── Example 6: Error Handling ──");
+
+    let eng = start_matlab("");
+    defer { eng.quit(); }
+
+    // Catch a MATLAB runtime error
+    match eng.feval("error_prone_function", [], 1) {
+        // In real Novaould use Result<MatlabValue, EngineError>
+        // For now we demonstrate the pattern:
+        v => println(f"  Got: {v.display()}"),
+    }
+
+    // Demonstrate terminated engine detection
+    eng.quit();
+    // eng.eval("a = 1") would now panic with EngineTerminatedError
+}
+
+// ============================================================================
+//  Example 7 — cognitive / formal patterns using Novads
+// ============================================================================
+
+fn example_nova_native() {
+    println("── Example 7: Nova Patterns ──");
+
+    let eng = start_matlab("");
+    defer { eng.quit(); }
+
+    // `verify` — assert a post-condition on a MATLAB result
+    let result = eng.sqrt(25.0);
+    verify result == 5.0;
+
+    // `infer` — let Novathe numeric alias from a MatlabValue
+    let raw = eng.eval_with_nargout("pi", 1);
+    let pi_val: f64 = infer f64(raw);   // Novaarrowing
+    println(f"  π ≈ {pi_val}");
+
+    // `compute` block — group MATLAB calls that can be parallelised
+    compute {
+        let a = eng.feval_background("sqrt",     [f64_to_matlab(144.0)], 1);
+        let b = eng.feval_background("factorial", [i64_to_matlab(8)],    1);
+        let c = eng.feval_background("primes",   [i64_to_matlab(100)],   1);
+
+        println(f"  sqrt(144)     = {matlab_to_f64(a.result()).unwrap_or(0.0)}");
+        println(f"  factorial(8)  = {matlab_to_f64(b.result()).unwrap_or(0.0)}");
+        println(f"  primes ≤ 100  = {c.result().display()}");
+    }
+
+    // `advise` — ask the engine for an optimisation hint (Novanitive)
+    advise {
+        domain: "numerical_computation",
+        hint:   "Use MATLAB matrix ops instead of scalar loops for best performance."
+    }
+}
+
+// ============================================================================
+//  main — run all examples
+// ============================================================================
+
+fn main() {
+    println("╔════════════════════════════════════════════════════════╗");
+    println("║  MATLAB Engine for NovaDemo                  ║");
+    println("╚════════════════════════════════════════════════════════╝");
+    println();
+
+    example_basic();
+    println();
+    example_async_calls();
+    println();
+    example_async_startup();
+    println();
+    example_workspace();
+    println();
+    example_session_sharing();
+    println();
+    example_error_handling();
+    println();
+    example_nova_native();
+
+    println();
+    println("✅ All examples completed.");
+}

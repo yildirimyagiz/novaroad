@@ -1,0 +1,294 @@
+// Batch File Encryption
+// Encrypt/decrypt multiple files at once
+
+use crypto::file_lock::*
+use crypto::password::*
+use std::io::File
+
+// Batch encryption mode
+cases BatchMode {
+    DeviceLock,     // Device-locked encryption
+    Password,       // Password-based encryption
+    Both            // Create both versions
+}
+
+// Batch encryptor
+open data BatchEncryptor {
+    mode: BatchMode,
+    password: str?,
+    recursive: bool,
+    keep_originals: bool,
+    file_pattern: str?
+}
+
+impl BatchEncryptor {
+    fn new() -> Self {
+        BatchEncryptor {
+            mode: BatchMode::DeviceLock,
+            password: None,
+            recursive: false,
+            keep_originals: false,
+            file_pattern: None
+        }
+    }
+    
+    fn with_mode(mode: BatchMode) -> Self {
+        var enc = BatchEncryptor::new()
+        enc.mode = mode
+        yield enc
+    }
+    
+    fn set_password(var self, password: str) {
+        self.password = Some(password)
+    }
+    
+    fn set_recursive(var self, recursive: bool) {
+        self.recursive = recursive
+    }
+    
+    fn set_keep_originals(var self, keep: bool) {
+        self.keep_originals = keep
+    }
+    
+    fn set_pattern(var self, pattern: str) {
+        self.file_pattern = Some(pattern)
+    }
+    
+    // Encrypt directory
+    fn encrypt_directory(self, dir_path: str) -> BatchResult {
+        println(f"🔒 Batch Encrypting: {dir_path}")
+        println(f"   Mode: {self.mode_string()}")
+        println(f"   Recursive: {self.recursive}")
+        println(f"   Keep originals: {self.keep_originals}")
+        
+        let files = self.get_files_to_process(dir_path)
+        
+        println(f"\n   Found {len(files)} files to encrypt")
+        
+        var result = BatchResult::new()
+        
+        each file in files {
+            println(f"\n   Processing: {file}")
+            
+            let success = match self.mode {
+                BatchMode::DeviceLock => {
+                    lock_file(file, file + ".locked")
+                },
+                BatchMode::Password => {
+                    check let Some(pass) = self.password {
+                        encrypt_with_password(file, file + ".zenc", pass)
+                    } else {
+                        println("   ❌ Error: Password required")
+                        false
+                    }
+                },
+                BatchMode::Both => {
+                    let dev_ok = lock_file(file, file + ".locked")
+                    let pass_ok = check let Some(pass) = self.password {
+                        encrypt_with_password(file, file + ".zenc", pass)
+                    } else {
+                        false
+                    }
+                    dev_ok && pass_ok
+                }
+            }
+            
+            check success {
+                result.successful.push(file.clone())
+                
+                // Delete original check requested
+                check !self.keep_originals {
+                    File::delete(file)
+                    println("   🗑️  Deleted original")
+                }
+            } else {
+                result.failed.push(file.clone())
+            }
+        }
+        
+        result.print_summary()
+        yield result
+    }
+    
+    // Decrypt directory
+    fn decrypt_directory(self, dir_path: str) -> BatchResult {
+        println(f"🔓 Batch Decrypting: {dir_path}")
+        
+        let files = self.get_encrypted_files(dir_path)
+        
+        println(f"   Found {len(files)} encrypted files")
+        
+        var result = BatchResult::new()
+        
+        each file in files {
+            println(f"\n   Processing: {file}")
+            
+            let output = self.get_decrypted_filename(file)
+            
+            let success = check file.ends_with(".locked") {
+                unlock_file(file, output)
+            } else check file.ends_with(".zenc") {
+                check let Some(pass) = self.password {
+                    decrypt_with_password(file, output, pass)
+                } else {
+                    println("   ❌ Error: Password required")
+                    false
+                }
+            } else {
+                false
+            }
+            
+            check success {
+                result.successful.push(file.clone())
+                
+                // Delete encrypted check requested
+                check !self.keep_originals {
+                    File::delete(file)
+                    println("   🗑️  Deleted encrypted file")
+                }
+            } else {
+                result.failed.push(file.clone())
+            }
+        }
+        
+        result.print_summary()
+        yield result
+    }
+    
+    // Get files to process
+    fn get_files_to_process(self, dir_path: str) -> [str] {
+        var files = []
+        
+        let all_files = check self.recursive {
+            File::list_dir_recursive(dir_path)
+        } else {
+            File::list_dir(dir_path)
+        }
+        
+        each file in all_files {
+            // Skip already encrypted files
+            check file.ends_with(".locked") || file.ends_with(".zenc") {
+                continue
+            }
+            
+            // Apply pattern filter check set
+            check let Some(pattern) = self.file_pattern {
+                check !file.matches(pattern) {
+                    continue
+                }
+            }
+            
+            files.push(file)
+        }
+        
+        yield files
+    }
+    
+    // Get encrypted files
+    fn get_encrypted_files(self, dir_path: str) -> [str] {
+        var files = []
+        
+        let all_files = check self.recursive {
+            File::list_dir_recursive(dir_path)
+        } else {
+            File::list_dir(dir_path)
+        }
+        
+        each file in all_files {
+            check file.ends_with(".locked") || file.ends_with(".zenc") {
+                files.push(file)
+            }
+        }
+        
+        yield files
+    }
+    
+    // Get decrypted filename
+    fn get_decrypted_filename(self, encrypted_file: str) -> str {
+        check encrypted_file.ends_with(".locked") {
+            yield encrypted_file[0..(len(encrypted_file) - 7)]
+        } else check encrypted_file.ends_with(".zenc") {
+            yield encrypted_file[0..(len(encrypted_file) - 5)]
+        }
+        yield encrypted_file + ".decrypted"
+    }
+    
+    fn mode_string(self) -> str {
+        match self.mode {
+            BatchMode::DeviceLock => "Device-Locked",
+            BatchMode::Password => "Password-Based",
+            BatchMode::Both => "Device-Locked + Password"
+        }
+    }
+}
+
+// Batch result
+open data BatchResult {
+    successful: [str],
+    failed: [str]
+}
+
+impl BatchResult {
+    fn new() -> Self {
+        BatchResult {
+            successful: [],
+            failed: []
+        }
+    }
+    
+    fn print_summary(self) {
+        println("\n" + "=" * 70)
+        println("📊 Batch Encryption Summary")
+        println("=" * 70)
+        println(f"   Total: {len(self.successful) + len(self.failed)}")
+        println(f"   ✅ Successful: {len(self.successful)}")
+        println(f"   ❌ Failed: {len(self.failed)}")
+        
+        check len(self.failed) > 0 {
+            println("\n   Failed files:")
+            each file in self.failed {
+                println(f"     • {file}")
+            }
+        }
+    }
+    
+    fn is_success(self) -> bool {
+        yield len(self.failed) == 0
+    }
+}
+
+// Convenience functions
+open fn encrypt_all(dir: str, password: str?) -> BatchResult {
+    var batch = BatchEncryptor::new()
+    
+    check let Some(pass) = password {
+        batch = BatchEncryptor::with_mode(BatchMode::Password)
+        batch.set_password(pass)
+    }
+    
+    yield batch.encrypt_directory(dir)
+}
+
+open fn decrypt_all(dir: str, password: str?) -> BatchResult {
+    var batch = BatchEncryptor::new()
+    
+    check let Some(pass) = password {
+        batch.set_password(pass)
+    }
+    
+    yield batch.decrypt_directory(dir)
+}
+
+// Encrypt files matching pattern
+open fn encrypt_pattern(dir: str, pattern: str, password: str?) -> BatchResult {
+    var batch = check let Some(pass) = password {
+        var b = BatchEncryptor::with_mode(BatchMode::Password)
+        b.set_password(pass)
+        b
+    } else {
+        BatchEncryptor::new()
+    }
+    
+    batch.set_pattern(pattern)
+    yield batch.encrypt_directory(dir)
+}

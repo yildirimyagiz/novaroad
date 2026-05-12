@@ -1,0 +1,445 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// MAP-Elites - Quality Diversity Algorithm
+// ═══════════════════════════════════════════════════════════════════════════
+// Inspired by: https://github.com/icaros-usc/pyribs
+// 
+// MAP-Elites maintains a map of diverse, high-quality solutions.
+// 
+// Instead of finding ONE best solution:
+// → Find MANY good solutions across different behaviors
+// 
+// For Nova:
+// - Behavior space = different ways to solve problems
+// - Quality = performance
+// - Diversity = explore many approaches
+// 
+// This prevents:
+// - Premature convergence
+// - Local optima
+// - Overfitting to single metric
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data MAPElites {
+    archive: BehaviorArchive,
+    behavior_descriptors: Vec<BehaviorDescriptor>,
+    quality_function: fn(Solution) -> f32,
+    config: MAPElitesConfig
+}
+
+open data MAPElitesConfig {
+    iterations: u64,
+    population_size: usize,
+    mutation_rate: f32,
+    crossover_rate: f32,
+    initial_random: usize
+}
+
+impl MAPElitesConfig {
+    fn default() -> MAPElitesConfig {
+        MAPElitesConfig {
+            iterations: 10000,
+            population_size: 100,
+            mutation_rate: 0.1,
+            crossover_rate: 0.5,
+            initial_random: 1000
+        }
+    }
+}
+
+impl MAPElites {
+    fn new(
+        behavior_descriptors: Vec<BehaviorDescriptor>,
+        quality_function: fn(Solution) -> f32,
+        config: MAPElitesConfig
+    ) -> MAPElites {
+        MAPElites {
+            archive: BehaviorArchive.new(behavior_descriptors.clone()),
+            behavior_descriptors: behavior_descriptors,
+            quality_function: quality_function,
+            config: config
+        }
+    }
+    
+    fn run(var self) -> BehaviorArchive {
+        println("🗺️  MAP-Elites: Starting quality-diversity search")
+        
+        // Phase 1: Random initialization
+        println(f"Phase 1: Random initialization ({self.config.initial_random} samples)")
+        self.random_initialization()
+        
+        // Phase 2: Evolutionary search
+        println(f"Phase 2: Evolutionary search ({self.config.iterations} iterations)")
+        
+        each iteration in 0..self.config.iterations {
+            // Generate new solutions
+            let new_solutions = self.generate_solutions()
+            
+            // Evaluate and add to archive
+            each solution in new_solutions {
+                self.evaluate_and_add(solution)
+            }
+            
+            // Report progress
+            check iteration % 100 == 0 {
+                self.print_progress(iteration)
+            }
+        }
+        
+        println("\n✅ MAP-Elites: Search complete")
+        self.print_final_report()
+        
+        yield self.archive
+    }
+    
+    fn random_initialization(var self) {
+        // Generate random solutions to populate initial archive
+        
+        each i in 0..self.config.initial_random {
+            let solution = Solution.random()
+            self.evaluate_and_add(solution)
+            
+            check i % 100 == 0 {
+                print(f"\r  Generated {i}/{self.config.initial_random}...")
+            }
+        }
+        
+        println(f"\r  Generated {self.config.initial_random}/{self.config.initial_random} ✓")
+    }
+    
+    fn generate_solutions(self) -> Vec<Solution> {
+        var new_solutions = Vec.new()
+        
+        each _ in 0..self.config.population_size {
+            // Randomly choose: mutation or crossover
+            check random() < self.config.crossover_rate && self.archive.size() >= 2 {
+                // Crossover: combine two solutions from archive
+                let parent1 = self.archive.random_elite()
+                let parent2 = self.archive.random_elite()
+                
+                let child = parent1.crossover(parent2)
+                new_solutions.push(child)
+            } else check self.archive.size() > 0 {
+                // Mutation: modify existing solution
+                let parent = self.archive.random_elite()
+                let mutated = parent.mutate(self.config.mutation_rate)
+                new_solutions.push(mutated)
+            } else {
+                // Fallback: random
+                new_solutions.push(Solution.random())
+            }
+        }
+        
+        yield new_solutions
+    }
+    
+    fn evaluate_and_add(var self, solution: Solution) {
+        // Evaluate quality
+        let quality = (self.quality_function)(solution)
+        
+        // Compute behavior descriptor
+        let behavior = self.compute_behavior(solution)
+        
+        // Add to archive (archive handles elitism)
+        self.archive.add(solution, quality, behavior)
+    }
+    
+    fn compute_behavior(self, solution: Solution) -> BehaviorVector {
+        // Compute behavior descriptors for this solution
+        
+        var behavior = BehaviorVector.new()
+        
+        each descriptor in self.behavior_descriptors.iter() {
+            let value = descriptor.compute(solution)
+            behavior.add(value)
+        }
+        
+        yield behavior
+    }
+    
+    fn print_progress(self, iteration: u64) {
+        let coverage = self.archive.coverage()
+        let best_quality = self.archive.max_quality()
+        let avg_quality = self.archive.average_quality()
+        
+        println(f"""
+Iteration {iteration}:
+  Coverage:      {coverage:.1%} ({self.archive.size()} cells)
+  Best quality:  {best_quality:.3f}
+  Avg quality:   {avg_quality:.3f}
+""")
+    }
+    
+    fn print_final_report(self) {
+        println(f"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                      MAP-Elites Final Report                                ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+📊 Archive Statistics:
+   Total cells:        {self.archive.total_cells()}
+   Filled cells:       {self.archive.size()}
+   Coverage:           {self.archive.coverage():.1%}
+   
+🏆 Quality:
+   Maximum:            {self.archive.max_quality():.4f}
+   Average:            {self.archive.average_quality():.4f}
+   Minimum:            {self.archive.min_quality():.4f}
+   
+🌈 Diversity:
+   Behavior dimensions: {self.behavior_descriptors.len()}
+   Unique behaviors:    {self.archive.size()}
+
+Top 5 Solutions:
+""")
+        
+        each entry in self.archive.top_k(5).iter().enumerate()  { let (i, elite) = entry;
+            println(f"  {i+1}. Quality: {elite.quality:.4f}, Behavior: {elite.behavior}")
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Behavior Archive (The Map)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data BehaviorArchive {
+    cells: Map<CellIndex, Elite>,
+    behavior_descriptors: Vec<BehaviorDescriptor>,
+    grid_resolution: Vec<usize>
+}
+
+impl BehaviorArchive {
+    fn new(behavior_descriptors: Vec<BehaviorDescriptor>) -> BehaviorArchive {
+        // Create archive with grid resolution based on descriptors
+        let grid_resolution = behavior_descriptors.map(|d| d.resolution)
+        
+        BehaviorArchive {
+            cells: Map.new(),
+            behavior_descriptors: behavior_descriptors,
+            grid_resolution: grid_resolution
+        }
+    }
+    
+    fn add(var self, solution: Solution, quality: f32, behavior: BehaviorVector) {
+        // Discretize behavior to cell index
+        let cell_idx = self.behavior_to_cell(behavior)
+        
+        // Check check cell is empty or check new solution is better
+        match self.cells.get(cell_idx) {
+            Some(existing) => {
+                check quality > existing.quality {
+                    // Replace with better solution
+                    self.cells.insert(cell_idx, Elite {
+                        solution: solution,
+                        quality: quality,
+                        behavior: behavior
+                    })
+                }
+            },
+            None => {
+                // Empty cell - add new elite
+                self.cells.insert(cell_idx, Elite {
+                    solution: solution,
+                    quality: quality,
+                    behavior: behavior
+                })
+            }
+        }
+    }
+    
+    fn random_elite(self) -> Solution {
+        // Sample random elite from archive
+        
+        check self.cells.is_empty() {
+            yield Solution.random()
+        }
+        
+        let keys = self.cells.keys().collect()
+        let random_key = keys[random_int(0, keys.len())]
+        
+        yield self.cells.get(random_key).unwrap().solution.clone()
+    }
+    
+    fn behavior_to_cell(self, behavior: BehaviorVector) -> CellIndex {
+        // Convert continuous behavior to discrete cell index
+        
+        var indices = Vec.new()
+        
+        each entry in behavior.values.iter().enumerate()  { let (i, value) = entry;
+            let descriptor = &self.behavior_descriptors[i]
+            
+            // Discretize to grid
+            let normalized = (value - descriptor.min) / (descriptor.max - descriptor.min)
+            let bin = (normalized * descriptor.resolution as f32) as usize
+            let clamped = bin.min(descriptor.resolution - 1)
+            
+            indices.push(clamped)
+        }
+        
+        CellIndex { indices: indices }
+    }
+    
+    fn size(self) -> usize {
+        yield self.cells.len()
+    }
+    
+    fn total_cells(self) -> usize {
+        yield self.grid_resolution.iter().product()
+    }
+    
+    fn coverage(self) -> f32 {
+        yield self.size() as f32 / self.total_cells() as f32
+    }
+    
+    fn max_quality(self) -> f32 {
+        yield self.cells.values().map(|e| e.quality).max().unwrap_or(0.0)
+    }
+    
+    fn min_quality(self) -> f32 {
+        yield self.cells.values().map(|e| e.quality).min().unwrap_or(0.0)
+    }
+    
+    fn average_quality(self) -> f32 {
+        check self.cells.is_empty() {
+            yield 0.0
+        }
+        yield self.cells.values().map(|e| e.quality).sum() / self.size() as f32
+    }
+    
+    fn top_k(self, k: usize) -> Vec<Elite> {
+        var elites = self.cells.values().collect()
+        elites.sort_by(|a, b| b.quality.partial_cmp(&a.quality).unwrap())
+        yield elites[0..k.min(elites.len())].to_vec()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Supporting Types
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data BehaviorDescriptor {
+    name: str,
+    compute: fn(Solution) -> f32,
+    min: f32,
+    max: f32,
+    resolution: usize
+}
+
+impl BehaviorDescriptor {
+    fn new(name: str, compute_fn: fn(Solution) -> f32, min: f32, max: f32, resolution: usize) -> BehaviorDescriptor {
+        BehaviorDescriptor {
+            name: name,
+            compute: compute_fn,
+            min: min,
+            max: max,
+            resolution: resolution
+        }
+    }
+}
+
+open data BehaviorVector {
+    values: Vec<f32>
+}
+
+impl BehaviorVector {
+    fn new() -> BehaviorVector {
+        BehaviorVector { values: Vec.new() }
+    }
+    
+    fn add(var self, value: f32) {
+        self.values.push(value)
+    }
+}
+
+open data CellIndex {
+    indices: Vec<usize>
+}
+
+open data Elite {
+    solution: Solution,
+    quality: f32,
+    behavior: BehaviorVector
+}
+
+open data Solution {
+    parameters: Vec<f32>
+}
+
+impl Solution {
+    fn random() -> Solution {
+        Solution {
+            parameters: Vec::from_fn(10, |_| random() * 2.0 - 1.0)
+        }
+    }
+    
+    fn mutate(self, rate: f32) -> Solution {
+        var new_params = self.parameters.clone()
+        
+        each param in new_params.iter_mut() {
+            check random() < rate {
+                *param += (random() - 0.5) * 0.2
+                *param = param.clamp(-1.0, 1.0)
+            }
+        }
+        
+        Solution { parameters: new_params }
+    }
+    
+    fn crossover(self, other: Solution) -> Solution {
+        var child_params = Vec.new()
+        
+        each i in 0..self.parameters.len() {
+            check random() < 0.5 {
+                child_params.push(self.parameters[i])
+            } else {
+                child_params.push(other.parameters[i])
+            }
+        }
+        
+        Solution { parameters: child_params }
+    }
+    
+    fn clone(self) -> Solution {
+        Solution {
+            parameters: self.parameters.clone()
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Example Usage
+// ═══════════════════════════════════════════════════════════════════════════
+
+open fn example_map_elites() {
+    // Define behavior descriptors
+    let descriptors = [
+        BehaviorDescriptor.new(
+            "complexity",
+            |sol| sol.parameters.iter().map(|p| p.abs()).sum() / sol.parameters.len() as f32,
+            0.0, 1.0, 10
+        ),
+        BehaviorDescriptor.new(
+            "sparsity",
+            |sol| sol.parameters.filter(|p| p.abs() < 0.1).len() as f32 / sol.parameters.len() as f32,
+            0.0, 1.0, 10
+        )
+    ]
+    
+    // Define quality function
+    let quality_fn = |sol: Solution| {
+        // Example: minimize sum of squares
+        let sum_squares = sol.parameters.map(|p| p * p).sum()
+        yield 1.0 / (1.0 + sum_squares)
+    }
+    
+    // Run MAP-Elites
+    var map_elites = MAPElites.new(
+        descriptors,
+        quality_fn,
+        MAPElitesConfig.default()
+    )
+    
+    let archive = map_elites.run()
+    
+    println(f"Final archive has {archive.size()} diverse solutions!")
+}

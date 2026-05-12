@@ -1,0 +1,385 @@
+// Complete Training Example
+// Demonstrates all advanced training features in Nova ML
+
+// module examples.complete_training;
+
+use nova.tensor.Tensor;
+use nova.ml.nn::{Module, Linear, Sequential};
+use nova.ml.optim::{Adam, Optimizer};
+use nova.ml.optim.scheduler::{CosineAnnealingLR, ReduceLROnPlateau};
+use nova.ml.nn.loss::{CrossEntropyLoss, MSELoss, FocalLoss};
+use nova.ml.nn.mixed_precision::{MixedPrecisionTrainer, Precision};
+use nova.ml.nn.callbacks::{ModelCheckpoint, EarlyStopping, TensorBoard, ProgressBar};
+use nova.ml.nn.training_advanced::{AdvancedTrainer, TrainingConfig};
+use nova.ml.distributed::{DistributedConfig, launch_distributed};
+
+/// Example 1: Basic Training with All Features
+fn example_basic_training() {
+    println("=== Example 1: Basic Training with LR Scheduler & Callbacks ===\n");
+
+    // 1. Create a simple model
+    let model = Sequential::new()
+        .add(Linear::new(784, 256))
+        .add(ReLU::new())
+        .add(Linear::new(256, 128))
+        .add(ReLU::new())
+        .add(Linear::new(128, 10))
+        .build();
+
+    // 2. Setup optimizer
+    var optimizer = Adam::new(model.parameters(), lr: 0.001);
+
+    // 3. Setup loss function
+    let loss_fn = CrossEntropyLoss::new();
+
+    // 4. Configure training
+    let config = TrainingConfig {
+        epochs: 50,
+        batch_size: 64,
+        learning_rate: 0.001,
+        use_amp: false,
+        distributed: false,
+        checkpoint_path: "./checkpoints/basic".into(),
+        tensorboard_dir: "./logs/basic".into(),
+        early_stopping_patience: 5,
+        scheduler_type: "cosine".into(),
+        gradient_clip_norm: 1.0,
+        ..TrainingConfig::default()
+    };
+
+    // 5. Create trainer
+    var trainer = AdvancedTrainer::new(
+        Box::new(model),
+        Box::new(optimizer),
+        Box::new(loss_fn),
+        config,
+    );
+
+    // 6. Load data (placeholder)
+    let train_loader = create_mnist_loader("train", batch_size: 64);
+    let val_loader = create_mnist_loader("val", batch_size: 64);
+
+    // 7. Train!
+    let history = trainer.fit(&train_loader, Some(&val_loader))
+        .expect("Training failed");
+
+    println("Training completed!");
+    println("Final train loss: {:.4}", history.train_loss.last().unwrap());
+    println("Final val loss: {:.4}", history.val_loss.last().unwrap());
+}
+
+/// Example 2: Mixed Precision Training (FP16)
+fn example_mixed_precision_training() {
+    println("\n=== Example 2: Mixed Precision Training (FP16) ===\n");
+
+    // 1. Create model
+    let model = create_resnet18(num_classes: 10);
+
+    // 2. Optimizer
+    let optimizer = Adam::new(model.parameters(), lr: 0.001);
+
+    // 3. Loss
+    let loss_fn = CrossEntropyLoss::with_smoothing(0.1);
+
+    // 4. Configure with AMP
+    let config = TrainingConfig::with_amp(Precision::FP16);
+    config.epochs = 100;
+    config.batch_size = 128;
+    config.scheduler_type = "cosine".into();
+
+    // 5. Create trainer
+    var trainer = AdvancedTrainer::new(
+        Box::new(model),
+        Box::new(optimizer),
+        Box::new(loss_fn),
+        config,
+    );
+
+    // 6. Train
+    let train_loader = create_imagenet_loader("train", batch_size: 128);
+    let val_loader = create_imagenet_loader("val", batch_size: 128);
+
+    let history = trainer.fit(&train_loader, Some(&val_loader))
+        .expect("Training failed");
+
+    println("Mixed precision training completed!");
+    println("Memory saved: ~50%");
+    println("Speed improvement: ~2x");
+}
+
+/// Example 3: Custom Learning Rate Schedulers
+fn example_lr_schedulers() {
+    println("\n=== Example 3: Learning Rate Schedulers ===\n");
+
+    let model = create_simple_model();
+    var optimizer = Adam::new(model.parameters(), lr: 0.01);
+
+    // Option A: Cosine Annealing
+    let scheduler_cosine = CosineAnnealingLR::new(&var optimizer, T_max: 100, eta_min: 1e-6);
+
+    // Option B: Step Decay
+    let scheduler_step = StepLR::new(&var optimizer, step_size: 30, gamma: 0.1);
+
+    // Option C: Reduce on Plateau
+    let scheduler_plateau = ReduceLROnPlateau::new(
+        &var optimizer,
+        mode: "min",
+        factor: 0.5,
+        patience: 10,
+        threshold: 0.0001,
+        cooldown: 5,
+        min_lr: 1e-7,
+        eps: 1e-8,
+    );
+
+    // Option D: One Cycle (best for fast training)
+    let scheduler_onecycle = OneCycleLR::new(
+        &var optimizer,
+        max_lr: 0.1,
+        total_steps: 1000,
+        pct_start: 0.3,
+        div_factor: 25.0,
+        final_div_factor: 10000.0,
+    );
+
+    println("Scheduler types available:");
+    println("  - CosineAnnealingLR: Smooth cosine decay");
+    println("  - StepLR: Step-wise decay");
+    println("  - ReduceLROnPlateau: Adaptive based on metrics");
+    println("  - OneCycleLR: Fast convergence with warmup");
+}
+
+/// Example 4: All Loss Functions
+fn example_loss_functions() {
+    println("\n=== Example 4: Loss Functions Library ===\n");
+
+    let predictions = Tensor::randn([32, 10]);
+    let targets = Tensor::randint(0, 10, [32]);
+
+    // Classification losses
+    let ce_loss = CrossEntropyLoss::new().forward(&predictions, &targets);
+    println("Cross Entropy Loss: {:.4}", ce_loss.item());
+
+    let focal_loss = FocalLoss::new(alpha: 0.25, gamma: 2.0).forward(&predictions, &targets);
+    println("Focal Loss (for imbalanced data): {:.4}", focal_loss.item());
+
+    // Regression losses
+    let pred_reg = Tensor::randn([32, 1]);
+    let target_reg = Tensor::randn([32, 1]);
+
+    let mse = MSELoss::new().forward(&pred_reg, &target_reg);
+    println("MSE Loss: {:.4}", mse.item());
+
+    let mae = MAELoss::new().forward(&pred_reg, &target_reg);
+    println("MAE Loss: {:.4}", mae.item());
+
+    let huber = HuberLoss::new(delta: 1.0).forward(&pred_reg, &target_reg);
+    println("Huber Loss (robust): {:.4}", huber.item());
+
+    // Advanced losses
+    let kl_div = KLDivLoss::new().forward(&predictions.log_softmax(-1), &targets.softmax(-1));
+    println("KL Divergence: {:.4}", kl_div.item());
+
+    println("\nAvailable loss functions:");
+    println("  Classification: CrossEntropy, BCE, Focal, KLDiv");
+    println("  Regression: MSE, MAE, Huber");
+    println("  Metric Learning: Contrastive");
+}
+
+/// Example 5: Distributed Training (Multi-GPU)
+fn example_distributed_training() {
+    println("\n=== Example 5: Distributed Training (Multi-GPU) ===\n");
+
+    let num_gpus = 4;
+
+    // Launch distributed training on 4 GPUs
+    launch_distributed(
+        |rank| {
+            println("Process {} started", rank);
+
+            // Create model
+            let model = create_large_model();
+
+            // Optimizer
+            let optimizer = Adam::new(model.parameters(), lr: 0.001);
+
+            // Loss
+            let loss_fn = CrossEntropyLoss::new();
+
+            // Distributed config
+            let config = TrainingConfig::distributed(world_size: num_gpus, rank);
+            config.epochs = 50;
+            config.batch_size = 64; // Per GPU batch size
+
+            // Trainer
+            var trainer = AdvancedTrainer::new(
+                Box::new(model),
+                Box::new(optimizer),
+                Box::new(loss_fn),
+                config,
+            );
+
+            // Data loader with distributed sampler
+            let train_loader = create_distributed_loader(rank, num_gpus);
+            let val_loader = create_distributed_loader(rank, num_gpus);
+
+            // Train
+            trainer.fit(&train_loader, Some(&val_loader))?;
+
+            println("Process {} finished", rank);
+            Ok(())
+        },
+        num_gpus,
+    ).expect("Distributed training failed");
+
+    println("Distributed training completed on {} GPUs!", num_gpus);
+    println("Effective batch size: {} (64 per GPU × 4 GPUs)", 64 * num_gpus);
+}
+
+/// Example 6: Custom Callbacks
+fn example_custom_callbacks() {
+    println("\n=== Example 6: Custom Callbacks ===\n");
+
+    // Define custom callback
+    data CustomCallback {
+        log_file: File,
+    }
+
+    impl Callback for CustomCallback {
+        fn on_epoch_end(&var self, epoch: int, logs: &var CallbackLogs) {
+            // Custom logging
+            check let Some(loss) = logs.get("train_loss") {
+                writeln!(self.log_file, "Epoch {}: Loss = {:.6}", epoch, loss);
+            }
+
+            // Custom early stopping logic
+            check epoch > 10 && logs.get("val_loss").unwrap() > 1.0 {
+                println("Custom condition met: stopping training");
+                logs.stop_training = true;
+            }
+        }
+    }
+
+    let model = create_simple_model();
+    let optimizer = Adam::new(model.parameters(), lr: 0.001);
+    let loss_fn = CrossEntropyLoss::new();
+    let config = TrainingConfig::default();
+
+    var trainer = AdvancedTrainer::new(
+        Box::new(model),
+        Box::new(optimizer),
+        Box::new(loss_fn),
+        config,
+    );
+
+    // Add custom callback
+    let custom_cb = CustomCallback {
+        log_file: File::create("custom_log.txt").unwrap(),
+    };
+    trainer.callbacks.add(Box::new(custom_cb));
+
+    // Also add standard callbacks
+    trainer.callbacks.add(Box::new(ModelCheckpoint::new("./ckpt", "val_loss")));
+    trainer.callbacks.add(Box::new(EarlyStopping::new("val_loss", patience: 10)));
+    trainer.callbacks.add(Box::new(TensorBoard::new("./logs")));
+
+    println("Training with custom callbacks...");
+}
+
+/// Example 7: Complete Production Pipeline
+fn example_production_pipeline() {
+    println("\n=== Example 7: Production-Grade Training Pipeline ===\n");
+
+    // 1. Model
+    let model = create_production_model();
+
+    // 2. Optimizer with weight decay
+    let optimizer = Adam::new(model.parameters())
+        .lr(0.001)
+        .weight_decay(0.01)
+        .build();
+
+    // 3. Loss with label smoothing
+    let loss_fn = CrossEntropyLoss::with_smoothing(0.1);
+
+    // 4. Full configuration
+    var config = TrainingConfig::default();
+    config.epochs = 200;
+    config.batch_size = 256;
+    config.learning_rate = 0.001;
+    
+    // Mixed precision
+    config.use_amp = true;
+    config.precision = Precision::FP16;
+    
+    // Distributed
+    config.distributed = true;
+    config.world_size = 8;
+    
+    // Scheduler
+    config.scheduler_type = "cosine".into();
+    config.scheduler_params.insert("eta_min", 1e-6);
+    
+    // Gradient clipping
+    config.gradient_clip_norm = 1.0;
+    
+    // Gradient accumulation for larger effective batch
+    config.accumulation_steps = 4; // Effective batch: 256 × 4 × 8 = 8192
+    
+    // Checkpointing
+    config.checkpoint_path = "./checkpoints/prod".into();
+    config.tensorboard_dir = "./logs/prod".into();
+    config.early_stopping_patience = 20;
+
+    println("Production Configuration:");
+    println("  - Mixed Precision: {:?}", config.precision);
+    println("  - Distributed GPUs: {}", config.world_size);
+    println("  - Effective Batch Size: {}", config.batch_size * config.accumulation_steps * config.world_size);
+    println("  - Gradient Clipping: {}", config.gradient_clip_norm);
+    println("  - LR Scheduler: {}", config.scheduler_type);
+
+    // 5. Create trainer
+    var trainer = AdvancedTrainer::new(
+        Box::new(model),
+        Box::new(optimizer),
+        Box::new(loss_fn),
+        config,
+    );
+
+    // 6. Train
+    println("\nStarting production training...");
+    // trainer.fit(&train_loader, Some(&val_loader));
+}
+
+/// Helper functions
+fn create_simple_model() -> impl Module {
+    Sequential::new()
+        .add(Linear::new(10, 64))
+        .add(ReLU::new())
+        .add(Linear::new(64, 10))
+        .build()
+}
+
+fn create_production_model() -> impl Module {
+    // Large production model
+    ResNet::v2_101(num_classes: 1000)
+}
+
+/// Main function - run all examples
+open fn main() {
+    println("╔══════════════════════════════════════════════════════════╗");
+    println("║     Nova ML: Advanced Training Examples                 ║");
+    println("╚══════════════════════════════════════════════════════════╝\n");
+
+    example_basic_training();
+    example_mixed_precision_training();
+    example_lr_schedulers();
+    example_loss_functions();
+    example_distributed_training();
+    example_custom_callbacks();
+    example_production_pipeline();
+
+    println("\n╔══════════════════════════════════════════════════════════╗");
+    println("║     All Examples Completed Successfully!                ║");
+    println("╚══════════════════════════════════════════════════════════╝");
+}

@@ -1,0 +1,138 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║ ML Kernels: Fused Operations with MLIR Backend                             ║
+// ║ Nova MLIR Integration for Kernel Fusion and SIMD                         ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use from crate::compiler::core::backend::mlir_backend::{MLIRGenerator, MLIROptimizer};
+
+// ============================================================================
+// FUSED ML OPERATIONS
+// ============================================================================
+
+/// Fused MatMul + Bias + ReLU operation using MLIR kernel fusion
+open data FusedMatMulBiasReLU {
+    mlir_gen: MLIRGenerator,
+    optimizer: MLIROptimizer,
+}
+
+impl FusedMatMulBiasReLU {
+    fn new() -> FusedMatMulBiasReLU {
+        FusedMatMulBiasReLU {
+            mlir_gen: MLIRGenerator::new(),
+            optimizer: MLIROptimizer::new(),
+        }
+    }
+
+    /// Generate fused MLIR code for MatMul + Bias + ReLU
+    fn generate_fused_kernel(var self, m: i32, n: i32, k: i32) -> String {
+        // Affine loops for MatMul
+        var body = String::new();
+        body.push_str("    affine.for %i = 0 to ");
+        body.push_str(&m.into());
+        body.push_str(" {\n");
+        body.push_str("      affine.for %j = 0 to ");
+        body.push_str(&n.into());
+        body.push_str(" {\n");
+        body.push_str("        %sum = arith.constant 0.0 : f32\n");
+        body.push_str("        affine.for %p = 0 to ");
+        body.push_str(&k.into());
+        body.push_str(" {\n");
+        body.push_str("          %a_val = affine.load %A[%i, %p] : memref<?x?xf32>\n");
+        body.push_str("          %b_val = affine.load %B[%p, %j] : memref<?x?xf32>\n");
+        body.push_str("          %prod = arith.mulf %a_val, %b_val : f32\n");
+        body.push_str("          %sum = arith.addf %sum, %prod : f32\n");
+        body.push_str("        }\n");
+        // Bias addition
+        body.push_str("        %bias_val = affine.load %bias[%j] : memref<?xf32>\n");
+        body.push_str("        %biased = arith.addf %sum, %bias_val : f32\n");
+        // ReLU
+        body.push_str("        %zero = arith.constant 0.0 : f32\n");
+        body.push_str("        %relu = arith.maxf %biased, %zero : f32\n");
+        body.push_str("        affine.store %relu, %C[%i, %j] : memref<?x?xf32>\n");
+        body.push_str("      }\n");
+        body.push_str("    }\n");
+
+        self.mlir_gen.generate_function(
+            "fused_matmul_bias_relu".into(),
+            [
+                ("A".into(), "memref<?x?xf32>".into()),
+                ("B".into(), "memref<?x?xf32>".into()),
+                ("bias".into(), "memref<?xf32>".into()),
+                ("C".into(), "memref<?x?xf32>".into()),
+            ],
+            "memref<?x?xf32>".into()".into(),
+            body
+        );
+
+        let mlir_code = self.mlir_gen.output.join("\n");
+        self.optimizer.optimize(mlir_code)
+    }
+
+    /// Execute the fused kernel (placeholder for FFI to MLIR runtime)
+    fn execute(self, a: &var [f32], b: &var [f32], bias: &var [f32], c: &var [f32], m: i32, n: i32, k: i32) {
+        // Generate MLIR
+        let kernel = self.generate_fused_kernel(m, n, k);
+        println("Generated MLIR Kernel:\n{}", kernel);
+
+        // Energy-aware execution: min battery için güç optimizasyonu
+        let start_energy = unsafe { measure_energy_start() };
+        
+        // In full implementation, compile and run via MLIR runtime
+        // For now, fallback to FFI
+        unsafe { fused_matmul_bias_relu_ffi(a.as_mut_ptr(), b.as_mut_ptr(), bias.as_mut_ptr(), c.as_mut_ptr(), m, n, k); }
+        
+        let end_energy = unsafe { measure_energy_end() };
+        let energy_used = end_energy - start_energy;
+        println("⚡ Energy used: {:.3} J (Max verim, min battery hedefi)", energy_used);
+    }
+}
+
+// ============================================================================
+// SIMD VECTORIZED OPERATIONS
+// ============================================================================
+
+/// SIMD vectorized operations using MLIR vector dialect
+open data SIMDOperations {
+    mlir_gen: MLIRGenerator,
+}
+
+impl SIMDOperations {
+    fn new() -> SIMDOperations {
+        SIMDOperations { mlir_gen: MLIRGenerator::new() }
+    }
+
+    /// Generate SIMD vectorized dot product
+    fn generate_simd_dot_product(var self, size: i32) -> String {
+        var body = String::new();
+        body.push_str("    %sum = arith.constant dense<0.0> : vector<8xf32>\n");
+        body.push_str("    affine.for %i = 0 to ");
+        body.push_str(&(size / 8).into());
+        body.push_str(" step 8 {\n");
+        body.push_str("      %a_vec = vector.load %A[%i] : memref<?xf32>, vector<8xf32>\n");
+        body.push_str("      %b_vec = vector.load %B[%i] : memref<?xf32>, vector<8xf32>\n");
+        body.push_str("      %prod = arith.mulf %a_vec, %b_vec : vector<8xf32>\n");
+        body.push_str("      %sum = arith.addf %sum, %prod : vector<8xf32>\n");
+        body.push_str("    }\n");
+        body.push_str("    %result = vector.reduction <add>, %sum : vector<8xf32> into f32\n");
+        body.push_str("    yield %result : f32\n");
+
+        self.mlir_gen.generate_function(
+            "simd_dot_product".into(),
+            [
+                ("A".into(), "memref<?xf32>".into()),
+                ("B".into(), "memref<?xf32>".into()),
+            ],
+            "f32".into(),
+            body
+        );
+
+        self.mlir_gen.output.join("\n")
+    }
+}
+
+// FFI fallback for fused operations
+unsafe extern {
+    fn fused_matmul_bias_relu_ffi(a: *var f32, b: *var f32, bias: *var f32, c: *var f32, m: i32, n: i32, k: i32);
+    fn measure_energy_start() -> f64;
+    fn measure_energy_end() -> f64;
+}

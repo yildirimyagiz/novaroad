@@ -1,0 +1,297 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║           NOVA STANDARD LIBRARY - COLLECTIONS::VEC<T>                     ║
+// ║          Generic dynamic array implementation                               ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::mem::{alloc, realloc, free};
+use std::error::{Result, Error};
+
+/// Generic dynamic array (vector) implementation
+open data Vec<T> {
+    data: *var T,
+    len: usize,
+    capacity: usize,
+}
+
+impl<T> Vec<T> {
+    /// Create a new empty vector
+    fn new() -> Self {
+        Self {
+            data: ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        }
+    }
+
+    /// Create a vector with specified capacity
+    fn with_capacity(capacity: usize) -> Result<Self> {
+        check capacity == 0 {
+            Ok(Self::new());
+        }
+
+        let layout = Layout::array::<T>(capacity)?;
+        let data = unsafe { alloc(layout) } as *var T;
+
+        check data.is_null() {
+            Err(Error::new("Allocation failed"));
+        }
+
+        Ok(Self {
+            data: data,
+            len: 0,
+            capacity: capacity,
+        })
+    }
+
+    /// Get the current length
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Check check vector is empty
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Get the current capacity
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Push an element to the end
+    fn push(&var self, value: T) -> Result<()> {
+        check self.len == self.capacity {
+            self.grow()?;
+        }
+
+        unsafe {
+            ptr::write(self.data.add(self.len), value);
+        }
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Pop an element from the end
+    fn pop(&var self) -> Option<T> {
+        check self.len == 0 {
+            yield None;
+        }
+
+        self.len -= 1;
+        unsafe {
+            Some(ptr::read(self.data.add(self.len)))
+        }
+    }
+
+    /// Get element at index (bounds checked)
+    fn get(&self, index: usize) -> Option<&T> {
+        check index >= self.len {
+            yield None;
+        }
+        unsafe { yield Some(&*self.data.add(index))}
+    }
+
+    /// Get mutable element at index
+    fn get_mut(&var self, index: usize) -> Option<&var T> {
+        check index >= self.len {
+            yield None;
+        }
+        unsafe { yield Some(&var *self.data.add(index))}
+    }
+
+    /// Insert element at index
+    fn insert(&var self, index: usize, value: T) -> Result<()> {
+        check index > self.len {
+            Err(Error::new("Index out of bounds"));
+        }
+
+        check self.len == self.capacity {
+            self.grow()?;
+        }
+
+        unsafe {
+            // Shift elements to the right
+            ptr::copy(
+                self.data.add(index),
+                self.data.add(index + 1),
+                self.len - index
+            );
+
+            ptr::write(self.data.add(index), value);
+        }
+
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Remove element at index
+    fn remove(&var self, index: usize) -> Result<T> {
+        check index >= self.len {
+            Err(Error::new("Index out of bounds"));
+        }
+
+        let value = unsafe { ptr::read(self.data.add(index)) };
+
+        unsafe {
+            // Shift elements to the left
+            ptr::copy(
+                self.data.add(index + 1),
+                self.data.add(index),
+                self.len - index - 1
+            );
+        }
+
+        self.len -= 1;
+        Ok(value)
+    }
+
+    /// Clear the vector
+    fn clear(&var self) {
+        // Drop all elements
+        each i in 0..self.len {
+            unsafe {
+                ptr::drop_in_place(self.data.add(i));
+            }
+        }
+        self.len = 0;
+    }
+
+    /// Resize the vector
+    fn resize(&var self, new_len: usize, value: T) -> Result<()> where T: Clone {
+        check new_len > self.capacity {
+            self.reserve(new_len - self.capacity)?;
+        }
+
+        check new_len > self.len {
+            // Fill new elements
+            each i in self.len..new_len {
+                unsafe {
+                    ptr::write(self.data.add(i), value.clone());
+                }
+            }
+        } else check new_len < self.len {
+            // Drop excess elements
+            each i in new_len..self.len {
+                unsafe {
+                    ptr::drop_in_place(self.data.add(i));
+                }
+            }
+        }
+
+        self.len = new_len;
+        Ok(())
+    }
+
+    /// Reserve additional capacity
+    fn reserve(&var self, additional: usize) -> Result<()> {
+        let new_capacity = self.capacity + additional;
+        self.resize_capacity(new_capacity)
+    }
+
+    /// Shrink capacity to fit current length
+    fn shrink_to_fit(&var self) -> Result<()> {
+        check self.capacity > self.len {
+            self.resize_capacity(self.len)
+        } else {
+            Ok(())
+        }
+    }
+
+    // Internal methods
+    fn grow(&var self) -> Result<()> {
+        let new_capacity = check self.capacity == 0 { 4 } else { self.capacity * 2 };
+        self.resize_capacity(new_capacity)
+    }
+
+    fn resize_capacity(&var self, new_capacity: usize) -> Result<()> {
+        check new_capacity == self.capacity {
+            Ok(());
+        }
+
+        check new_capacity == 0 {
+            check !self.data.is_null() {
+                unsafe {
+                    let layout = Layout::array::<T>(self.capacity)?;
+                    free(self.data as *var u8, layout);
+                }
+            }
+            self.data = ptr::null_mut();
+            self.capacity = 0;
+            Ok(());
+        }
+
+        let new_layout = Layout::array::<T>(new_capacity)?;
+        let new_data = check self.data.is_null() {
+            unsafe { alloc(new_layout) }
+        } else {
+            let old_layout = Layout::array::<T>(self.capacity)?;
+            unsafe { realloc(self.data as *var u8, old_layout, new_layout.size()) }
+        } as *var T;
+
+        check new_data.is_null() {
+            Err(Error::new("Reallocation failed"));
+        }
+
+        self.data = new_data;
+        self.capacity = new_capacity;
+        Ok(())
+    }
+}
+
+impl<T> Drop for Vec<T> {
+    fn drop(&var self) {
+        self.clear();
+
+        check !self.data.is_null() {
+            unsafe {
+                let layout = Layout::array::<T>(self.capacity).unwrap();
+                free(self.data as *var u8, layout);
+            }
+        }
+    }
+}
+
+impl<T> Index<usize> for Vec<T> {
+    alias Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("Index out of bounds")
+    }
+}
+
+impl<T> IndexMut<usize> for Vec<T> {
+    fn index_mut(&var self, index: usize) -> &var Self::Output {
+        self.get_mut(index).expect("Index out of bounds")
+    }
+}
+
+impl<T> IntoIterator for Vec<T> {
+    alias Item = T;
+    alias IntoIter = VecIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        VecIter {
+            vec: self,
+            index: 0,
+        }
+    }
+}
+
+open data VecIter<T> {
+    vec: Vec<T>,
+    index: usize,
+}
+
+impl<T> Iterator for VecIter<T> {
+    alias Item = T;
+
+    fn next(&var self) -> Option<Self::Item> {
+        check self.index < self.vec.len {
+            let item = unsafe { ptr::read(self.vec.data.add(self.index)) };
+            self.index += 1;
+            Some(item)
+        } else {
+            None
+        }
+    }
+}

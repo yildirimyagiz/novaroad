@@ -1,0 +1,5 @@
+#ifndef NOVA_PIPELINE_TAGS_H
+#define NOVA_PIPELINE_TAGS_H
+
+#endif
+

@@ -1,0 +1,722 @@
+// 🌐 Nova Networking — v10.0
+// TCP/UDP socket networking with async support
+// + Nova Magic: Type-safe sockets, automatic connection pooling
+
+@module("network::socket")
+@reproducible
+@export
+@inline
+
+use std::collections::{HashMap, Vec};
+use std::sync::Arc;
+use std::result::Result;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  SOCKET CORE TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Socket address
+open data SocketAddress {
+    ip: IpAddress,
+    port: u16,
+}
+
+impl SocketAddress {
+    open fn new(ip: IpAddress, port: u16) -> SocketAddress {
+        return SocketAddress { ip: ip, port: port };
+    }
+    
+    open fn from_str(addr_str: &str) -> Result<SocketAddress, String> {
+        if let Some(colon_pos) = addr_str.rfind(':') {
+            let ip_str = &addr_str[..colon_pos];
+            let port_str = &addr_str[colon_pos + 1..];
+            
+            let ip = IpAddress::from_str(ip_str)?;
+            let port = port_str.parse().map_err(|_| "Invalid port".to_string())?;
+            
+            return Ok(SocketAddress::new(ip, port));
+        } else {
+            return Err("Invalid address format".to_string());
+        }
+    }
+    
+    open fn to_string(&self) -> String {
+        return format!("{}:{}", self.ip.to_string(), self.port);
+    }
+}
+
+/// IP address
+open cases IpAddress {
+    IPv4([u8; 4]),
+    IPv6([u8; 16]),
+}
+
+impl IpAddress {
+    open fn from_str(addr_str: &str) -> Result<IpAddress, String> {
+        if addr_str.contains('.') {
+            // IPv4
+            let parts: Vec<&str> = addr_str.split('.').collect();
+            check parts.len() == 4 {
+                let mut octets = [0u8; 4];
+                for (i, part) in parts.iter().enumerate() {
+                    octets[i] = part.parse().map_err(|_| "Invalid IPv4 address".to_string())?;
+                }
+                return Ok(IpAddress::IPv4(octets));
+            } else {
+                return Err("Invalid IPv4 address".to_string());
+            }
+        } else {
+            // IPv6
+            let parts: Vec<&str> = addr_str.split(':').collect();
+            check parts.len() == 8 {
+                let mut segments = [0u8; 16];
+                for (i, part) in parts.iter().enumerate() {
+                    let value = u16::from_str_radix(part, 16).map_err(|_| "Invalid IPv6 address".to_string())?;
+                    segments[i * 2] = (value >> 8) as u8;
+                    segments[i * 2 + 1] = (value & 0xFF) as u8;
+                }
+                return Ok(IpAddress::IPv6(segments));
+            } else {
+                return Err("Invalid IPv6 address".to_string());
+            }
+        }
+    }
+    
+    open fn to_string(&self) -> String {
+        match self {
+            IpAddress::IPv4(octets) => {
+                return format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
+            }
+            IpAddress::IPv6(segments) => {
+                let mut result = String::new();
+                for i in 0..8 {
+                    if i > 0 { result = result + ":"; }
+                    let value = ((segments[i * 2] as u16) << 8) | (segments[i * 2 + 1] as u16);
+                    result = result + format!("{:x}", value);
+                }
+                return result;
+            }
+        }
+    }
+    
+    open fn is_loopback(&self) -> bool {
+        match self {
+            IpAddress::IPv4(octets) => octets[0] == 127,
+            IpAddress::IPv6(segments) => segments.iter().all(|&x| x == 0),
+        }
+    }
+}
+
+/// Socket type
+open cases SocketType {
+    Stream,    // TCP
+    Datagram,   // UDP
+    Raw,       // Raw socket
+}
+
+/// Protocol family
+open cases ProtocolFamily {
+    IPv4,
+    IPv6,
+    Unix,
+}
+
+/// Socket options
+open data SocketOptions {
+    reuse_addr: bool,
+    reuse_port: bool,
+    keep_alive: bool,
+    no_delay: bool,
+    send_buffer_size: Option<usize>,
+    recv_buffer_size: Option<usize>,
+    timeout: Option<Duration>,
+}
+
+impl SocketOptions {
+    open fn default() -> SocketOptions {
+        return SocketOptions {
+            reuse_addr: false,
+            reuse_port: false,
+            keep_alive: false,
+            no_delay: true,
+            send_buffer_size: None,
+            recv_buffer_size: None,
+            timeout: None,
+        };
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  TCP SOCKET
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// TCP socket
+open data TcpSocket {
+    fd: i32,
+    local_addr: Option<SocketAddress>,
+    remote_addr: Option<SocketAddress>,
+    options: SocketOptions,
+    is_connected: bool,
+}
+
+impl TcpSocket {
+    open fn new() -> Result<TcpSocket, String> {
+        let fd = create_socket(SocketType::Stream, ProtocolFamily::IPv4)?;
+        
+        return Ok(TcpSocket {
+            fd: fd,
+            local_addr: None,
+            remote_addr: None,
+            options: SocketOptions::default(),
+            is_connected: false,
+        });
+    }
+    
+    open fn bind(&mut self, addr: SocketAddress) -> Result<(), String> {
+        let result = bind_socket(self.fd, &addr);
+        if result == 0 {
+            self.local_addr = Some(addr);
+            return Ok(());
+        } else {
+            return Err(format!("Bind failed: {}", get_last_error()));
+        }
+    }
+    
+    open fn listen(&mut self, backlog: i32) -> Result<(), String> {
+        let result = listen_socket(self.fd, backlog);
+        if result == 0 {
+            return Ok(());
+        } else {
+            return Err(format!("Listen failed: {}", get_last_error()));
+        }
+    }
+    
+    open async fn connect(&mut self, addr: SocketAddress) -> Result<(), String> {
+        let result = connect_socket(self.fd, &addr);
+        if result == 0 {
+            self.remote_addr = Some(addr);
+            self.is_connected = true;
+            return Ok(());
+        } else {
+            return Err(format!("Connect failed: {}", get_last_error()));
+        }
+    }
+    
+    open async fn accept(&mut self) -> Result<(TcpSocket, SocketAddress), String> {
+        let (client_fd, client_addr) = accept_socket(self.fd)?;
+        
+        let client_socket = TcpSocket {
+            fd: client_fd,
+            local_addr: self.local_addr.clone(),
+            remote_addr: Some(client_addr.clone()),
+            options: SocketOptions::default(),
+            is_connected: true,
+        };
+        
+        return Ok((client_socket, client_addr));
+    }
+    
+    open async fn send(&mut self, data: &[u8]) -> Result<usize, String> {
+        check self.is_connected {
+            let result = send_socket(self.fd, data);
+            if result >= 0 {
+                return Ok(result as usize);
+            } else {
+                return Err(format!("Send failed: {}", get_last_error()));
+            }
+        } else {
+            return Err("Socket not connected".to_string());
+        }
+    }
+    
+    open async fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, String> {
+        check self.is_connected {
+            let result = recv_socket(self.fd, buffer);
+            if result >= 0 {
+                return Ok(result as usize);
+            } else {
+                return Err(format!("Recv failed: {}", get_last_error()));
+            }
+        } else {
+            return Err("Socket not connected".to_string());
+        }
+    }
+    
+    open async fn send_all(&mut self, data: &[u8]) -> Result<(), String> {
+        let mut sent = 0;
+        while sent < data.len() {
+            let result = self.send(&data[sent..]).await?;
+            sent = sent + result;
+        }
+        return Ok(());
+    }
+    
+    open async fn recv_exact(&mut self, buffer: &mut [u8]) -> Result<(), String> {
+        let mut received = 0;
+        while received < buffer.len() {
+            let result = self.recv(&mut buffer[received..]).await?;
+            received = received + result;
+            if result == 0 {
+                return Err("Connection closed".to_string());
+            }
+        }
+        return Ok(());
+    }
+    
+    open fn shutdown(&mut self, how: ShutdownMode) -> Result<(), String> {
+        let result = shutdown_socket(self.fd, how);
+        if result == 0 {
+            return Ok(());
+        } else {
+            return Err(format!("Shutdown failed: {}", get_last_error()));
+        }
+    }
+    
+    open fn close(&mut self) -> Result<(), String> {
+        let result = close_socket(self.fd);
+        if result == 0 {
+            self.is_connected = false;
+            return Ok(());
+        } else {
+            return Err(format!("Close failed: {}", get_last_error()));
+        }
+    }
+    
+    open fn set_option(&mut self, option: SocketOption) -> Result<(), String> {
+        let result = set_socket_option(self.fd, &option);
+        if result == 0 {
+            return Ok(());
+        } else {
+            return Err(format!("Set option failed: {}", get_last_error()));
+        }
+    }
+    
+    open fn get_local_address(&self) -> Option<SocketAddress> {
+        return self.local_addr.clone();
+    }
+    
+    open fn get_remote_address(&self) -> Option<SocketAddress> {
+        return self.remote_addr.clone();
+    }
+    
+    open fn is_connected(&self) -> bool {
+        return self.is_connected;
+    }
+}
+
+/// Shutdown mode
+open cases ShutdownMode {
+    Read,
+    Write,
+    Both,
+}
+
+/// Socket option
+open cases SocketOption {
+    ReuseAddr(bool),
+    ReusePort(bool),
+    KeepAlive(bool),
+    NoDelay(bool),
+    SendBufferSize(usize),
+    RecvBufferSize(usize),
+    Timeout(Duration),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  UDP SOCKET
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// UDP socket
+open data UdpSocket {
+    fd: i32,
+    local_addr: Option<SocketAddress>,
+    options: SocketOptions,
+}
+
+impl UdpSocket {
+    open fn new() -> Result<UdpSocket, String> {
+        let fd = create_socket(SocketType::Datagram, ProtocolFamily::IPv4)?;
+        
+        return Ok(UdpSocket {
+            fd: fd,
+            local_addr: None,
+            options: SocketOptions::default(),
+        });
+    }
+    
+    open fn bind(&mut self, addr: SocketAddress) -> Result<(), String> {
+        let result = bind_socket(self.fd, &addr);
+        if result == 0 {
+            self.local_addr = Some(addr);
+            return Ok(());
+        } else {
+            return Err(format!("Bind failed: {}", get_last_error()));
+        }
+    }
+    
+    open async fn send_to(&mut self, data: &[u8], addr: SocketAddress) -> Result<usize, String> {
+        let result = sendto_socket(self.fd, data, &addr);
+        if result >= 0 {
+            return Ok(result as usize);
+        } else {
+            return Err(format!("Send failed: {}", get_last_error()));
+        }
+    }
+    
+    open async fn recv_from(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddress), String> {
+        let (bytes_read, addr) = recvfrom_socket(self.fd, buffer);
+        if bytes_read >= 0 {
+            return Ok((bytes_read as usize, addr));
+        } else {
+            return Err(format!("Recv failed: {}", get_last_error()));
+        }
+    }
+    
+    open async fn send_to_all(&mut self, data: &[u8], addrs: &[SocketAddress]) -> Result<Vec<Result<usize, String>>, String> {
+        let mut results = Vec::new();
+        
+        for addr in addrs {
+            results.push(self.send_to(data, addr.clone()).await);
+        }
+        
+        return Ok(results);
+    }
+    
+    open fn close(&mut self) -> Result<(), String> {
+        let result = close_socket(self.fd);
+        if result == 0 {
+            return Ok(());
+        } else {
+            return Err(format!("Close failed: {}", get_last_error()));
+        }
+    }
+    
+    open fn set_option(&mut self, option: SocketOption) -> Result<(), String> {
+        let result = set_socket_option(self.fd, &option);
+        if result == 0 {
+            return Ok(());
+        } else {
+            return Err(format!("Set option failed: {}", get_last_error()));
+        }
+    }
+    
+    open fn get_local_address(&self) -> Option<SocketAddress> {
+        return self.local_addr.clone();
+    }
+    
+    open fn join_multicast(&mut self, group: IpAddress) -> Result<(), String> {
+        let result = join_multicast_group(self.fd, &group);
+        if result == 0 {
+            return Ok(());
+        } else {
+            return Err(format!("Join multicast failed: {}", get_last_error()));
+        }
+    }
+    
+    open fn leave_multicast(&mut self, group: IpAddress) -> Result<(), String> {
+        let result = leave_multicast_group(self.fd, &group);
+        if result == 0 {
+            return Ok(());
+        } else {
+            return Err(format!("Leave multicast failed: {}", get_last_error()));
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  SOCKET LISTENER
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// TCP listener
+open data TcpListener {
+    socket: TcpSocket,
+    backlog: i32,
+}
+
+impl TcpListener {
+    open fn new() -> Result<TcpListener, String> {
+        let socket = TcpSocket::new()?;
+        return Ok(TcpListener {
+            socket: socket,
+            backlog: 128,
+        });
+    }
+    
+    open fn bind(&mut self, addr: SocketAddress) -> Result<(), String> {
+        return self.socket.bind(addr);
+    }
+    
+    open fn listen(&mut self) -> Result<(), String> {
+        return self.socket.listen(self.backlog);
+    }
+    
+    open async fn accept(&mut self) -> Result<(TcpSocket, SocketAddress), String> {
+        return self.socket.accept().await;
+    }
+    
+    open fn local_address(&self) -> Option<SocketAddress> {
+        return self.socket.get_local_address();
+    }
+    
+    open fn close(&mut self) -> Result<(), String> {
+        return self.socket.close();
+    }
+}
+
+/// UDP listener
+open data UdpListener {
+    socket: UdpSocket,
+}
+
+impl UdpListener {
+    open fn new() -> Result<UdpListener, String> {
+        let socket = UdpSocket::new()?;
+        return Ok(UdpListener {
+            socket: socket,
+        });
+    }
+    
+    open fn bind(&mut self, addr: SocketAddress) -> Result<(), String> {
+        return self.socket.bind(addr);
+    }
+    
+    open async fn recv_from(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddress), String> {
+        return self.socket.recv_from(buffer).await;
+    }
+    
+    open async fn send_to(&mut self, data: &[u8], addr: SocketAddress) -> Result<usize, String> {
+        return self.socket.send_to(data, addr).await;
+    }
+    
+    open fn local_address(&self) -> Option<SocketAddress> {
+        return self.socket.get_local_address();
+    }
+    
+    open fn close(&mut self) -> Result<(), String> {
+        return self.socket.close();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §5  CONNECTION POOL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Connection pool
+open data ConnectionPool {
+    connections: Vec<PooledConnection>,
+    max_connections: usize,
+    idle_timeout: Duration,
+}
+
+/// Pooled connection
+open data PooledConnection {
+    socket: TcpSocket,
+    last_used: u64,
+    in_use: bool,
+    remote_addr: SocketAddress,
+}
+
+impl ConnectionPool {
+    open fn new(max_connections: usize, idle_timeout: Duration) -> ConnectionPool {
+        return ConnectionPool {
+            connections: Vec::new(),
+            max_connections: max_connections,
+            idle_timeout: idle_timeout,
+        };
+    }
+    
+    open async fn get_connection(&mut self, addr: SocketAddress) -> Result<TcpSocket, String> {
+        // Try to reuse existing connection
+        for conn in &mut self.connections {
+            if conn.remote_addr == addr && !conn.in_use {
+                if self.is_connection_valid(conn) {
+                    conn.in_use = true;
+                    conn.last_used = get_current_timestamp();
+                    return Ok(conn.socket.clone());
+                }
+            }
+        }
+        
+        // Create new connection
+        if self.connections.len() >= self.max_connections {
+            self.cleanup_idle_connections();
+        }
+        
+        let mut socket = TcpSocket::new()?;
+        socket.connect(addr).await?;
+        
+        self.connections.push(PooledConnection {
+            socket: socket.clone(),
+            last_used: get_current_timestamp(),
+            in_use: true,
+            remote_addr: addr,
+        });
+        
+        return Ok(socket);
+    }
+    
+    open fn return_connection(&mut self, addr: SocketAddress, socket: TcpSocket) {
+        for conn in &mut self.connections {
+            if conn.remote_addr == addr && conn.in_use {
+                conn.socket = socket;
+                conn.in_use = false;
+                conn.last_used = get_current_timestamp();
+                break;
+            }
+        }
+    }
+    
+    fn is_connection_valid(&self, conn: &PooledConnection) -> bool {
+        let now = get_current_timestamp();
+        return now - conn.last_used < self.idle_timeout.as_secs() as u64;
+    }
+    
+    fn cleanup_idle_connections(&mut self) {
+        let now = get_current_timestamp();
+        self.connections.retain(|conn| {
+            !conn.in_use || (now - conn.last_used) < self.idle_timeout.as_secs() as u64
+        });
+    }
+    
+    open fn close_all(&mut self) {
+        for conn in &mut self.connections {
+            let _ = conn.socket.close();
+        }
+        self.connections.clear();
+    }
+    
+    open fn get_stats(&self) -> ConnectionPoolStats {
+        let active = self.connections.iter().filter(|c| c.in_use).count();
+        let idle = self.connections.iter().filter(|c| !c.in_use).count();
+        
+        return ConnectionPoolStats {
+            total_connections: self.connections.len(),
+            active_connections: active,
+            idle_connections: idle,
+            max_connections: self.max_connections,
+        };
+    }
+}
+
+/// Connection pool statistics
+open data ConnectionPoolStats {
+    total_connections: usize,
+    active_connections: usize,
+    idle_connections: usize,
+    max_connections: usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §6  NETWORK UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Network interface
+open data NetworkInterface {
+    name: String,
+    ip_address: IpAddress,
+    netmask: IpAddress,
+    broadcast: Option<IpAddress>,
+    is_up: bool,
+    is_loopback: bool,
+}
+
+/// Network utilities
+open struct NetworkUtils;
+
+impl NetworkUtils {
+    open fn get_local_interfaces() -> Vec<NetworkInterface> {
+        // In real implementation, would query system for network interfaces
+        return Vec::new();
+    }
+    
+    open fn resolve_hostname(hostname: &str) -> Result<Vec<IpAddress>, String> {
+        // In real implementation, would perform DNS lookup
+        return Ok(Vec::new());
+    }
+    
+    open fn reverse_lookup(ip: IpAddress) -> Result<String, String> {
+        // In real implementation, would perform reverse DNS lookup
+        return Ok("unknown".to_string());
+    }
+    
+    open fn is_port_open(host: &str, port: u16, timeout: Duration) -> bool {
+        // In real implementation, would attempt to connect
+        return false;
+    }
+    
+    open fn get_default_gateway() -> Option<IpAddress> {
+        // In real implementation, would query routing table
+        return None;
+    }
+    
+    open fn get_dns_servers() -> Vec<IpAddress> {
+        // In real implementation, would query system DNS configuration
+        return Vec::new();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §7  EXTERNAL DECLARATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+extern "C" fn create_socket(socket_type: SocketType, family: ProtocolFamily) -> Result<i32, String>;
+extern "C" fn bind_socket(fd: i32, addr: &SocketAddress) -> i32;
+extern "C" fn listen_socket(fd: i32, backlog: i32) -> i32;
+extern "C" fn connect_socket(fd: i32, addr: &SocketAddress) -> i32;
+extern "C" fn accept_socket(fd: i32) -> Result<(i32, SocketAddress), String>;
+extern "C" fn send_socket(fd: i32, data: &[u8]) -> isize;
+extern "C" fn recv_socket(fd: i32, buffer: &mut [u8]) -> isize;
+extern "C" fn sendto_socket(fd: i32, data: &[u8], addr: &SocketAddress) -> isize;
+extern "C" fn recvfrom_socket(fd: i32, buffer: &mut [u8]) -> (isize, SocketAddress);
+extern "C" fn shutdown_socket(fd: i32, how: ShutdownMode) -> i32;
+extern "C" fn close_socket(fd: i32) -> i32;
+extern "C" fn set_socket_option(fd: i32, option: &SocketOption) -> i32;
+extern "C" fn get_socket_option(fd: i32, option: &SocketOption) -> Result<SocketOption, String>;
+extern "C" fn join_multicast_group(fd: i32, group: &IpAddress) -> i32;
+extern "C" fn leave_multicast_group(fd: i32, group: &IpAddress) -> i32;
+extern "C" fn get_last_error() -> String;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §8  GLOBAL INSTANCE AND HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create TCP socket
+open fn create_tcp_socket() -> Result<TcpSocket, String> {
+    return TcpSocket::new();
+}
+
+/// Create UDP socket
+open fn create_udp_socket() -> Result<UdpSocket, String> {
+    return UdpSocket::new();
+}
+
+/// Create TCP listener
+open fn create_tcp_listener() -> Result<TcpListener, String> {
+    return TcpListener::new();
+}
+
+/// Create UDP listener
+open fn create_udp_listener() -> Result<UdpListener, String> {
+    return UdpListener::new();
+}
+
+/// Create connection pool
+open fn create_connection_pool(max_connections: usize, idle_timeout: Duration) -> ConnectionPool {
+    return ConnectionPool::new(max_connections, idle_timeout);
+}
+
+/// Parse socket address
+open fn parse_socket_address(addr: &str) -> Result<SocketAddress, String> {
+    return SocketAddress::from_str(addr);
+}
+
+/// Get current timestamp
+fn get_current_timestamp() -> u64 {
+    // In real implementation, would use system time
+    return 0;
+}
+
+/// Initialize networking system
+open fn init_networking() {
+    // Initialize networking system
+}

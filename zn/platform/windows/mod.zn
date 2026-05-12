@@ -1,0 +1,222 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova Windows Platform Support                                                 ║
+// ║ Windows-specific APIs and system integration                                  ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+module platform::windows;
+
+import core::ffi::c_void;
+
+// Windows API types
+open alias HANDLE = *var c_void;
+open alias DWORD = u32;
+open alias BOOL = i32;
+open alias LPVOID = *var c_void;
+open alias LPCVOID = *const c_void;
+
+// Windows constants
+open const INVALID_HANDLE_VALUE: HANDLE = -1 as HANDLE;
+open const TRUE: BOOL = 1;
+open const FALSE: BOOL = 0;
+
+// Memory allocation flags
+open const MEM_COMMIT: DWORD = 0x1000;
+open const MEM_RESERVE: DWORD = 0x2000;
+open const MEM_RELEASE: DWORD = 0x8000;
+
+open const PAGE_READWRITE: DWORD = 0x04;
+open const PAGE_EXECUTE_READWRITE: DWORD = 0x40;
+
+/// Windows kernel32.dll FFI bindings
+#[link(name = "kernel32")]
+extern "C" {
+    /// Allocates virtual memory
+    fn VirtualAlloc(
+        lpAddress: LPVOID,
+        dwSize: usize,
+        flAllocationType: DWORD,
+        flProtect: DWORD,
+    ) -> LPVOID;
+
+    /// Frees virtual memory
+    fn VirtualFree(
+        lpAddress: LPVOID,
+        dwSize: usize,
+        dwFreeType: DWORD,
+    ) -> BOOL;
+
+    /// Gets the last error code
+    fn GetLastError() -> DWORD;
+
+    /// Sleeps for specified milliseconds
+    fn Sleep(dwMilliseconds: DWORD);
+
+    /// Creates a new thread
+    fn CreateThread(
+        lpThreadAttributes: LPVOID,
+        dwStackSize: usize,
+        lpStartAddress: extern "C" fn(LPVOID) -> DWORD,
+        lpParameter: LPVOID,
+        dwCreationFlags: DWORD,
+        lpThreadId: *var DWORD,
+    ) -> HANDLE;
+
+    /// Waits for a single object
+    fn WaitForSingleObject(
+        hHandle: HANDLE,
+        dwMilliseconds: DWORD,
+    ) -> DWORD;
+
+    /// Closes a handle
+    fn CloseHandle(hHandle: HANDLE) -> BOOL;
+
+    /// Creates a file
+    fn CreateFileA(
+        lpFileName: *const u8,
+        dwDesiredAccess: DWORD,
+        dwShareMode: DWORD,
+        lpSecurityAttributes: LPVOID,
+        dwCreationDisposition: DWORD,
+        dwFlagsAndAttributes: DWORD,
+        hTemplateFile: HANDLE,
+    ) -> HANDLE;
+
+    /// Reads from a file
+    fn ReadFile(
+        hFile: HANDLE,
+        lpBuffer: LPVOID,
+        nNumberOfBytesToRead: DWORD,
+        lpNumberOfBytesRead: *var DWORD,
+        lpOverlapped: LPVOID,
+    ) -> BOOL;
+
+    /// Writes to a file
+    fn WriteFile(
+        hFile: HANDLE,
+        lpBuffer: LPCVOID,
+        nNumberOfBytesToWrite: DWORD,
+        lpNumberOfBytesWritten: *var DWORD,
+        lpOverlapped: LPVOID,
+    ) -> BOOL;
+}
+
+/// Windows-specific memory allocator
+open data WindowsAllocator;
+
+impl WindowsAllocator {
+    /// Allocates memory using VirtualAlloc
+    fn alloc(size: usize) -> *var u8 {
+        unsafe {
+            VirtualAlloc(
+                core::ptr::null_mut(),
+                size,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            ) as *var u8
+        }
+    }
+
+    /// Frees memory using VirtualFree
+    fn free(ptr: *var u8) {
+        unsafe {
+            VirtualFree(ptr as LPVOID, 0, MEM_RELEASE);}
+    }
+
+    /// Allocates executable memory
+    fn alloc_executable(size: usize) -> *var u8 {
+        unsafe {
+            VirtualAlloc(
+                core::ptr::null_mut(),
+                size,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            ) as *var u8
+        }
+    }
+}
+
+/// Windows thread handle wrapper
+open data Thread {
+    handle: HANDLE,
+}
+
+impl Thread {
+    /// Creates a new thread
+    fn spawn<F>(f: F) -> Self
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        extern "C" fn thread_proc(param: LPVOID) -> DWORD {
+            unsafe {
+                let boxed: Box<Box<dyn FnOnce()>> = Box::from_raw(param as *var _);
+                boxed();
+            }
+            0
+        }
+
+        let boxed = Box::new(Box::new(f) as Box<dyn FnOnce()>);
+        let param = Box::into_raw(boxed) as LPVOID;
+
+        unsafe {
+            let handle = CreateThread(
+                core::ptr::null_mut(),
+                0,
+                thread_proc,
+                param,
+                0,
+                core::ptr::null_mut(),
+            );
+
+            Thread { handle }
+        }
+    }
+
+    /// Waits for the thread to finish
+    fn join(self) {
+        unsafe {
+            WaitForSingleObject(self.handle, 0xFFFFFFFF); // INFINITE
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+/// High-resolution timer using QueryPerformanceCounter
+open data PerformanceCounter;
+
+impl PerformanceCounter {
+    /// Gets the current performance counter value
+    fn now() -> u64 {
+        unsafe {
+            var counter: i64 = 0;
+            QueryPerformanceCounter(&var counter);
+            counter as u64
+        }
+    }
+
+    /// Gets the performance counter frequency
+    fn frequency() -> u64 {
+        unsafe {
+            var freq: i64 = 0;
+            QueryPerformanceFrequency(&var freq);
+            freq as u64
+        }
+    }
+
+    /// Converts counter ticks to seconds
+    fn to_seconds(ticks: u64) -> f64 {
+        ticks as f64 / Self::frequency() as f64
+    }
+}
+
+#[link(name = "kernel32")]
+extern "C" {
+    fn QueryPerformanceCounter(lpPerformanceCount: *var i64) -> BOOL;
+    fn QueryPerformanceFrequency(lpFrequency: *var i64) -> BOOL;
+}
+
+#[test]
+fn test_windows_allocator() {
+    let ptr = WindowsAllocator::alloc(1024);
+    assert(!ptr.is_null());
+    WindowsAllocator::free(ptr);
+}

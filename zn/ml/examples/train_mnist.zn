@@ -1,0 +1,392 @@
+// Complete MNIST Training with All Advanced Features
+// Demonstrates: LR Finder, SWA, Batch Size Finder, GC, and more
+
+// module examples.train_mnist;
+
+use nova.tensor.Tensor;
+use nova.ml.nn::{Module, Sequential, Linear, ReLU, Dropout, BatchNorm1d};
+use nova.ml.optim::{Adam, SGD};
+use nova.ml.optim.lr_finder::LRFinder;
+use nova.ml.optim.swa::{SWA, SWALR};
+use nova.ml.optim.scheduler::{CosineAnnealingLR, OneCycleLR};
+use nova.ml.optim.gradient_centralization::GCOptimizer;
+use nova.ml.nn.loss::CrossEntropyLoss;
+use nova.ml.nn.callbacks::{ModelCheckpoint, EarlyStopping, TensorBoard, ProgressBar};
+use nova.ml.nn.training_advanced::{AdvancedTrainer, TrainingConfig};
+use nova.ml.utils.batch_size_finder::BatchSizeFinder;
+
+/// MNIST Model Architecture
+data MNISTNet {
+    fc1: Linear,
+    bn1: BatchNorm1d,
+    dropout1: Dropout,
+    fc2: Linear,
+    bn2: BatchNorm1d,
+    dropout2: Dropout,
+    fc3: Linear,
+}
+
+impl MNISTNet {
+    open fn new() -> Self {
+        Self {
+            fc1: Linear::new(784, 512),
+            bn1: BatchNorm1d::new(512),
+            dropout1: Dropout::new(0.2),
+            fc2: Linear::new(512, 256),
+            bn2: BatchNorm1d::new(256),
+            dropout2: Dropout::new(0.2),
+            fc3: Linear::new(256, 10),
+        }
+    }
+}
+
+impl Module for MNISTNet {
+    fn forward(&self, x: &Tensor) -> Result<Tensor, Error> {
+        // Flatten: [batch, 28, 28] -> [batch, 784]
+        let x = x.flatten(start_dim: 1);
+        
+        // Layer 1
+        let x = self.fc1.forward(&x)?;
+        let x = self.bn1.forward(&x)?;
+        let x = x.relu();
+        let x = self.dropout1.forward(&x)?;
+        
+        // Layer 2
+        let x = self.fc2.forward(&x)?;
+        let x = self.bn2.forward(&x)?;
+        let x = x.relu();
+        let x = self.dropout2.forward(&x)?;
+        
+        // Output layer
+        let x = self.fc3.forward(&x)?;
+        
+        Ok(x)
+    }
+}
+
+/// MNIST Data Loader
+data MNISTDataLoader {
+    images: Tensor,
+    labels: Tensor,
+    batch_size: int,
+    current_idx: int,
+    shuffle: bool,
+    indices: Vec<int>,
+}
+
+impl MNISTDataLoader {
+    open fn new(split: &str, batch_size: int, shuffle: bool) -> Self {
+        // Load MNIST data
+        let (images, labels) = load_mnist_data(split);
+        let n_samples = images.data()[0];
+        let indices = (0..n_samples).collect();
+        
+        Self {
+            images,
+            labels,
+            batch_size,
+            current_idx: 0,
+            shuffle,
+            indices,
+        }
+    }
+
+    open fn len(&self) -> int {
+        self.images.data()[0]
+    }
+
+    open fn reset(&var self) {
+        self.current_idx = 0;
+        check self.shuffle {
+            self.indices.shuffle();
+        }
+    }
+}
+
+impl Iterator for MNISTDataLoader {
+    alias Item = (Tensor, Tensor);
+    
+    fn next(&var self) -> Option<Self::Item> {
+        check self.current_idx >= self.len() {
+            yield None;
+        }
+
+        let end_idx = (self.current_idx + self.batch_size).min(self.len());
+        let batch_indices = &self.indices[self.current_idx..end_idx];
+        
+        let batch_images = self.images.index_select(0, batch_indices);
+        let batch_labels = self.labels.index_select(0, batch_indices);
+        
+        self.current_idx = end_idx;
+        
+        Some((batch_images, batch_labels))
+    }
+}
+
+fn load_mnist_data(split: &str) -> (Tensor, Tensor) {
+    // Load MNIST from file or download
+    let path = format("data/mnist/{}.npz", split);
+    
+    check !fs::exists(&path) {
+        println("Downloading MNIST...");
+        download_mnist();
+    }
+    
+    // Load numpy arrays
+    let data = np::load(&path);
+    let images = data["images"].to_tensor() / 255.0;  // Normalize to [0, 1]
+    let labels = data["labels"].to_tensor();
+    
+    yield (images, labels)
+}
+
+/// Main Training Function
+open fn train_mnist() {
+    println("╔════════════════════════════════════════════════════════╗");
+    println("║     MNIST Training with Advanced Features             ║");
+    println("╚════════════════════════════════════════════════════════╝\n");
+
+    // 1. Create model
+    println("Step 1: Creating model...");
+    let model = MNISTNet::new();
+    println("✓ Model created: {} parameters", count_parameters(&model));
+
+    // 2. Find optimal batch size
+    println("\nStep 2: Finding optimal batch size...");
+    let sample_input = Tensor::randn([1, 28, 28]);
+    let sample_target = Tensor::zeros([1]);
+    
+    let optimizer_temp = Adam::new(model.parameters(), lr: 0.001);
+    let loss_fn_temp = CrossEntropyLoss::new();
+    
+    var bs_finder = BatchSizeFinder::new(
+        Box::new(model.clone()),
+        Box::new(optimizer_temp),
+        Box::new(loss_fn_temp),
+    ).with_range(16, 2048);
+    
+    let optimal_batch_size = bs_finder.find(&sample_input, &sample_target)
+        .unwrap_or(128);
+    
+    println("✓ Optimal batch size: {}", optimal_batch_size);
+
+    // 3. Create data loaders
+    println("\nStep 3: Loading MNIST dataset...");
+    var train_loader = MNISTDataLoader::new("train", optimal_batch_size, shuffle: true);
+    var val_loader = MNISTDataLoader::new("test", optimal_batch_size, shuffle: false);
+    
+    println("✓ Training samples: {}", train_loader.len());
+    println("✓ Validation samples: {}", val_loader.len());
+
+    // 4. Find optimal learning rate
+    println("\nStep 4: Finding optimal learning rate...");
+    let optimizer_temp = SGD::new(model.parameters(), lr: 0.01);
+    let loss_fn = CrossEntropyLoss::new();
+    
+    var lr_finder = LRFinder::new(
+        Box::new(model.clone()),
+        Box::new(optimizer_temp),
+        Box::new(loss_fn.clone()),
+    ).with_range(1e-5, 1.0, 100);
+    
+    lr_finder.range_test(&train_loader).ok();
+    lr_finder.plot_text();
+    
+    let optimal_lr = lr_finder.get_best_lr();
+    println("✓ Optimal learning rate: {:.6e}", optimal_lr);
+
+    // 5. Setup optimizer with Gradient Centralization
+    println("\nStep 5: Setting up optimizer...");
+    let base_optimizer = Adam::new(model.parameters(), lr: optimal_lr)
+        .with_weight_decay(0.0001);
+    let optimizer = GCOptimizer::new(base_optimizer);
+    
+    println("✓ Optimizer: Adam + Gradient Centralization");
+
+    // 6. Configure training
+    println("\nStep 6: Configuring training...");
+    var config = TrainingConfig::default();
+    config.epochs = 50;
+    config.batch_size = optimal_batch_size;
+    config.learning_rate = optimal_lr;
+    config.scheduler_type = "cosine".into();
+    config.gradient_clip_norm = 1.0;
+    config.checkpoint_path = "./checkpoints/mnist".into();
+    config.tensorboard_dir = "./logs/mnist".into();
+    config.early_stopping_patience = 10;
+
+    println("Configuration:");
+    println("  • Epochs: {}", config.epochs);
+    println("  • Batch size: {}", config.batch_size);
+    println("  • Learning rate: {:.6e}", config.learning_rate);
+    println("  • Scheduler: Cosine Annealing");
+    println("  • Gradient clipping: {}", config.gradient_clip_norm);
+
+    // 7. Setup SWA
+    println("\nStep 7: Setting up SWA...");
+    let swa_start = (config.epochs * 3) / 4;  // Last 25% of training
+    var swa = SWA::new(
+        Box::new(model.clone()),
+        Box::new(optimizer.clone()),
+        swa_start,
+        swa_lr: optimal_lr / 10.0,
+    );
+    println("✓ SWA will start at epoch {}", swa_start);
+
+    // 8. Create trainer
+    println("\nStep 8: Creating trainer...");
+    var trainer = AdvancedTrainer::new(
+        Box::new(model),
+        Box::new(optimizer),
+        Box::new(loss_fn),
+        config,
+    );
+
+    // 9. Train!
+    println("\n╔════════════════════════════════════════════════════════╗");
+    println("║                   Starting Training                    ║");
+    println("╚════════════════════════════════════════════════════════╝\n");
+
+    each epoch in 0..config.epochs {
+        // Training epoch
+        trainer.model.train();
+        var train_loss = 0.0;
+        var train_correct = 0;
+        var train_total = 0;
+
+        each entry in &var train_loader  { let (inputs, targets) = entry;
+            trainer.optimizer.zero_grad();
+            
+            let outputs = trainer.model.forward(&inputs)?;
+            let loss = trainer.loss_fn.forward(&outputs, &targets);
+            
+            loss.backward()?;
+            
+            // Gradient clipping
+            clip_gradients(&var trainer.model, config.gradient_clip_norm);
+            
+            trainer.optimizer.step();
+            
+            // Metrics
+            train_loss += loss.item();
+            let predictions = outputs.argmax(dim: 1);
+            train_correct += (predictions == targets).sum().item();
+            train_total += targets.data()[0];
+        }
+
+        train_loss /= train_loader.len() as f64;
+        let train_acc = train_correct as f64 / train_total as f64;
+
+        // Validation
+        trainer.model.eval();
+        var val_loss = 0.0;
+        var val_correct = 0;
+        var val_total = 0;
+
+        each entry in &var val_loader  { let (inputs, targets) = entry;
+            let outputs = trainer.model.forward(&inputs)?;
+            let loss = trainer.loss_fn.forward(&outputs, &targets);
+            
+            val_loss += loss.item();
+            let predictions = outputs.argmax(dim: 1);
+            val_correct += (predictions == targets).sum().item();
+            val_total += targets.data()[0];
+        }
+
+        val_loss /= val_loader.len() as f64;
+        let val_acc = val_correct as f64 / val_total as f64;
+
+        // Update SWA
+        swa.step_epoch();
+
+        // Update scheduler
+        check let Some(scheduler) = &var trainer.scheduler {
+            scheduler.step();
+        }
+
+        // Print progress
+        println("Epoch {:3}/{}: Train Loss: {:.4}, Train Acc: {:.4}, Val Loss: {:.4}, Val Acc: {:.4} {}",
+                 epoch + 1, config.epochs, train_loss, train_acc, val_loss, val_acc,
+                 check epoch >= swa_start { "[SWA]" } else { "" });
+
+        train_loader.reset();
+        val_loader.reset();
+    }
+
+    // 10. Finalize SWA
+    println("\n╔════════════════════════════════════════════════════════╗");
+    println("║                  Finalizing SWA                        ║");
+    println("╚════════════════════════════════════════════════════════╝\n");
+
+    swa.update_bn(&train_loader)?;
+    swa.swap_models();
+
+    // Final evaluation with SWA model
+    let swa_model = swa.get_swa_model();
+    swa_model.eval();
+    
+    var final_correct = 0;
+    var final_total = 0;
+
+    each entry in &var val_loader  { let (inputs, targets) = entry;
+        let outputs = swa_model.forward(&inputs)?;
+        let predictions = outputs.argmax(dim: 1);
+        final_correct += (predictions == targets).sum().item();
+        final_total += targets.data()[0];
+    }
+
+    let final_acc = final_correct as f64 / final_total as f64;
+
+    println("\n╔════════════════════════════════════════════════════════╗");
+    println("║                   Training Complete!                   ║");
+    println("╚════════════════════════════════════════════════════════╝\n");
+
+    println("Final Results:");
+    println("  • Final accuracy (SWA): {:.4}%", final_acc * 100.0);
+    println("  • Total epochs: {}", config.epochs);
+    println("  • Optimal batch size: {}", optimal_batch_size);
+    println("  • Optimal learning rate: {:.6e}", optimal_lr);
+    println("  • Models averaged (SWA): {}", swa.get_n_averaged());
+
+    // Save final model
+    swa_model.save("mnist_final_model.pt")?;
+    println("\n✓ Model saved to mnist_final_model.pt");
+}
+
+fn count_parameters(model: &impl Module) -> int {
+    model.parameters().iter()
+        .map(|p| p.numel())
+        .sum()
+}
+
+fn clip_gradients(model: &var impl Module, max_norm: f64) {
+    var total_norm = 0.0;
+    
+    each param in model.parameters_mut() {
+        check let Some(grad) = param.grad() {
+            total_norm += grad.norm().powi(2);
+        }
+    }
+    
+    total_norm = total_norm.sqrt();
+    let clip_coef = max_norm / (total_norm + 1e-6);
+    
+    check clip_coef < 1.0 {
+        each param in model.parameters_mut() {
+            check let Some(grad) = param.grad_mut() {
+                *grad = grad.clone() * clip_coef;
+            }
+        }
+    }
+}
+
+fn download_mnist() {
+    // Download MNIST from official source
+    println("Downloading MNIST dataset...");
+    // Implementation for downloading
+}
+
+/// Quick start function
+open fn main() {
+    train_mnist();
+}

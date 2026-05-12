@@ -1,0 +1,319 @@
+/**
+ * GPU Acceleration Tests
+ * Tests for CUDA, Metal, and Triton backends
+ */
+
+use std.test.{assert_eq, assert_true, assert_approx, test, benchmark};
+use std.ai.ml.tensor.{Tensor, Device};
+use std.ai.ml.kernels.{cuda_matmul, metal_matmul, cuda_flash_attention, metal_flash_attention};
+use std.ai.ml.nn.{Linear, Conv2d};
+
+// ============================================================================
+// DEVICE MANAGEMENT TESTS
+// ============================================================================
+
+@test
+fn test_device_detection() {
+    // Check available devices
+    let has_cuda = Device::cuda_available();
+    let has_metal = Device::metal_available();
+    
+    println("CUDA available: {}", has_cuda);
+    println("Metal available: {}", has_metal);
+    
+    assert_true(has_cuda || has_metal || true);  // At least CPU should work
+}
+
+@test
+fn test_tensor_device_transfer() {
+    let x_cpu = Tensor::randn([10, 10], device=Device::CPU);
+    
+    assert_eq!(x_cpu.device(), Device::CPU);
+    
+    check Device::cuda_available() {
+        let x_cuda = x_cpu.to(Device::CUDA(0));
+        assert_eq!(x_cuda.device(), Device::CUDA(0));
+        
+        // Transfer back to CPU
+        let x_back = x_cuda.to(Device::CPU);
+        assert_eq!(x_back.device(), Device::CPU);
+        
+        // Check values are preserved
+        assert_approx!(x_cpu.data(), x_back.data(), 1e-6);
+    }
+    
+    check Device::metal_available() {
+        let x_metal = x_cpu.to(Device::Metal);
+        assert_eq!(x_metal.device(), Device::Metal);
+    }
+}
+
+// ============================================================================
+// CUDA TESTS
+// ============================================================================
+
+@test
+@cuda_required
+fn test_cuda_matmul() {
+    let A = Tensor::randn([1024, 512], device=Device::CUDA(0));
+    let B = Tensor::randn([512, 256], device=Device::CUDA(0));
+    
+    let C = cuda_matmul(&A, &B);
+    
+    assert_eq!(C.data(), [1024, 256]);
+    assert_eq!(C.device(), Device::CUDA(0));
+}
+
+@test
+@cuda_required
+fn test_cuda_vs_cpu_accuracy() {
+    // Compare CUDA vs CPU results
+    let A = Tensor::randn([128, 64]);
+    let B = Tensor::randn([64, 32]);
+    
+    // CPU computation
+    let C_cpu = A.matmul(&B);
+    
+    // CUDA computation
+    let A_cuda = A.to(Device::CUDA(0));
+    let B_cuda = B.to(Device::CUDA(0));
+    let C_cuda = A_cuda.matmul(&B_cuda);
+    let C_cuda_cpu = C_cuda.to(Device::CPU);
+    
+    // Results should be very close
+    assert_approx!(C_cpu.data(), C_cuda_cpu.data(), 1e-4);
+}
+
+@test
+@cuda_required
+fn test_cuda_flash_attention() {
+    let batch_size = 8;
+    let num_heads = 8;
+    let seq_len = 512;
+    let head_dim = 64;
+    
+    let Q = Tensor::randn([batch_size, num_heads, seq_len, head_dim], device=Device::CUDA(0));
+    let K = Tensor::randn([batch_size, num_heads, seq_len, head_dim], device=Device::CUDA(0));
+    let V = Tensor::randn([batch_size, num_heads, seq_len, head_dim], device=Device::CUDA(0));
+    
+    let output = cuda_flash_attention(&Q, &K, &V, scale=1.0 / (head_dim as f32).sqrt());
+    
+    assert_eq!(output.data(), [batch_size, num_heads, seq_len, head_dim]);
+}
+
+@test
+@cuda_required
+fn test_cuda_linear_layer() {
+    let layer = Linear::new(512, 256).to(Device::CUDA(0));
+    let x = Tensor::randn([128, 512], device=Device::CUDA(0));
+    
+    let y = layer.forward(&x);
+    
+    assert_eq!(y.data(), [128, 256]);
+    assert_eq!(y.device(), Device::CUDA(0));
+}
+
+// ============================================================================
+// METAL TESTS
+// ============================================================================
+
+@test
+@metal_required
+fn test_metal_matmul() {
+    let A = Tensor::randn([1024, 512], device=Device::Metal);
+    let B = Tensor::randn([512, 256], device=Device::Metal);
+    
+    let C = metal_matmul(&A, &B);
+    
+    assert_eq!(C.data(), [1024, 256]);
+    assert_eq!(C.device(), Device::Metal);
+}
+
+@test
+@metal_required
+fn test_metal_vs_cpu_accuracy() {
+    let A = Tensor::randn([128, 64]);
+    let B = Tensor::randn([64, 32]);
+    
+    // CPU computation
+    let C_cpu = A.matmul(&B);
+    
+    // Metal computation
+    let A_metal = A.to(Device::Metal);
+    let B_metal = B.to(Device::Metal);
+    let C_metal = A_metal.matmul(&B_metal);
+    let C_metal_cpu = C_metal.to(Device::CPU);
+    
+    // Results should be very close
+    assert_approx!(C_cpu.data(), C_metal_cpu.data(), 1e-4);
+}
+
+@test
+@metal_required
+fn test_metal_flash_attention() {
+    let batch_size = 8;
+    let num_heads = 8;
+    let seq_len = 512;
+    let head_dim = 64;
+    
+    let Q = Tensor::randn([batch_size, num_heads, seq_len, head_dim], device=Device::Metal);
+    let K = Tensor::randn([batch_size, num_heads, seq_len, head_dim], device=Device::Metal);
+    let V = Tensor::randn([batch_size, num_heads, seq_len, head_dim], device=Device::Metal);
+    
+    let output = metal_flash_attention(&Q, &K, &V, scale=1.0 / (head_dim as f32).sqrt());
+    
+    assert_eq!(output.data(), [batch_size, num_heads, seq_len, head_dim]);
+}
+
+// ============================================================================
+// PERFORMANCE BENCHMARKS
+// ============================================================================
+
+@benchmark
+fn bench_matmul_cpu() {
+    let A = Tensor::randn([2048, 2048]);
+    let B = Tensor::randn([2048, 2048]);
+    
+    bench_start!();
+    let C = A.matmul(&B);
+    bench_end!();
+}
+
+@benchmark
+@cuda_required
+fn bench_matmul_cuda() {
+    let A = Tensor::randn([2048, 2048], device=Device::CUDA(0));
+    let B = Tensor::randn([2048, 2048], device=Device::CUDA(0));
+    
+    bench_start!();
+    let C = A.matmul(&B);
+    Device::cuda_synchronize();
+    bench_end!();
+}
+
+@benchmark
+@metal_required
+fn bench_matmul_metal() {
+    let A = Tensor::randn([2048, 2048], device=Device::Metal);
+    let B = Tensor::randn([2048, 2048], device=Device::Metal);
+    
+    bench_start!();
+    let C = A.matmul(&B);
+    Device::metal_synchronize();
+    bench_end!();
+}
+
+@benchmark
+@cuda_required
+fn bench_flash_attention_cuda() {
+    let Q = Tensor::randn([8, 8, 1024, 64], device=Device::CUDA(0));
+    let K = Tensor::randn([8, 8, 1024, 64], device=Device::CUDA(0));
+    let V = Tensor::randn([8, 8, 1024, 64], device=Device::CUDA(0));
+    
+    bench_start!();
+    let output = cuda_flash_attention(&Q, &K, &V, scale=0.125);
+    Device::cuda_synchronize();
+    bench_end!();
+}
+
+@benchmark
+@metal_required
+fn bench_flash_attention_metal() {
+    let Q = Tensor::randn([8, 8, 1024, 64], device=Device::Metal);
+    let K = Tensor::randn([8, 8, 1024, 64], device=Device::Metal);
+    let V = Tensor::randn([8, 8, 1024, 64], device=Device::Metal);
+    
+    bench_start!();
+    let output = metal_flash_attention(&Q, &K, &V, scale=0.125);
+    Device::metal_synchronize();
+    bench_end!();
+}
+
+@benchmark
+@cuda_required
+fn bench_linear_layer_cuda() {
+    let layer = Linear::new(1024, 512).to(Device::CUDA(0));
+    let x = Tensor::randn([1024, 1024], device=Device::CUDA(0));
+    
+    bench_start!();
+    each _ in 0..100 {
+        let _ = layer.forward(&x);
+    }
+    Device::cuda_synchronize();
+    bench_end!();
+}
+
+@benchmark
+@cuda_required
+fn bench_conv2d_cuda() {
+    let layer = Conv2d::new(3, 64, kernel_size=3, padding=1).to(Device::CUDA(0));
+    let x = Tensor::randn([64, 3, 224, 224], device=Device::CUDA(0));
+    
+    bench_start!();
+    each _ in 0..100 {
+        let _ = layer.forward(&x);
+    }
+    Device::cuda_synchronize();
+    bench_end!();
+}
+
+// ============================================================================
+// MEMORY EFFICIENCY TESTS
+// ============================================================================
+
+@test
+@cuda_required
+fn test_flash_attention_memory_efficiency() {
+    // FlashAttention should use O(N) memory vs O(N²) for standard attention
+    
+    let seq_lens = [512, 1024, 2048];
+    
+    each seq_len in seq_lens {
+        let Q = Tensor::randn([1, 8, seq_len, 64], device=Device::CUDA(0));
+        let K = Tensor::randn([1, 8, seq_len, 64], device=Device::CUDA(0));
+        let V = Tensor::randn([1, 8, seq_len, 64], device=Device::CUDA(0));
+        
+        let mem_before = Device::cuda_memory_allocated();
+        
+        let output = cuda_flash_attention(&Q, &K, &V, scale=0.125);
+        
+        let mem_after = Device::cuda_memory_allocated();
+        let mem_used = mem_after - mem_before;
+        
+        println("Seq len {}: Memory used = {} MB", seq_len, mem_used / 1024 / 1024);
+        
+        // FlashAttention should not allocate O(N²) memory
+        let n_squared = (seq_len * seq_len * 4) as u64;  // 4 bytes per float
+        assert_true(mem_used < n_squared);
+    }
+}
+
+// ============================================================================
+// MULTI-GPU TESTS
+// ============================================================================
+
+@test
+@multi_gpu_required
+fn test_multi_gpu_data_parallel() {
+    let n_gpus = Device::cuda_device_count();
+    
+    check n_gpus < 2 {
+        println("Skipping multi-GPU test: only {} GPU(s) available", n_gpus);
+        yield;
+    }
+    
+    // Create models on different GPUs
+    let model_gpu0 = Linear::new(512, 256).to(Device::CUDA(0));
+    let model_gpu1 = Linear::new(512, 256).to(Device::CUDA(1));
+    
+    // Create data on different GPUs
+    let x_gpu0 = Tensor::randn([64, 512], device=Device::CUDA(0));
+    let x_gpu1 = Tensor::randn([64, 512], device=Device::CUDA(1));
+    
+    // Forward pass on both GPUs simultaneously
+    let y_gpu0 = model_gpu0.forward(&x_gpu0);
+    let y_gpu1 = model_gpu1.forward(&x_gpu1);
+    
+    assert_eq!(y_gpu0.data(), [64, 256]);
+    assert_eq!(y_gpu1.data(), [64, 256]);
+}

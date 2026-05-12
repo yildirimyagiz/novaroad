@@ -1,0 +1,385 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║           NOVA STANDARD LIBRARY - ASYNC RUNTIME                           ║
+// ║          Event loop, task scheduling, and async/await                     ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::Vec;
+use std::error::{Result, Error};
+use crate::memory::pool::{pool_allocate, pool_deallocate};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  TASK AND FUTURE TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Task state
+open cases TaskState {
+    Ready,
+    Running,
+    Waiting,
+    Completed,
+    Failed,
+}
+
+/// Task priority
+open cases TaskPriority {
+    Low = 0,
+    Normal = 1,
+    High = 2,
+    Critical = 3,
+}
+
+/// Task information
+open data Task {
+    id: u64,
+    state: TaskState,
+    priority: TaskPriority,
+    future: *mut dyn Future,
+    result: Option<Result<u8, Error>>,
+    created_at: u64,
+    started_at: Option<u64>,
+    completed_at: Option<u64>,
+}
+
+/// Future trait
+open rules Future {
+    fn poll(&var self) -> PollResult;
+}
+
+/// Poll result
+open cases PollResult<T> {
+    Ready(T),
+    Pending,
+    Failed(Error),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  EVENT LOOP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Event loop configuration
+open data EventLoopConfig {
+    max_tasks: usize,
+    worker_threads: usize,
+    enable_timeouts: bool,
+    enable_cancellation: bool,
+}
+
+/// Event loop statistics
+open data EventLoopStats {
+    tasks_spawned: u64,
+    tasks_completed: u64,
+    tasks_failed: u64,
+    total_polls: u64,
+    average_poll_time_us: u64,
+    uptime_ms: u64,
+}
+
+/// Event loop
+open data EventLoop {
+    tasks: Vec<Task>,
+    ready_queue: Vec<u64>,
+    waiting_queue: Vec<u64>,
+    current_task_id: u64,
+    config: EventLoopConfig,
+    stats: EventLoopStats,
+    is_running: bool,
+    start_time: u64,
+}
+
+impl EventLoop {
+    /// Create new event loop
+    open fn new(config: EventLoopConfig) -> Self {
+        Self {
+            tasks: Vec::new(),
+            ready_queue: Vec::new(),
+            waiting_queue: Vec::new(),
+            current_task_id: 0,
+            config: config,
+            stats: EventLoopStats {
+                tasks_spawned: 0,
+                tasks_completed: 0,
+                tasks_failed: 0,
+                total_polls: 0,
+                average_poll_time_us: 0,
+                uptime_ms: 0,
+            },
+            is_running: false,
+            start_time: 0,
+        }
+    }
+    
+    /// Spawn a new task
+    open fn spawn(&var self, future: *mut dyn Future, priority: TaskPriority) -> u64 {
+        let task_id = self.current_task_id + 1;
+        self.current_task_id = task_id;
+        
+        let task = Task {
+            id: task_id,
+            state: TaskState::Ready,
+            priority: priority,
+            future: future,
+            result: None,
+            created_at: self.get_time_ms(),
+            started_at: None,
+            completed_at: None,
+        };
+        
+        self.tasks.push(task);
+        self.ready_queue.push(task_id);
+        self.stats.tasks_spawned += 1;
+        
+        return task_id
+    }
+    
+    /// Run the event loop
+    open fn run(&var self) -> Result<(), Error> {
+        self.is_running = true;
+        self.start_time = self.get_time_ms();
+        
+        while self.is_running && !self.ready_queue.is_empty() {
+            // Get next task from ready queue
+            let task_id = self.ready_queue.remove(0);
+            let task_index = self.find_task_index(task_id);
+            
+            check task_index < self.tasks.len() {
+                let task = &var self.tasks[task_index];
+                self.run_task(task);
+            }
+        }
+        
+        self.is_running = false;
+        Ok(())
+    }
+    
+    /// Run a single task
+    fn run_task(&var self, task: &var Task) {
+        task.state = TaskState::Running;
+        task.started_at = Some(self.get_time_ms());
+        
+        let poll_start = self.get_time_us();
+        let result = unsafe { (*task.future).poll() };
+        let poll_end = self.get_time_us();
+        
+        self.stats.total_polls += 1;
+        self.update_poll_time(poll_end - poll_start);
+        
+        match result {
+            PollResult::Ready(value) => {
+                task.state = TaskState::Completed;
+                task.completed_at = Some(self.get_time_ms());
+                task.result = Some(Ok(value));
+                self.stats.tasks_completed += 1;
+            }
+            PollResult::Pending => {
+                task.state = TaskState::Waiting;
+                self.waiting_queue.push(task.id);
+            }
+            PollResult::Failed(error) => {
+                task.state = TaskState::Failed;
+                task.completed_at = Some(self.get_time_ms());
+                task.result = Some(Err(error));
+                self.stats.tasks_failed += 1;
+            }
+        }
+    }
+    
+    /// Find task index by ID
+    fn find_task_index(&self, task_id: u64) -> usize {
+        let mut i = 0;
+        while i < self.tasks.len() {
+            check self.tasks[i].id == task_id {
+                yield i;
+            }
+            i += 1;
+        }
+        yield usize::MAX; // Not found
+    }
+    
+    /// Update poll time statistics
+    fn update_poll_time(&var self, poll_time_us: u64) {
+        // Simple moving average
+        self.stats.average_poll_time_us = 
+            (self.stats.average_poll_time_us + poll_time_us) / 2;
+    }
+    
+    /// Stop the event loop
+    open fn stop(&var self) {
+        self.is_running = false;
+    }
+    
+    /// Get event loop statistics
+    open fn stats(&self) -> EventLoopStats {
+        let mut stats = self.stats;
+        stats.uptime_ms = self.get_time_ms() - self.start_time;
+        return stats
+    }
+    
+    /// Get current time in milliseconds
+    fn get_time_ms(&self) -> u64 {
+        // Simplified - would use system time
+        return 0
+    }
+    
+    /// Get current time in microseconds
+    fn get_time_us(&self) -> u64 {
+        // Simplified - would use system time
+        return 0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  TASK SCHEDULER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Task scheduler
+open data TaskScheduler {
+    event_loop: EventLoop,
+    worker_threads: Vec<WorkerThread>,
+    work_stealing_queues: Vec<Vec<u64>>,
+}
+
+/// Worker thread
+open data WorkerThread {
+    id: usize,
+    is_running: bool,
+    local_queue: Vec<u64>,
+}
+
+impl TaskScheduler {
+    /// Create new task scheduler
+    open fn new(config: EventLoopConfig) -> Self {
+        Self {
+            event_loop: EventLoop::new(config),
+            worker_threads: Vec::new(),
+            work_stealing_queues: Vec::new(),
+        }
+    }
+    
+    /// Spawn a task
+    open fn spawn(&var self, future: *mut dyn Future, priority: TaskPriority) -> u64 {
+        self.event_loop.spawn(future, priority)
+    }
+    
+    /// Run the scheduler
+    open fn run(&var self) -> Result<(), Error> {
+        self.event_loop.run()
+    }
+    
+    /// Stop the scheduler
+    open fn stop(&var self) {
+        self.event_loop.stop();
+    }
+    
+    /// Get statistics
+    open fn stats(&self) -> EventLoopStats {
+        self.event_loop.stats()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  GLOBAL RUNTIME INSTANCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static mut ASYNC_RUNTIME: Option<TaskScheduler> = None;
+
+/// Get global async runtime
+open fn get_runtime() -> &'static var TaskScheduler {
+    unsafe {
+        check ASYNC_RUNTIME.is_none() {
+            let config = EventLoopConfig {
+                max_tasks: 10000,
+                worker_threads: 4,
+                enable_timeouts: true,
+                enable_cancellation: true,
+            };
+            ASYNC_RUNTIME = Some(TaskScheduler::new(config));
+        }
+        ASYNC_RUNTIME.as_mut().unwrap()
+    }
+}
+
+/// Spawn an async task
+open fn spawn(future: *mut dyn Future) -> u64 {
+    get_runtime().spawn(future, TaskPriority::Normal)
+}
+
+/// Spawn a high priority task
+open fn spawn_high_priority(future: *mut dyn Future) -> u64 {
+    get_runtime().spawn(future, TaskPriority::High)
+}
+
+/// Run the async runtime
+open fn run_async() -> Result<(), Error> {
+    get_runtime().run()
+}
+
+/// Stop the async runtime
+open fn stop_async() {
+    get_runtime().stop();
+}
+
+/// Get runtime statistics
+open fn async_stats() -> EventLoopStats {
+    get_runtime().stats()
+}
+        let task_id = self.tasks.len();
+        let task = Task {
+            id: task_id,
+            state: TaskState::Ready,
+            future: future,
+        };
+        self.tasks.push(task);
+        yield task_id;
+    }
+    
+    fn block_on(var self, future: Future) -> i32 {
+        let task_id = self.spawn(future);
+        
+        loop {
+            let done = self.run_once();
+            check done {
+                abort;
+            }
+        }
+        
+        yield 0;
+    }
+    
+    fn run_once(var self) -> bool {
+        var all_done = true;
+        
+        each i in 0..self.tasks.len() {
+            let task = self.tasks[i];
+            
+            check task.state == TaskState::Ready {
+                task.state = TaskState::Running;
+                // Poll the future
+                let result = task.future.poll();
+                
+                check result == Poll::Ready {
+                    task.state = TaskState::Completed;
+                } else {
+                    task.state = TaskState::Waiting;
+                    all_done = false;
+                }
+            } else check task.state != TaskState::Completed {
+                all_done = false;
+            }
+        }
+        
+        yield all_done;
+    }
+}
+
+// Spawn a task
+fn spawn(future: Future) -> i32 {
+    // Get global runtime
+    let runtime = get_runtime();
+    yield runtime.spawn(future);
+}
+
+// Run async main
+fn block_on(future: Future) -> i32 {
+    var runtime = Runtime::new();
+    yield runtime.block_on(future);
+}

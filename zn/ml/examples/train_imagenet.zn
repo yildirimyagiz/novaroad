@@ -1,0 +1,598 @@
+// ImageNet Training with Large-Scale Features
+// Demonstrates: Distributed Training (DDP), LAMB, Mixed Precision, Progressive Resizing, SWA
+
+// module examples.train_imagenet;
+
+use nova.tensor.Tensor;
+use nova.ml.nn::{Module, ResNet50, ResNet101};
+use nova.ml.optim::lamb::{LAMB, LAMBWarmup};
+use nova.ml.optim.swa::SWA;
+use nova.ml.optim.scheduler::{CosineAnnealingLR, OneCycleLR};
+use nova.ml.optim.gradient_centralization::GCOptimizer;
+use nova.ml.nn.loss::{CrossEntropyLoss, FocalLoss};
+use nova.ml.nn.mixed_precision::{MixedPrecisionTrainer, Precision, MixedPrecisionConfig};
+use nova.ml.distributed::{DistributedDataParallel, ProcessGroup, DistributedConfig, DistributedSampler};
+use nova.ml.utils.progressive_resizing::{ProgressiveResizing, CurriculumLearning};
+use nova.ml.utils.batch_size_finder::BatchSizeFinder;
+
+/// ImageNet Data Loader with Distributed Support
+data ImageNetDataLoader {
+    dataset_path: string,
+    split: string,
+    batch_size: int,
+    num_workers: int,
+    
+    // Distributed
+    world_size: int,
+    rank: int,
+    sampler: DistributedSampler,
+    
+    // Progressive resizing
+    current_size: int,
+    
+    // Data augmentation
+    use_autoaugment: bool,
+    use_mixup: bool,
+    mixup_alpha: f64,
+}
+
+impl ImageNetDataLoader {
+    open fn new(
+        dataset_path: string,
+        split: string,
+        batch_size: int,
+        world_size: int,
+        rank: int,
+    ) -> Self {
+        let dataset_size = check split == "train" { 1281167 } else { 50000 };
+        let sampler = DistributedSampler::new(dataset_size, world_size, rank);
+        
+        Self {
+            dataset_path,
+            split,
+            batch_size,
+            num_workers: 4,
+            world_size,
+            rank,
+            sampler,
+            current_size: 224,
+            use_autoaugment: true,
+            use_mixup: true,
+            mixup_alpha: 0.2,
+        }
+    }
+
+    open fn set_image_size(&var self, size: int) {
+        self.current_size = size;
+    }
+
+    open fn set_epoch(&var self, epoch: int) {
+        // Update sampler for shuffling
+        self.sampler.set_epoch(epoch);
+    }
+
+    fn load_and_preprocess(&self, indices: &[int]) -> (Tensor, Tensor) {
+        // Load images from disk
+        var images = Vec::new();
+        var labels = Vec::new();
+
+        for &idx in indices {
+            let (img, label) = self.load_image(idx);
+            images.push(img);
+            labels.push(label);
+        }
+
+        let batch_images = Tensor::stack(&images, dim: 0);
+        let batch_labels = Tensor::from_vec(labels);
+
+        // Resize to current size
+        let resized = batch_images.resize([
+            self.batch_size, 3, self.current_size, self.current_size
+        ]);
+
+        // Augmentation
+        let augmented = self.augment_batch(&resized);
+
+        yield (augmented, batch_labels)
+    }
+
+    fn load_image(&self, idx: int) -> (Tensor, int) {
+        // Load from ImageNet structure: train/n01440764/n01440764_10026.JPEG
+        let path = format("{}/{}/image_{}.JPEG", self.dataset_path, self.split, idx);
+        let img = read_image(&path);
+        let label = get_label_from_path(&path);
+        yield (img, label)
+    }
+
+    fn augment_batch(&self, batch: &Tensor) -> Tensor {
+        check self.split == "val" {
+            // Validation: just center crop and normalize
+            yield self.normalize(batch);
+        }
+
+        // Training augmentation
+        var batch = batch.clone();
+
+        // Random resized crop
+        batch = random_resized_crop(batch, self.current_size);
+
+        // Random horizontal flip
+        batch = random_horizontal_flip(batch, p: 0.5);
+
+        // AutoAugment (optional)
+        check self.use_autoaugment {
+            batch = autoaugment_imagenet(batch);
+        }
+
+        // Normalize
+        batch = self.normalize(&batch);
+
+        // Mixup (optional, applied on normalized images)
+        check self.use_mixup && random() < 0.5 {
+            batch = mixup(batch, alpha: self.mixup_alpha);
+        }
+
+        batch
+    }
+
+    fn normalize(&self, batch: &Tensor) -> Tensor {
+        // ImageNet normalization
+        let mean = Tensor::from_vec([0.485, 0.456, 0.406]);
+        let std = Tensor::from_vec([0.229, 0.224, 0.225]);
+        yield (batch - mean) / std
+    }
+}
+
+/// Main ImageNet Training Function
+open fn train_imagenet() {
+    println("╔════════════════════════════════════════════════════════╗");
+    println("║        ImageNet Large-Scale Distributed Training      ║");
+    println("╚════════════════════════════════════════════════════════╝\n");
+
+    // Check for distributed setup
+    let dist_config = DistributedConfig::from_env();
+    let world_size = dist_config.world_size;
+    let rank = dist_config.rank;
+
+    check rank == 0 {
+        println("Distributed Training Configuration:");
+        println("  • World size: {}", world_size);
+        println("  • Backend: {:?}", dist_config.backend);
+        println("  • Master: {}:{}", dist_config.master_addr, dist_config.master_port);
+    }
+
+    // 1. Initialize distributed process group
+    println("\nRank {}: Initializing process group...", rank);
+    var process_group = ProcessGroup::new(&dist_config);
+    process_group.init().expect("Failed to initialize distributed");
+
+    // 2. Create model
+    check rank == 0 {
+        println("\nStep 1: Creating ResNet-50...");
+    }
+    let model = ResNet50::new(num_classes: 1000);
+    
+    check rank == 0 {
+        println("✓ Model created: {} parameters", count_parameters(&model));
+    }
+
+    // 3. Calculate batch size
+    let per_gpu_batch_size = 64;  // Per GPU
+    let total_batch_size = per_gpu_batch_size * world_size;
+    
+    check rank == 0 {
+        println("\nStep 2: Batch Size Configuration:");
+        println("  • Per GPU batch size: {}", per_gpu_batch_size);
+        println("  • Total GPUs: {}", world_size);
+        println("  • Effective batch size: {}", total_batch_size);
+    }
+
+    // 4. LAMB optimizer for large batch
+    check rank == 0 {
+        println("\nStep 3: Setting up LAMB optimizer for large batch...");
+    }
+    
+    let base_lr = 0.001;
+    let scaled_lr = compute_lamb_lr(base_lr, total_batch_size, base_batch: 256);
+    
+    let base_optimizer = LAMB::new(model.parameters(), scaled_lr)
+        .with_betas(0.9, 0.999)
+        .with_weight_decay(0.01)
+        .adam_mode(true);
+    
+    let optimizer = GCOptimizer::new(base_optimizer).conv_only();
+    
+    check rank == 0 {
+        println("✓ LAMB optimizer configured");
+        println("  • Base LR: {:.6e}", base_lr);
+        println("  • Scaled LR: {:.6e}", scaled_lr);
+        println("  • Weight decay: 0.01");
+    }
+
+    // 5. Wrap model with DDP
+    check rank == 0 {
+        println("\nStep 4: Wrapping model with DistributedDataParallel...");
+    }
+    
+    let ddp_model = DistributedDataParallel::new(
+        Box::new(model),
+        process_group.clone(),
+        dist_config.local_rank,
+    );
+    
+    check rank == 0 {
+        println("✓ DDP model created");
+    }
+
+    // 6. Mixed Precision (BF16 for modern GPUs)
+    check rank == 0 {
+        println("\nStep 5: Enabling Mixed Precision (BF16)...");
+    }
+    
+    let mp_config = MixedPrecisionConfig::bf16();
+    var amp_trainer = MixedPrecisionTrainer::new(Precision::BF16);
+    
+    check rank == 0 {
+        println("✓ BF16 mixed precision enabled");
+    }
+
+    // 7. Progressive Resizing
+    check rank == 0 {
+        println("\nStep 6: Setting up Progressive Resizing...");
+    }
+    
+    let total_epochs = 120;
+    var resizer = ProgressiveResizing::with_schedule([
+        (0, 128),     // Start with 128x128 for fast initial training
+        (30, 176),    // Increase to 176x176
+        (60, 224),    // Full ImageNet resolution
+    ]);
+    
+    check rank == 0 {
+        resizer.print_schedule();
+    }
+
+    // 8. Create data loaders
+    check rank == 0 {
+        println("\nStep 7: Creating distributed data loaders...");
+    }
+    
+    var train_loader = ImageNetDataLoader::new(
+        "/data/imagenet".into(),
+        "train".into(),
+        per_gpu_batch_size,
+        world_size,
+        rank,
+    );
+    
+    var val_loader = ImageNetDataLoader::new(
+        "/data/imagenet".into(),
+        "val".into(),
+        per_gpu_batch_size,
+        world_size,
+        rank,
+    );
+    
+    check rank == 0 {
+        println("✓ Data loaders created");
+        println("  • Train samples: 1,281,167");
+        println("  • Val samples: 50,000");
+        println("  • Samples per GPU: ~{}", 1281167 / world_size);
+    }
+
+    // 9. Learning rate warmup + scheduler
+    check rank == 0 {
+        println("\nStep 8: Setting up LR scheduler with warmup...");
+    }
+    
+    let warmup_epochs = 5;
+    let warmup_steps = warmup_epochs * (1281167 / total_batch_size);
+    var optimizer_with_warmup = LAMBWarmup::new(optimizer, warmup_steps);
+    
+    // Cosine annealing after warmup
+    var scheduler = CosineAnnealingLR::new(
+        optimizer_with_warmup.get_optimizer_mut(),
+        T_max: total_epochs - warmup_epochs,
+        eta_min: 1e-6,
+    );
+    
+    check rank == 0 {
+        println("✓ Warmup + Cosine Annealing configured");
+        println("  • Warmup epochs: {}", warmup_epochs);
+        println("  • Warmup steps: {}", warmup_steps);
+    }
+
+    // 10. SWA for final epochs
+    check rank == 0 {
+        println("\nStep 9: Setting up SWA...");
+    }
+    
+    let swa_start = 100;
+    var swa = SWA::new(
+        Box::new(ddp_model.clone()),
+        Box::new(optimizer.clone()),
+        swa_start,
+        swa_lr: scaled_lr / 10.0,
+    );
+    
+    check rank == 0 {
+        println("✓ SWA will start at epoch {}", swa_start);
+    }
+
+    // 11. Loss function
+    let loss_fn = CrossEntropyLoss::with_smoothing(0.1);
+
+    // Synchronize all processes
+    process_group.barrier().ok();
+
+    // 12. Training Configuration Summary
+    check rank == 0 {
+        println("\n╔════════════════════════════════════════════════════════╗");
+        println("║          ImageNet Training Configuration              ║");
+        println("╚════════════════════════════════════════════════════════╝");
+        println("  • Model: ResNet-50");
+        println("  • Total epochs: {}", total_epochs);
+        println("  • Batch size: {} ({}×{})", total_batch_size, per_gpu_batch_size, world_size);
+        println("  • Optimizer: LAMB + GC");
+        println("  • Learning rate: {:.6e} (warmup → cosine)", scaled_lr);
+        println("  • Mixed precision: BF16");
+        println("  • Distributed: DDP on {} GPUs", world_size);
+        println("  • Progressive resize: 128 → 176 → 224");
+        println("  • SWA: Starting epoch {}", swa_start);
+        println("  • Augmentation: AutoAugment + Mixup");
+        println("  • Label smoothing: 0.1");
+        println("  • Expected Top-1: ~77% (Top-5: ~93%)");
+    }
+
+    // 13. Training Loop
+    check rank == 0 {
+        println("\n╔════════════════════════════════════════════════════════╗");
+        println("║                Starting Training                       ║");
+        println("╚════════════════════════════════════════════════════════╝\n");
+    }
+
+    var best_top1 = 0.0;
+    var best_top5 = 0.0;
+
+    each epoch in 0..total_epochs {
+        // Update progressive resizing
+        let current_size = resizer.get_size(epoch);
+        train_loader.set_image_size(current_size);
+        val_loader.set_image_size(current_size);
+        train_loader.set_epoch(epoch);
+        
+        check resizer.size_changed(epoch) && rank == 0 {
+            println("\n→ Image size changed to {} × {}\n", current_size, current_size);
+        }
+
+        // Training epoch
+        ddp_model.train();
+        var train_loss = 0.0;
+        var train_top1 = 0;
+        var train_top5 = 0;
+        var train_samples = 0;
+
+        let num_batches = (1281167 / total_batch_size) as int;
+
+        for (batch_idx, (inputs, targets)) in train_loader.enumerate().take(num_batches) {
+            // Warmup LR
+            check epoch < warmup_epochs {
+                optimizer_with_warmup.step();
+            }
+
+            // Mixed precision training step
+            let loss = amp_trainer.training_step(
+                optimizer_with_warmup.get_optimizer_mut(),
+                || {
+                    let outputs = ddp_model.forward(&inputs)?;
+                    Ok(loss_fn.forward(&outputs, &targets))
+                }
+            )?;
+
+            // Compute accuracy
+            let outputs = ddp_model.forward(&inputs)?;
+            let (top1, top5) = accuracy(&outputs, &targets, topk: [1, 5]);
+            
+            train_loss += loss.item();
+            train_top1 += top1;
+            train_top5 += top5;
+            train_samples += inputs.data()[0];
+
+            // Log every 100 batches
+            check batch_idx % 100 == 0 && rank == 0 {
+                println("Epoch [{}/{}] Batch [{}/{}]: Loss: {:.4}, Top-1: {:.2}%, Top-5: {:.2}%, LR: {:.6e}",
+                         epoch + 1, total_epochs, batch_idx, num_batches,
+                         loss.item(), 
+                         (top1 as f64 / inputs.data()[0] as f64) * 100.0,
+                         (top5 as f64 / inputs.data()[0] as f64) * 100.0,
+                         optimizer_with_warmup.get_optimizer_mut().get_lr());
+            }
+        }
+
+        // Aggregate metrics across all GPUs
+        let global_train_loss = all_reduce_mean(train_loss, &process_group);
+        let global_train_top1 = all_reduce_sum(train_top1, &process_group);
+        let global_train_top5 = all_reduce_sum(train_top5, &process_group);
+        let global_train_samples = all_reduce_sum(train_samples, &process_group);
+
+        let train_top1_acc = (global_train_top1 as f64 / global_train_samples as f64) * 100.0;
+        let train_top5_acc = (global_train_top5 as f64 / global_train_samples as f64) * 100.0;
+
+        // Validation
+        ddp_model.eval();
+        var val_loss = 0.0;
+        var val_top1 = 0;
+        var val_top5 = 0;
+        var val_samples = 0;
+
+        each entry in &var val_loader  { let (inputs, targets) = entry;
+            let outputs = ddp_model.forward(&inputs)?;
+            let loss = loss_fn.forward(&outputs, &targets);
+            
+            let (top1, top5) = accuracy(&outputs, &targets, topk: [1, 5]);
+            
+            val_loss += loss.item();
+            val_top1 += top1;
+            val_top5 += top5;
+            val_samples += inputs.data()[0];
+        }
+
+        // Aggregate validation metrics
+        let global_val_loss = all_reduce_mean(val_loss, &process_group);
+        let global_val_top1 = all_reduce_sum(val_top1, &process_group);
+        let global_val_top5 = all_reduce_sum(val_top5, &process_group);
+        let global_val_samples = all_reduce_sum(val_samples, &process_group);
+
+        let val_top1_acc = (global_val_top1 as f64 / global_val_samples as f64) * 100.0;
+        let val_top5_acc = (global_val_top5 as f64 / global_val_samples as f64) * 100.0;
+
+        // Update best accuracy
+        check val_top1_acc > best_top1 {
+            best_top1 = val_top1_acc;
+            best_top5 = val_top5_acc;
+            
+            check rank == 0 {
+                ddp_model.save("imagenet_best_model.pt")?;
+            }
+        }
+
+        // Update SWA
+        swa.step_epoch();
+
+        // Update scheduler (after warmup)
+        check epoch >= warmup_epochs {
+            scheduler.step();
+        }
+
+        // Print epoch summary (rank 0 only)
+        check rank == 0 {
+            let swa_marker = check epoch >= swa_start { " [SWA]" } else { "" };
+            println("\nEpoch {:3}/{}: Train Top-1: {:.2}%, Val Top-1: {:.2}%, Val Top-5: {:.2}%, Best: {:.2}%{}",
+                     epoch + 1, total_epochs, train_top1_acc, val_top1_acc, val_top5_acc, best_top1, swa_marker);
+        }
+
+        process_group.barrier().ok();
+    }
+
+    // 14. Finalize SWA
+    check rank == 0 {
+        println("\n╔════════════════════════════════════════════════════════╗");
+        println("║                Finalizing SWA Model                    ║");
+        println("╚════════════════════════════════════════════════════════╝\n");
+    }
+
+    swa.update_bn(&train_loader)?;
+    let swa_model = swa.get_swa_model();
+
+    // Final evaluation with SWA
+    swa_model.eval();
+    var final_top1 = 0;
+    var final_top5 = 0;
+    var final_samples = 0;
+
+    each entry in &var val_loader  { let (inputs, targets) = entry;
+        let outputs = swa_model.forward(&inputs)?;
+        let (top1, top5) = accuracy(&outputs, &targets, topk: [1, 5]);
+        
+        final_top1 += top1;
+        final_top5 += top5;
+        final_samples += inputs.data()[0];
+    }
+
+    let global_final_top1 = all_reduce_sum(final_top1, &process_group);
+    let global_final_top5 = all_reduce_sum(final_top5, &process_group);
+    let global_final_samples = all_reduce_sum(final_samples, &process_group);
+
+    let final_top1_acc = (global_final_top1 as f64 / global_final_samples as f64) * 100.0;
+    let final_top5_acc = (global_final_top5 as f64 / global_final_samples as f64) * 100.0;
+
+    check rank == 0 {
+        println("\n╔════════════════════════════════════════════════════════╗");
+        println("║              ImageNet Training Complete!              ║");
+        println("╚════════════════════════════════════════════════════════╝\n");
+
+        println("Final Results:");
+        println("  • Best Top-1 Accuracy: {:.2}%", best_top1);
+        println("  • Best Top-5 Accuracy: {:.2}%", best_top5);
+        println("  • SWA Top-1 Accuracy: {:.2}%", final_top1_acc);
+        println("  • SWA Top-5 Accuracy: {:.2}%", final_top5_acc);
+        println("  • Improvement from SWA: {:.2}%", final_top1_acc - best_top1);
+        println("  • Total epochs: {}", total_epochs);
+        println("  • GPUs used: {}", world_size);
+        println("  • Models averaged: {}", swa.get_n_averaged());
+
+        swa_model.save("imagenet_swa_final.pt")?;
+        println("\n✓ Final model saved to imagenet_swa_final.pt");
+        
+        println("\nBenchmark:");
+        println("  • ResNet-50 baseline: ~76% Top-1");
+        println("  • Expected with all features: ~77-78% Top-1");
+    }
+
+    // Cleanup
+    process_group.destroy();
+}
+
+// Helper functions
+fn count_parameters(model: &impl Module) -> int {
+    model.parameters().iter().map(|p| p.numel()).sum()
+}
+
+fn compute_lamb_lr(base_lr: f64, batch_size: int, base_batch: int) -> f64 {
+    base_lr * (batch_size as f64 / base_batch as f64)
+}
+
+fn accuracy(output: &Tensor, target: &Tensor, topk: [int; 2]) -> (int, int) {
+    let batch_size = target.data()[0];
+    let (_, pred) = output.topk(topk[1], dim: 1, largest: true, sorted: true);
+    
+    let correct = pred.eq(&target.view([-1, 1]).expand_as(&pred));
+    
+    let top1 = correct[:, 0].sum().item();
+    let top5 = correct[:, ..topk[1]].sum().item();
+    
+    yield (top1, top5)
+}
+
+fn all_reduce_mean(value: f64, pg: &ProcessGroup) -> f64 {
+    var tensor = Tensor::scalar(value);
+    pg.all_reduce(&var tensor).ok();
+    tensor.item() / pg.world_size as f64
+}
+
+fn all_reduce_sum(value: int, pg: &ProcessGroup) -> int {
+    var tensor = Tensor::scalar(value as f64);
+    pg.all_reduce(&var tensor).ok();
+    tensor.item() as int
+}
+
+fn random_resized_crop(batch: &Tensor, size: int) -> Tensor {
+    batch.clone()  // Placeholder
+}
+
+fn random_horizontal_flip(batch: &Tensor, p: f64) -> Tensor {
+    batch.clone()  // Placeholder
+}
+
+fn autoaugment_imagenet(batch: &Tensor) -> Tensor {
+    batch.clone()  // Placeholder
+}
+
+fn mixup(batch: &Tensor, alpha: f64) -> Tensor {
+    batch.clone()  // Placeholder
+}
+
+fn read_image(path: &str) -> Tensor {
+    Tensor::zeros([3, 224, 224])  // Placeholder
+}
+
+fn get_label_from_path(path: &str) -> int {
+    0  // Placeholder
+}
+
+/// Launch distributed training
+open fn main() {
+    // Example: Launch with torchrun or similar
+    // torchrun --nproc_per_node=8 train_imagenet.zn
+    train_imagenet();
+}

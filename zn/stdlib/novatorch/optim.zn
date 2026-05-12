@@ -1,0 +1,406 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                         NOVA - PYTORCH OPTIM                                ║
+// ║              Optimizasyon Algoritmaları (torch.optim)                        ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use torch::tensor::{Tensor, TensorOps};
+use torch::ffi::{torch_grad_data, torch_has_grad, torch_param_update};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SGD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data SGD {
+    params:       Vec<Tensor>,
+    lr:           f64,
+    momentum:     f64,
+    dampening:    f64,
+    weight_decay: f64,
+    nesterov:     bool,
+    velocity:     Vec<Tensor>,
+}
+
+open impl SGDOps {
+
+    open fn new(params: Vec<Tensor>, lr: f64) -> SGD {
+        let velocity: Vec<Tensor> = params.iter().map(|p| {
+            TensorOps::zeros(p.data, false)
+        }).collect();
+        SGD {
+            params, lr,
+            momentum:     0.0,
+            dampening:    0.0,
+            weight_decay: 0.0,
+            nesterov:     false,
+            velocity,
+        }
+    }
+
+    open fn with_momentum(opt: SGD, momentum: f64) -> SGD {
+        SGD { momentum, ..opt }
+    }
+
+    open fn with_weight_decay(opt: SGD, weight_decay: f64) -> SGD {
+        SGD { weight_decay, ..opt }
+    }
+
+    open fn step(opt: SGD) -> SGD {
+        var new_params:   Vec<Tensor> = [];
+        var new_velocity: Vec<Tensor> = [];
+
+        var i: i64 = 0;
+        each param in opt.params {
+            check unsafe { torch_has_grad(param.handle) } {
+                let grad = unsafe { torch_grad_data(param.handle) };
+
+                // Weight decay
+                var d_p = check opt.weight_decay != 0.0 {
+                    TensorOps::add(grad, TensorOps::mul_scalar(param, opt.weight_decay))
+                } else { grad };
+
+                // Momentum
+                var v = opt.velocity[i as usize];
+                check opt.momentum != 0.0 {
+                    v   = TensorOps::add(
+                              TensorOps::mul_scalar(v, opt.momentum),
+                              TensorOps::mul_scalar(d_p, 1.0 - opt.dampening)
+                          );
+                    d_p = check opt.nesterov {
+                        TensorOps::add(d_p, TensorOps::mul_scalar(v, opt.momentum))
+                    } else { v };
+                }
+
+                // Parametre güncelleme: param = param - lr * d_p
+                let updated = TensorOps::add(param, TensorOps::mul_scalar(d_p, -opt.lr));
+                new_params.push(updated);
+                new_velocity.push(v);
+            } else {
+                new_params.push(param);
+                new_velocity.push(opt.velocity[i as usize]);
+            }
+            i = i + 1;
+        }
+        SGD { params: new_params, velocity: new_velocity, ..opt }
+    }
+
+    open fn zero_grad(opt: SGD) -> SGD {
+        let zeroed: Vec<Tensor> = opt.params.iter().map(|p| TensorOps::zero_grad(*p)).collect();
+        SGD { params: zeroed, ..opt }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Adam
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data Adam {
+    params:       Vec<Tensor>,
+    lr:           f64,
+    beta1:        f64,
+    beta2:        f64,
+    eps:          f64,
+    weight_decay: f64,
+    m:            Vec<Tensor>,   // Birinci moment
+    v:            Vec<Tensor>,   // İkinci moment
+    t:            i64,           // Zaman adımı
+}
+
+open impl AdamOps {
+
+    open fn new(params: Vec<Tensor>, lr: f64) -> Adam {
+        let m: Vec<Tensor> = params.iter().map(|p| TensorOps::zeros(p.data, false)).collect();
+        let v: Vec<Tensor> = params.iter().map(|p| TensorOps::zeros(p.data, false)).collect();
+        Adam {
+            params, lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps:   1e-8,
+            weight_decay: 0.0,
+            m, v, t: 0,
+        }
+    }
+
+    open fn with_betas(opt: Adam, beta1: f64, beta2: f64) -> Adam {
+        Adam { beta1, beta2, ..opt }
+    }
+
+    open fn with_weight_decay(opt: Adam, weight_decay: f64) -> Adam {
+        Adam { weight_decay, ..opt }
+    }
+
+    open fn step(opt: Adam) -> Adam {
+        let t         = opt.t + 1;
+        var new_params: Vec<Tensor> = [];
+        var new_m:      Vec<Tensor> = [];
+        var new_v:      Vec<Tensor> = [];
+
+        var i: i64 = 0;
+        each param in opt.params {
+            check unsafe { torch_has_grad(param.handle) } {
+                var g = unsafe { torch_grad_data(param.handle) };
+
+                // Weight decay
+                check opt.weight_decay != 0.0 {
+                    g = TensorOps::add(g, TensorOps::mul_scalar(param, opt.weight_decay));
+                }
+
+                // Birinci moment: m = β1*m + (1-β1)*g
+                let mi = TensorOps::add(
+                    TensorOps::mul_scalar(opt.m[i as usize], opt.beta1),
+                    TensorOps::mul_scalar(g, 1.0 - opt.beta1)
+                );
+
+                // İkinci moment: v = β2*v + (1-β2)*g²
+                let g2 = TensorOps::pow(g, 2.0);
+                let vi = TensorOps::add(
+                    TensorOps::mul_scalar(opt.v[i as usize], opt.beta2),
+                    TensorOps::mul_scalar(g2, 1.0 - opt.beta2)
+                );
+
+                // Bias düzeltme
+                let bias_corr1 = 1.0 - opt.beta1.powi(t as i32);
+                let bias_corr2 = 1.0 - opt.beta2.powi(t as i32);
+                let m_hat = TensorOps::mul_scalar(mi, 1.0 / bias_corr1);
+                let v_hat = TensorOps::mul_scalar(vi, 1.0 / bias_corr2);
+
+                // Güncelleme: param = param - lr * m_hat / (sqrt(v_hat) + eps)
+                let denom  = TensorOps::add_scalar(TensorOps::pow(v_hat, 0.5), opt.eps);
+                let update = TensorOps::mul_scalar(
+                    TensorOps::mul(m_hat, TensorOps::pow(denom, -1.0)),
+                    opt.lr
+                );
+                let updated = TensorOps::add(param, TensorOps::mul_scalar(update, -1.0));
+
+                new_params.push(updated);
+                new_m.push(mi);
+                new_v.push(vi);
+            } else {
+                new_params.push(param);
+                new_m.push(opt.m[i as usize]);
+                new_v.push(opt.v[i as usize]);
+            }
+            i = i + 1;
+        }
+        Adam { params: new_params, m: new_m, v: new_v, t, ..opt }
+    }
+
+    open fn zero_grad(opt: Adam) -> Adam {
+        let zeroed: Vec<Tensor> = opt.params.iter().map(|p| TensorOps::zero_grad(*p)).collect();
+        Adam { params: zeroed, ..opt }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AdamW (Ayrışık Weight Decay)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data AdamW {
+    params:       Vec<Tensor>,
+    lr:           f64,
+    beta1:        f64,
+    beta2:        f64,
+    eps:          f64,
+    weight_decay: f64,
+    m:            Vec<Tensor>,
+    v:            Vec<Tensor>,
+    t:            i64,
+}
+
+open impl AdamWOps {
+
+    open fn new(params: Vec<Tensor>, lr: f64, weight_decay: f64) -> AdamW {
+        let m: Vec<Tensor> = params.iter().map(|p| TensorOps::zeros(p.data, false)).collect();
+        let v: Vec<Tensor> = params.iter().map(|p| TensorOps::zeros(p.data, false)).collect();
+        AdamW {
+            params, lr, weight_decay,
+            beta1: 0.9, beta2: 0.999,
+            eps:   1e-8,
+            m, v, t: 0,
+        }
+    }
+
+    open fn step(opt: AdamW) -> AdamW {
+        let t = opt.t + 1;
+        var new_params: Vec<Tensor> = [];
+        var new_m:      Vec<Tensor> = [];
+        var new_v:      Vec<Tensor> = [];
+
+        var i: i64 = 0;
+        each param in opt.params {
+            check unsafe { torch_has_grad(param.handle) } {
+                // AdamW: weight decay param'a doğrudan uygulanır (gradyana değil)
+                let param_wd = check opt.weight_decay != 0.0 {
+                    TensorOps::mul_scalar(param, 1.0 - opt.lr * opt.weight_decay)
+                } else { param };
+
+                let g  = unsafe { torch_grad_data(param.handle) };
+                let mi = TensorOps::add(
+                    TensorOps::mul_scalar(opt.m[i as usize], opt.beta1),
+                    TensorOps::mul_scalar(g, 1.0 - opt.beta1)
+                );
+                let g2 = TensorOps::pow(g, 2.0);
+                let vi = TensorOps::add(
+                    TensorOps::mul_scalar(opt.v[i as usize], opt.beta2),
+                    TensorOps::mul_scalar(g2, 1.0 - opt.beta2)
+                );
+
+                let bc1    = 1.0 - opt.beta1.powi(t as i32);
+                let bc2    = 1.0 - opt.beta2.powi(t as i32);
+                let m_hat  = TensorOps::mul_scalar(mi, 1.0 / bc1);
+                let v_hat  = TensorOps::mul_scalar(vi, 1.0 / bc2);
+                let denom  = TensorOps::add_scalar(TensorOps::pow(v_hat, 0.5), opt.eps);
+                let update = TensorOps::mul_scalar(
+                    TensorOps::mul(m_hat, TensorOps::pow(denom, -1.0)),
+                    opt.lr
+                );
+                let updated = TensorOps::add(param_wd, TensorOps::mul_scalar(update, -1.0));
+
+                new_params.push(updated);
+                new_m.push(mi);
+                new_v.push(vi);
+            } else {
+                new_params.push(param);
+                new_m.push(opt.m[i as usize]);
+                new_v.push(opt.v[i as usize]);
+            }
+            i = i + 1;
+        }
+        AdamW { params: new_params, m: new_m, v: new_v, t, ..opt }
+    }
+
+    open fn zero_grad(opt: AdamW) -> AdamW {
+        let zeroed: Vec<Tensor> = opt.params.iter().map(|p| TensorOps::zero_grad(*p)).collect();
+        AdamW { params: zeroed, ..opt }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RMSprop
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data RMSprop {
+    params:       Vec<Tensor>,
+    lr:           f64,
+    alpha:        f64,
+    eps:          f64,
+    weight_decay: f64,
+    momentum:     f64,
+    v:            Vec<Tensor>,
+    buf:          Vec<Tensor>,
+}
+
+open impl RMSpropOps {
+
+    open fn new(params: Vec<Tensor>, lr: f64) -> RMSprop {
+        let v:   Vec<Tensor> = params.iter().map(|p| TensorOps::zeros(p.data, false)).collect();
+        let buf: Vec<Tensor> = params.iter().map(|p| TensorOps::zeros(p.data, false)).collect();
+        RMSprop {
+            params, lr,
+            alpha: 0.99, eps: 1e-8,
+            weight_decay: 0.0, momentum: 0.0,
+            v, buf,
+        }
+    }
+
+    open fn step(opt: RMSprop) -> RMSprop {
+        var new_params: Vec<Tensor> = [];
+        var new_v:      Vec<Tensor> = [];
+        var new_buf:    Vec<Tensor> = [];
+
+        var i: i64 = 0;
+        each param in opt.params {
+            check unsafe { torch_has_grad(param.handle) } {
+                var g = unsafe { torch_grad_data(param.handle) };
+                check opt.weight_decay != 0.0 {
+                    g = TensorOps::add(g, TensorOps::mul_scalar(param, opt.weight_decay));
+                }
+
+                // v = α*v + (1-α)*g²
+                let g2 = TensorOps::pow(g, 2.0);
+                let vi = TensorOps::add(
+                    TensorOps::mul_scalar(opt.v[i as usize], opt.alpha),
+                    TensorOps::mul_scalar(g2, 1.0 - opt.alpha)
+                );
+                let avg = TensorOps::add_scalar(TensorOps::pow(vi, 0.5), opt.eps);
+
+                var new_buf_i = opt.buf[i as usize];
+                let updated = check opt.momentum > 0.0 {
+                    new_buf_i = TensorOps::add(
+                        TensorOps::mul_scalar(opt.buf[i as usize], opt.momentum),
+                        TensorOps::mul(g, TensorOps::pow(avg, -1.0))
+                    );
+                    TensorOps::add(param, TensorOps::mul_scalar(new_buf_i, -opt.lr))
+                } else {
+                    TensorOps::add(param,
+                        TensorOps::mul_scalar(
+                            TensorOps::mul(g, TensorOps::pow(avg, -1.0)),
+                            -opt.lr
+                        )
+                    )
+                };
+
+                new_params.push(updated);
+                new_v.push(vi);
+                new_buf.push(new_buf_i);
+            } else {
+                new_params.push(param);
+                new_v.push(opt.v[i as usize]);
+                new_buf.push(opt.buf[i as usize]);
+            }
+            i = i + 1;
+        }
+        RMSprop { params: new_params, v: new_v, buf: new_buf, ..opt }
+    }
+
+    open fn zero_grad(opt: RMSprop) -> RMSprop {
+        let zeroed: Vec<Tensor> = opt.params.iter().map(|p| TensorOps::zero_grad(*p)).collect();
+        RMSprop { params: zeroed, ..opt }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Öğrenme Hızı Zamanlayıcıları
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data StepLR {
+    step_size: i64,
+    gamma:     f64,
+    last_epoch: i64,
+}
+
+open impl StepLROps {
+    open fn new(step_size: i64, gamma: f64) -> StepLR {
+        StepLR { step_size, gamma, last_epoch: 0 }
+    }
+
+    open fn step(scheduler: StepLR, lr: f64) -> (f64, StepLR) {
+        let new_epoch = scheduler.last_epoch + 1;
+        let new_lr    = check new_epoch % scheduler.step_size == 0 {
+            lr * scheduler.gamma
+        } else { lr };
+        yield (new_lr, StepLR { last_epoch: new_epoch, ..scheduler })
+    }
+}
+
+open data CosineAnnealingLR {
+    t_max:      i64,
+    eta_min:    f64,
+    last_epoch: i64,
+}
+
+open impl CosineAnnealingLROps {
+    use core::math::{cos, pi};
+
+    open fn new(t_max: i64, eta_min: f64) -> CosineAnnealingLR {
+        CosineAnnealingLR { t_max, eta_min, last_epoch: 0 }
+    }
+
+    open fn step(scheduler: CosineAnnealingLR, lr_init: f64) -> (f64, CosineAnnealingLR) {
+        let epoch  = scheduler.last_epoch + 1;
+        let new_lr = scheduler.eta_min
+            + (lr_init - scheduler.eta_min)
+            * (1.0 + cos(pi * epoch as f64 / scheduler.t_max as f64))
+            / 2.0;
+        yield (new_lr, CosineAnnealingLR { last_epoch: epoch, ..scheduler })
+    }
+}

@@ -1,0 +1,233 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║              NOVA CLIP TEXT ENCODER                                         ║
+// ║              Native implementation for text conditioning                      ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use stdlib.ai.torch.{Tensor, nn}
+
+// ============================================================================
+// CLIP TEXT ENCODER
+// ============================================================================
+
+open data CLIPTextEncoder {
+    // Token embedding
+    token_embedding: nn::Embedding,
+    position_embedding: nn::Embedding,
+    
+    // Transformer layers
+    layers: Vec<CLIPEncoderLayer>,
+    
+    // Final layer norm
+    final_layer_norm: nn::LayerNorm,
+    
+    // Config
+    vocab_size: i32,
+    max_position_embeddings: i32,
+    hidden_size: i32,
+    num_layers: i32,
+    num_heads: i32,
+}
+
+impl CLIPTextEncoder {
+    fn new(
+        vocab_size: i32,
+        max_position_embeddings: i32,
+        hidden_size: i32,
+        num_layers: i32,
+        num_heads: i32
+    ) -> Self {
+        var layers = Vec::new();
+        each _ in 0..num_layers {
+            layers.push(CLIPEncoderLayer::new(hidden_size, num_heads));
+        }
+        
+        CLIPTextEncoder {
+            token_embedding: nn::Embedding::new(vocab_size, hidden_size),
+            position_embedding: nn::Embedding::new(max_position_embeddings, hidden_size),
+            layers,
+            final_layer_norm: nn::LayerNorm::new(hidden_size),
+            vocab_size,
+            max_position_embeddings,
+            hidden_size,
+            num_layers,
+            num_heads
+        }
+    }
+    
+    @gpu_accelerated
+    fn forward(&var self, input_ids: &Tensor) -> Tensor {
+        let seq_length = input_ids.data[1];
+        
+        // Token embeddings
+        var hidden = self.token_embedding.forward(input_ids);
+        
+        // Position embeddings
+        let positions = Tensor::arange(0, seq_length).unsqueeze(0);
+        let pos_emb = self.position_embedding.forward(&positions);
+        
+        hidden = hidden + pos_emb;
+        
+        // Transformer layers
+        each layer in &var self.layers {
+            hidden = layer.forward(&hidden);
+        }
+        
+        // Final layer norm
+        self.final_layer_norm.forward(&hidden)
+    }
+    
+    /// Get pooled output (CLS token)
+    fn encode_text(&var self, input_ids: &Tensor) -> (Tensor, Tensor) {
+        let hidden = self.forward(input_ids);
+        
+        // Last hidden state
+        let last_hidden = hidden.clone();
+        
+        // Pooled output (first token - CLS)
+        let pooled = hidden.slice(1, 0, 1).squeeze(1);
+        
+        yield (last_hidden, pooled)
+    }
+}
+
+// ============================================================================
+// CLIP TRANSFORMER LAYER
+// ============================================================================
+
+open data CLIPEncoderLayer {
+    self_attn: nn::MultiHeadAttention,
+    layer_norm1: nn::LayerNorm,
+    
+    mlp: CLIPMLP,
+    layer_norm2: nn::LayerNorm,
+}
+
+impl CLIPEncoderLayer {
+    fn new(hidden_size: i32, num_heads: i32) -> Self {
+        CLIPEncoderLayer {
+            self_attn: nn::MultiHeadAttention::new(hidden_size, num_heads),
+            layer_norm1: nn::LayerNorm::new(hidden_size),
+            mlp: CLIPMLP::new(hidden_size),
+            layer_norm2: nn::LayerNorm::new(hidden_size)
+        }
+    }
+    
+    fn forward(&var self, hidden: &Tensor) -> Tensor {
+        // Self attention with residual
+        let residual = hidden.clone();
+        var hidden = self.layer_norm1.forward(hidden);
+        hidden = self.self_attn.forward(&hidden, &hidden, &hidden);
+        hidden = hidden + residual;
+        
+        // MLP with residual
+        let residual = hidden.clone();
+        var hidden = self.layer_norm2.forward(&hidden);
+        hidden = self.mlp.forward(&hidden);
+        hidden + residual
+    }
+}
+
+// ============================================================================
+// CLIP MLP
+// ============================================================================
+
+open data CLIPMLP {
+    fc1: nn::Linear,
+    fc2: nn::Linear,
+}
+
+impl CLIPMLP {
+    fn new(hidden_size: i32) -> Self {
+        let intermediate_size = hidden_size * 4;
+        
+        CLIPMLP {
+            fc1: nn::Linear::new(hidden_size, intermediate_size, true),
+            fc2: nn::Linear::new(intermediate_size, hidden_size, true)
+        }
+    }
+    
+    fn forward(&var self, x: &Tensor) -> Tensor {
+        var x = self.fc1.forward(x);
+        x = x.quick_gelu();  // CLIP uses QuickGELU
+        self.fc2.forward(&x)
+    }
+}
+
+// ============================================================================
+// CLIP TOKENIZER
+// ============================================================================
+
+open data CLIPTokenizer {
+    vocab: HashMap<String, i32>,
+    bpe_ranks: HashMap<(String, String), i32>,
+    max_length: i32,
+    bos_token_id: i32,
+    eos_token_id: i32,
+    pad_token_id: i32,
+}
+
+impl CLIPTokenizer {
+    fn new() -> Self {
+        // Load vocab and BPE merges (simplified)
+        CLIPTokenizer {
+            vocab: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            max_length: 77,
+            bos_token_id: 49406,
+            eos_token_id: 49407,
+            pad_token_id: 0
+        }
+    }
+    
+    fn encode(&self, text: &str) -> Vec<i32> {
+        var tokens = [self.bos_token_id];
+        
+        // Simplified tokenization
+        // In production, use proper BPE
+        let words = text.split_whitespace();
+        each word in words {
+            check let Some(&token_id) = self.vocab.get(word) {
+                tokens.push(token_id);
+            }
+        }
+        
+        tokens.push(self.eos_token_id);
+        
+        // Pad or truncate
+        while tokens.len() < self.max_length as usize {
+            tokens.push(self.pad_token_id);
+        }
+        tokens.truncate(self.max_length as usize);
+        
+        tokens
+    }
+    
+    fn encode_batch(&self, texts: &[String]) -> Tensor {
+        var all_tokens = Vec::new();
+        
+        each text in texts {
+            let tokens = self.encode(text);
+            all_tokens.extend(tokens);
+        }
+        
+        let batch_size = texts.len() as i32;
+        yield Tensor::from_vec(all_tokens, &[batch_size, self.max_length])
+    }
+}
+
+// ============================================================================
+// QUICK GELU ACTIVATION (CLIP specific)
+// ============================================================================
+
+impl Tensor {
+    fn quick_gelu(&self) -> Tensor {
+        // QuickGELU(x) = x * sigmoid(1.702 * x)
+        self * (self * 1.702).sigmoid()
+    }
+}
+
+export {
+    CLIPTextEncoder,
+    CLIPTokenizer,
+    CLIPEncoderLayer
+}

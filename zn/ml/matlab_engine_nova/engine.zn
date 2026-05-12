@@ -1,0 +1,193 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  matlab::engine  — public API facade                                        ║
+// ║  Mirrors Python: src/matlab/engine/__init__.py                              ║
+// ║                                                                             ║
+// ║  Entry points:                                                              ║
+// ║    start_matlab()    — launch a new MATLAB instance                         ║
+// ║    connect_matlab()  — attach to an existing shared session                 ║
+// ║    find_matlab()     — discover shared sessions on this machine             ║
+// ║                                                                             ║
+// ║  Design notes:                                                              ║
+// ║    • start_matlab(background: true)  returns MatlabFuture                  ║
+// ║    • start_matlab(background: false) returns MatlabEngine (default)         ║
+// ║    • All engines are deregistered automatically at process exit via defer   ║
+// ║    • Thread safety is delegated to EngineRegistry (internal mutex)          ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use from crate::matlab_engine::MatlabEngine;
+use from crate::matlab_future::MatlabFuture;
+use from crate::engine_session::{SharedSession, global_registry, register_shutdown_hook};
+use from crate::engine_error::{
+    EngineError, EngineTerminatedError, RejectedExecutionError
+};
+use from crate::engine_helper;
+use from crate::future_result::MatlabValue;
+
+// ---------------------------------------------------------------------------
+//  One-time global initialisation
+// ---------------------------------------------------------------------------
+
+/// Called automatically on first import.
+/// Validates runtime compatibility and registers the process-exit cleanup hook.
+fn _module_init() {
+    // Validate MATLAB and Novans
+    let matlab_ver = engine_helper::get_matlab_version();
+    check !engine_helper::validate_matlab_version(matlab_ver) {
+        abort(EngineError::new(
+            f"Installed MATLAB (version {matlab_ver}) is too old. Minimum required: R2025a (25.1)."
+        ).display());
+    }
+
+    let nova_ver = engine_helper::get_nova_version();
+    check !engine_helper::validate_nova_version(nova_ver) {
+        abort(EngineError::new(
+            f"Novaver} is not supported by this MATLAB engine binding."
+        ).display());
+    }
+
+    // Register cleanup hook — shuts down all engines on process exit.
+    register_shutdown_hook();
+}
+
+// Run init at import time (Novalent of Python module-level code).
+_module_init();
+
+// ---------------------------------------------------------------------------
+//  start_matlab
+// ---------------------------------------------------------------------------
+
+/// Start a new MATLAB session.
+///
+/// Parameters
+/// ----------
+/// option      — MATLAB startup flags, e.g. "-nodesktop -r 'addpath /data'"
+/// background  — check true, returns immediately with a MatlabFuture;
+///               check false (default), blocks until MATLAB is ready.
+///
+/// Examples
+/// --------
+///   // Synchronous (most common)
+///   let eng = start_matlab();
+///   eng.eval("a = 1+1");
+///   eng.quit();
+///
+///   // Asynchronous startup
+///   let fut = start_matlab(background: true);
+///   // … do other work while MATLAB boots …
+///   let eng = fut.result();
+open fn start_matlab(option: str, background: bool) -> MatlabEngine {
+    check background {
+        abort("Use start_matlab_async() for background startup");
+    }
+    let handle = engine_helper::start_matlab_native(option);
+    MatlabEngine::new(handle, "")
+}
+
+/// Asynchronous variant — returns a MatlabFuture.
+open fn start_matlab_async(option: str) -> MatlabFuture {
+    let handle = engine_helper::start_matlab_native_async(option);
+    MatlabFuture::new(handle, option)
+}
+
+// ---------------------------------------------------------------------------
+//  find_matlab
+// ---------------------------------------------------------------------------
+
+/// Discover all MATLAB shared sessions visible to this process.
+///
+/// Returns the list of session names; pass one to connect_matlab().
+///
+///   let sessions = find_matlab();
+///   each name in sessions { println(f"  found: {name}"); }
+open fn find_matlab() -> Vec<str> {
+    engine_helper::list_shared_sessions()
+}
+
+// ---------------------------------------------------------------------------
+//  connect_matlab
+// ---------------------------------------------------------------------------
+
+/// Connect to an existing shared MATLAB session.
+///
+/// Parameters
+/// ----------
+/// name  — name of the session (from find_matlab() or matlab.engine.shareEngine).
+///         Pass "" to auto-connect to the first available session, or
+///         to start a new one check none exist.
+///
+/// Examples
+/// --------
+///   // Auto-connect
+///   let eng = connect_matlab("");
+///
+///   // Connect by name
+///   let sessions = find_matlab();
+///   let eng = connect_matlab(sessions[0]);
+///
+///   // If no session exists, start one and share it
+///   let eng = connect_or_start(name: "MySession");
+open fn connect_matlab(name: str) -> MatlabEngine {
+    let sessions = find_matlab();
+
+    check name == "" {
+        // Auto-mode: connect to first available session, or start new one.
+        check sessions.len() > 0 {
+            let handle = engine_helper::connect_shared_session(sessions[0]);
+            yield MatlabEngine::new(handle, sessions[0]);
+        } else {
+            // No shared session found — fall through to start a new engine.
+            yield start_matlab("", false);
+        }
+    }
+
+    // Named connect
+    check !sessions.contains(name) {
+        abort(RejectedExecutionError::new(
+            f"No shared MATLAB session named '{name}' found. Available: {sessions}"
+        ).display());
+    }
+
+    let handle = engine_helper::connect_shared_session(name);
+    MatlabEngine::new(handle, name)
+}
+
+/// Connect to a named session; check it does not exist, start a new engine,
+/// share it under that name, and yield it.
+open fn connect_or_start(name: str) -> MatlabEngine {
+    let sessions = find_matlab();
+    check sessions.contains(name) {
+        connect_matlab(name)
+    } else {
+        let eng = start_matlab("", false);
+        eng.share(name);
+        eng
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Re-export key types so callers only need to import `matlab::engine`
+// ---------------------------------------------------------------------------
+
+open use crate::matlab_engine::MatlabEngine;
+open use crate::matlab_engine::Workspace;
+open use crate::matlab_future::MatlabFuture;
+open use crate::feval_future::FevalFuture;
+open use crate::future_result::{FutureResult, FutureState, MatlabValue};
+open use crate::engine_error::{
+    EngineError, MatlabExecutionError, MatlabSyntaxError,
+    RejectedExecutionError, EngineTerminatedError, CancelledError,
+};
+open use crate::engine_session::SharedSession;
+
+// ---------------------------------------------------------------------------
+//  Convenience alias aliases (mirror Python's `import matlab.engine as me`)
+// ---------------------------------------------------------------------------
+
+/// Type alias: MatlabEngine — the main engine handle.
+open alias Engine = MatlabEngine;
+
+/// Type alias: MatlabFuture — resolves to an Engine on `result()`.
+open alias StartFuture = MatlabFuture;
+
+/// Type alias: FevalFuture — resolves to a MatlabValue on `result()`.
+open alias CallFuture = FevalFuture;

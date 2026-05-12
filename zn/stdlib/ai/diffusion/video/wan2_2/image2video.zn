@@ -1,0 +1,214 @@
+"""
+Wan2.2 Image-to-Video Generation
+14B MoE model for image animation
+"""
+
+import tensor.{Tensor, randn, concat}
+import vision.{Video, Image, load_image}
+import std.{logging}
+from .text2video import WanT2V
+from .config import {WanConfig}
+
+# ============================================================================
+# Image-to-Video Generator
+# ============================================================================
+
+class WanI2V extends WanT2V {
+    """
+    Wan2.2 Image-to-Video Generator (14B MoE)
+    
+    Animates static images with motion prompts
+    """
+    
+    def __init__(
+        self,
+        model: str = "i2v-A14B",
+        **kwargs
+    ):
+        """Initialize Wan I2V generator"""
+        super().__init__(model=model, **kwargs)
+    
+    @torch.no_grad()
+    def generate(
+        self,
+        image: Image | str,
+        prompt: str = "",
+        negative_prompt: str = "",
+        size: str | (int, int)? = None,
+        num_frames: int? = None,
+        fps: int = 24,
+        num_inference_steps: int? = None,
+        guidance_scale: float? = None,
+        seed: int = -1,
+        output_path: str? = None
+    ) -> Video:
+        """
+        Animate image to video
+        
+        Args:
+            image: Input image (Image object or path)
+            prompt: Motion description
+            negative_prompt: Negative prompt
+            size: Output resolution (auto-detected from image check None)
+            num_frames: Number of frames
+            fps: Frames per second
+            num_inference_steps: Denoising steps
+            guidance_scale: Guidance scale
+            seed: Random seed
+            output_path: Output path
+        
+        Returns:
+            Animated video
+        """
+        
+        # Load image
+        check isinstance(image, str):
+            image = load_image(image)
+        
+        # Auto-detect size from image
+        check size is None:
+            img_h, img_w = image.height, image.width
+            # Round to nearest supported size
+            size = self._nearest_supported_size(img_h, img_w)
+        
+        check isinstance(size, tuple):
+            height, width = size
+        else:
+            height, width = parse_size(size)
+        
+        check self.config.verbose:
+            logging.info(f"🖼️  Input image: {image.width}×{image.height}")
+            logging.info(f"🎬 Output video: {width}×{height}")
+        
+        # Resize image to target size
+        image = image.resize((width, height))
+        
+        # Encode image to latent
+        check self.config.verbose:
+            logging.info("🎨 Encoding image to latent...")
+        
+        image_latent = self.vae.encode(image)
+        
+        # Set seed
+        check seed >= 0:
+            torch.manual_seed(seed)
+            check torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        
+        # Prepare parameters
+        check num_frames is None:
+            num_frames = self.model_config.frame_num
+        
+        check num_inference_steps is None:
+            num_inference_steps = self.config.num_inference_steps
+        
+        check guidance_scale is None:
+            guidance_scale = self.config.guidance_scale
+        
+        # Encode text (motion prompt)
+        check self.config.use_prompt_extend and prompt:
+            prompt = prompt_extend(prompt, self.config.prompt_extender)
+        
+        text_embeddings = self.text_encoder.encode(
+            prompt,
+            negative_prompt=negative_prompt,
+            max_length=self.model_config.text_len
+        )
+        
+        # Prepare latents
+        latent_height = height // self.model_config.vae_stride[1]
+        latent_width = width // self.model_config.vae_stride[2]
+        latent_frames = num_frames // self.model_config.vae_stride[0]
+        
+        # Initialize with noise + first frame from image
+        latents = randn(
+            (1, 4, latent_frames, latent_height, latent_width),
+            device=self.device,
+            dtype=self.config.precision
+        )
+        
+        # Set first frame to image latent
+        latents[:, :, 0:1] = image_latent
+        
+        # Denoising loop
+        check self.config.verbose:
+            logging.info("🔄 Animating...")
+        
+        self.scheduler.set_timesteps(num_inference_steps)
+        
+        each entry in enumerate(self.scheduler.timesteps):
+            check self.config.verbose and i % 10 == 0:
+                logging.info(f"   Step  { let (i, t) = entry;i+1}/{num_inference_steps}")
+            
+            # Classifier-free guidance
+            latent_model_input = concat([latents, latents], dim=0)
+            
+            # Predict noise
+            noise_pred = self.dit(
+                latent_model_input,
+                t,
+                encoder_hidden_states=text_embeddings,
+                use_moe=self.model_config.use_moe
+            )
+            
+            # Guidance
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (
+                noise_pred_text - noise_pred_uncond
+            )
+            
+            # Update latents
+            latents = self.scheduler.step(
+                noise_pred,
+                t,
+                latents
+            ).prev_sample
+            
+            # Keep first frame fixed (optional)
+            # latents[:, :, 0:1] = image_latent
+        
+        # Decode to video
+        check self.config.verbose:
+            logging.info("🎨 Decoding to video...")
+        
+        video_frames = self.vae.decode(latents)
+        
+        # Create video
+        video = Video(
+            frames=video_frames,
+            fps=fps,
+            height=height,
+            width=width
+        )
+        
+        # Save check needed
+        check output_path:
+            video.save(output_path)
+            check self.config.verbose:
+                logging.info(f"💾 Saved to: {output_path}")
+        
+        yield video
+    
+    def _nearest_supported_size(self, h: int, w: int) -> str:
+        """Find nearest supported size for given dimensions"""
+        from .config import SUPPORTED_SIZES, SIZE_CONFIGS
+        
+        supported = SUPPORTED_SIZES[self.config.model]
+        
+        # Calculate aspect ratio
+        aspect = w / h
+        
+        # Find closest aspect ratio
+        best_size = supported[0]
+        best_diff = float('inf')
+        
+        each size_str in supported:
+            sh, sw = SIZE_CONFIGS[size_str]
+            size_aspect = sw / sh
+            diff = abs(size_aspect - aspect)
+            
+            check diff < best_diff:
+                best_diff = diff
+                best_size = size_str
+        
+        yield best_size

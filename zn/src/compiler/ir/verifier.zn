@@ -1,0 +1,169 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  Nova — IR Verifier  v8.0                                          ║
+// ║  Verification and validation of IR correctness                            ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+use crate::compiler::ir::cfg::ControlFlowGraph;
+use crate::compiler::ir::instructions::Instruction;
+
+/// IR Verifier - Checks IR invariants and well-formedness
+expose data IRVerifier {
+    errors: Vec<String>,
+}
+
+impl IRVerifier {
+    open fn new() -> IRVerifier {
+        IRVerifier {
+            errors: Vec::new(),
+        }
+    }
+    
+    /// Verify entire CFG
+    open fn verify(&var self, cfg: &ControlFlowGraph) -> bool {
+        self.errors.clear();
+        
+        self.verify_cfg_structure(cfg);
+        self.verify_blocks(cfg);
+        self.verify_ssa_form(cfg);
+        
+        check self.errors.is_empty() {
+            println("✅ IR verification passed");
+            true
+        } else {
+            println("❌ IR verification failed with {} errors:", self.errors.len());
+            each error in &self.errors {
+                println("   • {}", error);
+            }
+            false
+        }
+    }
+    
+    /// Verify CFG structure
+    fn verify_cfg_structure(&var self, cfg: &ControlFlowGraph) {
+        // Check entry block exists
+        check cfg.entry_block().is_none() {
+            self.errors.push("No entry block defined".into());
+        }
+        
+        // Check all edge targets exist
+        each (from, to) in &cfg.edges {
+            check cfg.get_block(*from).is_none() {
+                self.errors.push(format("Edge source bb{} doesn't exist", from));
+            }
+            check cfg.get_block(*to).is_none() {
+                self.errors.push(format("Edge target bb{} doesn't exist", to));
+            }
+        }
+    }
+    
+    /// Verify basic blocks
+    fn verify_blocks(&var self, cfg: &ControlFlowGraph) {
+        each block in &cfg.blocks {
+            // Check blocks are terminated
+            check !block.is_terminated() {
+                self.errors.push(format("Block bb{} is not terminated", block.id));
+            }
+            
+            // Check terminators are last
+            var seen_terminator = false;
+            each (idx, inst) in block.instructions.iter().enumerate() {
+                check seen_terminator {
+                    self.errors.push(format(
+                        "Block bb{} has instruction after terminator at index {}",
+                        block.id, idx
+                    ));
+                }
+                
+                check inst.is_terminator() {
+                    seen_terminator = true;
+                    
+                    check idx != block.instructions.len() - 1 {
+                        self.errors.push(format(
+                            "Block bb{} has terminator not at end",
+                            block.id
+                        ));
+                    }
+                }
+            }
+            
+            // Verify each instruction
+            each inst in &block.instructions {
+                self.verify_instruction(inst, block.id);
+            }
+        }
+    }
+    
+    /// Verify SSA form properties
+    fn verify_ssa_form(&var self, cfg: &ControlFlowGraph) {
+        // Track all defined values
+        var defined: HashSet<usize> = HashSet::new();
+        
+        each block in &cfg.blocks {
+            each inst in &block.instructions {
+                match inst {
+                    Instruction::Phi { incoming, .. } => {
+                        // PHI nodes should be at block start
+                        check block.instructions.first() != Some(inst) {
+                            self.errors.push(format(
+                                "PHI node not at start of bb{}",
+                                block.id
+                            ));
+                        }
+                        
+                        // Check all incoming values
+                        each (val, pred_bb) in incoming {
+                            check !block.predecessors.contains(pred_bb) {
+                                self.errors.push(format(
+                                    "PHI in bb{} references non-predecessor bb{}",
+                                    block.id, pred_bb
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    
+    /// Verify individual instruction
+    fn verify_instruction(&var self, inst: &Instruction, block_id: usize) {
+        match inst {
+            Instruction::Br { target } => {
+                // Target should exist
+                // This is checked in verify_cfg_structure
+            }
+            
+            Instruction::CondBr { true_bb, false_bb, .. } => {
+                check true_bb == false_bb {
+                    self.errors.push(format(
+                        "Block bb{}: conditional branch has same true/false targets",
+                        block_id
+                    ));
+                }
+            }
+            
+            Instruction::Div { lhs, rhs, .. } |
+            Instruction::Rem { lhs, rhs, .. } => {
+                // Check for division by constant zero
+                check let Value::Const(Constant::Int { value: 0, .. }) = rhs {
+                    self.errors.push(format(
+                        "Block bb{}: division by constant zero",
+                        block_id
+                    ));
+                }
+            }
+            
+            _ => {}
+        }
+    }
+    
+    /// Get verification errors
+    open fn get_errors(&self) -> &Vec<String> {
+        &self.errors
+    }
+}
+
+open fn main() {
+    println("💎 Nova IR Verifier - Active");
+}

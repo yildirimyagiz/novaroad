@@ -1,0 +1,5 @@
+#ifndef NOVA_RUN_ALL_TESTS_TAGS_H
+#define NOVA_RUN_ALL_TESTS_TAGS_H
+
+#endif
+

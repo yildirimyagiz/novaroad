@@ -1,0 +1,244 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Parser Combinator Test Suite                                               ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use super::*;
+use super::core::{Parser, ParseResult, Token, TokenKind, Span};
+use super::combinators::*;
+use super::pratt::{PrattParser, ArithExpr};
+
+#[test]
+fn test_basic_token_parsing() {
+    let tokens = [
+        Token {
+            kind: TokenKind::IntLit(42),
+            span: Span { start: 0, end: 2, line: 1, column: 1 },
+            text: "42".into(),
+        }
+    ];
+    
+    let parser = super::core::token(TokenKind::IntLit(0));
+    match parser.parse(&tokens) {
+        ParseResult::Success(tok, _) => {
+            assert(matches!(tok.kind, TokenKind::IntLit(42)));
+        }
+        ParseResult::Failure(_) => abort("Expected success"),
+    }
+}
+
+#[test]
+fn test_map_combinator() {
+    let tokens = [
+        Token {
+            kind: TokenKind::IntLit(10),
+            span: Span { start: 0, end: 2, line: 1, column: 1 },
+            text: "10".into(),
+        }
+    ];
+    
+    let int_parser = super::core::token(TokenKind::IntLit(0));
+    let doubled = map(int_parser, |tok| {
+        check let TokenKind::IntLit(n) = tok.kind {
+            n * 2
+        } else {
+            0
+        }
+    });
+    
+    match doubled.parse(&tokens) {
+        ParseResult::Success(val, _) => assert_eq!(val, 20),
+        ParseResult::Failure(_) => abort("Expected success"),
+    }
+}
+
+#[test]
+fn test_and_then_combinator() {
+    let tokens = [
+        Token {
+            kind: TokenKind::Let,
+            span: Span { start: 0, end: 3, line: 1, column: 1 },
+            text: "let".into(),
+        },
+        Token {
+            kind: TokenKind::Ident("x".into()),
+            span: Span { start: 4, end: 5, line: 1, column: 5 },
+            text: "x".into(),
+        },
+    ];
+    
+    let p1 = super::core::token(TokenKind::Let);
+    let p2 = super::core::token(TokenKind::Ident("".into()));
+    let combined = and_then(p1, p2);
+    
+    match combined.parse(&tokens) {
+        ParseResult::Success((t1, t2), _) => {
+            assert(matches!(t1.kind, TokenKind::Let));
+            assert(matches!(t2.kind, TokenKind::Ident(_)));
+        }
+        ParseResult::Failure(_) => abort("Expected success"),
+    }
+}
+
+#[test]
+fn test_or_combinator() {
+    let tokens = [
+        Token {
+            kind: TokenKind::IntLit(42),
+            span: Span { start: 0, end: 2, line: 1, column: 1 },
+            text: "42".into(),
+        }
+    ];
+    
+    let string_parser = super::core::token(TokenKind::StringLit("".into()));
+    let int_parser = super::core::token(TokenKind::IntLit(0));
+    let either = or(string_parser, int_parser);
+    
+    match either.parse(&tokens) {
+        ParseResult::Success(tok, _) => {
+            assert(matches!(tok.kind, TokenKind::IntLit(42)));
+        }
+        ParseResult::Failure(_) => abort("Expected success"),
+    }
+}
+
+#[test]
+fn test_many_combinator() {
+    let tokens = [
+        Token { kind: TokenKind::IntLit(1), span: Span { start: 0, end: 1, line: 1, column: 1 }, text: "1".into() },
+        Token { kind: TokenKind::IntLit(2), span: Span { start: 2, end: 3, line: 1, column: 3 }, text: "2".into() },
+        Token { kind: TokenKind::IntLit(3), span: Span { start: 4, end: 5, line: 1, column: 5 }, text: "3".into() },
+        Token { kind: TokenKind::Eof, span: Span { start: 6, end: 6, line: 1, column: 7 }, text: "".into() },
+    ];
+    
+    let int_parser = super::core::token(TokenKind::IntLit(0));
+    let many_ints = many(int_parser);
+    
+    match many_ints.parse(&tokens) {
+        ParseResult::Success(toks, _) => {
+            assert_eq!(toks.len(), 3);
+        }
+        ParseResult::Failure(_) => abort("Expected success"),
+    }
+}
+
+#[test]
+fn test_optional_combinator() {
+    let tokens = [
+        Token { kind: TokenKind::Semicolon, span: Span { start: 0, end: 1, line: 1, column: 1 }, text: ";".into() },
+    ];
+    
+    let semi = super::core::token(TokenKind::Semicolon);
+    let opt_semi = optional(semi);
+    
+    match opt_semi.parse(&tokens) {
+        ParseResult::Success(Some(_), _) => {}, // Found semicolon
+        _ => abort("Expected Some"),
+    }
+    
+    // Test with missing semicolon
+    let empty: Vec<Token> = [];
+    match opt_semi.parse(&empty) {
+        ParseResult::Success(None, _) => {}, // No semicolon, that's OK
+        _ => abort("Expected None"),
+    }
+}
+
+#[test]
+fn test_sep_by_combinator() {
+    let tokens = [
+        Token { kind: TokenKind::IntLit(1), span: Span { start: 0, end: 1, line: 1, column: 1 }, text: "1".into() },
+        Token { kind: TokenKind::Comma, span: Span { start: 1, end: 2, line: 1, column: 2 }, text: ",".into() },
+        Token { kind: TokenKind::IntLit(2), span: Span { start: 2, end: 3, line: 1, column: 3 }, text: "2".into() },
+        Token { kind: TokenKind::Comma, span: Span { start: 3, end: 4, line: 1, column: 4 }, text: ",".into() },
+        Token { kind: TokenKind::IntLit(3), span: Span { start: 4, end: 5, line: 1, column: 5 }, text: "3".into() },
+    ];
+    
+    let int_parser = super::core::token(TokenKind::IntLit(0));
+    let comma = super::core::token(TokenKind::Comma);
+    let csv = sep_by(int_parser, comma);
+    
+    match csv.parse(&tokens) {
+        ParseResult::Success(toks, _) => {
+            assert_eq!(toks.len(), 3);
+        }
+        ParseResult::Failure(_) => abort("Expected success"),
+    }
+}
+
+#[test]
+fn test_pratt_parser_arithmetic() {
+    let parser = super::pratt::example_arithmetic_parser();
+    
+    // Parse: 1 + 2 * 3
+    let tokens = [
+        Token { kind: TokenKind::IntLit(1), span: Span { start: 0, end: 1, line: 1, column: 1 }, text: "1".into() },
+        Token { kind: TokenKind::Plus, span: Span { start: 2, end: 3, line: 1, column: 3 }, text: "+".into() },
+        Token { kind: TokenKind::IntLit(2), span: Span { start: 4, end: 5, line: 1, column: 5 }, text: "2".into() },
+        Token { kind: TokenKind::Star, span: Span { start: 6, end: 7, line: 1, column: 7 }, text: "*".into() },
+        Token { kind: TokenKind::IntLit(3), span: Span { start: 8, end: 9, line: 1, column: 9 }, text: "3".into() },
+    ];
+    
+    match parser.parse(&tokens) {
+        ParseResult::Success(expr, _) => {
+            // Should be: Add(1, Mul(2, 3)) due to precedence
+            match expr {
+                ArithExpr::Add(left, right) => {
+                    assert(matches!(*left, ArithExpr::Num(1)));
+                    assert(matches!(*right, ArithExpr::Mul(_, _)));
+                }
+                _ => abort("Expected Add at top level"),
+            }
+        }
+        ParseResult::Failure(err) => abort("Parse failed: {}", err.message),
+    }
+}
+
+#[test]
+fn test_pratt_parser_precedence() {
+    let parser = super::pratt::example_arithmetic_parser();
+    
+    // Parse: 2 * 3 + 4
+    let tokens = [
+        Token { kind: TokenKind::IntLit(2), span: Span { start: 0, end: 1, line: 1, column: 1 }, text: "2".into() },
+        Token { kind: TokenKind::Star, span: Span { start: 2, end: 3, line: 1, column: 3 }, text: "*".into() },
+        Token { kind: TokenKind::IntLit(3), span: Span { start: 4, end: 5, line: 1, column: 5 }, text: "3".into() },
+        Token { kind: TokenKind::Plus, span: Span { start: 6, end: 7, line: 1, column: 7 }, text: "+".into() },
+        Token { kind: TokenKind::IntLit(4), span: Span { start: 8, end: 9, line: 1, column: 9 }, text: "4".into() },
+    ];
+    
+    match parser.parse(&tokens) {
+        ParseResult::Success(expr, _) => {
+            // Should be: Add(Mul(2, 3), 4)
+            match expr {
+                ArithExpr::Add(left, right) => {
+                    assert(matches!(*left, ArithExpr::Mul(_, _)));
+                    assert(matches!(*right, ArithExpr::Num(4)));
+                }
+                _ => abort("Expected Add at top level"),
+            }
+        }
+        ParseResult::Failure(err) => abort("Parse failed: {}", err.message),
+    }
+}
+
+#[test]
+fn test_error_recovery() {
+    use super::error_recovery::RecoveringParser;
+    
+    let bad_tokens = [
+        Token { kind: TokenKind::IntLit(1), span: Span { start: 0, end: 1, line: 1, column: 1 }, text: "1".into() },
+        Token { kind: TokenKind::IntLit(2), span: Span { start: 2, end: 3, line: 1, column: 3 }, text: "2".into() }, // Unexpected
+        Token { kind: TokenKind::Semicolon, span: Span { start: 4, end: 5, line: 1, column: 5 }, text: ";".into() },
+    ];
+    
+    let int_parser = super::core::token(TokenKind::IntLit(0));
+    let recovering = RecoveringParser::new(int_parser, [TokenKind::Semicolon]);
+    
+    // Should fail but provide recovery info
+    match recovering.parse(&bad_tokens) {
+        ParseResult::Failure(err) => {
+            assert(!err.recovery_suggestions.is_empty());
+        }
+        ParseResult::Success(_, _) => {}, // May succeed on first token
+    }
+}

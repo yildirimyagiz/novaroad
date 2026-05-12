@@ -1,0 +1,344 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                 NOVA - ADVANCED STATISTICS                                  ║
+// ║         "Advanced statistical distributions and methods"                      ║
+// ║         Inspired by: scipy.stats, statsmodels                                 ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+import std.math
+import stdlib.numpy.core
+
+// Monte Carlo methods
+open space MonteCarlo {
+    
+    // Basic Monte Carlo integration
+    fn integrate(f: fn(f64) -> f64, a: f64, b: f64, n_samples: usize) -> f64 {
+        var sum = 0.0
+        
+        each _ in 0..n_samples {
+            let x = a + (b - a) * random_uniform()
+            sum += f(x)
+        }
+        
+        yield (b - a) * sum / (n_samples as f64)
+    }
+    
+    // Metropolis-Hastings MCMC
+    fn metropolis_hastings(
+        log_prob: fn(f64) -> f64,
+        initial: f64,
+        n_samples: usize,
+        step_size: f64
+    ) -> Vec<f64> {
+        var samples = [initial]
+        var current = initial
+        var current_log_prob = log_prob(current)
+        
+        each _ in 1..n_samples {
+            // Propose new state
+            let proposed = current + step_size * random_normal()
+            let proposed_log_prob = log_prob(proposed)
+            
+            // Accept/reject
+            let log_accept_ratio = proposed_log_prob - current_log_prob
+            
+            check log_accept_ratio > 0.0 || random_uniform() < Math.exp(log_accept_ratio) {
+                current = proposed
+                current_log_prob = proposed_log_prob
+            }
+            
+            samples.push(current)
+        }
+        
+        samples
+    }
+    
+    // Hamiltonian Monte Carlo (simplified)
+    fn hamiltonian_mc(
+        log_prob: fn(Vec<f64>) -> f64,
+        grad_log_prob: fn(Vec<f64>) -> Vec<f64>,
+        initial: Vec<f64>,
+        n_samples: usize,
+        step_size: f64,
+        n_steps: usize
+    ) -> Vec<Vec<f64>> {
+        let d = initial.len()
+        var samples = [initial.clone()]
+        var current = initial
+        
+        each _ in 1..n_samples {
+            // Sample momentum
+            var momentum = [0.0; d]
+            each i in 0..d {
+                momentum[i] = random_normal()
+            }
+            
+            var q = current.clone()
+            var p = momentum.clone()
+            
+            // Leapfrog integration
+            each _ in 0..n_steps {
+                let grad = grad_log_prob(q.clone())
+                
+                // Half step for momentum
+                each i in 0..d {
+                    p[i] += 0.5 * step_size * grad[i]
+                }
+                
+                // Full step for position
+                each i in 0..d {
+                    q[i] += step_size * p[i]
+                }
+                
+                let grad2 = grad_log_prob(q.clone())
+                
+                // Half step for momentum
+                each i in 0..d {
+                    p[i] += 0.5 * step_size * grad2[i]
+                }
+            }
+            
+            // Accept/reject (simplified - should include kinetic energy)
+            let current_log_prob = log_prob(current.clone())
+            let proposed_log_prob = log_prob(q.clone())
+            
+            check random_uniform() < Math.exp(proposed_log_prob - current_log_prob) {
+                current = q
+            }
+            
+            samples.push(current.clone())
+        }
+        
+        samples
+    }
+}
+
+// Advanced distributions
+open space Distributions {
+    
+    // Beta distribution
+    data Beta {
+        alpha: f64,
+        beta: f64
+    }
+    
+    impl Beta {
+        fn new(alpha: f64, beta: f64) -> Self {
+            Beta { alpha, beta }
+        }
+        
+        fn pdf(&self, x: f64) -> f64 {
+            check x <= 0.0 || x >= 1.0 {
+                yield 0.0
+            }
+            
+            let numerator = x.powf(self.alpha - 1.0) * (1.0 - x).powf(self.beta - 1.0)
+            let denominator = beta_function(self.alpha, self.beta)
+            
+            numerator / denominator
+        }
+        
+        fn sample(&self) -> f64 {
+            // Use gamma distribution to sample from beta
+            let g1 = Gamma::new(self.alpha, 1.0).sample()
+            let g2 = Gamma::new(self.beta, 1.0).sample()
+            g1 / (g1 + g2)
+        }
+    }
+    
+    // Gamma distribution
+    data Gamma {
+        data: f64,  // k
+        scale: f64   // θ
+    }
+    
+    impl Gamma {
+        fn new(data: f64, scale: f64) -> Self {
+            Gamma { data, scale }
+        }
+        
+        fn pdf(&self, x: f64) -> f64 {
+            check x <= 0.0 {
+                yield 0.0
+            }
+            
+            let numerator = x.powf(self.data - 1.0) * Math.exp(-x / self.scale)
+            let denominator = gamma_function(self.data) * self.scale.powf(self.data)
+            
+            numerator / denominator
+        }
+        
+        fn sample(&self) -> f64 {
+            // Marsaglia and Tsang's method for data >= 1
+            check self.data >= 1.0 {
+                let d = self.data - 1.0/3.0
+                let c = 1.0 / Math.sqrt(9.0 * d)
+                
+                loop {
+                    let z = random_normal()
+                    let v = (1.0 + c * z).powi(3)
+                    
+                    check v > 0.0 {
+                        let u = random_uniform()
+                        check u < 1.0 - 0.0331 * z.powi(4) {
+                            yield d * v * self.scale
+                        }
+                        check Math.log(u) < 0.5 * z * z + d * (1.0 - v + Math.log(v)) {
+                            yield d * v * self.scale
+                        }
+                    }
+                }
+            } else {
+                // For data < 1, use boost method
+                let g = Gamma::new(self.data + 1.0, self.scale).sample()
+                g * random_uniform().powf(1.0 / self.data)
+            }
+        }
+    }
+    
+    // Dirichlet distribution
+    data Dirichlet {
+        alphas: Vec<f64>
+    }
+    
+    impl Dirichlet {
+        fn new(alphas: Vec<f64>) -> Self {
+            Dirichlet { alphas }
+        }
+        
+        fn sample(&self) -> Vec<f64> {
+            let k = self.alphas.len()
+            var gammas = [0.0; k]
+            var sum = 0.0
+            
+            each i in 0..k {
+                let g = Gamma::new(self.alphas[i], 1.0).sample()
+                gammas[i] = g
+                sum += g
+            }
+            
+            each i in 0..k {
+                gammas[i] /= sum
+            }
+            
+            gammas
+        }
+    }
+    
+    // Student's t-distribution
+    data StudentT {
+        df: f64  // degrees of freedom
+    }
+    
+    impl StudentT {
+        fn new(df: f64) -> Self {
+            StudentT { df }
+        }
+        
+        fn pdf(&self, x: f64) -> f64 {
+            let numerator = gamma_function((self.df + 1.0) / 2.0)
+            let denominator = Math.sqrt(self.df * Math.PI) * gamma_function(self.df / 2.0)
+            let factor = (1.0 + x*x / self.df).powf(-(self.df + 1.0) / 2.0)
+            
+            numerator / denominator * factor
+        }
+        
+        fn sample(&self) -> f64 {
+            let z = random_normal()
+            let v = Gamma::new(self.df / 2.0, 2.0).sample()
+            z / Math.sqrt(v / self.df)
+        }
+    }
+}
+
+// Hypothesis testing
+open space HypothesisTesting {
+    
+    // Two-sample t-test
+    fn t_test(sample1: &Vec<f64>, sample2: &Vec<f64>) -> (f64, f64) {
+        let n1 = sample1.len() as f64
+        let n2 = sample2.len() as f64
+        
+        let mean1 = mean(sample1)
+        let mean2 = mean(sample2)
+        
+        var1 = variance(sample1, mean1)
+        var2 = variance(sample2, mean2)
+        
+        let pooled_std = Math.sqrt((var1 / n1) + (var2 / n2))
+        let t_stat = (mean1 - mean2) / pooled_std
+        
+        let df = n1 + n2 - 2.0
+        
+        yield (t_stat, df)
+    }
+    
+    // Chi-square test
+    fn chi_square_test(observed: &Vec<f64>, expected: &Vec<f64>) -> f64 {
+        var chi_sq = 0.0
+        
+        each i in 0..observed.len() {
+            let diff = observed[i] - expected[i]
+            chi_sq += diff * diff / expected[i]
+        }
+        
+        chi_sq
+    }
+    
+    // Kolmogorov-Smirnov test
+    fn ks_test(sample: &Vec<f64>, cdf: fn(f64) -> f64) -> f64 {
+        var sorted = sample.clone()
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap())
+        
+        let n = sorted.len() as f64
+        var max_diff = 0.0
+        
+        each i in 0..sorted.len() {
+            let empirical_cdf = (i as f64 + 1.0) / n
+            let theoretical_cdf = cdf(sorted[i])
+            
+            let diff = (empirical_cdf - theoretical_cdf).abs()
+            check diff > max_diff {
+                max_diff = diff
+            }
+        }
+        
+        max_diff
+    }
+}
+
+// Helper functions
+fn mean(data: &Vec<f64>) -> f64 {
+    data.iter().sum::<f64>() / (data.len() as f64)
+}
+
+fn variance(data: &Vec<f64>, mean: f64) -> f64 {
+    let sum_sq_diff = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>()
+    sum_sq_diff / ((data.len() - 1) as f64)
+}
+
+fn gamma_function(x: f64) -> f64 {
+    // Lanczos approximation (simplified)
+    use std::math::special::functions::Gamma
+    Gamma::gamma(x)
+}
+
+fn beta_function(a: f64, b: f64) -> f64 {
+    gamma_function(a) * gamma_function(b) / gamma_function(a + b)
+}
+
+// Random number generation
+fn random_uniform() -> f64 {
+    // Placeholder - should use proper RNG
+    static var SEED: u64 = 12345
+    unsafe {
+        SEED = (SEED * 1103515245 + 12345) & 0x7fffffff
+        yield (SEED as f64) / (0x7fffffff as f64)
+    }
+}
+
+fn random_normal() -> f64 {
+    // Box-Muller transform
+    let u1 = random_uniform()
+    let u2 = random_uniform()
+    Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2)
+}

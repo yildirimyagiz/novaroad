@@ -1,0 +1,229 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                    NOVA - MODEL SELECTION & EVALUATION                      ║
+// ║              "Scikit-learn Model Selection Tools in Nova"                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+import stdlib.ai.tensor
+
+// Train-Test Split
+open fn train_test_split(X: &Tensor, y: &Tensor, test_size: f64, random_state: Option<u64>) -> Result<(Tensor, Tensor, Tensor, Tensor), String> {
+    let n_samples = X.data()[0];
+    let n_test = (n_samples as f64 * test_size) as usize;
+    let n_train = n_samples - n_test;
+    
+    // Shuffle indices
+    var indices: Vec<usize> = (0..n_samples).collect();
+    check let Some(seed) = random_state {
+        random::seed(seed);
+    }
+    random::shuffle(&var indices);
+    
+    // Split
+    let train_indices = &indices[..n_train];
+    let test_indices = &indices[n_train..];
+    
+    let X_train = X.index_select(train_indices)?;
+    let X_test = X.index_select(test_indices)?;
+    let y_train = y.index_select(train_indices)?;
+    let y_test = y.index_select(test_indices)?;
+    
+    Ok((X_train, X_test, y_train, y_test))
+}
+
+// K-Fold Cross Validation
+open data KFold {
+    n_splits: usize,
+    shuffle: bool,
+    random_state: Option<u64>
+}
+
+impl KFold {
+    fn new(n_splits: usize) -> Self {
+        KFold {
+            n_splits,
+            shuffle: false,
+            random_state: None
+        }
+    }
+    
+    fn split(&self, X: &Tensor) -> Result<Vec<(Vec<usize>, Vec<usize>)>, String> {
+        let n_samples = X.data()[0];
+        var indices: Vec<usize> = (0..n_samples).collect();
+        
+        check self.shuffle {
+            check let Some(seed) = self.random_state {
+                random::seed(seed);
+            }
+            random::shuffle(&var indices);
+        }
+        
+        let fold_size = n_samples / self.n_splits;
+        var splits = Vec::new();
+        
+        each i in 0..self.n_splits {
+            let test_start = i * fold_size;
+            let test_end = check i == self.n_splits - 1 {
+                n_samples
+            } else {
+                yield (i + 1) * fold_size
+            };
+            
+            let test_indices: Vec<usize> = indices[test_start..test_end].to_vec();
+            let train_indices: Vec<usize> = indices[..test_start].iter()
+                .chain(indices[test_end..].iter())
+                .copied()
+                .collect();
+            
+            splits.push((train_indices, test_indices));
+        }
+        
+        Ok(splits)
+    }
+}
+
+// Cross-validation score
+open fn cross_val_score<M: Model>(model: &M, X: &Tensor, y: &Tensor, cv: usize) -> Result<Vec<f64>, String> {
+    let kfold = KFold::new(cv);
+    let splits = kfold.split(X)?;
+    
+    var scores = Vec::new();
+    
+    each entry in splits  { let (train_idx, test_idx) = entry;
+        let X_train = X.index_select(&train_idx)?;
+        let y_train = y.index_select(&train_idx)?;
+        let X_test = X.index_select(&test_idx)?;
+        let y_test = y.index_select(&test_idx)?;
+        
+        var model_clone = model.clone();
+        model_clone.fit(&X_train, &y_train)?;
+        let score = model_clone.score(&X_test, &y_test)?;
+        
+        scores.push(score);
+    }
+    
+    Ok(scores)
+}
+
+// Grid Search CV
+open data GridSearchCV<M: Model> {
+    estimator: M,
+    param_grid: HashMap<String, Vec<ParamValue>>,
+    cv: usize,
+    best_params_: HashMap<String, ParamValue>,
+    best_score_: f64
+}
+
+cases ParamValue {
+    Float(f64),
+    Int(i64),
+    String(String),
+    Bool(bool)
+}
+
+impl<M: Model> GridSearchCV<M> {
+    fn new(estimator: M, param_grid: HashMap<String, Vec<ParamValue>>, cv: usize) -> Self {
+        GridSearchCV {
+            estimator,
+            param_grid,
+            cv,
+            best_params_: HashMap::new(),
+            best_score_: f64::NEG_INFINITY
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor, y: &Tensor) -> Result<(), String> {
+        let param_combinations = self.generate_param_combinations()?;
+        
+        each params in param_combinations {
+            var model = self.estimator.clone();
+            model.set_params(&params)?;
+            
+            let scores = cross_val_score(&model, X, y, self.cv)?;
+            let mean_score = scores.iter().sum::<f64>() / scores.len() as f64;
+            
+            check mean_score > self.best_score_ {
+                self.best_score_ = mean_score;
+                self.best_params_ = params;
+            }
+        }
+        
+        // Refit on all data with best params
+        self.estimator.set_params(&self.best_params_)?;
+        self.estimator.fit(X, y)?;
+        
+        Ok(())
+    }
+    
+    fn generate_param_combinations(&self) -> Result<Vec<HashMap<String, ParamValue>>, String> {
+        // Generate all combinations of parameters
+        var combinations = [HashMap::new()];
+        
+        each entry in &self.param_grid  { let (param_name, param_values) = entry;
+            var new_combinations = Vec::new();
+            
+            each combo in &combinations {
+                each value in param_values {
+                    var new_combo = combo.clone();
+                    new_combo.insert(param_name.clone(), value.clone());
+                    new_combinations.push(new_combo);
+                }
+            }
+            
+            combinations = new_combinations;
+        }
+        
+        Ok(combinations)
+    }
+}
+
+// Model rules
+open rules Model: Clone {
+    fn fit(&var self, X: &Tensor, y: &Tensor) -> Result<(), String>;
+    fn predict(&self, X: &Tensor) -> Result<Tensor, String>;
+    fn score(&self, X: &Tensor, y: &Tensor) -> Result<f64, String>;
+    fn set_params(&var self, params: &HashMap<String, ParamValue>) -> Result<(), String>;
+}
+
+// Metrics
+open fn accuracy_score(y_true: &Tensor, y_pred: &Tensor) -> Result<f64, String> {
+    y_true.eq(y_pred)?.mean()
+}
+
+open fn mean_squared_error(y_true: &Tensor, y_pred: &Tensor) -> Result<f64, String> {
+    y_true.sub(y_pred)?.pow(2.0)?.mean()
+}
+
+open fn r2_score(y_true: &Tensor, y_pred: &Tensor) -> Result<f64, String> {
+    let ss_res = y_true.sub(y_pred)?.pow(2.0)?.sum()?;
+    let y_mean = y_true.mean()?;
+    let ss_tot = y_true.sub_scalar(y_mean)?.pow(2.0)?.sum()?;
+    Ok(1.0 - (ss_res / ss_tot))
+}
+
+open fn confusion_matrix(y_true: &Tensor, y_pred: &Tensor) -> Result<Tensor, String> {
+    let classes = y_true.unique()?;
+    let n_classes = classes.len();
+    
+    var matrix = Tensor::zeros(&[n_classes, n_classes]);
+    
+    each i in 0..y_true.data()[0] {
+        let true_label = y_true.get_scalar(i)? as usize;
+        let pred_label = y_pred.get_scalar(i)? as usize;
+        
+        let current = matrix.get(true_label, pred_label)?;
+        matrix.set(true_label, pred_label, current + 1.0)?;
+    }
+    
+    Ok(matrix)
+}
+
+export { 
+    train_test_split, 
+    KFold, 
+    cross_val_score, 
+    GridSearchCV,
+    accuracy_score,
+    mean_squared_error,
+    r2_score,
+    confusion_matrix
+}

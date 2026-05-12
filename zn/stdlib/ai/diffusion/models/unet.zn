@@ -1,0 +1,181 @@
+// Nova Diffusion - UNet Model
+// The core denoising network for Stable Diffusion.
+// Takes noisy latents + timestep + text embedding -> predicts noise.
+
+import std.ai.core
+import std.ai.nn
+
+// Attention Block with Cross-Attention for text conditioning
+open data CrossAttention {
+    to_q: nn.Linear
+    to_k: nn.Linear
+    to_v: nn.Linear
+    to_out: nn.Linear
+    heads: u32
+    dim_head: u32
+}
+
+impl CrossAttention {
+    fn forward(var self, x: Tensor, context: Tensor) -> Tensor {
+        let b = x.data()[0]
+        let h = self.heads
+        
+        let q = self.to_q.forward(x)
+        let k = self.to_k.forward(context)
+        let v = self.to_v.forward(context)
+        
+        // Reshape to (batch, heads, seq_len, dim_head)
+        q = q.reshape([b, -1, h, self.dim_head]).transpose(1, 2)
+        k = k.reshape([b, -1, h, self.dim_head]).transpose(1, 2)
+        v = v.reshape([b, -1, h, self.dim_head]).transpose(1, 2)
+        
+        // Scaled dot-product attention
+        let scale = (self.dim_head as f64).sqrt()
+        let attn = (q @ k.transpose(-2, -1)) / scale
+        attn = nn.functional.softmax(attn, dim: -1)
+        
+        let out = attn @ v
+        out = out.transpose(1, 2).reshape([b, -1, h * self.dim_head])
+        
+        yield self.to_out.forward(out)
+    }
+}
+
+// Transformer Block with Self-Attention + Cross-Attention + FF
+open data BasicTransformerBlock {
+    attn1: CrossAttention,  // Self-attention
+    attn2: CrossAttention,  // Cross-attention with text
+    ff: FeedForward
+    norm1: nn.LayerNorm,
+    norm2: nn.LayerNorm,
+    norm3: nn.LayerNorm
+}
+
+impl BasicTransformerBlock {
+    fn forward(var self, x: Tensor, context: Tensor) -> Tensor {
+        // Self-attention
+        x = x + self.attn1.forward(self.norm1.forward(x), self.norm1.forward(x))
+        
+        // Cross-attention with text
+        x = x + self.attn2.forward(self.norm2.forward(x), context)
+        
+        // Feed-forward
+        x = x + self.ff.forward(self.norm3.forward(x))
+        
+        yield x
+    }
+}
+
+// ResNet Block with time embedding
+open data ResnetBlock2D {
+    in_channels: u32
+    out_channels: u32
+    conv1: nn.Conv2d,
+    conv2: nn.Conv2d,
+    time_emb_proj: nn.Linear
+    norm1: nn.GroupNorm,
+    norm2: nn.GroupNorm,
+    skip_conv: nn.Conv2d  // If in != out channels
+}
+
+impl ResnetBlock2D {
+    fn forward(var self, x: Tensor, time_emb: Tensor) -> Tensor {
+        let h = self.norm1.forward(x)
+        h = nn.functional.silu(h)
+        h = self.conv1.forward(h)
+        
+        // Add time embedding
+        let temb = nn.functional.silu(time_emb)
+        temb = self.time_emb_proj.forward(temb).unsqueeze(-1).unsqueeze(-1)
+        h = h + temb
+        
+        h = self.norm2.forward(h)
+        h = nn.functional.silu(h)
+        h = self.conv2.forward(h)
+        
+        // Skip connection
+        check self.in_channels != self.out_channels {
+            x = self.skip_conv.forward(x)
+        }
+        
+        yield x + h
+    }
+}
+
+// Main UNet Architecture
+open data UNet2DConditionModel {
+    // Down blocks
+    down_blocks: list<DownBlock2D>
+    
+    // Middle block
+    mid_block: UNetMidBlock2DCrossAttn
+    
+    // Up blocks
+    up_blocks: list<UpBlock2D>
+    
+    // Time embedding
+    time_embedding: TimestepEmbedding
+    
+    // In/Out convs
+    conv_in: nn.Conv2d
+    conv_out: nn.Conv2d
+    conv_norm_out: nn.GroupNorm
+}
+
+open data DownBlock2D {
+    resnets: list<ResnetBlock2D>
+    attentions: list<BasicTransformerBlock>
+    downsamplers: nn.Conv2d
+}
+
+open data UpBlock2D {
+    resnets: list<ResnetBlock2D>
+    attentions: list<BasicTransformerBlock>
+    upsamplers: nn.ConvTranspose2d
+}
+
+impl UNet2DConditionModel {
+    fn forward(var self, 
+        sample: Tensor,           // Noisy latents (B, 4, 64, 64)
+        timestep: Tensor,         // (B,)
+        encoder_hidden_states: Tensor  // Text embeddings (B, 77, 768)
+    ) -> Tensor {
+        // 1. Time embedding
+        let t_emb = self.time_embedding.forward(timestep)
+        
+        // 2. Initial conv
+        var h = self.conv_in.forward(sample)
+        
+        // 3. Down path
+        var down_skips = []
+        each block in self.down_blocks {
+            each entry in block.resnets.zip(block.attentions)  { let (resnet, attn) = entry;
+                h = resnet.forward(h, t_emb)
+                h = attn.forward(h, encoder_hidden_states)
+                down_skips.push(h)
+            }
+            h = block.downsamplers.forward(h)
+        }
+        
+        // 4. Middle block
+        h = self.mid_block.forward(h, t_emb, encoder_hidden_states)
+        
+        // 5. Up path with skip connections
+        each block in self.up_blocks {
+            each entry in block.resnets.zip(block.attentions)  { let (resnet, attn) = entry;
+                let skip = down_skips.pop()
+                h = Tensor.cat([h, skip], dim: 1)
+                h = resnet.forward(h, t_emb)
+                h = attn.forward(h, encoder_hidden_states)
+            }
+            h = block.upsamplers.forward(h)
+        }
+        
+        // 6. Output
+        h = self.conv_norm_out.forward(h)
+        h = nn.functional.silu(h)
+        h = self.conv_out.forward(h)
+        
+        yield h; // Predicted noise
+    }
+}

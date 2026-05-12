@@ -1,0 +1,698 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova LLVM Backend - Sovereign Edition v9.0                                   ║
+// ║ Full LLVM IR text generation — llc ile native binary'e dönüşür               ║
+// ║                                                                               ║
+// ║ Desteklenen özellikler:                                                       ║
+// ║   · Tüm aritmetik + karşılaştırma ifadeleri                                  ║
+// ║   · if/else → conditional branch + phi node                                  ║
+// ║   · while döngüsü → loop/body/exit blok yapısı                               ║
+// ║   · Fonksiyon parametreleri + çağrıları                                      ║
+// ║   · let/var bildirimleri (alloca + store + load)                             ║
+// ║   · String sabitler (global @str.N)                                          ║
+// ║   · Struct tanımları → LLVM named types                                      ║
+// ║   · Bool, i32, i64, f32, f64 tip haritası                                   ║
+// ║   · yield → ret                                                              ║
+// ║   · extern fn bildirimleri (printf, malloc, vb.)                             ║
+// ║   · Nova Grad/Backprop → metadata ile işaretleme                            ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use crate::frontend::ast::*;
+use std::collections::HashMap;
+
+// ── Derleme seçenekleri ───────────────────────────────────────────────────────
+
+expose data CompileOptions {
+    optimization_level: i64,   // 0-3
+    target_triple:      String, // "arm64-apple-macosx13.0.0" vb.
+    enable_simd:        bool,
+    enable_debug:       bool,
+}
+
+impl CompileOptions {
+    open fn default() -> CompileOptions {
+        CompileOptions {
+            optimization_level: 2,
+            target_triple:      "arm64-apple-macosx13.0.0".into(),
+            enable_simd:        true,
+            enable_debug:       false,
+        }
+    }
+
+    open fn for_target(triple: String) -> CompileOptions {
+        var opts = CompileOptions::default();
+        opts.target_triple = triple;
+        opts
+    }
+}
+
+// ── Tip haritası ──────────────────────────────────────────────────────────────
+
+fn nova_type_to_llvm(ty: &str) -> String {
+    match ty {
+        "i8"   | "u8"   => "i8".into(),
+        "i16"  | "u16"  => "i16".into(),
+        "i32"  | "u32"  => "i32".into(),
+        "i64"  | "u64"  | "int" | "uint" => "i64".into(),
+        "f32"  | "float32" => "float".into(),
+        "f64"  | "float"   | "float64" => "double".into(),
+        "bool" => "i1".into(),
+        "()"   | "void" => "void".into(),
+        "str"  | "String" => "ptr".into(),  // opaque pointer
+        _      => format("%struct.{}", ty),  // kullanıcı tanımlı struct
+    }
+}
+
+fn llvm_zero(llvm_ty: &str) -> String {
+    match llvm_ty {
+        "float" | "double" => "0.0".into(),
+        "i1"               => "false".into(),
+        _                  => "0".into(),
+    }
+}
+
+fn is_float_type(llvm_ty: &str) -> bool {
+    llvm_ty == "float" || llvm_ty == "double"
+}
+
+// ── LLVM Backend motoru ───────────────────────────────────────────────────────
+
+expose data LLVMBackend {
+    options:       CompileOptions,
+    lines:         Vec<String>,   // üretilen IR satırları
+    temp_counter:  i64,           // %t0, %t1 ...
+    block_counter: i64,           // blok etiketleri
+    str_counter:   i64,           // global string sabitleri
+    local_vars:    HashMap<String, String>, // isim → LLVM tip
+    func_sigs:     HashMap<String, String>, // fonksiyon adı → dönüş tipi
+    string_pool:   Vec<(String, String)>,   // (global_name, içerik)
+}
+
+impl LLVMBackend {
+
+    open fn new(options: CompileOptions) -> LLVMBackend {
+        LLVMBackend {
+            options,
+            lines:         Vec::new(),
+            temp_counter:  0,
+            block_counter: 0,
+            str_counter:   0,
+            local_vars:    HashMap::new(),
+            func_sigs:     HashMap::new(),
+            string_pool:   Vec::new(),
+        }
+    }
+
+    // ── İç yardımcılar ───────────────────────────────────────────────────────
+
+    fn emit(&var self, line: String) {
+        self.lines.push(line);
+    }
+
+    fn emit_comment(&var self, msg: String) {
+        check self.options.enable_debug {
+            self.lines.push(format("; {}", msg));
+        }
+    }
+
+    fn new_temp(&var self) -> String {
+        let t = format!("%t{}", self.temp_counter);
+        self.temp_counter += 1;
+        t
+    }
+
+    fn new_block(&var self, prefix: &str) -> String {
+        let b = format!("{}.{}", prefix, self.block_counter);
+        self.block_counter += 1;
+        b
+    }
+
+    fn new_str_global(&var self, content: String) -> String {
+        let name = format!("@str.{}", self.str_counter);
+        self.str_counter += 1;
+        self.string_pool.push((name.clone(), content));
+        name
+    }
+
+    // ── Ana derleme girişi ────────────────────────────────────────────────────
+
+    open fn compile_program(&var self, program: Program) -> String {
+        // Başlık
+        self.emit(format!("; Nova Sovereign Compiler — LLVM IR v9.0"));
+        self.emit(format!("target triple = \"{}\"", self.options.target_triple));
+        self.emit(format!("target datalayout = \"e-m:o-i64:64-i128:128-n32:64-S128\""));
+        self.emit("".into());
+
+        // Extern bildirimler (libc)
+        self.emit_stdlib_decls();
+
+        // Struct tanımları
+        each s in program.structs {
+            self.compile_struct_type(s);
+        }
+
+        // Fonksiyon imzalarını ön-topla (çapraz çağrı için)
+        each f in &program.functions {
+            let ret_ty = f.return_type.clone().unwrap_or("()".into());
+            self.func_sigs.insert(f.name.clone(), nova_type_to_llvm(&ret_ty));
+        }
+
+        // Fonksiyon gövdeleri
+        each f in program.functions {
+            self.compile_function(f);
+        }
+
+        // Global string sabitleri sona ekle
+        each (name, content) in self.string_pool.clone() {
+            let len = content.len() + 1; // null terminator
+            self.emit(format!(
+                "{} = private unnamed_addr constant [{} x i8] c\"{}\\00\", align 1",
+                name, len, content
+            ));
+        }
+
+        self.lines.join("\n")
+    }
+
+    // ── Standart kütüphane bildirimleri ───────────────────────────────────────
+
+    fn emit_stdlib_decls(&var self) {
+        self.emit("; --- stdlib declarations ---".into());
+        self.emit("declare i32 @printf(ptr, ...)".into());
+        self.emit("declare ptr @malloc(i64)".into());
+        self.emit("declare void @free(ptr)".into());
+        self.emit("declare ptr @memcpy(ptr, ptr, i64)".into());
+        self.emit("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)".into());
+        // SIMD intrinsics (ARM NEON / SSE2)
+        check self.options.enable_simd {
+            self.emit("declare <4 x float> @llvm.fmuladd.v4f32(<4 x float>, <4 x float>, <4 x float>)".into());
+            self.emit("declare <8 x float> @llvm.fmuladd.v8f32(<8 x float>, <8 x float>, <8 x float>)".into());
+        }
+        self.emit("".into());
+    }
+
+    // ── Struct tip tanımı ─────────────────────────────────────────────────────
+
+    fn compile_struct_type(&var self, s: StructDef) {
+        var field_tys: Vec<String> = Vec::new();
+        each f in s.fields {
+            field_tys.push(nova_type_to_llvm(&f.type_annotation));
+        }
+        self.emit(format!("%struct.{} = type {{ {} }}", s.name, field_tys.join(", ")));
+    }
+
+    // ── Fonksiyon ─────────────────────────────────────────────────────────────
+
+    fn compile_function(&var self, f: Function) {
+        self.local_vars = HashMap::new();
+        self.temp_counter = 0;
+
+        let ret_llvm = f.return_type
+            .as_deref()
+            .map(nova_type_to_llvm)
+            .unwrap_or("void".into());
+
+        // Parametre listesi
+        var param_strs: Vec<String> = Vec::new();
+        each p in &f.params {
+            let pty = nova_type_to_llvm(&p.type_annotation.clone().unwrap_or("i64".into()));
+            param_strs.push(format!("{} %{}", pty, p.name));
+            self.local_vars.insert(p.name.clone(), pty.clone());
+        }
+
+        self.emit("".into());
+        self.emit(format!(
+            "define {} @{}({}) #0 {{",
+            ret_llvm, f.name, param_strs.join(", ")
+        ));
+        self.emit("entry:".into());
+
+        // Parametreleri alloca ile yığına al (yeniden atama desteği)
+        each p in &f.params {
+            let pty = nova_type_to_llvm(&p.type_annotation.clone().unwrap_or("i64".into()));
+            let ptr = format!("%p.{}", p.name);
+            self.emit(format!("  {} = alloca {}, align 8", ptr, pty));
+            self.emit(format!("  store {} %{}, ptr {}, align 8", pty, p.name, ptr));
+            self.local_vars.insert(format!("addr.{}", p.name), "ptr".into());
+        }
+
+        let yielded = self.compile_block(&f.body, &ret_llvm);
+
+        // Eğer blok zaten ret üretmediyse implicit ret ekle
+        check !yielded {
+            check ret_llvm == "void" {
+                self.emit("  ret void".into());
+            } else {
+                self.emit(format!("  ret {} {}", ret_llvm, llvm_zero(&ret_llvm)));
+            }
+        }
+
+        self.emit("}".into());
+
+        // Fonksiyon özellikleri
+        self.emit(format!("attributes #0 = {{ nounwind optsize \"target-features\"=\"+neon\" }}"));
+    }
+
+    // ── Blok → bool (true = ret üretildi) ────────────────────────────────────
+
+    fn compile_block(&var self, block: &Block, ret_ty: &str) -> bool {
+        var yielded = false;
+        each stmt in &block.statements {
+            yielded = self.compile_stmt(stmt, ret_ty);
+        }
+        yielded
+    }
+
+    // ── Deyim ─────────────────────────────────────────────────────────────────
+
+    fn compile_stmt(&var self, stmt: &Stmt, ret_ty: &str) -> bool {
+        match stmt {
+
+            // let / var bildirimi
+            Stmt::Let(lt) | Stmt::Var(lt) => {
+                let val_ty = lt.type_annotation
+                    .as_deref()
+                    .map(nova_type_to_llvm)
+                    .unwrap_or("i64".into());
+                let ptr = format!("%var.{}", lt.name);
+                self.emit(format!("  {} = alloca {}, align 8", ptr, val_ty));
+                check let Some(init) = &lt.init {
+                    let (val, _) = self.compile_expr(init);
+                    self.emit(format!("  store {} {}, ptr {}, align 8", val_ty, val, ptr));
+                }
+                self.local_vars.insert(lt.name.clone(), val_ty);
+                self.local_vars.insert(format!("addr.{}", lt.name), "ptr".into());
+                false
+            }
+
+            // Atama: x = expr
+            Stmt::Assign(asgn) => {
+                let (rhs, rhs_ty) = self.compile_expr(&asgn.value);
+                let ptr = format!("%var.{}", asgn.target);
+                self.emit(format!("  store {} {}, ptr {}, align 8", rhs_ty, rhs, ptr));
+                false
+            }
+
+            // yield → ret
+            Stmt::Yield(y) => {
+                check let Some(expr) = &y.value {
+                    let (val, _) = self.compile_expr(expr);
+                    check ret_ty == "void" {
+                        self.emit("  ret void".into());
+                    } else {
+                        self.emit(format!("  ret {} {}", ret_ty, val));
+                    }
+                } else {
+                    self.emit("  ret void".into());
+                }
+                true
+            }
+
+            // return (açık)
+            Stmt::Return(r) => {
+                check let Some(expr) = &r.value {
+                    let (val, _) = self.compile_expr(expr);
+                    self.emit(format!("  ret {} {}", ret_ty, val));
+                } else {
+                    self.emit("  ret void".into());
+                }
+                true
+            }
+
+            // if / else
+            Stmt::If(if_stmt) => {
+                self.compile_if_stmt(if_stmt, ret_ty)
+            }
+
+            // while döngüsü
+            Stmt::While(w) => {
+                self.compile_while(w, ret_ty);
+                false
+            }
+
+            // for döngüsü (each)
+            Stmt::For(f) => {
+                self.compile_for(f, ret_ty);
+                false
+            }
+
+            // İfade deyimi
+            Stmt::Expr(e) => {
+                self.compile_expr(&e.expr);
+                false
+            }
+
+            // Grad/Backprop → metadata yorum
+            Stmt::Grad(g) => {
+                self.emit(format!("  ; grad({}, {})", g.func, g.var));
+                false
+            }
+
+            Stmt::Backprop(b) => {
+                self.emit(format!("  ; backprop({})", b.loss));
+                false
+            }
+
+            _ => false
+        }
+    }
+
+    // ── if/else ───────────────────────────────────────────────────────────────
+
+    fn compile_if_stmt(&var self, if_stmt: &IfStmt, ret_ty: &str) -> bool {
+        let then_lbl = self.new_block("then");
+        let else_lbl = self.new_block("else");
+        let merge_lbl = self.new_block("merge");
+
+        let (cond, _) = self.compile_expr(&if_stmt.condition);
+        self.emit(format!("  br i1 {}, label %{}, label %{}", cond, then_lbl, else_lbl));
+
+        // then
+        self.emit(format!("{}:", then_lbl));
+        let then_ret = self.compile_block(&if_stmt.then_body, ret_ty);
+        check !then_ret {
+            self.emit(format!("  br label %{}", merge_lbl));
+        }
+
+        // else
+        self.emit(format!("{}:", else_lbl));
+        let else_ret = check let Some(else_body) = &if_stmt.else_body {
+            self.compile_block(else_body, ret_ty)
+        } else {
+            false
+        };
+        check !else_ret {
+            self.emit(format!("  br label %{}", merge_lbl));
+        }
+
+        // merge
+        check !(then_ret && else_ret) {
+            self.emit(format!("{}:", merge_lbl));
+        }
+
+        then_ret && else_ret
+    }
+
+    // ── while döngüsü ─────────────────────────────────────────────────────────
+
+    fn compile_while(&var self, w: &WhileStmt, ret_ty: &str) {
+        let cond_lbl = self.new_block("while.cond");
+        let body_lbl = self.new_block("while.body");
+        let exit_lbl = self.new_block("while.exit");
+
+        self.emit(format!("  br label %{}", cond_lbl));
+        self.emit(format!("{}:", cond_lbl));
+
+        let (cond, _) = self.compile_expr(&w.condition);
+        self.emit(format!("  br i1 {}, label %{}, label %{}", cond, body_lbl, exit_lbl));
+
+        self.emit(format!("{}:", body_lbl));
+        self.compile_block(&w.body, ret_ty);
+        self.emit(format!("  br label %{}", cond_lbl));
+
+        self.emit(format!("{}:", exit_lbl));
+    }
+
+    // ── for/each döngüsü (range tabanlı) ─────────────────────────────────────
+
+    fn compile_for(&var self, f: &ForStmt, ret_ty: &str) {
+        // Basit range: for i in 0..n → i=0; while i<n { body; i++ }
+        let idx_ptr = format!("%for.idx.{}", f.var);
+        self.emit(format!("  {} = alloca i64, align 8", idx_ptr));
+        let (start, _) = self.compile_expr(&f.range_start);
+        self.emit(format!("  store i64 {}, ptr {}, align 8", start, idx_ptr));
+        self.local_vars.insert(f.var.clone(), "i64".into());
+        self.local_vars.insert(format!("addr.{}", f.var), "ptr".into());
+
+        let cond_lbl = self.new_block("for.cond");
+        let body_lbl = self.new_block("for.body");
+        let exit_lbl = self.new_block("for.exit");
+
+        self.emit(format!("  br label %{}", cond_lbl));
+        self.emit(format!("{}:", cond_lbl));
+
+        let cur = self.new_temp();
+        self.emit(format!("  {} = load i64, ptr {}, align 8", cur, idx_ptr));
+        let (end, _) = self.compile_expr(&f.range_end);
+        let cmp = self.new_temp();
+        self.emit(format!("  {} = icmp slt i64 {}, {}", cmp, cur, end));
+        self.emit(format!("  br i1 {}, label %{}, label %{}", cmp, body_lbl, exit_lbl));
+
+        self.emit(format!("{}:", body_lbl));
+        // Döngü değişkenini yükle
+        let var_ptr = format!("%var.{}", f.var);
+        self.emit(format!("  {} = alloca i64, align 8", var_ptr));
+        let iv = self.new_temp();
+        self.emit(format!("  {} = load i64, ptr {}, align 8", iv, idx_ptr));
+        self.emit(format!("  store i64 {}, ptr {}, align 8", iv, var_ptr));
+
+        self.compile_block(&f.body, ret_ty);
+
+        // idx++
+        let next = self.new_temp();
+        let iv2 = self.new_temp();
+        self.emit(format!("  {} = load i64, ptr {}, align 8", iv2, idx_ptr));
+        self.emit(format!("  {} = add i64 {}, 1", next, iv2));
+        self.emit(format!("  store i64 {}, ptr {}, align 8", next, idx_ptr));
+        self.emit(format!("  br label %{}", cond_lbl));
+
+        self.emit(format!("{}:", exit_lbl));
+    }
+
+    // ── İfade → (llvm_value_str, llvm_type_str) ───────────────────────────────
+
+    fn compile_expr(&var self, expr: &Expr) -> (String, String) {
+        match expr {
+
+            // Tam sayı sabiti
+            Expr::Integer(i) => (format!("{}", i.value), "i64".into()),
+
+            // Float sabiti
+            Expr::Float(f)   => (format!("{:.6e}", f.value), "double".into()),
+
+            // Bool sabiti
+            Expr::Bool(b)    => (if b.value { "true" } else { "false" }.into(), "i1".into()),
+
+            // String sabiti → global @str.N, GEP ile ptr
+            Expr::Str(s) => {
+                let gname = self.new_str_global(s.value.clone());
+                let len   = s.value.len() + 1;
+                let ptr   = self.new_temp();
+                self.emit(format!(
+                    "  {} = getelementptr [{} x i8], ptr {}, i32 0, i32 0",
+                    ptr, len, gname
+                ));
+                (ptr, "ptr".into())
+            }
+
+            // Tanımlayıcı → değişkenden yükle
+            Expr::Identifier(ident) => {
+                let ty = self.local_vars
+                    .get(&ident.name)
+                    .cloned()
+                    .unwrap_or("i64".into());
+                let ptr = format!("%var.{}", ident.name);
+                let tmp = self.new_temp();
+                self.emit(format!("  {} = load {}, ptr {}, align 8", tmp, ty, ptr));
+                (tmp, ty)
+            }
+
+            // İkili işlem
+            Expr::Binary(bin) => {
+                let (lv, lt) = self.compile_expr(&bin.left);
+                let (rv, _)  = self.compile_expr(&bin.right);
+                let dst = self.new_temp();
+                let is_float = is_float_type(&lt);
+
+                let instr = match bin.op.as_str() {
+                    "+"  => if is_float { "fadd" } else { "add" },
+                    "-"  => if is_float { "fsub" } else { "sub" },
+                    "*"  => if is_float { "fmul" } else { "mul" },
+                    "/"  => if is_float { "fdiv" } else { "sdiv" },
+                    "%"  => if is_float { "frem" } else { "srem" },
+                    "==" => if is_float { "fcmp oeq" } else { "icmp eq" },
+                    "!=" => if is_float { "fcmp one" } else { "icmp ne" },
+                    "<"  => if is_float { "fcmp olt" } else { "icmp slt" },
+                    ">"  => if is_float { "fcmp ogt" } else { "icmp sgt" },
+                    "<=" => if is_float { "fcmp ole" } else { "icmp sle" },
+                    ">=" => if is_float { "fcmp oge" } else { "icmp sge" },
+                    "&&" => "and",
+                    "||" => "or",
+                    "&"  => "and",
+                    "|"  => "or",
+                    "^"  => "xor",
+                    "<<" => "shl",
+                    ">>" => "ashr",
+                    _    => "add",
+                };
+
+                let res_ty = match bin.op.as_str() {
+                    "==" | "!=" | "<" | ">" | "<=" | ">=" | "&&" | "||" => "i1".into(),
+                    _ => lt.clone(),
+                };
+
+                self.emit(format!("  {} = {} {} {}, {}", dst, instr, lt, lv, rv));
+                (dst, res_ty)
+            }
+
+            // Tekli işlem
+            Expr::Unary(un) => {
+                let (v, ty) = self.compile_expr(&un.operand);
+                let dst = self.new_temp();
+                match un.op.as_str() {
+                    "-" => {
+                        check is_float_type(&ty) {
+                            self.emit(format!("  {} = fneg {} {}", dst, ty, v));
+                        } else {
+                            self.emit(format!("  {} = sub {} 0, {}", dst, ty, v));
+                        }
+                    }
+                    "!" => {
+                        self.emit(format!("  {} = xor i1 {}, true", dst, v));
+                    }
+                    "~" => {
+                        self.emit(format!("  {} = xor {} {}, -1", dst, ty, v));
+                    }
+                    _ => {
+                        self.emit(format!("  {} = add {} {}, 0", dst, ty, v));
+                    }
+                }
+                (dst, ty)
+            }
+
+            // Fonksiyon çağrısı
+            Expr::Call(call) => {
+                var arg_strs: Vec<String> = Vec::new();
+                each arg in &call.args {
+                    let (av, at) = self.compile_expr(arg);
+                    arg_strs.push(format!("{} {}", at, av));
+                }
+
+                let ret_ty = self.func_sigs
+                    .get(&call.callee)
+                    .cloned()
+                    .unwrap_or("i64".into());
+
+                check ret_ty == "void" {
+                    self.emit(format!("  call void @{}({})", call.callee, arg_strs.join(", ")));
+                    ("undef".into(), "void".into())
+                } else {
+                    let dst = self.new_temp();
+                    self.emit(format!(
+                        "  {} = call {} @{}({})",
+                        dst, ret_ty, call.callee, arg_strs.join(", ")
+                    ));
+                    (dst, ret_ty)
+                }
+            }
+
+            // Alan erişimi: obj.field → GEP
+            Expr::FieldAccess(fa) => {
+                let (obj, obj_ty) = self.compile_expr(&fa.object);
+                let dst = self.new_temp();
+                // Basit indeks 0 — tam tip sistemi gerektirir
+                self.emit(format!(
+                    "  {} = getelementptr inbounds {}, ptr {}, i32 0, i32 0 ; .{}",
+                    dst, obj_ty, obj, fa.field
+                ));
+                let loaded = self.new_temp();
+                self.emit(format!("  {} = load i64, ptr {}, align 8", loaded, dst));
+                (loaded, "i64".into())
+            }
+
+            // Cast: expr as Type
+            Expr::Cast(c) => {
+                let (v, from_ty) = self.compile_expr(&c.expr);
+                let to_ty = nova_type_to_llvm(&c.target_type);
+                let dst = self.new_temp();
+
+                let instr = match (from_ty.as_str(), to_ty.as_str()) {
+                    ("i32", "i64") | ("i16", "i64") | ("i8", "i64") => "sext",
+                    ("i64", "i32") | ("i64", "i16") | ("i64", "i8") => "trunc",
+                    ("i64", "double") | ("i32", "double") => "sitofp",
+                    ("double", "i64") | ("double", "i32") => "fptosi",
+                    ("float", "double") => "fpext",
+                    ("double", "float") => "fptrunc",
+                    _ => "bitcast",
+                };
+
+                self.emit(format!("  {} = {} {} {} to {}", dst, instr, from_ty, v, to_ty));
+                (dst, to_ty)
+            }
+
+            // Birim miktarı: 5.0.kg → sadece sayısal değer (compile-time erase)
+            Expr::Quantity(q) => {
+                self.compile_expr(&q.value)
+            }
+
+            // Tensor literali → malloc + memset (basit)
+            Expr::Tensor(t) => {
+                let elem_count: i64 = t.shape.iter().product();
+                let byte_size = elem_count * 4; // f32
+                let ptr = self.new_temp();
+                self.emit(format!(
+                    "  {} = call ptr @malloc(i64 {})",
+                    ptr, byte_size
+                ));
+                self.emit(format!(
+                    "  call void @llvm.memset.p0.i64(ptr {}, i8 0, i64 {}, i1 false)",
+                    ptr, byte_size
+                ));
+                (ptr, "ptr".into())
+            }
+
+            _ => {
+                // Bilinmeyen ifade — 0 döndür
+                self.emit_comment("unsupported expr → 0".into());
+                ("0".into(), "i64".into())
+            }
+        }
+    }
+}
+
+// ── Hata türleri ──────────────────────────────────────────────────────────────
+
+expose cases BackendError {
+    UnsupportedFeature(String),
+    TypeMismatch(String),
+    UndefinedSymbol(String),
+    InternalError(String),
+}
+
+impl BackendError {
+    open fn message(&self) -> String {
+        match self {
+            BackendError::UnsupportedFeature(f) => format!("Desteklenmeyen özellik: {}", f),
+            BackendError::TypeMismatch(m)        => format!("Tip uyuşmazlığı: {}", m),
+            BackendError::UndefinedSymbol(s)     => format!("Tanımsız sembol: {}", s),
+            BackendError::InternalError(e)       => format!("İç hata: {}", e),
+        }
+    }
+}
+
+// ── Genel API ─────────────────────────────────────────────────────────────────
+
+/// Program'ı LLVM IR metnine dönüştür.
+/// Çıktı doğrudan `llc` veya `clang` ile native binary'e çevrilir:
+///   llc -filetype=obj output.ll -o output.o
+///   clang output.o -o program
+open fn compile_to_llvm_ir(program: Program, options: CompileOptions) -> Result<String, BackendError> {
+    var backend = LLVMBackend::new(options);
+    let ir = backend.compile_program(program);
+    Ok(ir)
+}
+
+/// Varsayılan seçeneklerle derle (arm64-apple-macosx13)
+open fn compile_default(program: Program) -> Result<String, BackendError> {
+    compile_to_llvm_ir(program, CompileOptions::default())
+}
+
+/// Belirtilen hedef üçlüsü için derle
+open fn compile_for_target(program: Program, triple: String) -> Result<String, BackendError> {
+    compile_to_llvm_ir(program, CompileOptions::for_target(triple))
+}
+
+open fn main() {
+    println("💎 Nova LLVM Backend v9.0 — aktif");
+    println("   Kullanım: compile_to_llvm_ir(program, CompileOptions::default())");
+    println("   Çıktı:    llc -filetype=obj output.ll && clang output.o -o program");
+}

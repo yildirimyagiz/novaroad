@@ -1,0 +1,157 @@
+/**
+ * Nova Phi-3 Implementation
+ * 
+ * Microsoft Phi-3 (3.8B parameters)
+ * Small but powerful - outperforms 7B models!
+ * 
+ * Key features:
+ * - Long context (128k tokens)
+ * - Efficient architecture
+ * - High quality on small size
+ */
+
+use tensor::core::{Tensor, Device};
+use models::core::{Model, ModelConfig};
+use models::llama::{RMSNorm, RotaryEmbedding};
+use nn::core::{Linear};
+
+data Phi3 {
+    config: Phi3Config,
+    embed_tokens: Tensor<f32>,
+    layers: [Phi3Layer],
+    norm: RMSNorm,
+    lm_head: Linear
+}
+
+data Phi3Config {
+    vocab_size: i64,
+    hidden_size: i64,
+    num_hidden_layers: i64,
+    num_attention_heads: i64,
+    num_key_value_heads: i64,
+    intermediate_size: i64,
+    max_position_embeddings: i64,
+    rope_theta: f32,
+    rms_norm_eps: f32,
+    
+    // Phi-3 specific
+    original_max_position_embeddings: i64,
+    rope_scaling: RopeScaling
+}
+
+data RopeScaling {
+    alias: str,  // "longrope"
+    short_factor: [f32],
+    long_factor: [f32]
+}
+
+impl Phi3 {
+    fn new(config: Phi3Config) -> Phi3 {
+        var layers: [Phi3Layer] = [];
+        each _ in 0..config.num_hidden_layers {
+            layers.push(Phi3Layer::new(config));
+        }
+        
+        Phi3 {
+            config: config,
+            embed_tokens: Tensor::randn([config.vocab_size, config.hidden_size], 0.0, 0.02),
+            layers: layers,
+            norm: RMSNorm::new(config.hidden_size, config.rms_norm_eps),
+            lm_head: Linear::new(config.hidden_size, config.vocab_size, false)
+        };
+    }
+    
+    fn from_pretrained(path: str) -> Phi3 {
+        let model = Model::load(path);
+        yield build_phi3_from_weights(model);
+    }
+}
+
+data Phi3Layer {
+    self_attn: Phi3Attention,
+    mlp: Phi3MLP,
+    input_layernorm: RMSNorm,
+    post_attention_layernorm: RMSNorm
+}
+
+impl Phi3Layer {
+    fn new(config: Phi3Config) -> Phi3Layer {
+        Phi3Layer {
+            self_attn: Phi3Attention::new(config),
+            mlp: Phi3MLP::new(config),
+            input_layernorm: RMSNorm::new(config.hidden_size, config.rms_norm_eps),
+            post_attention_layernorm: RMSNorm::new(config.hidden_size, config.rms_norm_eps)
+        };
+    }
+}
+
+data Phi3Attention {
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    rope: LongRoPE  // Phi-3's extended RoPE
+}
+
+impl Phi3Attention {
+    fn new(config: Phi3Config) -> Phi3Attention {
+        let head_dim = config.hidden_size / config.num_attention_heads;
+        
+        Phi3Attention {
+            q_proj: Linear::new(config.hidden_size, config.num_attention_heads * head_dim, false),
+            k_proj: Linear::new(config.hidden_size, config.num_key_value_heads * head_dim, false),
+            v_proj: Linear::new(config.hidden_size, config.num_key_value_heads * head_dim, false),
+            o_proj: Linear::new(config.num_attention_heads * head_dim, config.hidden_size, false),
+            rope: LongRoPE::new(config)
+        };
+    }
+}
+
+data Phi3MLP {
+    gate_up_proj: Linear,  // Fused for efficiency
+    down_proj: Linear
+}
+
+impl Phi3MLP {
+    fn new(config: Phi3Config) -> Phi3MLP {
+        Phi3MLP {
+            gate_up_proj: Linear::new(config.hidden_size, config.intermediate_size * 2, false),
+            down_proj: Linear::new(config.intermediate_size, config.hidden_size, false)
+        };
+    }
+}
+
+// LongRoPE for extended context (128k tokens)
+data LongRoPE {
+    short_factor: [f32],
+    long_factor: [f32]
+}
+
+impl LongRoPE {
+    fn new(config: Phi3Config) -> LongRoPE {
+        LongRoPE {
+            short_factor: config.rope_scaling.short_factor,
+            long_factor: config.rope_scaling.long_factor
+        };
+    }
+}
+
+fn build_phi3_from_weights(model: Model) -> Phi3 {
+    yield Phi3::new(Phi3Config {
+        vocab_size: 32064,
+        hidden_size: 3072,
+        num_hidden_layers: 32,
+        num_attention_heads: 32,
+        num_key_value_heads: 32,
+        intermediate_size: 8192,
+        max_position_embeddings: 131072,  // 128k context!
+        rope_theta: 10000.0,
+        rms_norm_eps: 1e-5,
+        original_max_position_embeddings: 4096,
+        rope_scaling: RopeScaling {
+            alias: "longrope",
+            short_factor: [],
+            long_factor: []
+        }
+    });
+}

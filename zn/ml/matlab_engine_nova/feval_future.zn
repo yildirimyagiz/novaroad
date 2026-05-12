@@ -1,0 +1,99 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  matlab::engine::feval_future                                               ║
+// ║  Mirrors Python: fevalfuture.py                                            ║
+// ║                                                                             ║
+// ║  FevalFuture is returned by eng.some_function(..., background: true).      ║
+// ║  It extends FutureResult with nargout tracking so the MATLAB dispatcher    ║
+// ║  knows how many yield values to pack.                                      ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use from crate::future_result::{FutureResult, FutureState, MatlabValue};
+use from crate::engine_error::CancelledError;
+
+/// Specialised future for `feval`-style calls: `eng.sqrt(4.0, background: true)`.
+///
+/// `nargout` tells MATLAB how many yield values to produce.
+///   nargout = 0  →  discard all outputs (procedure call)
+///   nargout = 1  →  single yield value (default)
+///   nargout = N  →  tuple of N values
+open data FevalFuture {
+    inner:       FutureResult,
+    func_name:   str,
+    nargout:     i32,
+    /// Ordered list of inputs that were passed to the function.
+    input_args:  Vec<MatlabValue>,
+}
+
+impl FevalFuture {
+    // ------------------------------------------------------------------
+    // Construction — called by MatlabEngine::_call_async
+    // ------------------------------------------------------------------
+
+    fn new(
+        handle:     i64,
+        func_name:  str,
+        nargout:    i32,
+        input_args: Vec<MatlabValue>,
+    ) -> FevalFuture {
+        FevalFuture {
+            inner:      FutureResult::new(handle),
+            func_name,
+            nargout,
+            input_args,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Public API (delegates to inner FutureResult)
+    // ------------------------------------------------------------------
+
+    /// Block until done, yield the MATLAB result.
+    fn result(var self) -> MatlabValue {
+        self.inner.result()
+    }
+
+    /// Block with a timeout (seconds).  Raises CancelledError on timeout.
+    fn result_with_timeout(var self, timeout_secs: f64) -> MatlabValue {
+        self.inner.result_with_timeout(timeout_secs)
+    }
+
+    /// Attempt to cancel this feval call.
+    fn cancel(var self) -> bool {
+        self.inner.cancel()
+    }
+
+    /// True check the underlying computation has finished (any terminal state).
+    fn done(self) -> bool {
+        self.inner.done()
+    }
+
+    /// True check explicitly cancelled.
+    fn cancelled(self) -> bool {
+        self.inner.cancelled()
+    }
+
+    /// Display debug information about this future.
+    fn display(self) -> str {
+        let state_str = match self.inner.state {
+            FutureState::Pending   => "pending",
+            FutureState::Running   => "running",
+            FutureState::Done      => "done",
+            FutureState::Cancelled => "cancelled",
+            FutureState::Error     => "error",
+        };
+        f"FevalFuture<{self.func_name}, nargout={self.nargout}, state={state_str}>"
+    }
+
+    // ------------------------------------------------------------------
+    // nargout helpers
+    // ------------------------------------------------------------------
+
+    /// When nargout > 1, unpack result into a Vec of MatlabValues.
+    fn results(var self) -> Vec<MatlabValue> {
+        let val = self.result();
+        match val {
+            MatlabValue::CellArray(items) => items,
+            single                        => [single],
+        }
+    }
+}

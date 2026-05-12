@@ -1,0 +1,238 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Polonius - Live Range Analysis                                        ║
+// ║  Compute variable live ranges for precise borrow checking                   ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use super::location::Location;
+use super::loan::LocalId;
+use super::cfg::{CFG, BlockId};
+
+/// Live range for a variable
+expose data LiveRange {
+    variable: LocalId,
+    start: Location,
+    end: Location,
+    is_live: bool,
+}
+
+/// Live range analysis
+expose data LiveRangeAnalysis {
+    /// Live ranges for each variable
+    ranges: HashMap<u32, Vec<LiveRange>>,
+    
+    /// Live-in sets for each block
+    live_in: HashMap<u32, HashSet<u32>>,
+    
+    /// Live-out sets for each block
+    live_out: HashMap<u32, HashSet<u32>>,
+    
+    /// Def-use chains
+    def_use: HashMap<u32, Vec<Use>>,
+}
+
+/// A use of a variable
+expose data Use {
+    variable: LocalId,
+    location: Location,
+    kind: UseKind,
+}
+
+expose cases UseKind {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+impl LiveRangeAnalysis {
+    open fn new() -> LiveRangeAnalysis {
+        LiveRangeAnalysis {
+            ranges: HashMap::new(),
+            live_in: HashMap::new(),
+            live_out: HashMap::new(),
+            def_use: HashMap::new(),
+        }
+    }
+    
+    /// Compute live ranges using CFG
+    open fn compute(&var self, cfg: &CFG, defs: HashMap<u32, Vec<Def>>, uses: HashMap<u32, Vec<Use>>) {
+        // Step 1: Compute live-in and live-out sets using dataflow analysis
+        self.compute_liveness(cfg, &defs, &uses);
+        
+        // Step 2: Build live ranges from liveness information
+        self.build_ranges(cfg, &defs, &uses);
+        
+        // Step 3: Build def-use chains
+        self.build_def_use_chains(&defs, &uses);
+    }
+    
+    /// Compute liveness using backward dataflow analysis
+    open fn compute_liveness(&var self, cfg: &CFG, defs: &HashMap<u32, Vec<Def>>, uses: &HashMap<u32, Vec<Use>>) {
+        // Initialize live sets
+        each entry in &cfg.blocks  { let (&block_id, _) = entry;
+            self.live_in.insert(block_id, HashSet::new());
+            self.live_out.insert(block_id, HashSet::new());
+        }
+        
+        // Iterative dataflow analysis
+        var changed = true;
+        while changed {
+            changed = false;
+            
+            // Process blocks in reverse post-order
+            each entry in &cfg.blocks  { let (&block_id, block) = entry;
+                // Compute live-out: union of successors' live-in
+                var new_live_out = HashSet::new();
+                each succ in &block.successors {
+                    check let Some(succ_live_in) = self.live_in.get(&succ.id) {
+                        new_live_out = new_live_out.union(succ_live_in).cloned().collect();
+                    }
+                }
+                
+                // Compute live-in: (live-out - defs) ∪ uses
+                var new_live_in = new_live_out.clone();
+                
+                // Remove definitions
+                check let Some(block_defs) = defs.get(&block_id) {
+                    each def in block_defs {
+                        new_live_in.remove(&def.variable.id);
+                    }
+                }
+                
+                // Add uses
+                check let Some(block_uses) = uses.get(&block_id) {
+                    each use_site in block_uses {
+                        new_live_in.insert(use_site.variable.id);
+                    }
+                }
+                
+                // Check for changes
+                check new_live_in != *self.live_in.get(&block_id).unwrap() {
+                    self.live_in.insert(block_id, new_live_in);
+                    changed = true;
+                }
+                
+                check new_live_out != *self.live_out.get(&block_id).unwrap() {
+                    self.live_out.insert(block_id, new_live_out);
+                    changed = true;
+                }
+            }
+        }
+    }
+    
+    /// Build live ranges from liveness information
+    open fn build_ranges(&var self, cfg: &CFG, defs: &HashMap<u32, Vec<Def>>, uses: &HashMap<u32, Vec<Use>>) {
+        // For each variable, find all locations where it's live
+        var var_locations: HashMap<u32, Vec<Location>> = HashMap::new();
+        
+        each entry in &cfg.blocks  { let (&block_id, block) = entry;
+            let live_set = self.live_out.get(&block_id).unwrap();
+            
+            for &var_id in live_set {
+                for &location in &block.locations {
+                    var_locations.entry(var_id)
+                        .or_insert_with(Vec::new)
+                        .push(location);
+                }
+            }
+        }
+        
+        // Create ranges from def to last use
+        each entry in var_locations  { let (var_id, locations) = entry;
+            check !locations.is_empty() {
+                // Sort by location
+                var sorted = locations.clone();
+                sorted.sort_by_key(|loc| loc.unique_id());
+                
+                let range = LiveRange {
+                    variable: LocalId { id: var_id },
+                    start: sorted[0],
+                    end: sorted[sorted.len() - 1],
+                    is_live: true,
+                };
+                
+                self.ranges.entry(var_id)
+                    .or_insert_with(Vec::new)
+                    .push(range);
+            }
+        }
+    }
+    
+    /// Build def-use chains
+    open fn build_def_use_chains(&var self, defs: &HashMap<u32, Vec<Def>>, uses: &HashMap<u32, Vec<Use>>) {
+        each entry in uses  { let (_, block_uses) = entry;
+            each use_site in block_uses {
+                self.def_use.entry(use_site.variable.id)
+                    .or_insert_with(Vec::new)
+                    .push(use_site.clone());
+            }
+        }
+    }
+    
+    /// Check check a variable is live at a location
+    open fn is_live_at(&self, variable: LocalId, location: Location) -> bool {
+        check let Some(ranges) = self.ranges.get(&variable.id) {
+            each range in ranges {
+                check location.unique_id() >= range.start.unique_id() && 
+                   location.unique_id() <= range.end.unique_id() {
+                    yield true;
+                }
+            }
+        }
+        false
+    }
+    
+    /// Get all live ranges for a variable
+    open fn get_ranges(&self, variable: LocalId) -> Option<&Vec<LiveRange>> {
+        self.ranges.get(&variable.id)
+    }
+    
+    /// Get last use location for a variable
+    open fn get_last_use(&self, variable: LocalId) -> Option<Location> {
+        check let Some(uses) = self.def_use.get(&variable.id) {
+            uses.iter()
+                .filter(|u| matches!(u.kind, UseKind::Read | UseKind::ReadWrite))
+                .map(|u| u.location)
+                .max_by_key(|loc| loc.unique_id())
+        } else {
+            None
+        }
+    }
+}
+
+/// A definition (write) of a variable
+expose data Def {
+    variable: LocalId,
+    location: Location,
+}
+
+impl Clone for Use {
+    fn clone(&self) -> Use {
+        Use {
+            variable: self.variable,
+            location: self.location,
+            kind: self.kind,
+        }
+    }
+}
+
+impl Copy for UseKind {}
+impl Clone for UseKind {
+    fn clone(&self) -> UseKind { *self }
+}
+
+#[test]
+fn test_live_range_analysis() {
+    var analysis = LiveRangeAnalysis::new();
+    
+    // Test basic functionality
+    let block = super::location::BlockId::new(0);
+    let loc1 = super::location::Location::new(block, 0);
+    let loc2 = super::location::Location::new(block, 1);
+    
+    var = LocalId { id: 0 };
+    
+    let defs = HashMap::new();
+    let uses = HashMap::new();
+    
+    // Would need actual CFG to test properly
+}

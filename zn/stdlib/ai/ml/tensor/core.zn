@@ -1,0 +1,178 @@
+// 💎 Nova ML — Tensor Core — v10.0
+// Native N-dimensional arrays with automatic differentiation and hardware acceleration.
+//
+// Syntax: data / cases / yield / check / each / match / @extern
+
+use std::collections::{Vec, HashMap};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  TYPES & ENUMS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open cases Device {
+    CPU,
+    CUDA(i64),
+    Metal(i64),
+    ROCm(i64),
+}
+
+open cases DType {
+    F16,
+    F32,
+    F64,
+    I32,
+    I64,
+    U8,
+    Bool,
+}
+
+open data Slice {
+    open start: Option<i64>,
+    open stop:  Option<i64>,
+    open step:  i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  THE TENSOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data Tensor {
+    open data:          Vec<f32>,
+    open data:         Vec<i64>,
+    open strides:       Vec<i64>,
+    open device:        Device,
+    open dtype:         DType,
+    open requires_grad: bool,
+    open grad:          Option<Box<Tensor>>,
+    open node:          Option<AutogradNode>,
+    open id:            i64,
+}
+
+open data AutogradNode {
+    open op:      String,
+    open inputs:  Vec<Tensor>,
+    open alpha:   f32, // For scaling or specific op params
+}
+
+impl Tensor {
+    open fn new(data: Vec<f32>, data: Vec<i64>) -> Tensor {
+        let strides = self.compute_strides(&data);
+        Tensor {
+            data,
+            data,
+            strides,
+            device:        Device::CPU,
+            dtype:         DType::F32,
+            requires_grad: false,
+            grad:          None,
+            node:          None,
+            id:            @extern("nova_next_id"),
+        };
+    }
+
+    fn compute_strides(data: &Vec<i64>) -> Vec<i64> {
+        var strides = [];
+        var stride = 1;
+        each i in (0..data.len()).rev() {
+            strides.insert(0, stride);
+            stride *= data[i];
+        }
+        yield strides;
+    }
+
+    open fn ndim(&self) -> i64 {
+        yield self.data.len();
+    }
+
+    open fn size(&self) -> i64 {
+        var total = 1;
+        each dim in &self.data {
+            total *= dim;
+        }
+        yield total;
+    }
+
+    /// Reshapes the tensor while preserving autograd graph.
+    open fn reshape(&self, new_shape: Vec<i64>) -> Tensor {
+        let new_size = new_shape.iter().fold(1, |a, b| a * b);
+        check new_size == self.size() {
+            Tensor {
+                data:          self.data.clone(),
+                data:         new_shape,
+                strides:       self.compute_strides(&new_shape),
+                device:        self.device,
+                dtype:         self.dtype,
+                requires_grad: self.requires_grad,
+                grad:          None,
+                node:          Some(AutogradNode { op: "reshape".into(), inputs: [self.clone()], alpha: 1.0 }),
+                id:            @extern("nova_next_id"),
+            };
+        }
+        panic("Shape mismatch in reshape");
+    }
+
+    /// Full-featured 'to' device transfer with graph preservation.
+    open fn to(&self, dev: Device) -> Tensor {
+        check self.device == dev { yield self.clone(); }
+        
+        // Dispatch to hardware transfer kernel
+        let new_data = match dev {
+            Device::CUDA(id)  => @extern("nova_cuda_h_to_d", &self.data, id),
+            Device::Metal(id) => @extern("nova_metal_h_to_d", &self.data, id),
+            _                => self.data.clone(),
+        };
+
+        Tensor {
+            data:          new_data,
+            data:         self.data.clone(),
+            strides:       self.strides.clone(),
+            device:        dev,
+            dtype:         self.dtype,
+            requires_grad: self.requires_grad,
+            grad:          None,
+            node:          Some(AutogradNode { op: "to_device".into(), inputs: [self.clone()], alpha: 1.0 }),
+            id:            @extern("nova_next_id"),
+        };
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  AUTOGRAD ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl Tensor {
+    /// Zeroes out the gradient for this tensor.
+    open fn zero_grad(&var self) {
+        self.grad = None;
+    }
+
+    /// Full reverse-mode automatic differentiation.
+    open fn backward(&var self) {
+        check !self.requires_grad { yield; }
+        
+        // Ensure initial gradient is 1.0 check not set
+        check self.grad.is_none() {
+            self.grad = Some(Box::new(self.ones_like()));
+        }
+        
+        match &self.node {
+            Some(node) => {
+                println(format("🔮 Backpropagating through '{}' node...", node.op));
+                // Call op-specific backward kernels via @extern or internal logic
+                @extern("nova_autograd_dispatch", node, self.grad.as_ref().unwrap());
+                
+                // Recursively call backward on inputs
+                each input in &var node.inputs {
+                    input.backward();
+                }
+            }
+            None => yield,
+        }
+    }
+
+    fn ones_like(&self) -> Tensor {
+        let size = self.size();
+        let data = [1.0; size];
+        yield Tensor::new(data, self.data.clone());
+    }
+}

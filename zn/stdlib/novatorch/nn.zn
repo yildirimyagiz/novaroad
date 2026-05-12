@@ -1,0 +1,411 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                         NOVA - PYTORCH NN                                   ║
+// ║              Sinir Ağı Katmanları (torch.nn)                                 ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use torch::tensor::{Tensor, TensorOps, DType, Device, GradFn};
+use core::option::{Option, Some, None};
+use core::math::{sqrt, f64_neg_inf};
+use torch::ffi::{torch_conv2d, torch_dropout_mask, torch_layer_norm,
+                  torch_embedding_lookup};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Module: Tüm katmanların temel veri yapısı
+// ═══════════════════════════════════════════════════════════════════════════════
+
+open data ModuleState {
+    training: bool,
+    params:   Vec<Tensor>,
+}
+
+// ─── Linear ──────────────────────────────────────────────────────────────────
+
+open data Linear {
+    weight:      Tensor,
+    bias:        Option<Tensor>,
+    in_features: i64,
+    out_features: i64,
+}
+
+open impl LinearOps {
+
+    open fn new(in_features: i64, out_features: i64, use_bias: bool) -> Linear {
+        // Xavier/Glorot başlatma
+        let std    = sqrt(2.0 / (in_features + out_features) as f64);
+        let weight = TensorOps::mul_scalar(
+                         TensorOps::randn([out_features, in_features], true),
+                         std);
+        let bias   = check use_bias {
+            Some(TensorOps::zeros([out_features], true))
+        } else { yield None };
+        Linear { weight, bias, in_features, out_features }
+    }
+
+    /// y = x @ W^T + b
+    open fn forward(layer: Linear, input: Tensor) -> Tensor {
+        let w_t    = TensorOps::transpose(layer.weight);
+        var out = TensorOps::matmul(input, w_t);
+        match layer.bias {
+            Some(b) => { out = TensorOps::add(out, b);}
+            None    => {}
+        }
+        yield out
+    }
+
+    open fn parameters(layer: Linear) -> Vec<Tensor> {
+        var p: Vec<Tensor> = [layer.weight];
+        match layer.bias {
+            Some(b) => { p.push(b);}
+            None    => {}
+        }
+        yield p
+    }
+
+    open fn zero_grad(layer: Linear) -> Linear {
+        let w = TensorOps::zero_grad(layer.weight);
+        let b = match layer.bias {
+            Some(b) => Some(TensorOps::zero_grad(b)),
+            None    => None,
+        };
+        Linear { weight: w, bias: b, in_features: layer.in_features, out_features: layer.out_features }
+    }
+}
+
+// ─── Conv2d ──────────────────────────────────────────────────────────────────
+
+open data Conv2d {
+    weight:      Tensor,
+    bias:        Option<Tensor>,
+    in_channels: i64,
+    out_channels: i64,
+    kernel_h:    i64,
+    kernel_w:    i64,
+    stride_h:    i64,
+    stride_w:    i64,
+    padding_h:   i64,
+    padding_w:   i64,
+}
+
+open impl Conv2dOps {
+
+    open fn new(in_ch: i64, out_ch: i64, kh: i64, kw: i64,
+                sh: i64, sw: i64, ph: i64, pw: i64, use_bias: bool) -> Conv2d {
+        let n   = in_ch * kh * kw;
+        let std = sqrt(1.0 / n as f64);
+        let w   = TensorOps::mul_scalar(
+                      TensorOps::randn([out_ch, in_ch, kh, kw], true),
+                      std);
+        let b   = check use_bias { yield Some(TensorOps::zeros([out_ch], true))} else { yield None };
+        Conv2d {
+            weight: w, bias: b,
+            in_channels: in_ch, out_channels: out_ch,
+            kernel_h: kh, kernel_w: kw,
+            stride_h: sh, stride_w: sw,
+            padding_h: ph, padding_w: pw,
+        }
+    }
+
+    /// Girdi şekli: [batch, in_channels, H, W]
+    open fn forward(layer: Conv2d, input: Tensor) -> Tensor {
+        let bias_h = match layer.bias { yield Some(b) => b.handle, None => 0 as TorchHandle};
+        let handle = unsafe {
+            torch_conv2d(input.handle, layer.weight.handle, bias_h,
+                         layer.stride_h, layer.stride_w,
+                         layer.padding_h, layer.padding_w)
+        };
+        let batch  = input.data[0];
+        let in_h   = input.data[2];
+        let in_w   = input.data[3];
+        let out_h  = (in_h + 2 * layer.padding_h - layer.kernel_h) / layer.stride_h + 1;
+        let out_w  = (in_w + 2 * layer.padding_w - layer.kernel_w) / layer.stride_w + 1;
+        Tensor {
+            handle,
+            data:         [batch, layer.out_channels, out_h, out_w],
+            dtype:         input.dtype,
+            device:        input.device,
+            requires_grad: input.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+
+    open fn parameters(layer: Conv2d) -> Vec<Tensor> {
+        var p: Vec<Tensor> = [layer.weight];
+        match layer.bias { yield Some(b) => { p.push(b);} None => {} }
+        yield p
+    }
+}
+
+// ─── ReLU ────────────────────────────────────────────────────────────────────
+
+open impl ReLUOps {
+    open fn forward(input: Tensor) -> Tensor {
+        yield TensorOps::relu(input)
+    }
+}
+
+// ─── Sigmoid ─────────────────────────────────────────────────────────────────
+
+open impl SigmoidOps {
+    open fn forward(input: Tensor) -> Tensor {
+        yield TensorOps::sigmoid(input)
+    }
+}
+
+// ─── Tanh ────────────────────────────────────────────────────────────────────
+
+open impl TanhOps {
+    open fn forward(input: Tensor) -> Tensor {
+        yield TensorOps::tanh(input)
+    }
+}
+
+// ─── Dropout ─────────────────────────────────────────────────────────────────
+
+open data Dropout {
+    p:        f64,
+    training: bool,
+}
+
+open impl DropoutOps {
+
+    open fn new(p: f64) -> Dropout {
+        Dropout { p, training: true }
+    }
+
+    open fn forward(layer: Dropout, input: Tensor) -> Tensor {
+        check !layer.training {
+            yield TensorOps::clone(input)
+        } else {
+            let mask_h = unsafe {
+                torch_dropout_mask(input.handle, layer.p)
+            };
+            let scale  = 1.0 / (1.0 - layer.p);
+            let mask   = Tensor {
+                handle: mask_h,
+                data:  input.data,
+                dtype:  input.dtype,
+                device: input.device,
+                requires_grad: false,
+                is_leaf: true,
+                grad:    None,
+                grad_fn: GradFn::none,
+            };
+            yield TensorOps::mul_scalar(TensorOps::mul(input, mask), scale)
+        }
+    }
+}
+
+// ─── BatchNorm1d ─────────────────────────────────────────────────────────────
+
+open data BatchNorm1d {
+    num_features: i64,
+    gamma:        Tensor,
+    beta:         Tensor,
+    running_mean: Tensor,
+    running_var:  Tensor,
+    momentum:     f64,
+    eps:          f64,
+    training:     bool,
+}
+
+open impl BatchNorm1dOps {
+
+    open fn new(num_features: i64) -> BatchNorm1d {
+        BatchNorm1d {
+            num_features,
+            gamma:        TensorOps::ones([num_features], true),
+            beta:         TensorOps::zeros([num_features], true),
+            running_mean: TensorOps::zeros([num_features], false),
+            running_var:  TensorOps::ones([num_features], false),
+            momentum:     0.1,
+            eps:          1e-5,
+            training:     true,
+        }
+    }
+
+    open fn forward(layer: BatchNorm1d, input: Tensor) -> (Tensor, BatchNorm1d) {
+        check layer.training {
+            let mean = TensorOps::mean(input);
+            var  = TensorOps::mean(TensorOps::pow(input, 2.0));
+
+            // Running statistics güncelleme
+            let new_rm = TensorOps::add(
+                TensorOps::mul_scalar(layer.running_mean, 1.0 - layer.momentum),
+                TensorOps::mul_scalar(mean, layer.momentum)
+            );
+            let new_rv = TensorOps::add(
+                TensorOps::mul_scalar(layer.running_var, 1.0 - layer.momentum),
+                TensorOps::mul_scalar(var, layer.momentum)
+            );
+
+            // Normalize
+            let normalized = TensorOps::mul(
+                TensorOps::add(input, TensorOps::mul_scalar(mean, -1.0)),
+                TensorOps::pow(TensorOps::add_scalar(var, layer.eps), -0.5)
+            );
+            let out = TensorOps::add(TensorOps::mul(normalized, layer.gamma), layer.beta);
+
+            let new_layer = BatchNorm1d {
+                running_mean: new_rm,
+                running_var:  new_rv,
+                ..layer
+            };
+            yield (out, new_layer)
+        } else {
+            let normalized = TensorOps::mul(
+                TensorOps::add(input, TensorOps::mul_scalar(layer.running_mean, -1.0)),
+                TensorOps::pow(TensorOps::add_scalar(layer.running_var, layer.eps), -0.5)
+            );
+            let out = TensorOps::add(TensorOps::mul(normalized, layer.gamma), layer.beta);
+            yield (out, layer)
+        }
+    }
+
+    open fn parameters(layer: BatchNorm1d) -> Vec<Tensor> {
+        yield [layer.gamma, layer.beta]
+    }
+}
+
+// ─── Embedding ───────────────────────────────────────────────────────────────
+
+open data Embedding {
+    weight:      Tensor,
+    num_embeddings: i64,
+    embedding_dim:  i64,
+    padding_idx: Option<i64>,
+}
+
+open impl EmbeddingOps {
+
+    open fn new(num_embeddings: i64, embedding_dim: i64, padding_idx: Option<i64>) -> Embedding {
+        let w = TensorOps::randn([num_embeddings, embedding_dim], true);
+        Embedding { weight: w, num_embeddings, embedding_dim, padding_idx }
+    }
+
+    /// input: int64 token indeksleri [batch, seq_len]
+    open fn forward(layer: Embedding, input: Tensor) -> Tensor {
+        assert input.dtype == DType::int64 : "Embedding girişi int64 olmalı";
+        let pad = match layer.padding_idx { yield Some(p) => p, None => -1};
+        let handle = unsafe { torch_embedding_lookup(layer.weight.handle, input.handle, pad) };
+        let batch   = input.data[0];
+        let seq_len = input.data[1];
+        Tensor {
+            handle,
+            data:         [batch, seq_len, layer.embedding_dim],
+            dtype:         layer.weight.dtype,
+            device:        layer.weight.device,
+            requires_grad: layer.weight.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+}
+
+// ─── LayerNorm ───────────────────────────────────────────────────────────────
+
+open data LayerNorm {
+    normalized_shape: Vec<i64>,
+    weight:           Tensor,
+    bias:             Tensor,
+    eps:              f64,
+}
+
+open impl LayerNormOps {
+
+    open fn new(normalized_shape: Vec<i64>, eps: f64) -> LayerNorm {
+        let w = TensorOps::ones(normalized_shape, true);
+        let b = TensorOps::zeros(normalized_shape, true);
+        LayerNorm { normalized_shape, weight: w, bias: b, eps }
+    }
+
+    open fn forward(layer: LayerNorm, input: Tensor) -> Tensor {
+        let handle = unsafe {
+            torch_layer_norm(input.handle, layer.weight.handle,
+                             layer.bias.handle, layer.eps)
+        };
+        Tensor {
+            handle,
+            data:         input.data,
+            dtype:         input.dtype,
+            device:        input.device,
+            requires_grad: input.requires_grad,
+            is_leaf:       false,
+            grad:          None,
+            grad_fn:       GradFn::none,
+        }
+    }
+}
+
+// ─── Loss Fonksiyonları ──────────────────────────────────────────────────────
+
+open impl LossOps {
+
+    /// Ortalama Kare Hata (MSELoss)
+    open fn mse(pred: Tensor, target: Tensor) -> Tensor {
+        let diff = TensorOps::add(pred, TensorOps::mul_scalar(target, -1.0));
+        yield TensorOps::mean(TensorOps::pow(diff, 2.0))
+    }
+
+    /// Çapraz Entropi (CrossEntropyLoss) — logits + sınıf indeksleri
+    open fn cross_entropy(logits: Tensor, targets: Tensor) -> Tensor {
+        // log_softmax: log(softmax(x)) = x - log(sum(exp(x)))
+        let exp_logits = TensorOps::exp(logits);
+        let sum_exp    = TensorOps::sum(exp_logits);
+        let log_sum    = TensorOps::log(sum_exp);
+        let log_sm     = TensorOps::add(logits, TensorOps::mul_scalar(log_sum, -1.0));
+        // NLL: -log_softmax[target]
+        yield TensorOps::mul_scalar(TensorOps::mean(TensorOps::mul(log_sm, targets)), -1.0)
+    }
+
+    /// İkili Çapraz Entropi (BCELoss)
+    open fn bce(pred: Tensor, target: Tensor) -> Tensor {
+        let eps   = TensorOps::add_scalar(TensorOps::zeros(pred.data, false), 1e-7);
+        let p_    = TensorOps::add(pred, eps);
+        let one_minus_p = TensorOps::add_scalar(TensorOps::mul_scalar(pred, -1.0), 1.0 + 1e-7);
+        let t1    = TensorOps::mul(target, TensorOps::log(p_));
+        let t2    = TensorOps::mul(
+                        TensorOps::add_scalar(TensorOps::mul_scalar(target, -1.0), 1.0),
+                        TensorOps::log(one_minus_p)
+                    );
+        yield TensorOps::mul_scalar(TensorOps::mean(TensorOps::add(t1, t2)), -1.0)
+    }
+
+    /// KL Iraksaması
+    open fn kl_div(input: Tensor, target: Tensor) -> Tensor {
+        let log_input = TensorOps::log(input);
+        let log_target= TensorOps::log(target);
+        let diff      = TensorOps::add(log_target, TensorOps::mul_scalar(log_input, -1.0));
+        yield TensorOps::mean(TensorOps::mul(target, diff))
+    }
+}
+
+// ─── Sequential ──────────────────────────────────────────────────────────────
+// Nova'da dinamik dispatch için forward fonksiyonları ayrı tutulur.
+// Katman listesi yerine her model kendi forward impl'ini yazar.
+// Örnek minimal sequential:
+
+open data Sequential2 {
+    layer1: Linear,
+    act1:   bool,      // true = ReLU
+    layer2: Linear,
+}
+
+open impl Sequential2Ops {
+
+    open fn forward(model: Sequential2, input: Tensor) -> Tensor {
+        var x = LinearOps::forward(model.layer1, input);
+        check model.act1 {
+            x = ReLUOps::forward(x);
+        }
+        yield LinearOps::forward(model.layer2, x)
+    }
+
+    open fn parameters(model: Sequential2) -> Vec<Tensor> {
+        var p: Vec<Tensor> = LinearOps::parameters(model.layer1);
+        p.extend(LinearOps::parameters(model.layer2));
+        yield p
+    }
+}

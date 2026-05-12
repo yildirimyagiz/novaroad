@@ -1,0 +1,365 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Nova Code Signing - Cryptographic Ownership
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Ensures code authenticity and ownership through digital signatures
+//
+// Features:
+// - Ed25519 signatures (fast & secure)
+// - SHA-256 hashing
+// - Developer identity binding
+// - Tamper detection
+//
+// ═══════════════════════════════════════════════════════════════════════════
+
+use crypto::{Ed25519, SHA256, HMAC}
+use std::io::fs
+use std::time::DateTime
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Code Signer - Creates and verifies signatures
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data CodeSigner {
+    private_key: Ed25519PrivateKey,
+    public_key: Ed25519PublicKey,
+    developer_id: String,
+    email: String
+}
+
+impl CodeSigner {
+    /// Create new code signer with developer identity
+    fn new(developer_id: String, email: String) -> CodeSigner {
+        let (private_key, public_key) = Ed25519::generate_keypair();
+        
+        CodeSigner {
+            private_key,
+            public_key,
+            developer_id,
+            email
+        }
+    }
+    
+    /// Load signer from saved keys
+    fn from_keys(
+        private_key_path: String,
+        developer_id: String,
+        email: String
+    ) -> Result<CodeSigner, String> {
+        let private_key_bytes = fs::read(&private_key_path)?;
+        let private_key = Ed25519PrivateKey::from_bytes(&private_key_bytes)?;
+        let public_key = private_key.public_key();
+        
+        Ok(CodeSigner {
+            private_key,
+            public_key,
+            developer_id,
+            email
+        })
+    }
+    
+    /// Save keys to disk (encrypted)
+    fn save_keys(&self, output_dir: String, password: String) -> Result<(), String> {
+        fs::create_dir_all(&output_dir)?;
+        
+        // Encrypt private key with password
+        let encrypted_private = self.encrypt_private_key(&password);
+        
+        let private_path = format("{}/private_key.enc", output_dir);
+        let public_path = format("{}/public_key.pem", output_dir);
+        
+        fs::write(&private_path, encrypted_private)?;
+        fs::write(&public_path, self.public_key.to_pem())?;
+        
+        println("🔑 Keys saved:");
+        println("   Private: {} (encrypted)", private_path);
+        println("   Public: {}", public_path);
+        
+        Ok(())
+    }
+    
+    /// Sign a code file
+    fn sign_code(&self, code_path: String) -> Result<CodeSignature, String> {
+        println("✍️  Signing code: {}", code_path);
+        
+        // 1. Read code
+        let code = fs::read_to_string(&code_path)?;
+        
+        // 2. Compute hash
+        let code_hash = SHA256::hash(code.as_bytes());
+        
+        // 3. Create signature payload
+        let payload = self.create_signature_payload(&code, &code_hash);
+        
+        // 4. Sign payload
+        let signature_bytes = self.private_key.sign(&payload);
+        
+        // 5. Create signature object
+        let signature = CodeSignature {
+            developer_id: self.developer_id.clone(),
+            developer_email: self.email.clone(),
+            public_key: self.public_key.clone(),
+            signature: signature_bytes,
+            code_hash,
+            file_path: code_path,
+            signed_at: DateTime::now(),
+            nova_version: env!("NOVA_VERSION").into()
+        };
+        
+        println("✅ Code signed successfully");
+        println("   Developer: {}", self.developer_id);
+        println("   Hash: {}", hex::encode(&code_hash[..16]));
+        
+        Ok(signature)
+    }
+    
+    /// Sign multiple files (batch)
+    fn sign_project(&self, project_dir: String) -> Result<ProjectSignature, String> {
+        println("📦 Signing project: {}", project_dir);
+        
+        var file_signatures = Vec::new();
+        
+        // Find all .zn files
+        each path in fs::glob(&format("{}/**/*.zn", project_dir))? {
+            let signature = self.sign_code(path.clone())?;
+            file_signatures.push(signature);
+        }
+        
+        // Create project signature
+        let project_sig = ProjectSignature {
+            project_name: fs::path::filename(&project_dir),
+            developer_id: self.developer_id.clone(),
+            file_signatures,
+            signed_at: DateTime::now()
+        };
+        
+        println("✅ Project signed: {} files", project_sig.file_signatures.len());
+        
+        Ok(project_sig)
+    }
+    
+    /// Verify signature
+    fn verify_signature(&self, code: &str, signature: &CodeSignature) -> VerificationResult {
+        // 1. Recompute code hash
+        let computed_hash = SHA256::hash(code.as_bytes());
+        
+        // 2. Check hash matches
+        check computed_hash != signature.code_hash {
+            yield VerificationResult::Failed {
+                reason: "Code has been modified (hash mismatch)".into()
+            };
+        }
+        
+        // 3. Recreate signature payload
+        let payload = self.create_signature_payload(code, &computed_hash);
+        
+        // 4. Verify signature with public key
+        check !signature.public_key.verify(&payload, &signature.signature) {
+            yield VerificationResult::Failed {
+                reason: "Invalid signature (cryptographic verification failed)".into()
+            };
+        }
+        
+        VerificationResult::Valid {
+            developer: signature.developer_id.clone(),
+            signed_at: signature.signed_at
+        }
+    }
+    
+    fn create_signature_payload(&self, code: &str, code_hash: &[u8]) -> Vec<u8> {
+        var payload = Vec::new();
+        
+        // Include multiple fields to prevent replay attacks
+        payload.extend_from_slice(code_hash);
+        payload.extend_from_slice(self.developer_id.as_bytes());
+        payload.extend_from_slice(self.email.as_bytes());
+        
+        payload
+    }
+    
+    fn encrypt_private_key(&self, password: &str) -> Vec<u8> {
+        // Derive key from password
+        let key = crypto::pbkdf2(password.as_bytes(), b"nova-salt", 100000);
+        
+        // Encrypt private key
+        let private_bytes = self.private_key.to_bytes();
+        crypto::AES256::encrypt(&private_bytes, &key)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Code Signature - Proof of authorship
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data CodeSignature {
+    developer_id: String,
+    developer_email: String,
+    public_key: Ed25519PublicKey,
+    signature: Vec<u8>,
+    code_hash: Vec<u8>,
+    file_path: String,
+    signed_at: DateTime,
+    nova_version: String
+}
+
+impl CodeSignature {
+    /// Save signature to file
+    fn save(&self, output_path: String) -> Result<(), String> {
+        let json = self.to_json();
+        fs::write(&output_path, json)?;
+        Ok(())
+    }
+    
+    /// Load signature from file
+    fn load(path: String) -> Result<CodeSignature, String> {
+        let json = fs::read_to_string(&path)?;
+        CodeSignature::from_json(&json)
+    }
+    
+    fn to_json(&self) -> String {
+        json::object! {
+            "developer_id": self.developer_id.clone(),
+            "developer_email": self.developer_email.clone(),
+            "public_key": base64::encode(&self.public_key.to_bytes()),
+            "signature": base64::encode(&self.signature),
+            "code_hash": hex::encode(&self.code_hash),
+            "file_path": self.file_path.clone(),
+            "signed_at": self.signed_at.to_rfc3339(),
+            "nova_version": self.nova_version.clone()
+        }
+    }
+    
+    fn from_json(json: &str) -> Result<CodeSignature, String> {
+        let data = json::parse(json)?;
+        
+        Ok(CodeSignature {
+            developer_id: data["developer_id"].as_str()?.into(),
+            developer_email: data["developer_email"].as_str()?.into(),
+            public_key: Ed25519PublicKey::from_bytes(
+                &base64::decode(data["public_key"].as_str()?)?
+            )?,
+            signature: base64::decode(data["signature"].as_str()?)?,
+            code_hash: hex::decode(data["code_hash"].as_str()?)?,
+            file_path: data["file_path"].as_str()?.into(),
+            signed_at: DateTime::parse_rfc3339(data["signed_at"].as_str()?)?,
+            nova_version: data["nova_version"].as_str()?.into()
+        })
+    }
+}
+
+open data ProjectSignature {
+    project_name: String,
+    developer_id: String,
+    file_signatures: Vec<CodeSignature>,
+    signed_at: DateTime
+}
+
+impl ProjectSignature {
+    fn save(&self, output_path: String) -> Result<(), String> {
+        let json = json::object! {
+            "project_name": self.project_name.clone(),
+            "developer_id": self.developer_id.clone(),
+            "files": self.file_signatures.iter()
+                .map(|s| s.to_json())
+                .collect::<Vec<_>>(),
+            "signed_at": self.signed_at.to_rfc3339()
+        };
+        
+        fs::write(&output_path, json::stringify(&json))?;
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Verification Result
+// ═══════════════════════════════════════════════════════════════════════════
+
+open cases VerificationResult {
+    Valid {
+        developer: String,
+        signed_at: DateTime
+    },
+    Failed {
+        reason: String
+    }
+}
+
+impl VerificationResult {
+    fn is_valid(&self) -> bool {
+        matches!(self, VerificationResult::Valid { .. })
+    }
+    
+    fn print(&self) {
+        match self {
+            VerificationResult::Valid { developer, signed_at } => {
+                println("✅ Signature VALID");
+                println("   Developer: {}", developer);
+                println("   Signed: {}", signed_at);
+            },
+            VerificationResult::Failed { reason } => {
+                println("❌ Signature INVALID");
+                println("   Reason: {}", reason);
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CLI Integration
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[example]
+fn example_sign_code() {
+    // 1. Create signer
+    let signer = CodeSigner::new(
+        "developer123".into(),
+        "dev@example.com".into()
+    );
+    
+    // 2. Save keys
+    signer.save_keys(".nova/keys".into(), "my-password".into()).ok();
+    
+    // 3. Sign code
+    let signature = signer.sign_code("myapp.zn".into()).unwrap();
+    
+    // 4. Save signature
+    signature.save("myapp.zn.sig".into()).ok();
+    
+    // 5. Later: Verify
+    let code = fs::read_to_string("myapp.zn").unwrap();
+    let result = signer.verify_signature(&code, &signature);
+    result.print();
+}
+
+#[example]
+fn example_cli_usage() {
+    println(r#"
+# Create developer keys
+$ nova keygen --developer-id "myname" --email "me@email.com"
+🔑 Keys generated:
+   Private: ~/.nova/keys/private_key.enc
+   Public: ~/.nova/keys/public_key.pem
+
+# Sign a file
+$ nova sign myapp.zn
+✅ Code signed: myapp.zn
+   Signature: myapp.zn.sig
+
+# Sign entire project
+$ nova sign --project ./myproject
+📦 Signing project...
+✅ Signed 15 files
+   Manifest: ./myproject/.nova-signature
+
+# Verify signature
+$ nova verify myapp.zn
+✅ Signature VALID
+   Developer: myname
+   Signed: 2026-02-10T10:30:00Z
+
+# Verify project
+$ nova verify --project ./myproject
+✅ Project signature VALID
+   15/15 files verified
+    "#);
+}

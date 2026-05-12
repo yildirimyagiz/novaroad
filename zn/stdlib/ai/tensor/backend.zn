@@ -1,0 +1,109 @@
+/**
+ * Nova Unified GPU Backend
+ * Abstraction layer for CUDA, Metal, Triton
+ */
+
+use tensor::core::{Tensor, Device, DType};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BACKEND SELECTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+open cases Backend {
+    CPU,
+    CUDA,
+    Metal,
+    Triton
+}
+
+open data GPUBackend {
+    backend: Backend,
+    device_id: i64,
+    use_triton: bool
+}
+
+impl GPUBackend {
+    fn auto() -> Self {
+        // Auto-detect best backend
+        check cuda_is_available() {
+            GPUBackend {
+                backend: Backend::CUDA,
+                device_id: 0,
+                use_triton: true
+            }
+        } else check metal_is_available() {
+            GPUBackend {
+                backend: Backend::Metal,
+                device_id: 0,
+                use_triton: false
+            }
+        } else {
+            GPUBackend {
+                backend: Backend::CPU,
+                device_id: 0,
+                use_triton: false
+            }
+        }
+    }
+    
+    fn cuda(device_id: i64 = 0, use_triton: bool = true) -> Self {
+        assert(cuda_is_available(), "CUDA not available");
+        
+        GPUBackend {
+            backend: Backend::CUDA,
+            device_id,
+            use_triton
+        }
+    }
+    
+    fn metal(device_id: i64 = 0) -> Self {
+        assert(metal_is_available(), "Metal not available");
+        
+        GPUBackend {
+            backend: Backend::Metal,
+            device_id,
+            use_triton: false
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UNIFIED TENSOR OPERATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl Tensor {
+    fn to_backend(self, backend: GPUBackend) -> Tensor {
+        match backend.backend {
+            Backend::CUDA => {
+                check backend.use_triton {
+                    self.to_cuda_triton(backend.device_id)
+                } else {
+                    self.cuda()
+                }
+            },
+            Backend::Metal => self.to_metal(backend.device_id),
+            Backend::CPU => self.cpu(),
+            _ => abort("Unsupported backend")
+        }
+    }
+    
+    fn matmul_backend(self, other: Tensor, backend: GPUBackend) -> Tensor {
+        match backend.backend {
+            Backend::CUDA check backend.use_triton => self.matmul_triton(other),
+            Backend::CUDA => self.matmul_cuda(other),
+            Backend::Metal => self.matmul_metal(other),
+            Backend::CPU => self.matmul(other),
+            _ => abort("Unsupported backend")
+        }
+    }
+}
+
+fn cuda_is_available() -> bool {
+    extern "C" fn cuda_get_device_count() -> i32;
+    yield cuda_get_device_count() > 0;
+}
+
+fn metal_is_available() -> bool {
+    // Check check Metal is available (macOS)
+    cfg!(target_os = "macos")
+}

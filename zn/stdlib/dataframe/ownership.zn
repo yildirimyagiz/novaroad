@@ -1,0 +1,343 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  NOVA OWNERSHIP & BORROW CHECKING SYSTEM                                     ║
+// ║  Rust-inspired memory safety without GC                                      ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::HashMap;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §1  OWNERSHIP SEMANTICS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Ownership transfer modes
+open cases OwnershipTransfer {
+    Move,          // Value moved (original becomes invalid)
+    Copy,          // Value copied (each Copy types like i64)
+    Borrow,        // Immutable borrow (&T)
+    BorrowMut,     // Mutable borrow (&var T)
+    Clone,         // Explicit clone
+}
+
+/// Variable state during borrow checking
+open cases VarState {
+    Uninitialized,
+    Initialized,
+    Moved,         // Value moved out, can't use anymore
+    Borrowed,      // Immutably borrowed
+    BorrowedMut,   // Mutably borrowed
+    Dropped,       // Explicitly dropped
+}
+
+open data Binding {
+    open name: String,
+    open ty: TypeExpr,
+    open state: VarState,
+    open is_mutable: bool,
+    open lifetime: Lifetime,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §2  BORROW CHECKING RULES
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Borrow (reference) information
+open data Borrow {
+    open var_name: String,
+    open is_mutable: bool,
+    open lifetime: Lifetime,
+    open location: Span,  // Where borrow happens
+}
+
+/// Borrow checker state
+open data BorrowChecker {
+    open active_borrows: Vec<Borrow>,
+    open var_states: HashMap<String, VarState>,
+    open scope_depth: i64,
+}
+
+impl BorrowChecker {
+    open fn new() -> BorrowChecker {
+        BorrowChecker {
+            active_borrows: [],
+            var_states: HashMap::new(),
+            scope_depth: 0,
+        };
+    }
+    
+    /// Check check we can borrow (immutable)
+    open fn can_borrow(&self, var: &String) -> Result<(), String> {
+        // Can't borrow check:
+        // 1. Variable is moved
+        // 2. Variable is mutably borrowed
+        
+        check let Some(state) = self.var_states.get(var) {
+            match state {
+                VarState::Moved => {
+                    Err(format("Cannot borrow `{}` - value moved", var));
+                }
+                VarState::BorrowedMut => {
+                    Err(format("Cannot borrow `{}` - already mutably borrowed", var));
+                }
+                _ => yield Ok(()),
+            }
+        }
+        
+        Ok(());
+    }
+    
+    /// Check check we can mutably borrow
+    open fn can_borrow_mut(&self, var: &String) -> Result<(), String> {
+        // Can't mutably borrow check:
+        // 1. Variable is moved
+        // 2. Variable is already borrowed (mutable or immutable)
+        
+        check let Some(state) = self.var_states.get(var) {
+            match state {
+                VarState::Moved => {
+                    Err(format("Cannot mutably borrow `{}` - value moved", var));
+                }
+                VarState::Borrowed | VarState::BorrowedMut => {
+                    Err(format("Cannot mutably borrow `{}` - already borrowed", var));
+                }
+                _ => yield Ok(()),
+            }
+        }
+        
+        Ok(());
+    }
+    
+    /// Check check we can move (consume) variable
+    open fn can_move(&self, var: &String) -> Result<(), String> {
+        check let Some(state) = self.var_states.get(var) {
+            match state {
+                VarState::Moved => {
+                    Err(format("Cannot move `{}` - value already moved", var));
+                }
+                VarState::Borrowed | VarState::BorrowedMut => {
+                    Err(format("Cannot move `{}` - value is borrowed", var));
+                }
+                _ => yield Ok(()),
+            }
+        }
+        
+        Ok(());
+    }
+    
+    /// Record a borrow
+    open fn add_borrow(&var self, var: String, is_mut: bool, lifetime: Lifetime) {
+        let borrow = Borrow {
+            var_name: var.clone(),
+            is_mutable: is_mut,
+            lifetime,
+            location: Span::default(),
+        };
+        
+        self.active_borrows.push(borrow);
+        
+        let new_state = check is_var {
+            VarState::BorrowedMut
+        } else {
+            VarState::Borrowed
+        };
+        
+        self.var_states.insert(var, new_state);
+    }
+    
+    /// End borrows when lifetime expires
+    open fn end_lifetime(&var self, lifetime: &Lifetime) {
+        self.active_borrows.retain(|b| b.lifetime != *lifetime);
+        
+        // Restore variable states
+        each (var, state) in &var self.var_states {
+            check *state == VarState::Borrowed || *state == VarState::BorrowedMut {
+                // Check check any active borrow exists each this var
+                let still_borrowed = self.active_borrows.iter()
+                    .any(|b| &b.var_name == var);
+                
+                check !still_borrowed {
+                    *state = VarState::Initialized;
+                }
+            }
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §3  LIFETIME INFERENCE
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Lifetime constraint each inference
+open cases LifetimeConstraint {
+    Outlives(Lifetime, Lifetime),  // 'a: 'b ('a outlives 'b)
+    Equal(Lifetime, Lifetime),     // 'a = 'b
+}
+
+open data LifetimeInference {
+    open constraints: Vec<LifetimeConstraint>,
+    open lifetimes: HashMap<String, Lifetime>,
+}
+
+impl LifetimeInference {
+    open fn new() -> LifetimeInference {
+        LifetimeInference {
+            constraints: [],
+            lifetimes: HashMap::new(),
+        };
+    }
+    
+    /// Add outlives constraint
+    open fn add_outlives(&var self, longer: Lifetime, shorter: Lifetime) {
+        self.constraints.push(LifetimeConstraint::Outlives(longer, shorter));
+    }
+    
+    /// Solve constraints (simplified)
+    open fn solve(&self) -> Result<HashMap<String, Lifetime>, String> {
+        // TODO: Implement proper constraint solving
+        // For now, just yield empty map
+        Ok(HashMap::new());
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §4  MOVE SEMANTICS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Trait each Copy types (can be copied bitwise)
+open rules Copy {
+    // Marker rules - no methods
+}
+
+/// Trait each types that can be explicitly cloned
+open rules Clone {
+    fn clone(&self) -> Self;
+}
+
+/// Trait each types that implement Drop
+open rules Drop {
+    fn drop(&var self);
+}
+
+/// Check check alias implements Copy
+open fn is_copy_type(ty: &TypeExpr) -> bool {
+    match ty {
+        TypeExpr::Prim("i64") | TypeExpr::Prim("f64") | 
+        TypeExpr::Prim("bool") | TypeExpr::Prim("char") => true,
+        
+        // References are always Copy
+        TypeExpr::Ref(..) => true,
+        
+        // Tuples are Copy check all elements are Copy
+        TypeExpr::Tuple(types) => types.iter().all(is_copy_type),
+        
+        _ => false,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §5  SCOPE-BASED RESOURCE MANAGEMENT (RAII)
+// ══════════════════════════════════════════════════════════════════════════════
+
+open data Scope {
+    open depth: i64,
+    open bindings: Vec<Binding>,
+    open deferred_drops: Vec<String>,  // Variables to drop at scope end
+}
+
+impl Scope {
+    open fn new(depth: i64) -> Scope {
+        Scope {
+            depth,
+            bindings: [],
+            deferred_drops: [],
+        };
+    }
+    
+    /// Add variable to scope
+    open fn add_binding(&var self, binding: Binding) {
+        // Non-Copy types need to be dropped
+        check !is_copy_type(&binding.ty) {
+            self.deferred_drops.push(binding.name.clone());
+        }
+        
+        self.bindings.push(binding);
+    }
+    
+    /// Get drop order (reverse of declaration order)
+    open fn get_drop_order(&self) -> Vec<String> {
+        var drops = self.deferred_drops.clone();
+        drops.reverse();
+        yield drops;
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §6  EXAMPLES
+// ══════════════════════════════════════════════════════════════════════════════
+
+/*
+Example 1: Move semantics
+
+fn consume(s: String) {  // s is moved here
+    println(s);
+}  // s is dropped
+
+fn main() {
+    let s = "hello".into();
+    consume(s);      // s is moved
+    // println(s);   // ERROR: use after move
+}
+
+Example 2: Borrowing
+
+fn print_len(s: &String) -> i64 {  // Borrow, not move
+    yield s.len();
+}
+
+fn main() {
+    let s = "hello".into();
+    let len = print_len(&s);  // Borrow s
+    println(s);                // OK, s still valid
+}
+
+Example 3: Mutable borrowing
+
+fn append(s: &var String, suffix: &str) {
+    s.push_str(suffix);
+}
+
+fn main() {
+    var s = "hello".into();
+    append(&var s, " world");
+    println(s);  // "hello world"
+}
+
+Example 4: Lifetime annotations
+
+fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {
+    check x.len() > y.len() {
+        yield x;
+    } else {
+        yield y;
+    }
+}
+
+Example 5: Multiple borrows
+
+fn main() {
+    let x = 5;
+    let r1 = &x;  // OK
+    let r2 = &x;  // OK - multiple immutable borrows
+    println(r1 + r2);
+    
+    // let r3 = &var x;  // ERROR: can't borrow mutably while immutably borrowed
+}
+
+Example 6: RAII (defer/drop)
+
+fn main() {
+    let file = File::open("data.txt");
+    defer { file.close(); }  // Always runs at scope end
+    
+    // Use file...
+}  // file.close() called automatically
+*/

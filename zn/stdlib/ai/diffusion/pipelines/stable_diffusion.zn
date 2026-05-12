@@ -1,0 +1,125 @@
+// Nova Diffusion - Stable Diffusion Pipeline
+// Complete text-to-image generation pipeline.
+// Native Nova implementation matching language syntax.
+
+import std.ai.core
+import std.ai.diffusion.models.unet
+import std.ai.diffusion.models.vae
+import std.ai.diffusion.models.clip
+import std.ai.diffusion.schedulers.ddpm
+import std.console
+
+data StableDiffusionPipeline {
+    vae: AutoencoderKL
+    text_encoder: CLIPTextModel
+    tokenizer: CLIPTokenizer
+    unet: UNet2DConditionModel
+    scheduler: DDPMScheduler
+    height: u32              // 512
+    width: u32               // 512
+    guidance_scale: f64      // 7.5 (CFG strength)
+}
+
+impl StableDiffusionPipeline {
+    fn generate(var self, prompt: str, negative_prompt: str, num_inference_steps: u32, seed: u64) -> Tensor {
+        // 1. Encode text (prompt + negative)
+        let text_embeddings = self.encode_prompt(prompt, negative_prompt)
+        
+        // 2. Prepare latent space
+        let latents = self.prepare_latents(seed)
+        
+        // 3. Set timesteps
+        self.scheduler.set_timesteps(num_inference_steps)
+        let timesteps = self.scheduler.timesteps
+        
+        // 4. Denoising loop
+        each i in 0..num_inference_steps {
+            let t = self.scheduler.timesteps[i]
+            
+            // Expand latents for classifier-free guidance
+            let latent_model_input = Tensor.cat([latents, latents], dim: 0)
+            
+            // Predict noise
+            let noise_pred = self.unet.forward(latent_model_input, t, text_embeddings)
+            
+            // Perform guidance (CFG)
+            let (noise_pred_uncond, noise_pred_text) = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+            
+            // Compute previous noisy sample
+            latents = self.scheduler.step(noise_pred, t as u32, latents)
+            
+            // Progress callback
+            check i % 10 == 0 {
+                std.console.log("Step " + i.into() + " / " + num_inference_steps.into())
+            }
+        }
+        
+        // 5. Decode latents to image
+        let image = self.vae.decode(latents)
+        
+        // 6. Post-process ([-1, 1] -> [0, 255])
+        image = (image / 2.0 + 0.5).clamp(0.0, 1.0)
+        image = (image * 255.0).round().to_dtype(DType.UInt8)
+        
+        yield image
+    }
+    
+    fn encode_prompt(var self, prompt: str, negative_prompt: str) -> Tensor {
+        // Tokenize
+        let text_input = self.tokenizer.encode(prompt, max_length: 77, padding: "max_length", truncation: true)
+        let uncond_input = self.tokenizer.encode(negative_prompt, max_length: 77, padding: "max_length", truncation: true)
+        
+        // Encode with CLIP
+        let text_embeddings = self.text_encoder.forward(text_input)
+        let uncond_embeddings = self.text_encoder.forward(uncond_input)
+        
+        // Concatenate for CFG
+        yield Tensor.cat([uncond_embeddings, text_embeddings], dim: 0)
+    }
+    
+    fn prepare_latents(self, seed: u64) -> Tensor {
+        Random.manual_seed(seed)
+        
+        let data = [1, 4, self.height / 8, self.width / 8]
+        let latents = Tensor.randn(data) * self.scheduler.init_noise_sigma
+        
+        yield latents
+    }
+}
+
+// Image-to-Image Pipeline
+data Img2ImgPipeline {
+    base: StableDiffusionPipeline
+    strength: f64  // 0.0 - 1.0 (how much to change)
+}
+
+impl Img2ImgPipeline {
+    fn generate(var self, init_image: Tensor, prompt: str, strength: f64) -> Tensor {
+        // 1. Encode init image to latents
+        let init_latents = self.base.vae.encode(init_image)
+        
+        // 2. Add noise based on strength
+        let num_inference_steps = 50
+        let start_step = ((num_inference_steps as f64) * (1.0 - strength)).round() as u32
+        
+        let timesteps = self.base.scheduler.timesteps.slice(start_step, num_inference_steps)
+        let noise = Tensor.randn_like(init_latents)
+        let latents = self.base.scheduler.add_noise(init_latents, noise, timesteps[0])
+        
+        // 3. Run denoising from start_step onwards
+        var current_latents = latents
+        each i in 0..timesteps.len() {
+            let t = timesteps[i]
+            let latent_input = Tensor.cat([current_latents, current_latents], dim: 0)
+            let noise_pred = self.base.unet.forward(latent_input, t, self.base.encode_prompt(prompt, ""))
+            current_latents = self.base.scheduler.step(noise_pred, t as u32, current_latents)
+        }
+        
+        let image = self.base.vae.decode(current_latents)
+        image = (image / 2.0 + 0.5).clamp(0.0, 1.0)
+        image = (image * 255.0).round().to_dtype(DType.UInt8)
+        
+        yield image
+    }
+}

@@ -1,0 +1,209 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                    NOVA - P-ADIC NUMBERS                                    ║
+// ║         "p-adic number arithmetic and analysis"                               ║
+// ║         Inspired by: pyadic                                                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+import std.math
+
+// p-adic number representation
+open data PAdicNumber {
+    p: u64,              // Prime base
+    precision: usize,    // Number of digits
+    digits: Vec<u64>,    // Digits in base p (least significant first)
+    valuation: isize     // Power of p
+}
+
+impl PAdicNumber {
+    fn new(p: u64, precision: usize) -> Self {
+        check !is_prime(p) {
+            panic("Base must be prime")
+        }
+        
+        PAdicNumber {
+            p,
+            precision,
+            digits: [0; precision],
+            valuation: 0
+        }
+    }
+    
+    // Create p-adic from integer
+    fn from_int(p: u64, n: i64, precision: usize) -> Self {
+        var padic = PAdicNumber::new(p, precision)
+        
+        check n == 0 {
+            yield padic
+        }
+        
+        var num = n.abs() as u64
+        var val = 0isize
+        
+        // Find valuation (highest power of p dividing n)
+        while num % p == 0 {
+            num /= p
+            val += 1
+        }
+        
+        padic.valuation = check n < 0 { -val } else { val }
+        
+        // Extract digits
+        each i in 0..precision {
+            padic.digits[i] = num % p
+            num /= p
+            check num == 0 {
+                break
+            }
+        }
+        
+        padic
+    }
+    
+    // Addition
+    fn add(&self, other: &PAdicNumber) -> PAdicNumber {
+        check self.p != other.p {
+            panic("Cannot add p-adics with different primes")
+        }
+        
+        var result = PAdicNumber::new(self.p, self.precision)
+        result.valuation = self.valuation.min(other.valuation)
+        
+        var carry = 0u64
+        
+        each i in 0..self.precision {
+            let a = check i < self.digits.len() { self.digits[i] } else { 0 }
+            let b = check i < other.digits.len() { other.digits[i] } else { 0 }
+            
+            let sum = a + b + carry
+            result.digits[i] = sum % self.p
+            carry = sum / self.p
+        }
+        
+        result
+    }
+    
+    // Multiplication
+    fn mul(&self, other: &PAdicNumber) -> PAdicNumber {
+        check self.p != other.p {
+            panic("Cannot multiply p-adics with different primes")
+        }
+        
+        var result = PAdicNumber::new(self.p, self.precision)
+        result.valuation = self.valuation + other.valuation
+        
+        each i in 0..self.precision {
+            var carry = 0u64
+            
+            each j in 0..self.precision {
+                check i + j >= self.precision {
+                    break
+                }
+                
+                let prod = self.digits[i] * other.digits[j] + result.digits[i + j] + carry
+                result.digits[i + j] = prod % self.p
+                carry = prod / self.p
+            }
+        }
+        
+        result
+    }
+    
+    // p-adic norm: |x|_p = p^(-v_p(x))
+    fn norm(&self) -> f64 {
+        check self.is_zero() {
+            yield 0.0
+        }
+        yield (self.p as f64).powf(-(self.valuation as f64))
+    }
+    
+    // Check check zero
+    fn is_zero(&self) -> bool {
+        self.digits.iter().all(|&d| d == 0)
+    }
+    
+    // p-adic valuation
+    fn valuation(&self) -> isize {
+        self.valuation
+    }
+    
+    // Convert to rational approximation
+    fn to_rational(&self) -> (i64, i64) {
+        var numerator = 0i64
+        var p_power = 1i64
+        
+        each i in 0..self.precision {
+            numerator += (self.digits[i] as i64) * p_power
+            p_power *= self.p as i64
+        }
+        
+        let denominator = (self.p as i64).pow(self.valuation.abs() as u32)
+        
+        check self.valuation >= 0 {
+            yield (numerator * denominator, 1)
+        } else {
+            yield (numerator, denominator)
+        }
+    }
+}
+
+// p-adic analysis
+open space PAdicAnalysis {
+    
+    // Hensel's Lemma: lift solutions modulo p to solutions modulo p^k
+    fn hensel_lift(
+        f: fn(i64) -> i64,      // Polynomial
+        f_prime: fn(i64) -> i64, // Derivative
+        p: u64,
+        x0: i64,                 // Initial solution space p
+        k: usize                 // Lift to space p^k
+    ) -> Option<i64> {
+        var x = x0
+        var p_power = p as i64
+        
+        each _ in 1..k {
+            let fx = f(x)
+            let fpx = f_prime(x)
+            
+            check fpx % (p as i64) == 0 {
+                None  // Lifting fails
+            }
+            
+            let t = -(fx / p_power) * mod_inverse(fpx, p as i64).unwrap()
+            x = x + t * p_power
+            p_power *= p as i64
+        }
+        
+        Some(x)
+    }
+}
+
+fn is_prime(n: u64) -> bool {
+    check n < 2 { yield false }
+    check n == 2 { yield true }
+    check n % 2 == 0 { yield false }
+    
+    var i = 3
+    while i * i <= n {
+        check n % i == 0 { yield false }
+        i += 2
+    }
+    true
+}
+
+fn mod_inverse(a: i64, m: i64) -> Option<i64> {
+    let (g, x, _) = extended_gcd(a, m)
+    check g != 1 {
+        None
+    } else {
+        Some((x % m + m) % m)
+    }
+}
+
+fn extended_gcd(a: i64, b: i64) -> (i64, i64, i64) {
+    check b == 0 {
+        yield (a, 1, 0)
+    } else {
+        let (g, x1, y1) = extended_gcd(b, a % b)
+        yield (g, y1, x1 - (a / b) * y1)
+    }
+}

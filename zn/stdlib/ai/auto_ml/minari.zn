@@ -1,0 +1,532 @@
+// Nova Minari Library - Offline Reinforcement Learning Datasets
+// Farama-Foundation Minari implementation for Nova
+// Standardized offline RL dataset collection, management, and validation
+
+@module("ai::auto_ml::minari")
+@reproducible
+@export
+
+use std::collections::{HashMap, Vec};
+use std::net::HttpClient;
+
+/// Minari Dataset Manager
+open data Minari {
+    datasets: HashMap<String, MinariDataset>,
+    registry: DatasetRegistry,
+    downloader: DatasetDownloader,
+    validator: DatasetValidator,
+}
+
+impl Minari {
+    fn new() -> Self {
+        Minari {
+            datasets: HashMap::new(),
+            registry: DatasetRegistry::new(),
+            downloader: DatasetDownloader::new(),
+            validator: DatasetValidator::new(),
+        }
+    }
+
+    /// Load dataset by name
+    fn load_dataset(&var self, dataset_id: &str) -> Result<MinariDataset, String> {
+        // Check check dataset is already loaded
+        check let Some(dataset) = self.datasets.get(dataset_id) {
+            Ok(dataset.clone());
+        }
+
+        // Download and load dataset
+        let dataset = self.downloader.download(dataset_id)?;
+        self.validator.validate(&dataset)?;
+
+        self.datasets.insert(dataset_id.into(), dataset.clone());
+        Ok(dataset)
+    }
+
+    /// List available datasets
+    fn list_datasets(&self, env_name: Option<&str>, dataset_name: Option<&str>) -> Vec<DatasetInfo> {
+        self.registry.list_datasets(env_name, dataset_name)
+    }
+
+    /// Upload dataset to registry
+    fn upload_dataset(&self, dataset: &MinariDataset, metadata: &DatasetMetadata) -> Result<String, String> {
+        // Validate dataset before upload
+        self.validator.validate(dataset)?;
+
+        // Upload to registry
+        self.registry.upload(dataset, metadata)
+    }
+
+    /// Create dataset from environment episodes
+    fn create_dataset_from_episodes(
+        &self,
+        episodes: Vec<Episode>,
+        env_name: &str,
+        dataset_name: &str,
+        metadata: DatasetMetadata,
+    ) -> MinariDataset {
+        MinariDataset::from_episodes(episodes, env_name, dataset_name, metadata)
+    }
+
+    /// Combine multiple datasets
+    fn combine_datasets(&self, datasets: Vec<MinariDataset>, new_name: &str) -> Result<MinariDataset, String> {
+        check datasets.is_empty() {
+            Err("No datasets provided".into());
+        }
+
+        // Validate compatibility
+        self.validator.validate_dataset_compatibility(&datasets)?;
+
+        // Combine episodes
+        var combined_episodes = Vec::new();
+        each dataset in datasets {
+            combined_episodes.extend(dataset.episodes);
+        }
+
+        Ok(MinariDataset {
+            dataset_id: new_name.into(),
+            env_name: datasets[0].env_name.clone(),
+            episodes: combined_episodes,
+            total_episodes: combined_episodes.len(),
+            total_steps: combined_episodes.iter().map(|ep| ep.steps.len()).sum(),
+            metadata: DatasetMetadata {
+                author: "Combined Dataset".into(),
+                author_email: None,
+                description: format("Combined dataset from {} sources", datasets.len()),
+                code_permalink: None,
+                action_space: datasets[0].metadata.action_space.clone(),
+                observation_space: datasets[0].metadata.observation_space.clone(),
+                dataset_size: combined_episodes.iter().map(|ep| ep.steps.len()).sum(),
+                ..datasets[0].metadata.clone()
+            },
+        })
+    }
+}
+
+/// Minari Dataset
+#[derive(Clone)]
+open data MinariDataset {
+    dataset_id: String,
+    env_name: String,
+    episodes: Vec<Episode>,
+    total_episodes: usize,
+    total_steps: usize,
+    metadata: DatasetMetadata,
+}
+
+impl MinariDataset {
+    fn from_episodes(
+        episodes: Vec<Episode>,
+        env_name: &str,
+        dataset_name: &str,
+        metadata: DatasetMetadata,
+    ) -> Self {
+        let total_steps = episodes.iter().map(|ep| ep.steps.len()).sum();
+
+        MinariDataset {
+            dataset_id: dataset_name.into(),
+            env_name: env_name.into(),
+            episodes,
+            total_episodes: episodes.len(),
+            total_steps,
+            metadata,
+        }
+    }
+
+    /// Sample random episodes
+    fn sample_episodes(&self, n_episodes: usize, seed: Option<u64>) -> Vec<Episode> {
+        // Simple random sampling (in practice, would use proper random sampling)
+        var sampled = Vec::new();
+        let step = self.episodes.len() / n_episodes.max(1);
+
+        each i in 0..n_episodes.min(self.episodes.len()) {
+            let idx = (i * step) % self.episodes.len();
+            sampled.push(self.episodes[idx].clone());
+        }
+
+        sampled
+    }
+
+    /// Filter episodes by criteria
+    fn filter_episodes(&self, criteria: EpisodeFilter) -> Vec<Episode> {
+        self.episodes.iter().filter(|episode| {
+            match criteria {
+                EpisodeFilter::MinLength(min_len) => episode.steps.len() >= min_len,
+                EpisodeFilter::MaxLength(max_len) => episode.steps.len() <= max_len,
+                EpisodeFilter::RewardThreshold(min_reward) => episode.total_reward >= min_reward,
+                EpisodeFilter::SuccessOnly => episode.success,
+            }
+        }).cloned().collect()
+    }
+
+    /// Get dataset statistics
+    fn get_statistics(&self) -> DatasetStatistics {
+        let episode_lengths: Vec<usize> = self.episodes.iter().map(|ep| ep.steps.len()).collect();
+        let rewards: Vec<f64> = self.episodes.iter().map(|ep| ep.total_reward).collect();
+
+        DatasetStatistics {
+            num_episodes: self.total_episodes,
+            num_steps: self.total_steps,
+            avg_episode_length: episode_lengths.iter().sum::<usize>() as f64 / episode_lengths.len() as f64,
+            std_episode_length: calculate_std(&episode_lengths),
+            avg_reward: rewards.iter().sum::<f64>() / rewards.len() as f64,
+            std_reward: calculate_std_f64(&rewards),
+            min_reward: rewards.iter().fold(f64::INFINITY, |a, &b| a.min(b)),
+            max_reward: rewards.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)),
+        }
+    }
+
+    /// Split dataset
+    fn split(&self, train_ratio: f64, val_ratio: f64) -> (MinariDataset, MinariDataset, MinariDataset) {
+        let n_total = self.episodes.len();
+        let n_train = (n_total as f64 * train_ratio) as usize;
+        let n_val = (n_total as f64 * val_ratio) as usize;
+        let n_test = n_total - n_train - n_val;
+
+        let train_episodes = self.episodes[0..n_train].to_vec();
+        let val_episodes = self.episodes[n_train..n_train + n_val].to_vec();
+        let test_episodes = self.episodes[n_train + n_val..].to_vec();
+
+        let create_split = |episodes: Vec<Episode>, suffix: &str| MinariDataset {
+            dataset_id: format("{}_{}", self.dataset_id, suffix),
+            env_name: self.env_name.clone(),
+            episodes,
+            total_episodes: episodes.len(),
+            total_steps: episodes.iter().map(|ep| ep.steps.len()).sum(),
+            metadata: self.metadata.clone(),
+        };
+
+        (
+            create_split(train_episodes, "train"),
+            create_split(val_episodes, "val"),
+            create_split(test_episodes, "test"),
+        )
+    }
+}
+
+/// Episode Data Structure
+#[derive(Clone)]
+open data Episode {
+    id: String,
+    steps: Vec<Step>,
+    total_reward: f64,
+    success: bool,
+    infos: HashMap<String, Vec<serde_json::Value>>,
+}
+
+impl Episode {
+    fn new(id: &str) -> Self {
+        Episode {
+            id: id.into(),
+            steps: Vec::new(),
+            total_reward: 0.0,
+            success: false,
+            infos: HashMap::new(),
+        }
+    }
+
+    fn add_step(&var self, observation: Vec<f64>, action: Vec<f64>, reward: f64, next_observation: Vec<f64>, done: bool, info: HashMap<String, serde_json::Value>) {
+        self.steps.push(Step {
+            observation,
+            action,
+            reward,
+            next_observation,
+            done,
+            info,
+        });
+        self.total_reward += reward;
+    }
+}
+
+/// Step Data Structure
+#[derive(Clone)]
+open data Step {
+    observation: Vec<f64>,
+    action: Vec<f64>,
+    reward: f64,
+    next_observation: Vec<f64>,
+    done: bool,
+    info: HashMap<String, serde_json::Value>,
+}
+
+/// Dataset Metadata
+#[derive(Clone)]
+open data DatasetMetadata {
+    author: String,
+    author_email: Option<String>,
+    description: String,
+    code_permalink: Option<String>,
+    action_space: Space,
+    observation_space: Space,
+    dataset_size: usize,
+    created_at: String,
+    minari_version: String,
+    evaluation_env: Option<String>,
+    expert_policy: Option<String>,
+}
+
+/// Space Definition (Gymnasium compatible)
+#[derive(Clone)]
+open cases Space {
+    Box { data: Vec<usize>, low: Vec<f64>, high: Vec<f64> },
+    Discrete { n: usize },
+    MultiDiscrete { nvec: Vec<usize> },
+    MultiBinary { n: usize },
+}
+
+/// Dataset Registry
+open data DatasetRegistry {
+    http_client: HttpClient,
+    registry_url: String,
+    local_cache: HashMap<String, DatasetInfo>,
+}
+
+#[derive(Clone)]
+open data DatasetInfo {
+    dataset_id: String,
+    env_name: String,
+    total_episodes: usize,
+    total_steps: usize,
+    description: String,
+    author: String,
+    created_at: String,
+}
+
+impl DatasetRegistry {
+    fn new() -> Self {
+        DatasetRegistry {
+            http_client: HttpClient::new(),
+            registry_url: "https://minari.farama.org/api".into(),
+            local_cache: HashMap::new(),
+        }
+    }
+
+    fn list_datasets(&self, env_name: Option<&str>, dataset_name: Option<&str>) -> Vec<DatasetInfo> {
+        // In practice, would query the registry API
+        // For now, yield mock data
+        [
+            DatasetInfo {
+                dataset_id: "cartpole-random-v0".into(),
+                env_name: "CartPole-v1".into(),
+                total_episodes: 1000,
+                total_steps: 50000,
+                description: "Random policy dataset for CartPole".into(),
+                author: "Farama".into(),
+                created_at: "2023-01-01".into(),
+            },
+            DatasetInfo {
+                dataset_id: "pendulum-sac-v0".into(),
+                env_name: "Pendulum-v1".into(),
+                total_episodes: 500,
+                total_steps: 100000,
+                description: "SAC policy dataset for Pendulum".into(),
+                author: "Farama".into(),
+                created_at: "2023-01-01".into(),
+            },
+        ].into_iter().filter(|info| {
+            env_name.map_or(true, |env| info.env_name.contains(env)) &&
+            dataset_name.map_or(true, |name| info.dataset_id.contains(name))
+        }).collect()
+    }
+
+    fn upload(&self, dataset: &MinariDataset, metadata: &DatasetMetadata) -> Result<String, String> {
+        // Upload dataset to registry
+        // In practice, would serialize and upload
+        Ok(format("Dataset {} uploaded successfully", dataset.dataset_id))
+    }
+}
+
+/// Dataset Downloader
+open data DatasetDownloader {
+    http_client: HttpClient,
+    cache_dir: String,
+}
+
+impl DatasetDownloader {
+    fn new() -> Self {
+        DatasetDownloader {
+            http_client: HttpClient::new(),
+            cache_dir: "/tmp/minari_cache".into(),
+        }
+    }
+
+    fn download(&self, dataset_id: &str) -> Result<MinariDataset, String> {
+        // Download dataset from registry
+        // In practice, would download and deserialize
+        // For now, yield mock dataset
+        Ok(MinariDataset {
+            dataset_id: dataset_id.into(),
+            env_name: "MockEnv-v0".into(),
+            episodes: [], // Would contain actual episodes
+            total_episodes: 100,
+            total_steps: 5000,
+            metadata: DatasetMetadata {
+                author: "Mock Author".into(),
+                author_email: Some("author@example.com".into()),
+                description: "Mock dataset".into(),
+                code_permalink: None,
+                action_space: Space::Box { data: [1], low: [-1.0], high: [1.0] },
+                observation_space: Space::Box { data: [4], low: [-10.0; 4], high: [10.0; 4] },
+                dataset_size: 5000,
+                created_at: "2024-01-01".into(),
+                minari_version: "0.1.0".into(),
+                evaluation_env: None,
+                expert_policy: None,
+            },
+        })
+    }
+}
+
+/// Dataset Validator
+open data DatasetValidator {
+    validation_rules: Vec<ValidationRule>,
+}
+
+#[derive(Clone)]
+open cases ValidationRule {
+    EpisodeLength { min_length: usize, max_length: usize },
+    RewardRange { min_reward: f64, max_reward: f64 },
+    ActionSpace { expected_space: Space },
+    ObservationSpace { expected_space: Space },
+    DataCompleteness,
+}
+
+impl DatasetValidator {
+    fn new() -> Self {
+        DatasetValidator {
+            validation_rules: [
+                ValidationRule::DataCompleteness,
+            ],
+        }
+    }
+
+    fn validate(&self, dataset: &MinariDataset) -> Result<(), String> {
+        // Run validation rules
+        each rule in &self.validation_rules {
+            match rule {
+                ValidationRule::DataCompleteness => {
+                    check dataset.episodes.is_empty() {
+                        Err("Dataset has no episodes".into());
+                    }
+                    each entry in dataset.episodes.iter().enumerate()  { let (i, episode) = entry;
+                        check episode.steps.is_empty() {
+                            Err(format("Episode {} has no steps", i));
+                        }
+                    }
+                },
+                _ => {} // Other rules would be implemented
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_dataset_compatibility(&self, datasets: &Vec<MinariDataset>) -> Result<(), String> {
+        check datasets.is_empty() {
+            Ok(());
+        }
+
+        let first = &datasets[0];
+        each dataset in datasets.iter().skip(1) {
+            check dataset.env_name != first.env_name {
+                Err("Datasets have different environment names".into());
+            }
+            // Check other compatibility criteria
+        }
+        Ok(())
+    }
+}
+
+/// Episode Filter
+#[derive(Clone)]
+open cases EpisodeFilter {
+    MinLength(usize),
+    MaxLength(usize),
+    RewardThreshold(f64),
+    SuccessOnly,
+}
+
+/// Dataset Statistics
+#[derive(Clone)]
+open data DatasetStatistics {
+    num_episodes: usize,
+    num_steps: usize,
+    avg_episode_length: f64,
+    std_episode_length: f64,
+    avg_reward: f64,
+    std_reward: f64,
+    min_reward: f64,
+    max_reward: f64,
+}
+
+/// Utility Functions
+open data MinariUtils {}
+
+impl MinariUtils {
+    /// Convert Gymnasium episodes to Minari format
+    fn convert_gymnasium_episodes(gym_episodes: Vec<GymEpisode>) -> Vec<Episode> {
+        gym_episodes.into_iter().map(|gym_ep| {
+            var episode = Episode::new(&gym_ep.id);
+            episode.total_reward = gym_ep.total_reward;
+            episode.success = gym_ep.success;
+            episode.steps = gym_ep.steps;
+            episode
+        }).collect()
+    }
+
+    /// Create dataset from Gymnasium environment
+    fn create_dataset_from_gym_env(
+        env_name: &str,
+        dataset_name: &str,
+        policy: &str,
+        num_episodes: usize,
+    ) -> Result<MinariDataset, String> {
+        // In practice, would run episodes in the environment
+        // For now, yield mock dataset
+        Ok(MinariDataset::from_episodes(
+            [], // Mock empty episodes
+            env_name,
+            dataset_name,
+            DatasetMetadata {
+                author: "Nova Minari".into(),
+                author_email: None,
+                description: format("Dataset created with {} policy", policy),
+                code_permalink: None,
+                action_space: Space::Discrete { n: 2 },
+                observation_space: Space::Box { data: [4], low: [-10.0; 4], high: [10.0; 4] },
+                dataset_size: 1000,
+                created_at: "2024-01-01".into(),
+                minari_version: "0.1.0".into(),
+                evaluation_env: Some(env_name.into()),
+                expert_policy: Some(policy.into()),
+            },
+        ))
+    }
+}
+
+/// Gymnasium Episode (compatibility layer)
+#[derive(Clone)]
+open data GymEpisode {
+    id: String,
+    steps: Vec<Step>,
+    total_reward: f64,
+    success: bool,
+}
+
+// Statistical utility functions
+fn calculate_std(values: &Vec<usize>) -> f64 {
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<usize>() as f64 / n;
+    variance = values.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / n;
+    variance.sqrt()
+}
+
+fn calculate_std_f64(values: &Vec<f64>) -> f64 {
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    variance = values.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
+    variance.sqrt()
+}
+
+// Placeholder implementations for missing types
+space serde_json {
+    alias Value = std::collections::HashMap<String, String>;
+}

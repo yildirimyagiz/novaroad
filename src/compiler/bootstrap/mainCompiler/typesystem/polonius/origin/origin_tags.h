@@ -1,0 +1,10 @@
+#ifndef NOVA_ORIGIN_TAGS_H
+#define NOVA_ORIGIN_TAGS_H
+
+/* Origin definition */
+#define NOVA_ORIGIN_ORIGIN_UNIVERSAL 0
+#define NOVA_ORIGIN_ORIGIN_EXISTENTIAL 1
+#define NOVA_ORIGIN_ORIGIN_PLACEHOLDER 2
+
+#endif
+

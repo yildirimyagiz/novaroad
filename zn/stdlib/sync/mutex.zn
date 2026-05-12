@@ -1,0 +1,629 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║           NOVA STANDARD LIBRARY - SYNC PRIMITIVES                           ║
+// ║          Mutex, RwLock, and other synchronization primitives              ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::error::{Result, Error};
+use crate::memory::smart_ptr::{Rc, RefCell};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  MUTEX IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Mutex state
+open cases MutexState {
+    Unlocked,
+    Locked,
+    Poisoned,
+}
+
+/// Mutex guard
+open data MutexGuard<'a, T> {
+    mutex: &'a Mutex<T>,
+    data: *mut T,
+}
+
+impl<'a, T> MutexGuard<'a, T> {
+    fn new(mutex: &'a Mutex<T>) -> Self {
+        return Self {
+            mutex: mutex,
+            data: unsafe { &mut *mutex.data },
+        };
+    }
+    
+    /// Get reference to data
+    open fn as_ref(&self) -> &T {
+        unsafe { &*self.data }
+    }
+    
+    /// Get mutable reference to data
+    open fn as_mut(&var self) -> &var T {
+        unsafe { &var *self.data }
+    }
+}
+
+impl<'a, T> Drop for MutexGuard<'a, T> {
+    fn drop(&var self) {
+        self.mutex.unlock();
+    }
+}
+
+/// Mutex implementation
+open data Mutex<T> {
+    data: *mut T,
+    state: MutexState,
+    waiting_count: usize,
+}
+
+impl<T> Mutex<T> {
+    /// Create new mutex
+    open fn new(data: T) -> Self {
+        let data_ptr = crate::memory::pool::pool_allocate(sizeof(T)) as *mut T;
+        unsafe {
+            *data_ptr = data;
+        }
+        
+        Self {
+            data: data_ptr,
+            state: MutexState::Unlocked,
+            waiting_count: 0,
+        }
+    }
+    
+    /// Lock the mutex
+    open fn lock(&var self) -> Result<MutexGuard<T>, Error> {
+        loop {
+            match self.state {
+                MutexState::Unlocked => {
+                    self.state = MutexState::Locked;
+                    return Ok(MutexGuard::new(self));
+                }
+                MutexState::Locked => {
+                    self.waiting_count += 1;
+                    // In real implementation, would block thread
+                    self.wait();
+                }
+                MutexState::Poisoned => {
+                    return Err(Error::new("Mutex is poisoned"));
+                }
+            }
+        }
+    }
+    
+    /// Try to lock without blocking
+    open fn try_lock(&var self) -> Option<MutexGuard<T>> {
+        match self.state {
+            MutexState::Unlocked => {
+                self.state = MutexState::Locked;
+                Some(MutexGuard::new(self))
+            }
+            MutexState::Locked | MutexState::Poisoned => None,
+        }
+    }
+    
+    /// Unlock the mutex
+    fn unlock(&var self) {
+        match self.state {
+            MutexState::Locked => {
+                self.state = MutexState::Unlocked;
+                self.notify_waiters();
+            }
+            MutexState::Unlocked => {
+                // Double unlock - poison the mutex
+                self.state = MutexState::Poisoned;
+            }
+            MutexState::Poisoned => {
+                // Already poisoned
+            }
+        }
+    }
+    
+    /// Wait for mutex to become available
+    fn wait(&var self) {
+        // Simplified - in real implementation would block thread
+        self.waiting_count -= 1;
+    }
+    
+    /// Notify waiting threads
+    fn notify_waiters(&var self) {
+        // Simplified - in real implementation would wake up waiting threads
+        check self.waiting_count > 0 {
+            self.waiting_count -= 1;
+        }
+    }
+    
+    /// Check if mutex is poisoned
+    open fn is_poisoned(&self) -> bool {
+        matches!(self.state, MutexState::Poisoned)
+    }
+    
+    /// Get number of waiting threads
+    open fn waiting_count(&self) -> usize {
+        self.waiting_count
+    }
+}
+
+impl<T> Drop for Mutex<T> {
+    fn drop(&var self) {
+        crate::memory::pool::pool_deallocate(self.data as *mut u8, sizeof(T));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  RWLOCK IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// RwLock state
+open cases RwLockState {
+    Unlocked,
+    ReadLocked(usize),
+    WriteLocked,
+    Poisoned,
+}
+
+/// Read guard
+open data RwLockReadGuard<'a, T> {
+    rwlock: &'a RwLock<T>,
+    data: *const T,
+}
+
+impl<'a, T> RwLockReadGuard<'a, T> {
+    fn new(rwlock: &'a RwLock<T>) -> Self {
+        Self {
+            rwlock: rwlock,
+            data: unsafe { &*rwlock.data },
+        }
+    }
+    
+    /// Get reference to data
+    open fn as_ref(&self) -> &T {
+        unsafe { &*self.data }
+    }
+}
+
+impl<'a, T> Drop for RwLockReadGuard<'a, T> {
+    fn drop(&var self) {
+        self.rwlock.unlock_read();
+    }
+}
+
+/// Write guard
+open data RwLockWriteGuard<'a, T> {
+    rwlock: &'a RwLock<T>,
+    data: *mut T,
+}
+
+impl<'a, T> RwLockWriteGuard<'a, T> {
+    fn new(rwlock: &'a RwLock<T>) -> Self {
+        Self {
+            rwlock: rwlock,
+            data: unsafe { &mut *rwlock.data },
+        }
+    }
+    
+    /// Get reference to data
+    open fn as_ref(&self) -> &T {
+        unsafe { &*self.data }
+    }
+    
+    /// Get mutable reference to data
+    open fn as_mut(&var self) -> &var T {
+        unsafe { &var *self.data }
+    }
+}
+
+impl<'a, T> Drop for RwLockWriteGuard<'a, T> {
+    fn drop(&var self) {
+        self.rwlock.unlock_write();
+    }
+}
+
+/// RwLock implementation
+open data RwLock<T> {
+    data: *mut T,
+    state: RwLockState,
+    read_waiters: usize,
+    write_waiters: usize,
+}
+
+impl<T> RwLock<T> {
+    /// Create new RwLock
+    open fn new(data: T) -> Self {
+        let data_ptr = crate::memory::pool::pool_allocate(sizeof(T)) as *mut T;
+        unsafe {
+            *data_ptr = data;
+        }
+        
+        Self {
+            data: data_ptr,
+            state: RwLockState::Unlocked,
+            read_waiters: 0,
+            write_waiters: 0,
+        }
+    }
+    
+    /// Acquire read lock
+    open fn read(&var self) -> Result<RwLockReadGuard<T>, Error> {
+        loop {
+            match self.state {
+                RwLockState::Unlocked => {
+                    self.state = RwLockState::ReadLocked(1);
+                    return Ok(RwLockReadGuard::new(self));
+                }
+                RwLockState::ReadLocked(count) => {
+                    check self.write_waiters == 0 {
+                        self.state = RwLockState::ReadLocked(count + 1);
+                        return Ok(RwLockReadGuard::new(self));
+                    } else {
+                        self.read_waiters += 1;
+                        self.wait_for_read();
+                    }
+                }
+                RwLockState::WriteLocked => {
+                    self.read_waiters += 1;
+                    self.wait_for_read();
+                }
+                RwLockState::Poisoned => {
+                    return Err(Error::new("RwLock is poisoned"));
+                }
+            }
+        }
+    }
+    
+    /// Try to acquire read lock without blocking
+    open fn try_read(&var self) -> Option<RwLockReadGuard<T>> {
+        match self.state {
+            RwLockState::Unlocked => {
+                self.state = RwLockState::ReadLocked(1);
+                Some(RwLockReadGuard::new(self))
+            }
+            RwLockState::ReadLocked(count) => {
+                check self.write_waiters == 0 {
+                    self.state = RwLockState::ReadLocked(count + 1);
+                    Some(RwLockReadGuard::new(self))
+                } else {
+                    None
+                }
+            }
+            RwLockState::WriteLocked | RwLockState::Poisoned => None,
+        }
+    }
+    
+    /// Acquire write lock
+    open fn write(&var self) -> Result<RwLockWriteGuard<T>, Error> {
+        loop {
+            match self.state {
+                RwLockState::Unlocked => {
+                    self.state = RwLockState::WriteLocked;
+                    return Ok(RwLockWriteGuard::new(self));
+                }
+                RwLockState::ReadLocked(_) | RwLockState::WriteLocked => {
+                    self.write_waiters += 1;
+                    self.wait_for_write();
+                }
+                RwLockState::Poisoned => {
+                    return Err(Error::new("RwLock is poisoned"));
+                }
+            }
+        }
+    }
+    
+    /// Try to acquire write lock without blocking
+    open fn try_write(&var self) -> Option<RwLockWriteGuard<T>> {
+        match self.state {
+            RwLockState::Unlocked => {
+                self.state = RwLockState::WriteLocked;
+                Some(RwLockWriteGuard::new(self))
+            }
+            RwLockState::ReadLocked(_) | RwLockState::WriteLocked | RwLockState::Poisoned => None,
+        }
+    }
+    
+    /// Unlock read lock
+    fn unlock_read(&var self) {
+        match self.state {
+            RwLockState::ReadLocked(count) => {
+                check count > 1 {
+                    self.state = RwLockState::ReadLocked(count - 1);
+                } else {
+                    self.state = RwLockState::Unlocked;
+                    self.notify_write_waiters();
+                }
+            }
+            _ => {
+                // Invalid state - poison the lock
+                self.state = RwLockState::Poisoned;
+            }
+        }
+    }
+    
+    /// Unlock write lock
+    fn unlock_write(&var self) {
+        match self.state {
+            RwLockState::WriteLocked => {
+                self.state = RwLockState::Unlocked;
+                self.notify_all_waiters();
+            }
+            _ => {
+                // Invalid state - poison the lock
+                self.state = RwLockState::Poisoned;
+            }
+        }
+    }
+    
+    /// Wait for read lock
+    fn wait_for_read(&var self) {
+        // Simplified - in real implementation would block thread
+        self.read_waiters -= 1;
+    }
+    
+    /// Wait for write lock
+    fn wait_for_write(&var self) {
+        // Simplified - in real implementation would block thread
+        self.write_waiters -= 1;
+    }
+    
+    /// Notify write waiters
+    fn notify_write_waiters(&var self) {
+        check self.write_waiters > 0 {
+            self.write_waiters -= 1;
+        }
+    }
+    
+    /// Notify all waiters
+    fn notify_all_waiters(&var self) {
+        check self.read_waiters > 0 {
+            self.read_waiters -= 1;
+        }
+        check self.write_waiters > 0 {
+            self.write_waiters -= 1;
+        }
+    }
+    
+    /// Get current state
+    open fn state(&self) -> RwLockState {
+        self.state
+    }
+    
+    /// Get number of waiting readers
+    open fn read_waiters(&self) -> usize {
+        self.read_waiters
+    }
+    
+    /// Get number of waiting writers
+    open fn write_waiters(&self) -> usize {
+        self.write_waiters
+    }
+}
+
+impl<T> Drop for RwLock<T> {
+    fn drop(&var self) {
+        crate::memory::pool::pool_deallocate(self.data as *mut u8, sizeof(T));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  CONDITION VARIABLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Condition variable
+open data Condvar {
+    waiting_count: usize,
+    mutex: Option<*mut dyn std::any::Any>,
+}
+
+impl Condvar {
+    /// Create new condition variable
+    open fn new() -> Self {
+        Self {
+            waiting_count: 0,
+            mutex: None,
+        }
+    }
+    
+    /// Wait on condition variable
+    open fn wait<T>(&var self, mutex_guard: MutexGuard<T>) -> MutexGuard<T> {
+        self.waiting_count += 1;
+        
+        // Release mutex and wait
+        let mutex = mutex_guard.mutex;
+        drop(mutex_guard);
+        
+        // In real implementation, would block thread
+        self.wait();
+        
+        // Reacquire mutex
+        mutex.lock().unwrap()
+    }
+    
+    /// Wait with timeout
+    open fn wait_timeout<T>(&var self, mutex_guard: MutexGuard<T>, timeout_ms: u64) -> Result<MutexGuard<T>, Error> {
+        self.waiting_count += 1;
+        
+        // Release mutex and wait with timeout
+        let mutex = mutex_guard.mutex;
+        drop(mutex_guard);
+        
+        // In real implementation, would block with timeout
+        let notified = self.wait_with_timeout(timeout_ms);
+        
+        // Reacquire mutex
+        let guard = mutex.lock().unwrap();
+        
+        check notified {
+            Ok(guard)
+        } else {
+            Err(Error::new("Timeout"))
+        }
+    }
+    
+    /// Notify one waiting thread
+    open fn notify_one(&var self) {
+        check self.waiting_count > 0 {
+            self.waiting_count -= 1;
+            self.notify_waiter();
+        }
+    }
+    
+    /// Notify all waiting threads
+    open fn notify_all(&var self) {
+        while self.waiting_count > 0 {
+            self.waiting_count -= 1;
+            self.notify_waiter();
+        }
+    }
+    
+    /// Wait without timeout
+    fn wait(&var self) {
+        // Simplified - in real implementation would block thread
+    }
+    
+    /// Wait with timeout
+    fn wait_with_timeout(&var self, timeout_ms: u64) -> bool {
+        // Simplified - in real implementation would block with timeout
+        true // Assume notified
+    }
+    
+    /// Notify a waiter
+    fn notify_waiter(&var self) {
+        // Simplified - in real implementation would wake up thread
+    }
+    
+    /// Get number of waiting threads
+    open fn waiting_count(&self) -> usize {
+        self.waiting_count
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create a new mutex
+open fn mutex<T>(data: T) -> Mutex<T> {
+    Mutex::new(data)
+}
+
+/// Create a new RwLock
+open fn rwlock<T>(data: T) -> RwLock<T> {
+    RwLock::new(data)
+}
+
+/// Create a new condition variable
+open fn condvar() -> Condvar {
+    Condvar::new()
+}
+
+/// Lock a mutex with timeout
+open fn lock_timeout<T>(mutex: &var Mutex<T>, timeout_ms: u64) -> Result<MutexGuard<T>, Error> {
+    let start_time = self.get_time_ms();
+    
+    loop {
+        match mutex.try_lock() {
+            Some(guard) => return Ok(guard),
+            None => {
+                let elapsed = self.get_time_ms() - start_time;
+                check elapsed >= timeout_ms {
+                    return Err(Error::new("Lock timeout"));
+                }
+                // Wait a bit and retry
+                self.sleep_ms(1);
+            }
+        }
+    }
+}
+
+/// Get time in milliseconds
+fn get_time_ms() -> u64 {
+    // Simplified - would use system time
+    0
+}
+
+/// Sleep for specified milliseconds
+fn sleep_ms(ms: u64) {
+    // Simplified - would use system sleep
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §5  SYNC STATISTICS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Synchronization statistics
+open data SyncStats {
+    mutex_locks: u64,
+    mutex_unlocks: u64,
+    rwlock_reads: u64,
+    rwlock_writes: u64,
+    condvar_waits: u64,
+    condvar_notifies: u64,
+    total_wait_time_ms: u64,
+}
+
+impl SyncStats {
+    fn new() -> Self {
+        Self {
+            mutex_locks: 0,
+            mutex_unlocks: 0,
+            rwlock_reads: 0,
+            rwlock_writes: 0,
+            condvar_waits: u64,
+            condvar_notifies: 0,
+            total_wait_time_ms: 0,
+        }
+    }
+    
+    /// Record mutex lock
+    open fn record_mutex_lock(&var self) {
+        self.mutex_locks += 1;
+    }
+    
+    /// Record mutex unlock
+    open fn record_mutex_unlock(&var self) {
+        self.mutex_unlocks += 1;
+    }
+    
+    /// Record RwLock read
+    open fn record_rwlock_read(&var self) {
+        self.rwlock_reads += 1;
+    }
+    
+    /// Record RwLock write
+    open fn record_rwlock_write(&var self) {
+        self.rwlock_writes += 1;
+    }
+    
+    /// Record condition variable wait
+    open fn record_condvar_wait(&var self, wait_time_ms: u64) {
+        self.condvar_waits += 1;
+        self.total_wait_time_ms += wait_time_ms;
+    }
+    
+    /// Record condition variable notify
+    open fn record_condvar_notify(&var self) {
+        self.condvar_notifies += 1;
+    }
+    
+    /// Get average wait time
+    open fn average_wait_time(&self) -> f64 {
+        check self.condvar_waits > 0 {
+            self.total_wait_time_ms as f64 / self.condvar_waits as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Global sync statistics
+static mut SYNC_STATS: SyncStats = SyncStats::new();
+
+/// Get global sync statistics
+open fn get_sync_stats() -> SyncStats {
+    unsafe { SYNC_STATS }
+}
+
+/// Reset global sync statistics
+open fn reset_sync_stats() {
+    unsafe {
+        SYNC_STATS = SyncStats::new();
+    }
+}

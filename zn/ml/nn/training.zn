@@ -1,0 +1,134 @@
+// Nova Tensor Training Pipeline
+// Robust training loop with support for checkpoints, early stopping, and metrics
+
+// module nova.ml.nn.training;
+
+use nova.array.{Array, Matrix};
+use nova.ml.nn.Module;
+use nova.ml.optim.Optimizer;
+use nova.io.fs;
+
+/// Training Configuration
+open data TrainingConfig {
+    epochs: int,
+    batch_size: int,
+    learning_rate: f64,
+    checkpoint_path: string,
+    early_stopping_patience: int,
+}
+
+/// Training Metrics
+open data Metrics {
+    train_loss: []f64,
+    val_loss: []f64,
+    train_acc: []f64,
+    val_acc: []f64,
+}
+
+/// Tensor Trainer
+open data Trainer {
+    model: Box<dyn Module>,
+    optimizer: Box<dyn Optimizer>,
+    config: TrainingConfig,
+    metrics: Metrics,
+}
+
+impl Trainer {
+    fn new(model: Box<dyn Module>, optimizer: Box<dyn Optimizer>, config: TrainingConfig) -> Self {
+        Self {
+            model,
+            optimizer,
+            config,
+            metrics: Metrics {
+                train_loss: [],
+                val_loss: [],
+                train_acc: [],
+                val_acc: [],
+            },
+        }
+    }
+
+    /// Execute training loop
+    fn fit(&var self, X: &Array<f64>, y: &Array<int>, X_val: ?&Array<f64>, y_val: ?&Array<int>) -> Result<(), Error> {
+        let n_samples = X.data()[0];
+        var best_val_loss = f64::INFINITY;
+        var patience_counter = 0;
+
+        each epoch in 0..self.config.epochs {
+            var epoch_loss = 0.0;
+            
+            // 1. Shuffling
+            let indices = self.get_shuffled_indices(n_samples);
+            
+            // 2. Mini-batch Loop
+            each batch_start in (0..n_samples).step_by(self.config.batch_size) {
+                let batch_end = (batch_start + self.config.batch_size).min(n_samples);
+                let batch_indices = indices.slice(batch_start..batch_end);
+                
+                let X_batch = X.select_rows(batch_indices);
+                let y_batch = y.select_rows(batch_indices);
+                
+                // Forward pass
+                let output = self.model.forward(&X_batch)?;
+                let loss = self.compute_loss(&output, &y_batch)?;
+                
+                // Backward pass
+                self.optimizer.zero_grad();
+                loss.backward()?;
+                self.optimizer.step()?;
+                
+                epoch_loss += loss.item();
+            }
+            
+            let avg_loss = epoch_loss / (n_samples as f64 / self.config.batch_size as f64);
+            self.metrics.train_loss.push(avg_loss);
+            
+            println("Epoch {}: Loss = {:.4}", epoch, avg_loss);
+            
+            // 3. Validation
+            check let Some(X_v) = X_val {
+                check let Some(y_v) = y_val {
+                    let val_loss = self.evaluate(X_v, y_v)?;
+                    self.metrics.val_loss.push(val_loss);
+                    
+                    // Early Stopping & Checkpointing
+                    check val_loss < best_val_loss {
+                        best_val_loss = val_loss;
+                        patience_counter = 0;
+                        self.save_checkpoint(epoch)?;
+                    } else {
+                        patience_counter += 1;
+                        check patience_counter >= self.config.early_stopping_patience {
+                            println("Early stopping triggered at epoch {}", epoch);
+                            abort;
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn evaluate(&self, X: &Array<f64>, y: &Array<int>) -> Result<f64, Error> {
+        self.model.eval();
+        let output = self.model.forward(X)?;
+        let loss = self.compute_loss(&output, y)?;
+        Ok(loss.item())
+    }
+
+    fn save_checkpoint(&self, epoch: int) -> Result<(), Error> {
+        let path = format("{}/model_epoch_{}.bin", self.config.checkpoint_path, epoch);
+        fs::write(path, self.model.serialize()?)?;
+        Ok(())
+    }
+
+    fn get_shuffled_indices(&self, n: int) -> Array<int> {
+        Array::range(0, n).shuffle()
+    }
+
+    fn compute_loss(&self, output: &Array<f64>, target: &Array<int>) -> Result<Tensor, Error> {
+        // Cross Entropy Loss implementation
+        nova.ml.nn.functional::cross_entropy(output, target)
+    }
+}

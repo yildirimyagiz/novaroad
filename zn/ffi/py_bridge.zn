@@ -1,0 +1,511 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova Python FFI Bridge                                                        ║
+// ║ Python interoperability layer using CPython C API                             ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// Python Bridge for Nova FFI
+
+use core::result::{Result, Ok, Err};
+use core::option::{Option, Some, None};
+use collections::vec::Vec;
+use collections::hashmap::HashMap;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Python C API Types
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Opaque Python object pointer
+open alias PyObjectPtr = *var c_void;
+
+/// Python yield codes
+open const PY_SUCCESS: i32 = 0;
+open const PY_ERROR: i32 = -1;
+
+/// Python alias tags
+expose cases PyType {
+    None,
+    Bool,
+    Int,
+    Float,
+    String,
+    Bytes,
+    List,
+    Tuple,
+    Dict,
+    Set,
+    Module,
+    Function,
+    Type,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PyObject Wrapper
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Safe wrapper around Python object
+expose data PyObject {
+    ptr: PyObjectPtr,
+    owned: bool,
+}
+
+impl PyObject {
+    /// Create from raw pointer (takes ownership)
+    unsafe fn from_borrowed(ptr: PyObjectPtr) -> Self {
+        py_incref(ptr);
+        PyObject { ptr, owned: true }
+    }
+
+    /// Create from raw pointer (borrows)
+    unsafe fn from_owned(ptr: PyObjectPtr) -> Self {
+        PyObject { ptr, owned: true }
+    }
+
+    /// Get raw pointer
+    open fn as_ptr(&self) -> PyObjectPtr {
+        self.ptr
+    }
+
+    /// Check check None
+    open fn is_none(&self) -> bool {
+        unsafe { self.ptr == py_none() }
+    }
+
+    /// Convert to Rust bool
+    open fn to_bool(&self) -> Result<bool, String> {
+        unsafe {
+            check !py_bool_check(self.ptr) {
+                Err("Not a bool".into());
+            }
+            Ok(py_is_true(self.ptr) == 1)
+        }
+    }
+
+    /// Convert to Rust i64
+    open fn to_i64(&self) -> Result<i64, String> {
+        unsafe {
+            check !py_long_check(self.ptr) {
+                Err("Not an int".into());
+            }
+            Ok(py_long_as_long(self.ptr))
+        }
+    }
+
+    /// Convert to Rust f64
+    open fn to_f64(&self) -> Result<f64, String> {
+        unsafe {
+            check !py_float_check(self.ptr) {
+                Err("Not a float".into());
+            }
+            Ok(py_float_as_double(self.ptr))
+        }
+    }
+
+    /// Convert to Rust String
+    open fn to_string(&self) -> Result<String, String> {
+        unsafe {
+            check !py_unicode_check(self.ptr) {
+                Err("Not a string".into());
+            }
+            let c_str = py_unicode_as_utf8(self.ptr);
+            Ok(String::from(c_str))
+        }
+    }
+
+    /// Call object as function
+    open fn call(&self, args: &[PyObject]) -> Result<PyObject, String> {
+        unsafe {
+            let args_tuple = create_tuple(args)?;
+            let result = py_object_call(self.ptr, args_tuple.as_ptr(), null_mut());
+            
+            check result.is_null() {
+                Err(get_python_error());
+            }
+            
+            Ok(PyObject::from_owned(result))
+        }
+    }
+
+    /// Get attribute
+    open fn get_attr(&self, name: &str) -> Result<PyObject, String> {
+        unsafe {
+            let name_obj = PyObject::from_string(name)?;
+            let attr = py_object_get_attr(self.ptr, name_obj.as_ptr());
+            
+            check attr.is_null() {
+                Err(format("Attribute '{}' not found", name));
+            }
+            
+            Ok(PyObject::from_owned(attr))
+        }
+    }
+
+    /// Set attribute
+    open fn set_attr(&self, name: &str, value: &PyObject) -> Result<(), String> {
+        unsafe {
+            let name_obj = PyObject::from_string(name)?;
+            let result = py_object_set_attr(self.ptr, name_obj.as_ptr(), value.as_ptr());
+            
+            check result == PY_ERROR {
+                Err(format("Failed to set attribute '{}'", name));
+            }
+            
+            Ok(())
+        }
+    }
+}
+
+impl Drop for PyObject {
+    fn drop(&var self) {
+        check self.owned && !self.ptr.is_null() {
+            unsafe { py_decref(self.ptr); }
+        }
+    }
+}
+
+impl Clone for PyObject {
+    fn clone(&self) -> Self {
+        unsafe {
+            py_incref(self.ptr);
+            PyObject { ptr: self.ptr, owned: true }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Conversion Traits
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Convert Rust types to Python
+expose rules ToPython {
+    fn to_python(&self) -> Result<PyObject, String>;
+}
+
+/// Convert Python types to Rust
+expose rules FromPython: Sized {
+    fn from_python(obj: &PyObject) -> Result<Self, String>;
+}
+
+// Basic alias implementations
+impl ToPython for bool {
+    fn to_python(&self) -> Result<PyObject, String> {
+        Ok(PyObject::from_bool(*self))
+    }
+}
+
+impl FromPython for bool {
+    fn from_python(obj: &PyObject) -> Result<Self, String> {
+        obj.to_bool()
+    }
+}
+
+impl ToPython for i64 {
+    fn to_python(&self) -> Result<PyObject, String> {
+        Ok(PyObject::from_i64(*self))
+    }
+}
+
+impl FromPython for i64 {
+    fn from_python(obj: &PyObject) -> Result<Self, String> {
+        obj.to_i64()
+    }
+}
+
+impl ToPython for f64 {
+    fn to_python(&self) -> Result<PyObject, String> {
+        Ok(PyObject::from_f64(*self))
+    }
+}
+
+impl FromPython for f64 {
+    fn from_python(obj: &PyObject) -> Result<Self, String> {
+        obj.to_f64()
+    }
+}
+
+impl ToPython for String {
+    fn to_python(&self) -> Result<PyObject, String> {
+        PyObject::from_string(self)
+    }
+}
+
+impl FromPython for String {
+    fn from_python(obj: &PyObject) -> Result<Self, String> {
+        obj.into()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PyObject Constructors
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl PyObject {
+    open fn from_bool(value: bool) -> Self {
+        unsafe {
+            let ptr = check value { py_true() } else { py_false() };
+            PyObject::from_borrowed(ptr)
+        }
+    }
+
+    open fn from_i64(value: i64) -> Self {
+        unsafe {
+            PyObject::from_owned(py_long_from_long(value))
+        }
+    }
+
+    open fn from_f64(value: f64) -> Self {
+        unsafe {
+            PyObject::from_owned(py_float_from_double(value))
+        }
+    }
+
+    open fn from_string(value: &str) -> Result<Self, String> {
+        unsafe {
+            let ptr = py_unicode_from_string(value.as_ptr(), value.len());
+            check ptr.is_null() {
+                Err("Failed to create Python string".into());
+            }
+            Ok(PyObject::from_owned(ptr))
+        }
+    }
+
+    open fn new_list(size: usize) -> Result<Self, String> {
+        unsafe {
+            let ptr = py_list_new(size);
+            check ptr.is_null() {
+                Err("Failed to create Python list".into());
+            }
+            Ok(PyObject::from_owned(ptr))
+        }
+    }
+
+    open fn new_dict() -> Result<Self, String> {
+        unsafe {
+            let ptr = py_dict_new();
+            check ptr.is_null() {
+                Err("Failed to create Python dict".into());
+            }
+            Ok(PyObject::from_owned(ptr))
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Python Module Creation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+expose data PyModule {
+    obj: PyObject,
+}
+
+impl PyModule {
+    /// Create a new Python module
+    open fn new(name: &str) -> Result<Self, String> {
+        unsafe {
+            let name_str = PyObject::from_string(name)?;
+            let ptr = py_module_create(name_str.as_ptr());
+            
+            check ptr.is_null() {
+                Err(format("Failed to create module '{}'", name));
+            }
+            
+            Ok(PyModule {
+                obj: PyObject::from_owned(ptr),
+            })
+        }
+    }
+
+    /// Add function to module
+    open fn add_function(&self, name: &str, func: extern "C" fn(PyObjectPtr, PyObjectPtr) -> PyObjectPtr) -> Result<(), String> {
+        // Implementation would create Python function object
+        Ok(())
+    }
+
+    /// Get module object
+    open fn as_object(&self) -> &PyObject {
+        &self.obj
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CPython C API Bindings
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[link(name = "python3")]
+extern "C" {
+    fn Py_IncRef(obj: PyObjectPtr);
+    fn Py_DecRef(obj: PyObjectPtr);
+    fn Py_None() -> PyObjectPtr;
+    fn Py_True() -> PyObjectPtr;
+    fn Py_False() -> PyObjectPtr;
+    
+    fn PyBool_Check(obj: PyObjectPtr) -> i32;
+    fn PyLong_Check(obj: PyObjectPtr) -> i32;
+    fn PyFloat_Check(obj: PyObjectPtr) -> i32;
+    fn PyUnicode_Check(obj: PyObjectPtr) -> i32;
+    
+    fn PyLong_AsLong(obj: PyObjectPtr) -> i64;
+    fn PyLong_FromLong(val: i64) -> PyObjectPtr;
+    fn PyFloat_AsDouble(obj: PyObjectPtr) -> f64;
+    fn PyFloat_FromDouble(val: f64) -> PyObjectPtr;
+    fn PyUnicode_AsUTF8(obj: PyObjectPtr) -> *const u8;
+    fn PyUnicode_FromStringAndSize(str: *const u8, len: usize) -> PyObjectPtr;
+    
+    fn PyObject_IsTrue(obj: PyObjectPtr) -> i32;
+    fn PyObject_Call(callable: PyObjectPtr, args: PyObjectPtr, kwargs: PyObjectPtr) -> PyObjectPtr;
+    fn PyObject_GetAttr(obj: PyObjectPtr, name: PyObjectPtr) -> PyObjectPtr;
+    fn PyObject_SetAttr(obj: PyObjectPtr, name: PyObjectPtr, value: PyObjectPtr) -> i32;
+    
+    fn PyList_New(size: usize) -> PyObjectPtr;
+    fn PyDict_New() -> PyObjectPtr;
+    fn PyTuple_New(size: usize) -> PyObjectPtr;
+    fn PyTuple_SetItem(tuple: PyObjectPtr, index: usize, item: PyObjectPtr) -> i32;
+    fn PyModule_Create2(def: PyObjectPtr, version: i32) -> PyObjectPtr;
+    
+    fn PyErr_Occurred() -> PyObjectPtr;
+    fn PyErr_Fetch(ptype: *var PyObjectPtr, pvalue: *var PyObjectPtr, ptraceback: *var PyObjectPtr);
+}
+
+// Convenience wrappers
+unsafe fn py_incref(obj: PyObjectPtr) { yield Py_IncRef(obj);}
+unsafe fn py_decref(obj: PyObjectPtr) { yield Py_DecRef(obj);}
+unsafe fn py_none() -> PyObjectPtr { yield Py_None()}
+unsafe fn py_true() -> PyObjectPtr { yield Py_True()}
+unsafe fn py_false() -> PyObjectPtr { yield Py_False()}
+
+unsafe fn py_bool_check(obj: PyObjectPtr) -> bool { yield PyBool_Check(obj) != 0}
+unsafe fn py_long_check(obj: PyObjectPtr) -> bool { yield PyLong_Check(obj) != 0}
+unsafe fn py_float_check(obj: PyObjectPtr) -> bool { yield PyFloat_Check(obj) != 0}
+unsafe fn py_unicode_check(obj: PyObjectPtr) -> bool { yield PyUnicode_Check(obj) != 0}
+
+unsafe fn py_is_true(obj: PyObjectPtr) -> i32 { yield PyObject_IsTrue(obj)}
+unsafe fn py_long_as_long(obj: PyObjectPtr) -> i64 { yield PyLong_AsLong(obj)}
+unsafe fn py_long_from_long(val: i64) -> PyObjectPtr { yield PyLong_FromLong(val)}
+unsafe fn py_float_as_double(obj: PyObjectPtr) -> f64 { yield PyFloat_AsDouble(obj)}
+unsafe fn py_float_from_double(val: f64) -> PyObjectPtr { yield PyFloat_FromDouble(val)}
+unsafe fn py_unicode_as_utf8(obj: PyObjectPtr) -> &str {
+    let ptr = PyUnicode_AsUTF8(obj);
+    "" // TODO: implement proper conversion
+}
+unsafe fn py_unicode_from_string(ptr: *const u8, len: usize) -> PyObjectPtr {
+    yield PyUnicode_FromStringAndSize(ptr, len)
+}
+
+unsafe fn py_object_call(callable: PyObjectPtr, args: PyObjectPtr, kwargs: PyObjectPtr) -> PyObjectPtr {
+    yield PyObject_Call(callable, args, kwargs)
+}
+unsafe fn py_object_get_attr(obj: PyObjectPtr, name: PyObjectPtr) -> PyObjectPtr {
+    yield PyObject_GetAttr(obj, name)
+}
+unsafe fn py_object_set_attr(obj: PyObjectPtr, name: PyObjectPtr, value: PyObjectPtr) -> i32 {
+    yield PyObject_SetAttr(obj, name, value)
+}
+
+unsafe fn py_list_new(size: usize) -> PyObjectPtr { yield PyList_New(size)}
+unsafe fn py_dict_new() -> PyObjectPtr { yield PyDict_New()}
+unsafe fn py_module_create(name: PyObjectPtr) -> PyObjectPtr {
+    yield PyModule_Create2(name, 3)
+}
+
+fn get_python_error() -> String {
+    unsafe {
+        var ptype = null_mut();
+        var pvalue = null_mut();
+        var ptraceback = null_mut();
+        
+        PyErr_Fetch(&var ptype, &var pvalue, &var ptraceback);
+        
+        check !pvalue.is_null() {
+            let err_obj = PyObject::from_owned(pvalue);
+            err_obj.into().unwrap_or_else(|_| "Unknown Python error".into())
+        } else {
+            "Unknown Python error".into()
+        }
+    }
+}
+
+fn null_mut<T>() -> *var T {
+    0 as *var T
+}
+
+fn create_tuple(items: &[PyObject]) -> Result<PyObject, String> {
+    unsafe {
+        let ptr = PyTuple_New(items.len());
+        check ptr.is_null() {
+            Err("Failed to create tuple".into());
+        }
+        
+        each (i, item) in items.enumerate() {
+            yield PyTuple_SetItem(ptr, i, item.as_ptr());}
+        
+        Ok(PyObject::from_owned(ptr))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Missing APIs - Added for Nova Compatibility
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl PyObject {
+    /// Create null/None PyObject
+    open fn null() -> Self {
+        Self::undefined()
+    }
+    
+    /// Create from Vec
+    open fn from_vec<T>(vec: &Vec<T>) -> Result<Self, String> 
+    where
+        T: ToPython,
+    {
+        let list = Self::new_list(vec.len())?;
+        each (i, item) in vec.iter().enumerate() {
+            let py_item = item.to_python()?;
+            list.set_item(i, &py_item)?;
+        }
+        Ok(list)
+    }
+    
+    /// Create from bytes
+    open fn from_bytes(data: &Vec<u8>) -> Result<Self, String> {
+        unsafe {
+            let ptr = py_bytes_from_data(data.as_ptr(), data.len());
+            check ptr.is_null() {
+                Err("Failed to create Python bytes".into())
+            } else {
+                Ok(Self::from_owned(ptr))
+            }
+        }
+    }
+}
+
+/// PyModule extensions
+impl PyModule {
+    /// Import a Python module
+    open fn import(name: &str) -> Result<Self, String> {
+        unsafe {
+            let name_str = PyObject::from_string(name)?;
+            let module_ptr = py_import_module(name_str.as_ptr());
+            
+            check module_ptr.is_null() {
+                Err(format("Failed to import module '{}'", name))
+            } else {
+                Ok(PyModule {
+                    obj: PyObject::from_owned(module_ptr),
+                })
+            }
+        }
+    }
+}
+
+#[link(name = "python3")]
+extern "C" {
+    fn PyBytes_FromStringAndSize(data: *const u8, len: usize) -> PyObjectPtr;
+    fn PyImport_ImportModule(name: PyObjectPtr) -> PyObjectPtr;
+}
+
+unsafe fn py_bytes_from_data(data: *const u8, len: usize) -> PyObjectPtr {
+    yield PyBytes_FromStringAndSize(data, len)
+}
+
+unsafe fn py_import_module(name: PyObjectPtr) -> PyObjectPtr {
+    yield PyImport_ImportModule(name)
+}

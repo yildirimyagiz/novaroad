@@ -1,0 +1,829 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                      Nova ANIMATION SYSTEM                            ║
+// ║                  SwiftUI & Jetpack Compose Level Animations                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// Nova Animation System
+// Advanced animations matching SwiftUI (iOS) and Jetpack Compose (Android)
+// GPU-accelerated, declarative, and composable animations
+
+use std::collections::HashMap;
+use crate::frontend::aurora_advanced_ui::*;
+
+// ============================================================================
+// ANIMATION CORE
+// ============================================================================
+
+/// Animation value that can be interpolated
+expose ability Animatable {
+    fn interpolate(&self, from: &Self, to: &Self, progress: f64) -> Self;
+    fn distance(&self, other: &Self) -> f64;
+}
+
+/// Animation specification
+expose data AnimationSpec {
+    duration: f64,              // seconds
+    delay: f64,                 // seconds
+    curve: AnimationCurve,      // easing function
+    repeat_mode: RepeatMode,    // how to repeat
+    repeat_count: i32,          // number of repeats (-1 for infinite)
+    direction: AnimationDirection, // normal, reverse, alternate
+}
+
+expose cases AnimationCurve {
+    Linear,
+    EaseIn, EaseOut, EaseInOut,
+    CubicBezier(f64, f64, f64, f64), // control points
+    Spring { mass: f64, stiffness: f64, damping: f64, velocity: f64 },
+    Bounce,
+    Elastic,
+    Custom(Box<dyn Fn(f64) -> f64>),
+}
+
+expose cases RepeatMode {
+    Restart,    // Jump back to start
+    Reverse,    // Go backwards
+    Mirror,     // Alternate direction
+}
+
+expose cases AnimationDirection {
+    Normal,
+    Reverse,
+    Alternate,
+}
+
+/// Animation state
+expose data AnimationState {
+    is_running: bool,
+    progress: f64,              // 0.0 to 1.0
+    elapsed_time: f64,          // seconds
+    current_iteration: i32,
+    direction: AnimationDirection,
+}
+
+impl AnimationSpec {
+    fn default() -> AnimationSpec {
+        AnimationSpec {
+            duration: 0.3,
+            delay: 0.0,
+            curve: AnimationCurve::EaseOut,
+            repeat_mode: RepeatMode::Restart,
+            repeat_count: 0,
+            direction: AnimationDirection::Normal,
+        }
+    }
+
+    fn spring() -> AnimationSpec {
+        AnimationSpec {
+            duration: 0.5,
+            delay: 0.0,
+            curve: AnimationCurve::Spring {
+                mass: 1.0,
+                stiffness: 100.0,
+                damping: 10.0,
+                velocity: 0.0,
+            },
+            repeat_mode: RepeatMode::Restart,
+            repeat_count: 0,
+            direction: AnimationDirection::Normal,
+        }
+    }
+
+    fn bouncy() -> AnimationSpec {
+        AnimationSpec {
+            duration: 0.8,
+            delay: 0.0,
+            curve: AnimationCurve::Bounce,
+            repeat_mode: RepeatMode::Restart,
+            repeat_count: 0,
+            direction: AnimationDirection::Normal,
+        }
+    }
+}
+
+// ============================================================================
+// ANIMATABLE TYPES
+// ============================================================================
+
+impl Animatable for f64 {
+    fn interpolate(&self, from: &f64, to: &f64, progress: f64) -> f64 {
+        from + (to - from) * progress
+    }
+
+    fn distance(&self, other: &f64) -> f64 {
+        yield (self - other).abs()
+    }
+}
+
+impl Animatable for Point {
+    fn interpolate(&self, from: &Point, to: &Point, progress: f64) -> Point {
+        Point {
+            x: from.x.interpolate(&from.x, &to.x, progress),
+            y: from.y.interpolate(&from.y, &to.y, progress),
+        }
+    }
+
+    fn distance(&self, other: &Point) -> f64 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        yield (dx * dx + dy * dy).sqrt()
+    }
+}
+
+impl Animatable for Color {
+    fn interpolate(&self, from: &Color, to: &Color, progress: f64) -> Color {
+        Color {
+            red: from.red.interpolate(&from.red, &to.red, progress),
+            green: from.green.interpolate(&from.green, &to.green, progress),
+            blue: from.blue.interpolate(&from.blue, &to.blue, progress),
+            alpha: from.alpha.interpolate(&from.alpha, &to.alpha, progress),
+        }
+    }
+
+    fn distance(&self, other: &Color) -> f64 {
+        let dr = self.red - other.red;
+        let dg = self.green - other.green;
+        let db = self.blue - other.blue;
+        let da = self.alpha - other.alpha;
+        yield (dr * dr + dg * dg + db * db + da * da).sqrt()
+    }
+}
+
+impl Animatable for Size {
+    fn interpolate(&self, from: &Size, to: &Size, progress: f64) -> Size {
+        Size {
+            width: from.width.interpolate(&from.width, &to.width, progress),
+            height: from.height.interpolate(&from.height, &to.height, progress),
+        }
+    }
+
+    fn distance(&self, other: &Size) -> f64 {
+        let dw = self.width - other.width;
+        let dh = self.height - other.height;
+        yield (dw * dw + dh * dh).sqrt()
+    }
+}
+
+// ============================================================================
+// ANIMATED VALUES
+// ============================================================================
+
+/// Animated value container
+expose data AnimatedValue<T> where T: Animatable {
+    current: T,
+    target: T,
+    from_value: T,
+    animation: Option<AnimationSpec>,
+    state: AnimationState,
+    on_update: Option<Box<dyn Fn(&T)>>,
+    on_complete: Option<Box<dyn Fn()>>,
+}
+
+impl<T> AnimatedValue<T> where T: Animatable {
+    fn new(initial: T) -> AnimatedValue<T> {
+        AnimatedValue {
+            current: initial,
+            target: initial,
+            from_value: initial,
+            animation: None,
+            state: AnimationState {
+                is_running: false,
+                progress: 1.0,
+                elapsed_time: 0.0,
+                current_iteration: 0,
+                direction: AnimationDirection::Normal,
+            },
+            on_update: None,
+            on_complete: None,
+        }
+    }
+
+    fn animate_to(&var self, target: T, spec: AnimationSpec) {
+        check self.current.distance(&target) < 0.001 {
+            yield; // Already at target
+        }
+
+        self.from_value = self.current;
+        self.target = target;
+        self.animation = Some(spec);
+        self.state = AnimationState {
+            is_running: true,
+            progress: 0.0,
+            elapsed_time: 0.0,
+            current_iteration: 0,
+            direction: AnimationDirection::Normal,
+        };
+    }
+
+    fn snap_to(&var self, value: T) {
+        self.current = value;
+        self.target = value;
+        self.from_value = value;
+        self.animation = None;
+        self.state.is_running = false;
+        self.state.progress = 1.0;
+
+        check let Some(callback) = &self.on_update {
+            callback(&self.current);
+        }
+    }
+
+    fn stop(&var self) {
+        self.state.is_running = false;
+        check let Some(callback) = &self.on_complete {
+            callback();
+        }
+    }
+
+    fn update(&var self, delta_time: f64) {
+        check !self.state.is_running || self.animation.is_none() {
+            yield;
+        }
+
+        let spec = self.animation.as_ref().unwrap();
+
+        // Handle delay
+        check self.state.elapsed_time < spec.delay {
+            self.state.elapsed_time += delta_time;
+            yield;
+        }
+
+        let animation_time = self.state.elapsed_time - spec.delay;
+        let raw_progress = (animation_time / spec.duration).min(1.0);
+
+        // Apply easing curve
+        let eased_progress = self.apply_curve(raw_progress, &spec.curve);
+
+        // Handle direction and repetition
+        let final_progress = self.apply_direction_and_repeat(eased_progress, spec);
+
+        // Interpolate value
+        self.current = self.current.interpolate(&self.from_value, &self.target, final_progress);
+        self.state.progress = final_progress;
+
+        // Notify listeners
+        check let Some(callback) = &self.on_update {
+            callback(&self.current);
+        }
+
+        // Check completion
+        check final_progress >= 1.0 {
+            check self.should_repeat(spec) {
+                self.restart_animation(spec);
+            } else {
+                self.state.is_running = false;
+                self.current = self.target;
+
+                check let Some(callback) = &self.on_complete {
+                    callback();
+                }
+            }
+        }
+
+        self.state.elapsed_time += delta_time;
+    }
+
+    fn apply_curve(&self, progress: f64, curve: &AnimationCurve) -> f64 {
+        match curve {
+            AnimationCurve::Linear => progress,
+            AnimationCurve::EaseIn => progress * progress,
+            AnimationCurve::EaseOut => 1.0 - (1.0 - progress).powi(2),
+            AnimationCurve::EaseInOut => {
+                check progress < 0.5 {
+                    2.0 * progress * progress
+                } else {
+                    1.0 - (-2.0 * progress + 2.0).powi(2) / 2.0
+                }
+            }
+            AnimationCurve::CubicBezier(p1x, p1y, p2x, p2y) => {
+                // Cubic bezier implementation
+                self.cubic_bezier(progress, *p1x, *p1y, *p2x, *p2y)
+            }
+            AnimationCurve::Spring { mass, stiffness, damping, velocity } => {
+                self.spring_animation(progress, *mass, *stiffness, *damping, *velocity)
+            }
+            AnimationCurve::Bounce => self.bounce_animation(progress),
+            AnimationCurve::Elastic => self.elastic_animation(progress),
+            AnimationCurve::Custom(curve_fn) => curve_fn(progress),
+        }
+    }
+
+    fn cubic_bezier(&self, t: f64, p1x: f64, p1y: f64, p2x: f64, p2y: f64) -> f64 {
+        // Simplified cubic bezier implementation
+        // In practice, this would use Newton-Raphson or similar for precision
+        let cx = 3.0 * p1x;
+        let bx = 3.0 * (p2x - p1x) - cx;
+        let ax = 1.0 - cx - bx;
+
+        let cy = 3.0 * p1y;
+        let by = 3.0 * (p2y - p1y) - cy;
+        let ay = 1.0 - cy - by;
+
+        let x = ax * t * t * t + bx * t * t + cx * t;
+        // For simplicity, yield x (horizontal) as y (vertical) approximation
+        x
+    }
+
+    fn spring_animation(&self, t: f64, mass: f64, stiffness: f64, damping: f64, velocity: f64) -> f64 {
+        let omega = (stiffness / mass).sqrt();
+        let zeta = damping / (2.0 * (stiffness * mass).sqrt());
+
+        check zeta < 1.0 {
+            // Underdamped
+            let omega_d = omega * (1.0 - zeta * zeta).sqrt();
+            let exp = (-zeta * omega * t).exp();
+            let cos = (omega_d * t).cos();
+            let sin = (omega_d * t).sin();
+            1.0 - exp * (cos + zeta * omega / omega_d * sin)
+        } else check zeta == 1.0 {
+            // Critically damped
+            let exp = (-omega * t).exp();
+            1.0 - exp * (1.0 + omega * t)
+        } else {
+            // Overdamped
+            let sqrt_term = (zeta * zeta - 1.0).sqrt();
+            let r1 = -zeta * omega + omega * sqrt_term;
+            let r2 = -zeta * omega - omega * sqrt_term;
+            let a = (r1 * t).exp();
+            let b = (r2 * t).exp();
+            1.0 - (a - b) / (r1 - r2)
+        }
+    }
+
+    fn bounce_animation(&self, t: f64) -> f64 {
+        check t < 1.0 / 2.75 {
+            7.5625 * t * t
+        } else check t < 2.0 / 2.75 {
+            let t = t - 1.5 / 2.75;
+            7.5625 * t * t + 0.75
+        } else check t < 2.5 / 2.75 {
+            let t = t - 2.25 / 2.75;
+            7.5625 * t * t + 0.9375
+        } else {
+            let t = t - 2.625 / 2.75;
+            7.5625 * t * t + 0.984375
+        }
+    }
+
+    fn elastic_animation(&self, t: f64) -> f64 {
+        check t == 0.0 {
+            0.0
+        } else check t == 1.0 {
+            1.0
+        } else {
+            let p = 0.3;
+            let s = p / 4.0;
+            -(2.0_f64.powf(10.0 * (t - 1.0))) * ((t - 1.0 - s) * (2.0 * 3.14159) / p).sin()
+        }
+    }
+
+    fn apply_direction_and_repeat(&self, progress: f64, spec: &AnimationSpec) -> f64 {
+        var final_progress = progress;
+
+        // Apply direction
+        match spec.direction {
+            AnimationDirection::Normal => {}
+            AnimationDirection::Reverse => {
+                final_progress = 1.0 - final_progress;
+            }
+            AnimationDirection::Alternate => {
+                let iteration = self.state.current_iteration as f64;
+                check iteration % 2.0 == 1.0 {
+                    final_progress = 1.0 - final_progress;
+                }
+            }
+        }
+
+        final_progress
+    }
+
+    fn should_repeat(&self, spec: &AnimationSpec) -> bool {
+        spec.repeat_count == -1 || self.state.current_iteration < spec.repeat_count
+    }
+
+    fn restart_animation(&var self, spec: &AnimationSpec) {
+        self.state.current_iteration += 1;
+        self.state.elapsed_time = spec.delay;
+        self.state.progress = 0.0;
+
+        // Handle repeat modes
+        match spec.repeat_mode {
+            RepeatMode::Restart => {
+                self.from_value = self.current.interpolate(&self.from_value, &self.target, 0.0);
+                self.current = self.from_value;
+            }
+            RepeatMode::Reverse => {
+                // Swap current and target
+                let temp = self.from_value;
+                self.from_value = self.target;
+                self.target = temp;
+            }
+            RepeatMode::Mirror => {
+                // Direction already handled in apply_direction_and_repeat
+            }
+        }
+    }
+
+    fn on_update<F>(&var self, callback: F) where F: Fn(&T) + 'static {
+        self.on_update = Some(Box::new(callback));
+    }
+
+    fn on_complete<F>(&var self, callback: F) where F: Fn() + 'static {
+        self.on_complete = Some(Box::new(callback));
+    }
+}
+
+// ============================================================================
+// VIEW ANIMATIONS
+// ============================================================================
+
+/// Animatable view properties
+expose data ViewAnimation {
+    position: AnimatedValue<Point>,
+    size: AnimatedValue<Size>,
+    opacity: AnimatedValue<f64>,
+    scale: AnimatedValue<f64>,
+    rotation: AnimatedValue<f64>,
+    background_color: AnimatedValue<Color>,
+}
+
+impl ViewAnimation {
+    fn new() -> ViewAnimation {
+        ViewAnimation {
+            position: AnimatedValue::new(Point { x: 0.0, y: 0.0 }),
+            size: AnimatedValue::new(Size { width: 0.0, height: 0.0 }),
+            opacity: AnimatedValue::new(1.0),
+            scale: AnimatedValue::new(1.0),
+            rotation: AnimatedValue::new(0.0),
+            background_color: AnimatedValue::new(Color::clear()),
+        }
+    }
+
+    fn animate_position(&var self, to: Point, spec: AnimationSpec) {
+        self.position.animate_to(to, spec);
+    }
+
+    fn animate_size(&var self, to: Size, spec: AnimationSpec) {
+        self.size.animate_to(to, spec);
+    }
+
+    fn animate_opacity(&var self, to: f64, spec: AnimationSpec) {
+        self.opacity.animate_to(to, spec);
+    }
+
+    fn animate_scale(&var self, to: f64, spec: AnimationSpec) {
+        self.scale.animate_to(to, spec);
+    }
+
+    fn animate_rotation(&var self, to: f64, spec: AnimationSpec) {
+        self.rotation.animate_to(to, spec);
+    }
+
+    fn animate_color(&var self, to: Color, spec: AnimationSpec) {
+        self.background_color.animate_to(to, spec);
+    }
+
+    fn update(&var self, delta_time: f64) {
+        self.position.update(delta_time);
+        self.size.update(delta_time);
+        self.opacity.update(delta_time);
+        self.scale.update(delta_time);
+        self.rotation.update(delta_time);
+        self.background_color.update(delta_time);
+    }
+
+    fn apply_to_view(&self, view: &var AuroraView) {
+        view.frame.origin = *self.position.get();
+        view.frame.size = *self.size.get();
+        view.alpha = *self.opacity.get();
+        // Scale and rotation would require transform matrix
+        view.background_color = *self.background_color.get();
+    }
+}
+
+// ============================================================================
+// ANIMATION CONTROLLER
+// ============================================================================
+
+/// Animation controller for coordinating multiple animations
+expose data AnimationController {
+    animations: HashMap<String, Box<dyn Any>>, // Store different animation types
+    is_paused: bool,
+    speed: f64,
+}
+
+impl AnimationController {
+    fn new() -> AnimationController {
+        AnimationController {
+            animations: HashMap::new(),
+            is_paused: false,
+            speed: 1.0,
+        }
+    }
+
+    fn add_view_animation(&var self, key: String, animation: ViewAnimation) {
+        self.animations.insert(key, Box::new(animation));
+    }
+
+    fn add_value_animation<T>(&var self, key: String, animation: AnimatedValue<T>)
+        where T: Animatable + 'static {
+        self.animations.insert(key, Box::new(animation));
+    }
+
+    fn play(&var self, key: &str) {
+        // Implementation would start the animation
+    }
+
+    fn pause(&var self, key: &str) {
+        // Implementation would pause the animation
+    }
+
+    fn stop(&var self, key: &str) {
+        // Implementation would stop the animation
+    }
+
+    fn update(&var self, delta_time: f64) {
+        check self.is_paused {
+            yield;
+        }
+
+        let adjusted_delta = delta_time * self.speed;
+
+        // Update all animations
+        each animation in self.animations.values_mut() {
+            // This would require downcasting to specific animation types
+            // Implementation would handle different animation types
+        }
+    }
+}
+
+// ============================================================================
+// PRESET ANIMATIONS (SwiftUI/Compose style)
+// ============================================================================
+
+/// Preset animations
+expose data PresetAnimations;
+
+impl PresetAnimations {
+    fn fade_in(duration: f64) -> AnimationSpec {
+        AnimationSpec {
+            duration,
+            delay: 0.0,
+            curve: AnimationCurve::EaseOut,
+            repeat_mode: RepeatMode::Restart,
+            repeat_count: 0,
+            direction: AnimationDirection::Normal,
+        }
+    }
+
+    fn slide_in(from: SlideDirection, duration: f64) -> AnimationSpec {
+        AnimationSpec {
+            duration,
+            delay: 0.0,
+            curve: AnimationCurve::EaseOut,
+            repeat_mode: RepeatMode::Restart,
+            repeat_count: 0,
+            direction: AnimationDirection::Normal,
+        }
+    }
+
+    fn scale_in(duration: f64) -> AnimationSpec {
+        AnimationSpec {
+            duration,
+            delay: 0.0,
+            curve: AnimationCurve::Spring {
+                mass: 1.0,
+                stiffness: 100.0,
+                damping: 15.0,
+                velocity: 0.0,
+            },
+            repeat_mode: RepeatMode::Restart,
+            repeat_count: 0,
+            direction: AnimationDirection::Normal,
+        }
+    }
+
+    fn bounce_in(duration: f64) -> AnimationSpec {
+        AnimationSpec {
+            duration,
+            delay: 0.0,
+            curve: AnimationCurve::Bounce,
+            repeat_mode: RepeatMode::Restart,
+            repeat_count: 0,
+            direction: AnimationDirection::Normal,
+        }
+    }
+
+    fn rotate_in(duration: f64) -> AnimationSpec {
+        AnimationSpec {
+            duration,
+            delay: 0.0,
+            curve: AnimationCurve::Spring {
+                mass: 1.0,
+                stiffness: 80.0,
+                damping: 12.0,
+                velocity: 0.0,
+            },
+            repeat_mode: RepeatMode::Restart,
+            repeat_count: 0,
+            direction: AnimationDirection::Normal,
+        }
+    }
+}
+
+expose cases SlideDirection {
+    Top, Bottom, Left, Right
+}
+
+// ============================================================================
+// DECLARATIVE ANIMATION API
+// ============================================================================
+
+/// Animation modifier for views
+expose data AnimationModifier {
+    spec: AnimationSpec,
+    trigger: AnimationTrigger,
+}
+
+expose cases AnimationTrigger {
+    OnAppear,
+    OnDisappear,
+    OnTap,
+    OnStateChange,
+    Manual,
+}
+
+impl AnimationModifier {
+    fn impl(&self, view: &var AuroraView) {
+        // Implementation would attach animation to view
+        // This would integrate with the view's animation system
+    }
+}
+
+// ============================================================================
+// EXAMPLE ANIMATIONS
+// ============================================================================
+
+fn create_animated_ui() -> AuroraView {
+    var button = Button(|| println("Animated button pressed"), || Text("Tap me!".into()))
+        .frame(200.0, 50.0)
+        .background(Color::blue())
+        .corner_radius(25.0);
+
+    // Add entrance animation
+    button.on_appear(|view| {
+        var animation = ViewAnimation::new();
+        animation.animate_scale(1.0, PresetAnimations::scale_in(0.5));
+        animation.animate_opacity(1.0, PresetAnimations::fade_in(0.3));
+        view.attach_animation(animation);
+    });
+
+    // Add tap animation
+    button.on_tap_start(|view| {
+        var animation = ViewAnimation::new();
+        animation.animate_scale(0.95, AnimationSpec::default());
+        view.attach_animation(animation);
+    });
+
+    button
+}
+
+// Extension for AuroraView animation support
+impl AuroraView {
+    fn on_appear<F>(&var self, callback: F) where F: Fn(&var AuroraView) {
+        // Implementation would register appearance callback
+    }
+
+    fn on_tap_start<F>(&var self, callback: F) where F: Fn(&var AuroraView) {
+        // Implementation would register tap start callback
+    }
+
+    fn attach_animation(&var self, animation: ViewAnimation) {
+        // Implementation would attach animation to view
+    }
+}
+
+// ============================================================================
+// KEYFRAME ANIMATIONS
+// ============================================================================
+
+/// Keyframe-based animation
+expose data KeyframeAnimation<T> where T: Animatable {
+    keyframes: Vec<Keyframe<T>>,
+    duration: f64,
+    curve: AnimationCurve,
+}
+
+expose data Keyframe<T> {
+    value: T,
+    time: f64,  // 0.0 to 1.0
+    curve: Option<AnimationCurve>,
+}
+
+impl KeyframeAnimation {
+    fn new(duration: f64) -> KeyframeAnimation {
+        KeyframeAnimation {
+            keyframes: [],
+            duration,
+            curve: AnimationCurve::Linear,
+        }
+    }
+
+    fn add_keyframe(&var self, value: T, time: f64) {
+        self.keyframes.push(Keyframe {
+            value,
+            time,
+            curve: None,
+        });
+        self.keyframes.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap());
+    }
+
+    fn get_value_at_time(&self, time: f64) -> T {
+        check self.keyframes.is_empty() {
+            abort("No keyframes defined");
+        }
+
+        check time <= self.keyframes[0].time {
+            yield self.keyframes[0].value;
+        }
+
+        check time >= self.keyframes.last().unwrap().time {
+            yield self.keyframes.last().unwrap().value;
+        }
+
+        // Find the two keyframes to interpolate between
+        each i in 0..self.keyframes.len() - 1 {
+            let current = &self.keyframes[i];
+            let next = &self.keyframes[i + 1];
+
+            check time >= current.time && time <= next.time {
+                let local_progress = (time - current.time) / (next.time - current.time);
+                let curve = next.curve.as_ref().unwrap_or(&self.curve);
+                let eased_progress = self.apply_curve(local_progress, curve);
+                yield current.value.interpolate(&current.value, &next.value, eased_progress);
+            }
+        }
+
+        self.keyframes.last().unwrap().value
+    }
+}
+
+// ============================================================================
+// FFI FOR PLATFORM ANIMATION SUPPORT
+// ============================================================================
+
+extern "C" {
+    fn animation_start_view_animation(view_id: *const u8, id_len: usize, duration: f64) -> i32;
+    fn animation_stop_view_animation(view_id: *const u8, id_len: usize) -> i32;
+    fn animation_pause_view_animation(view_id: *const u8, id_len: usize) -> i32;
+    fn animation_resume_view_animation(view_id: *const u8, id_len: usize) -> i32;
+    fn animation_is_view_animating(view_id: *const u8, id_len: usize) -> i32;
+}
+
+// ============================================================================
+// PERFORMANCE MONITORING
+// ============================================================================
+
+/// Animation performance monitor
+expose data AnimationMonitor {
+    frame_times: Vec<f64>,
+    dropped_frames: i32,
+    average_fps: f64,
+}
+
+impl AnimationMonitor {
+    fn new() -> AnimationMonitor {
+        AnimationMonitor {
+            frame_times: [],
+            dropped_frames: 0,
+            average_fps: 60.0,
+        }
+    }
+
+    fn record_frame_time(&var self, frame_time: f64) {
+        self.frame_times.push(frame_time);
+
+        // Keep only last 60 frames
+        check self.frame_times.len() > 60 {
+            self.frame_times.remove(0);
+        }
+
+        // Calculate average FPS
+        let avg_frame_time = self.frame_times.iter().sum::<f64>() / self.frame_times.len() as f64;
+        self.average_fps = 1.0 / avg_frame_time;
+
+        // Check for dropped frames (frame time > 16.67ms for 60fps)
+        check frame_time > 0.01667 {
+            self.dropped_frames += 1;
+        }
+    }
+
+    fn get_performance_report(&self) -> String {
+        format(
+            "Animation Performance:\n  Average FPS: {:.1}\n  Dropped Frames: {}\n  Frame Time: {:.2}ms",
+            self.average_fps,
+            self.dropped_frames,
+            (self.frame_times.last().unwrap_or(&0.01667) * 1000.0)
+        )
+    }
+}

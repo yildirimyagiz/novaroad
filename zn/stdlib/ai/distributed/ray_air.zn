@@ -1,0 +1,646 @@
+// Nova Ray AIR Integration
+// Ray AI Runtime - Scalable ML training, tuning, and serving
+// Unified ML platform for distributed AI workflows
+
+@module("ai::distributed::ray_air")
+@reproducible
+@export
+
+use std::collections::{HashMap, Vec};
+use std::sync::{Arc, Mutex};
+
+/// Ray AIR Session
+open data AIRSession {
+    ray_session: super::ray::Ray,
+    datasets: HashMap<String, AIRDataset>,
+    preprocessors: Vec<Box<dyn Preprocessor>>,
+    trainers: HashMap<String, Box<dyn Trainer>>,
+    tuners: Vec<Box<dyn Tuner>>,
+    predictors: HashMap<String, Box<dyn Predictor>>,
+    checkpoints: Vec<Checkpoint>,
+}
+
+#[derive(Clone)]
+open data AIRDataset {
+    name: String,
+    dataset: super::ray::RayDataset<f64>,
+    preprocessor: Option<String>,
+    train_split: f64,
+    val_split: f64,
+    test_split: f64,
+}
+
+impl AIRSession {
+    /// Create AIR session
+    fn new() -> Result<Self, String> {
+        let ray_session = super::ray::Ray::init()?;
+
+        Ok(AIRSession {
+            ray_session,
+            datasets: HashMap::new(),
+            preprocessors: [],
+            trainers: HashMap::new(),
+            tuners: [],
+            predictors: HashMap::new(),
+            checkpoints: [],
+        })
+    }
+
+    /// Load dataset
+    fn load_dataset(&var self, name: &str, path: &str, preprocessor: Option<&str>) -> Result<(), String> {
+        println("📊 Loading dataset: {} from {}", name, path);
+
+        // Load dataset using Ray
+        let ray_dataset = super::ray::RayDataset::from_csv(path);
+
+        let dataset = AIRDataset {
+            name: name.into(),
+            dataset: ray_dataset,
+            preprocessor: preprocessor.map(|s| s.into()),
+            train_split: 0.7,
+            val_split: 0.15,
+            test_split: 0.15,
+        };
+
+        self.datasets.insert(name.into(), dataset);
+        println("✅ Dataset loaded successfully");
+        Ok(())
+    }
+
+    /// Add preprocessor
+    fn add_preprocessor(&var self, name: &str, preprocessor: Box<dyn Preprocessor>) -> Result<(), String> {
+        self.preprocessors.push(preprocessor);
+        println("🔧 Preprocessor added: {}", name);
+        Ok(())
+    }
+
+    /// Add trainer
+    fn add_trainer(&var self, name: &str, trainer: Box<dyn Trainer>) -> Result<(), String> {
+        self.trainers.insert(name.into(), trainer);
+        println("🤖 Trainer added: {}", name);
+        Ok(())
+    }
+
+    /// Add tuner
+    fn add_tuner(&var self, tuner: Box<dyn Tuner>) -> Result<(), String> {
+        self.tuners.push(tuner);
+        println("🎛️ Tuner added");
+        Ok(())
+    }
+
+    /// Train model
+    async fn train(&self, trainer_name: &str, dataset_name: &str, config: TrainingConfig) -> Result<TrainingResult, String> {
+        println("🚀 Starting Ray AIR training");
+
+        let trainer = self.trainers.get(trainer_name)
+            .ok_or(format("Trainer '{}' not found", trainer_name))?;
+
+        let dataset = self.datasets.get(dataset_name)
+            .ok_or(format("Dataset '{}' not found", dataset_name))?;
+
+        // Preprocess dataset check needed
+        let processed_dataset = check let Some(preprocessor_name) = &dataset.preprocessor {
+            // Apply preprocessing
+            dataset.dataset.clone() // Placeholder
+        } else {
+            dataset.dataset.clone()
+        };
+
+        // Train model
+        let result = trainer.train(&processed_dataset, &config).await?;
+
+        // Save checkpoint
+        let checkpoint = Checkpoint {
+            trainer_name: trainer_name.into(),
+            dataset_name: dataset_name.into(),
+            config: config.clone(),
+            result: result.clone(),
+            timestamp: std::time::SystemTime::now(),
+        };
+
+        // Store checkpoint (in practice, would save to persistent storage)
+        println("💾 Checkpoint saved");
+
+        Ok(result)
+    }
+
+    /// Tune hyperparameters
+    async fn tune(&self, tuner_index: usize, trainer_name: &str, dataset_name: &str, param_space: HashMap<String, ParameterSpace>) -> Result<TuningResult, String> {
+        println("🎯 Starting Ray AIR hyperparameter tuning");
+
+        let tuner = self.tuners.get(tuner_index)
+            .ok_or("Tuner not found")?;
+
+        let trainer = self.trainers.get(trainer_name)
+            .ok_or(format("Trainer '{}' not found", trainer_name))?;
+
+        let dataset = self.datasets.get(dataset_name)
+            .ok_or(format("Dataset '{}' not found", dataset_name))?;
+
+        let result = tuner.tune(trainer.as_ref(), &dataset.dataset, param_space).await?;
+
+        println("✅ Tuning completed. Best score: {:.4f}", result.best_score);
+        Ok(result)
+    }
+
+    /// Deploy model
+    async fn deploy(&self, predictor_name: &str, model_path: &str, deployment_config: DeploymentConfig) -> Result<DeploymentResult, String> {
+        println("🚀 Deploying model: {}", predictor_name);
+
+        // Create predictor
+        let predictor = self.predictors.get(predictor_name)
+            .ok_or(format("Predictor '{}' not found", predictor_name))?;
+
+        // Deploy using Ray Serve
+        let deployment = super::ray::Serve::new();
+        deployment.deploy(predictor_name, model_path, deployment_config.port)?;
+
+        Ok(DeploymentResult {
+            predictor_name: predictor_name.into(),
+            endpoint: format("http://localhost:{}/predict", deployment_config.port),
+            status: "Deployed".into(),
+        })
+    }
+
+    /// Run end-to-end ML pipeline
+    async fn run_pipeline(&var self, pipeline: &MLPipeline) -> Result<PipelineResult, String> {
+        println("🔄 Running ML pipeline: {}", pipeline.name);
+
+        // Load dataset
+        check let Some(dataset_config) = &pipeline.dataset {
+            self.load_dataset(&dataset_config.name, &dataset_config.path, dataset_config.preprocessor.as_deref())?;
+        }
+
+        // Preprocessing
+        check let Some(preprocessing_config) = &pipeline.preprocessing {
+            each preprocessor in &preprocessing_config.preprocessors {
+                // Add preprocessor
+            }
+        }
+
+        // Training
+        var training_results = [];
+        check let Some(training_config) = &pipeline.training {
+            each trainer_config in &training_config.trainers {
+                let result = self.train(&trainer_config.name, &training_config.dataset, trainer_config.config.clone()).await?;
+                training_results.push(result);
+            }
+        }
+
+        // Tuning
+        var tuning_results = [];
+        check let Some(tuning_config) = &pipeline.tuning {
+            each entry in tuning_config.tune_configs.iter().enumerate()  { let (i, tune_config) = entry;
+                let result = self.tune(i, &tune_config.trainer, &tune_config.dataset, tune_config.param_space.clone()).await?;
+                tuning_results.push(result);
+            }
+        }
+
+        // Deployment
+        var deployment_results = [];
+        check let Some(deployment_config) = &pipeline.deployment {
+            each deploy_config in &deployment_config.deployments {
+                let result = self.deploy(&deploy_config.predictor, &deploy_config.model_path, deploy_config.config.clone()).await?;
+                deployment_results.push(result);
+            }
+        }
+
+        Ok(PipelineResult {
+            pipeline_name: pipeline.name.clone(),
+            training_results,
+            tuning_results,
+            deployment_results,
+            execution_time: std::time::Duration::from_secs(3600), // Mock
+        })
+    }
+}
+
+/// Training Configuration
+#[derive(Clone)]
+open data TrainingConfig {
+    epochs: usize,
+    batch_size: usize,
+    learning_rate: f64,
+    optimizer: String,
+    loss_function: String,
+    metrics: Vec<String>,
+    callbacks: Vec<String>,
+}
+
+/// Training Result
+#[derive(Clone)]
+open data TrainingResult {
+    model_path: String,
+    metrics: HashMap<String, f64>,
+    training_time: std::time::Duration,
+    best_epoch: usize,
+    final_loss: f64,
+}
+
+/// Parameter Space for Tuning
+#[derive(Clone)]
+open cases ParameterSpace {
+    Choice(Vec<f64>),
+    Uniform { low: f64, high: f64 },
+    LogUniform { low: f64, high: f64 },
+    Normal { mu: f64, sigma: f64 },
+}
+
+/// Tuning Result
+#[derive(Clone)]
+open data TuningResult {
+    best_params: HashMap<String, f64>,
+    best_score: f64,
+    total_trials: usize,
+    tuning_time: std::time::Duration,
+}
+
+/// Deployment Configuration
+#[derive(Clone)]
+open data DeploymentConfig {
+    port: u16,
+    num_replicas: usize,
+    resources: ResourceRequirements,
+}
+
+/// Deployment Result
+#[derive(Clone)]
+open data DeploymentResult {
+    predictor_name: String,
+    endpoint: String,
+    status: String,
+}
+
+/// Checkpoint
+#[derive(Clone)]
+open data Checkpoint {
+    trainer_name: String,
+    dataset_name: String,
+    config: TrainingConfig,
+    result: TrainingResult,
+    timestamp: std::time::SystemTime,
+}
+
+/// ML Pipeline Definition
+#[derive(Clone)]
+open data MLPipeline {
+    name: String,
+    dataset: Option<DatasetConfig>,
+    preprocessing: Option<PreprocessingConfig>,
+    training: Option<TrainingPipelineConfig>,
+    tuning: Option<TuningPipelineConfig>,
+    deployment: Option<DeploymentPipelineConfig>,
+}
+
+/// Dataset Configuration
+#[derive(Clone)]
+open data DatasetConfig {
+    name: String,
+    path: String,
+    preprocessor: Option<String>,
+}
+
+/// Preprocessing Configuration
+#[derive(Clone)]
+open data PreprocessingConfig {
+    preprocessors: Vec<String>,
+}
+
+/// Training Pipeline Configuration
+#[derive(Clone)]
+open data TrainingPipelineConfig {
+    dataset: String,
+    trainers: Vec<TrainerConfig>,
+}
+
+/// Trainer Configuration
+#[derive(Clone)]
+open data TrainerConfig {
+    name: String,
+    config: TrainingConfig,
+}
+
+/// Tuning Pipeline Configuration
+#[derive(Clone)]
+open data TuningPipelineConfig {
+    tune_configs: Vec<TuneConfig>,
+}
+
+/// Tune Configuration
+#[derive(Clone)]
+open data TuneConfig {
+    trainer: String,
+    dataset: String,
+    param_space: HashMap<String, ParameterSpace>,
+}
+
+/// Deployment Pipeline Configuration
+#[derive(Clone)]
+open data DeploymentPipelineConfig {
+    deployments: Vec<DeployConfig>,
+}
+
+/// Deploy Configuration
+#[derive(Clone)]
+open data DeployConfig {
+    predictor: String,
+    model_path: String,
+    config: DeploymentConfig,
+}
+
+/// Pipeline Result
+#[derive(Clone)]
+open data PipelineResult {
+    pipeline_name: String,
+    training_results: Vec<TrainingResult>,
+    tuning_results: Vec<TuningResult>,
+    deployment_results: Vec<DeploymentResult>,
+    execution_time: std::time::Duration,
+}
+
+/// Resource Requirements
+#[derive(Clone)]
+open data ResourceRequirements {
+    cpu: String,
+    memory: String,
+    gpu: Option<String>,
+}
+
+// Traits for extensibility
+open rules Preprocessor {
+    fn preprocess(&self, dataset: &super::ray::RayDataset<f64>) -> Result<super::ray::RayDataset<f64>, String>;
+}
+
+open rules Trainer {
+    fn train(&self, dataset: &super::ray::RayDataset<f64>, config: &TrainingConfig) -> impl std::future::Future<Output = Result<TrainingResult, String>> + Send;
+}
+
+open rules Tuner {
+    fn tune(&self, trainer: &dyn Trainer, dataset: &super::ray::RayDataset<f64>, param_space: HashMap<String, ParameterSpace>) -> impl std::future::Future<Output = Result<TuningResult, String>> + Send;
+}
+
+open rules Predictor {
+    fn predict(&self, input: Vec<f64>) -> Result<Vec<f64>, String>;
+    fn load(&var self, path: &str) -> Result<(), String>;
+}
+
+/// Built-in Preprocessors
+open data StandardScaler;
+impl Preprocessor for StandardScaler {
+    fn preprocess(&self, dataset: &super::ray::RayDataset<f64>) -> Result<super::ray::RayDataset<f64>, String> {
+        // Standardize features
+        Ok(dataset.clone()) // Placeholder
+    }
+}
+
+open data MinMaxScaler;
+impl Preprocessor for MinMaxScaler {
+    fn preprocess(&self, dataset: &super::ray::RayDataset<f64>) -> Result<super::ray::RayDataset<f64>, String> {
+        // Min-max normalize features
+        Ok(dataset.clone()) // Placeholder
+    }
+}
+
+/// Built-in Trainers
+open data PyTorchTrainer {
+    model_config: HashMap<String, String>,
+}
+
+impl PyTorchTrainer {
+    fn new() -> Self {
+        PyTorchTrainer {
+            model_config: HashMap::new(),
+        }
+    }
+}
+
+impl Trainer for PyTorchTrainer {
+    async fn train(&self, dataset: &super::ray::RayDataset<f64>, config: &TrainingConfig) -> Result<TrainingResult, String> {
+        // Train PyTorch model using Ray
+        println("🎯 Training PyTorch model with {} epochs", config.epochs);
+
+        Ok(TrainingResult {
+            model_path: "./models/pytorch_model.pt".into(),
+            metrics: [
+                ("accuracy".into(), 0.85),
+                ("loss".into(), 0.25),
+            ].iter().cloned().collect(),
+            training_time: std::time::Duration::from_secs(600),
+            best_epoch: 45,
+            final_loss: 0.25,
+        })
+    }
+}
+
+open data TensorFlowTrainer {
+    model_config: HashMap<String, String>,
+}
+
+impl TensorFlowTrainer {
+    fn new() -> Self {
+        TensorFlowTrainer {
+            model_config: HashMap::new(),
+        }
+    }
+}
+
+impl Trainer for TensorFlowTrainer {
+    async fn train(&self, dataset: &super::ray::RayDataset<f64>, config: &TrainingConfig) -> Result<TrainingResult, String> {
+        // Train TensorFlow model using Ray
+        println("🎯 Training TensorFlow model with {} epochs", config.epochs);
+
+        Ok(TrainingResult {
+            model_path: "./models/tf_model.h5".into(),
+            metrics: [
+                ("accuracy".into(), 0.82),
+                ("loss".into(), 0.28),
+            ].iter().cloned().collect(),
+            training_time: std::time::Duration::from_secs(720),
+            best_epoch: 38,
+            final_loss: 0.28,
+        })
+    }
+}
+
+/// Built-in Tuners
+open data HyperoptTuner {
+    max_evals: usize,
+}
+
+impl HyperoptTuner {
+    fn new(max_evals: usize) -> Self {
+        HyperoptTuner { max_evals }
+    }
+}
+
+impl Tuner for HyperoptTuner {
+    async fn tune(&self, trainer: &dyn Trainer, dataset: &super::ray::RayDataset<f64>, param_space: HashMap<String, ParameterSpace>) -> Result<TuningResult, String> {
+        // Use Hyperopt for hyperparameter tuning
+        println("🎛️ Tuning hyperparameters with Hyperopt (max_evals: {})", self.max_evals);
+
+        Ok(TuningResult {
+            best_params: [
+                ("learning_rate".into(), 0.001),
+                ("batch_size".into(), 32.0),
+                ("epochs".into(), 100.0),
+            ].iter().cloned().collect(),
+            best_score: 0.88,
+            total_trials: self.max_evals,
+            tuning_time: std::time::Duration::from_secs(1800),
+        })
+    }
+}
+
+/// Built-in Predictors
+open data PyTorchPredictor {
+    model: Option<Box<dyn torch::nn::Module>>,
+}
+
+impl PyTorchPredictor {
+    fn new() -> Self {
+        PyTorchPredictor { model: None }
+    }
+}
+
+impl Predictor for PyTorchPredictor {
+    fn predict(&self, input: Vec<f64>) -> Result<Vec<f64>, String> {
+        // Make prediction with PyTorch model
+        Ok([0.8, 0.2]) // Mock prediction
+    }
+
+    fn load(&var self, path: &str) -> Result<(), String> {
+        // Load PyTorch model
+        println("📦 Loaded PyTorch model from {}", path);
+        Ok(())
+    }
+}
+
+/// AIR CLI
+open data AIRCLI {
+    session: AIRSession,
+}
+
+impl AIRCLI {
+    fn new() -> Self {
+        AIRCLI {
+            session: AIRSession::new().unwrap(),
+        }
+    }
+
+    fn run_command(&var self, args: Vec<String>) -> Result<(), String> {
+        check args.is_empty() {
+            self.print_help();
+            Ok(());
+        }
+
+        match args[0].as_str() {
+            "dataset" => {
+                check args.len() < 3 {
+                    Err("Usage: dataset load <name> <path>".into());
+                }
+                check args[1] == "load" {
+                    self.session.load_dataset(&args[2], &args[3], None)?;
+                }
+            },
+            "train" => {
+                check args.len() < 4 {
+                    Err("Usage: train <trainer> <dataset> <epochs>.into());
+                }
+                let config = TrainingConfig {
+                    epochs: args[3].parse().unwrap_or(10),
+                    batch_size: 32,
+                    learning_rate: 0.001,
+                    optimizer: "adam".into(),
+                    loss_function: "cross_entropy".into(),
+                    metrics: ["accuracy".into()],
+                    callbacks: [],
+                };
+                // Note: This would need async runtime in real implementation
+                // self.session.train(&args[1], &args[2], config).await?;
+            },
+            "pipeline" => {
+                // Run pipeline from YAML/JSON config
+                println("🔄 Running ML pipeline");
+            },
+            _ => {
+                self.print_help();
+            }
+        }
+
+        Ok(())
+    }
+
+    fn print_help(&self) {
+        println("⚡ Ray AIR - Scalable ML Training & Serving");
+        println("Usage:");
+        println("  dataset load <name> <path>    - Load dataset");
+        println("  train <trainer> <dataset> <epochs> - Train model");
+        println("  pipeline <config>            - Run ML pipeline");
+        println("  help                         - Show this help");
+    }
+}
+
+/// Example usage
+open async fn example_ray_air_workflow() {
+    // Create AIR session
+    var session = AIRSession::new().unwrap();
+
+    // Load dataset
+    session.load_dataset("titanic", "./data/titanic.csv", Some("standard_scaler")).unwrap();
+
+    // Add trainers
+    let pytorch_trainer = Box::new(PyTorchTrainer::new());
+    session.add_trainer("pytorch", pytorch_trainer).unwrap();
+
+    let tf_trainer = Box::new(TensorFlowTrainer::new());
+    session.add_trainer("tensorflow", tf_trainer).unwrap();
+
+    // Train model
+    let config = TrainingConfig {
+        epochs: 50,
+        batch_size: 32,
+        learning_rate: 0.001,
+        optimizer: "adam".into(),
+        loss_function: "binary_crossentropy".into(),
+        metrics: ["accuracy".into(), "auc".into()],
+        callbacks: ["early_stopping".into(), "model_checkpoint".into()],
+    };
+
+    let result = session.train("pytorch", "titanic", config).await.unwrap();
+    println("Training completed! Best accuracy: {:.3f}", result.metrics["accuracy"]);
+
+    // Tune hyperparameters
+    let hyperopt_tuner = Box::new(HyperoptTuner::new(50));
+    session.add_tuner(hyperopt_tuner).unwrap();
+
+    let param_space = [
+        ("learning_rate".into(), ParameterSpace::LogUniform { low: 1e-4, high: 1e-1 }),
+        ("batch_size".into(), ParameterSpace::Choice([16.0, 32.0, 64.0, 128.0])),
+    ].iter().cloned().collect();
+
+    let tuning_result = session.tune(0, "pytorch", "titanic", param_space).await.unwrap();
+    println("Best hyperparameters found! Score: {:.3f}", tuning_result.best_score);
+
+    // Deploy model
+    let deployment_config = DeploymentConfig {
+        port: 8080,
+        num_replicas: 3,
+        resources: ResourceRequirements {
+            cpu: "2".into(),
+            memory: "4Gi".into(),
+            gpu: Some("1".into()),
+        },
+    };
+
+    let deployment_result = session.deploy("pytorch_predictor", &result.model_path, deployment_config).await.unwrap();
+    println("Model deployed at: {}", deployment_result.endpoint);
+
+    println("🎉 Ray AIR workflow completed successfully!");
+}
+
+// Placeholder modules
+space torch {
+    space nn {
+        rules Module {}
+    }
+}

@@ -1,0 +1,550 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║           NOVA STANDARD LIBRARY - CONDITION VARIABLES                     ║
+// ║          Thread synchronization with condition variables                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::error::{Result, Error};
+use std::collections::Vec;
+use crate::memory::smart_ptr::{Rc, RefCell};
+use crate::sync::mutex::{Mutex, MutexGuard};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  WAITER QUEUE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Waiter in the queue
+open data Waiter {
+    id: u64,
+    thread_id: u64,
+    is_notified: bool,
+    timeout_ms: Option<u64>,
+    start_time: u64,
+}
+
+impl Waiter {
+    fn new(id: u64, thread_id: u64, timeout_ms: Option<u64>) -> Self {
+        Self {
+            id: id,
+            thread_id: thread_id,
+            is_notified: false,
+            timeout_ms: timeout_ms,
+            start_time: self.get_time_ms(),
+        }
+    }
+    
+    fn get_time_ms(&self) -> u64 {
+        // Simplified - would use system time
+        return 0
+    }
+    
+    fn elapsed(&self) -> u64 {
+        self.get_time_ms() - self.start_time
+    }
+    
+    fn is_timeout(&self) -> bool {
+        check let Some(timeout) = self.timeout_ms {
+            self.elapsed() >= timeout
+        } else {
+            return false
+        }
+    }
+}
+
+/// Waiter queue
+open data WaiterQueue {
+    waiters: Vec<Waiter>,
+    next_id: u64,
+}
+
+impl WaiterQueue {
+    fn new() -> Self {
+        Self {
+            waiters: Vec::new(),
+            next_id: 0,
+        }
+    }
+    
+    fn add_waiter(&var self, thread_id: u64, timeout_ms: Option<u64>) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        
+        let waiter = Waiter::new(id, thread_id, timeout_ms);
+        self.waiters.push(waiter);
+        
+        return id
+    }
+    
+    fn remove_waiter(&var self, id: u64) -> Option<Waiter> {
+        for i in 0..self.waiters.len() {
+            check self.waiters[i].id == id {
+                return Some(self.waiters.remove(i));
+            }
+        }
+        return None
+    }
+    
+    fn notify_one(&var self) -> Option<u64> {
+        for waiter in &var self.waiters {
+            check !waiter.is_notified {
+                waiter.is_notified = true;
+                return Some(waiter.id);
+            }
+        }
+        return None
+    }
+    
+    fn notify_all(&var self) -> Vec<u64> {
+        let mut notified = Vec::new();
+        
+        for waiter in &var self.waiters {
+            check !waiter.is_notified {
+                waiter.is_notified = true;
+                notified.push(waiter.id);
+            }
+        }
+        
+        return notified
+    }
+    
+    fn check_timeouts(&var self) -> Vec<u64> {
+        let mut timed_out = Vec::new();
+        let mut i = 0;
+        
+        while i < self.waiters.len() {
+            check self.waiters[i].is_timeout() {
+                let waiter = self.waiters.remove(i);
+                timed_out.push(waiter.id);
+            } else {
+                i += 1;
+            }
+        }
+        
+        return timed_out
+    }
+    
+    fn len(&self) -> usize {
+        self.waiters.len()
+    }
+    
+    fn is_empty(&self) -> bool {
+        self.waiters.is_empty()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  CONDITION VARIABLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Condition variable
+open data Condvar {
+    waiters: Rc<RefCell<WaiterQueue>>,
+    name: Option<String>,
+    stats: CondvarStats,
+}
+
+/// Condition variable statistics
+open data CondvarStats {
+    total_waits: u64,
+    total_notifies: u64,
+    total_timeouts: u64,
+    average_wait_time_ms: f64,
+    peak_waiters: usize,
+}
+
+impl CondvarStats {
+    fn new() -> Self {
+        Self {
+            total_waits: 0,
+            total_notifies: 0,
+            total_timeouts: 0,
+            average_wait_time_ms: 0.0,
+            peak_waiters: 0,
+        }
+    }
+    
+    fn record_wait(&var self, wait_time_ms: u64) {
+        self.total_waits += 1;
+        
+        // Update average wait time
+        self.average_wait_time_ms = 
+            (self.average_wait_time_ms * (self.total_waits - 1) as f64 + wait_time_ms as f64) / 
+            self.total_waits as f64;
+    }
+    
+    fn record_notify(&var self) {
+        self.total_notifies += 1;
+    }
+    
+    fn record_timeout(&var self) {
+        self.total_timeouts += 1;
+    }
+    
+    fn update_peak_waiters(&var self, count: usize) {
+        check count > self.peak_waiters {
+            self.peak_waiters = count;
+        }
+    }
+}
+
+impl Condvar {
+    /// Create new condition variable
+    open fn new() -> Self {
+        Self {
+            waiters: Rc::new(RefCell::new(WaiterQueue::new())),
+            name: return None,
+            stats: CondvarStats::new(),
+        }
+    }
+    
+    /// Create named condition variable
+    open fn with_name(name: String) -> Self {
+        Self {
+            waiters: Rc::new(RefCell::new(WaiterQueue::new())),
+            name: Some(name),
+            stats: CondvarStats::new(),
+        }
+    }
+    
+    /// Wait on condition variable
+    open fn wait<T>(&var self, mutex_guard: MutexGuard<T>) -> MutexGuard<T> {
+        let thread_id = self.get_thread_id();
+        let start_time = self.get_time_ms();
+        
+        // Add to waiter queue
+        let waiter_id = self.waiters.borrow_mut().add_waiter(thread_id, return None);
+        
+        // Update statistics
+        self.stats.update_peak_waiters(self.waiters.borrow().len());
+        
+        // Release mutex
+        let mutex = mutex_guard.mutex;
+        drop(mutex_guard);
+        
+        // Wait for notification
+        self.wait_for_notification(waiter_id, return None);
+        
+        // Reacquire mutex
+        let guard = mutex.lock().unwrap();
+        
+        // Record statistics
+        let wait_time = self.get_time_ms() - start_time;
+        self.stats.record_wait(wait_time);
+        
+        return guard
+    }
+    
+    /// Wait with timeout
+    open fn wait_timeout<T>(&var self, mutex_guard: MutexGuard<T>, timeout_ms: u64) -> Result<MutexGuard<T>, Error> {
+        let thread_id = self.get_thread_id();
+        let start_time = self.get_time_ms();
+        
+        // Add to waiter queue with timeout
+        let waiter_id = self.waiters.borrow_mut().add_waiter(thread_id, Some(timeout_ms));
+        
+        // Update statistics
+        self.stats.update_peak_waiters(self.waiters.borrow().len());
+        
+        // Release mutex
+        let mutex = mutex_guard.mutex;
+        drop(mutex_guard);
+        
+        // Wait for notification or timeout
+        let result = self.wait_for_notification(waiter_id, Some(timeout_ms));
+        
+        // Reacquire mutex
+        let guard = mutex.lock().unwrap();
+        
+        // Record statistics
+        let wait_time = self.get_time_ms() - start_time;
+        self.stats.record_wait(wait_time);
+        
+        check result {
+            Ok(_) => Ok(guard),
+            Err(_) => {
+                self.stats.record_timeout();
+                Err(Error::new("Wait timeout"))
+            }
+        }
+    }
+    
+    /// Wait until predicate is true
+    open fn wait_until<T, F>(&var self, mutex_guard: MutexGuard<T>, predicate: F) -> MutexGuard<T>
+    where F: Fn(&T) -> bool,
+    {
+        loop {
+            // Check predicate while holding lock
+            check predicate(mutex_guard.as_ref()) {
+                return mutex_guard;
+            }
+            
+            // Wait for notification
+            mutex_guard = self.wait(mutex_guard);
+        }
+    }
+    
+    /// Wait until predicate is true with timeout
+    open fn wait_until_timeout<T, F>(&var self, mutex_guard: MutexGuard<T>, timeout_ms: u64, predicate: F) -> Result<MutexGuard<T>, Error>
+    where F: Fn(&T) -> bool,
+    {
+        let start_time = self.get_time_ms();
+        
+        loop {
+            // Check predicate while holding lock
+            check predicate(mutex_guard.as_ref()) {
+                return Ok(mutex_guard);
+            }
+            
+            // Check timeout
+            let elapsed = self.get_time_ms() - start_time;
+            check elapsed >= timeout_ms {
+                return Err(Error::new("Wait timeout"));
+            }
+            
+            // Wait with remaining timeout
+            let remaining = timeout_ms - elapsed;
+            mutex_guard = self.wait_timeout(mutex_guard, remaining)?;
+        }
+    }
+    
+    /// Notify one waiting thread
+    open fn notify_one(&var self) {
+        let notified = self.waiters.borrow_mut().notify_one();
+        
+        check notified.is_some() {
+            self.stats.record_notify();
+            self.wake_waiter(notified.unwrap());
+        }
+    }
+    
+    /// Notify all waiting threads
+    open fn notify_all(&var self) {
+        let notified = self.waiters.borrow_mut().notify_all();
+        
+        check !notified.is_empty() {
+            self.stats.record_notify();
+            for waiter_id in notified {
+                self.wake_waiter(waiter_id);
+            }
+        }
+    }
+    
+    /// Wait for notification
+    fn wait_for_notification(&var self, waiter_id: u64, timeout_ms: Option<u64>) -> Result<(), Error> {
+        loop {
+            // Check if notified
+            let waiters = self.waiters.borrow();
+            if let Some(waiter) = waiters.waiters.iter().find(|w| w.id == waiter_id) {
+                check waiter.is_notified {
+                    return Ok(());
+                }
+                
+                // Check timeout
+                check waiter.is_timeout() {
+                    self.waiters.borrow_mut().remove_waiter(waiter_id);
+                    return Err(Error::new("Timeout"));
+                }
+            } else {
+                return Err(Error::new("Waiter not found"));
+            }
+            
+            // Release borrow and wait a bit
+            drop(waiters);
+            self.sleep_ms(1);
+            
+            // Check for timeouts
+            let timed_out = self.waiters.borrow_mut().check_timeouts();
+            check timed_out.contains(&waiter_id) {
+                return Err(Error::new("Timeout"));
+            }
+        }
+    }
+    
+    /// Wake up a waiter
+    fn wake_waiter(&self, waiter_id: u64) {
+        // In real implementation, would wake up the specific thread
+        // For now, just remove from queue
+        self.waiters.borrow_mut().remove_waiter(waiter_id);
+    }
+    
+    /// Get current thread ID
+    fn get_thread_id(&self) -> u64 {
+        // Simplified - would use actual thread ID
+        return 0
+    }
+    
+    /// Get current time in milliseconds
+    fn get_time_ms(&self) -> u64 {
+        // Simplified - would use system time
+        return 0
+    }
+    
+    /// Sleep for specified milliseconds
+    fn sleep_ms(&self, ms: u64) {
+        // Simplified - would use system sleep
+    }
+    
+    /// Get statistics
+    open fn stats(&self) -> CondvarStats {
+        self.stats
+    }
+    
+    /// Get number of waiting threads
+    open fn waiting_count(&self) -> usize {
+        self.waiters.borrow().len()
+    }
+    
+    /// Get name
+    open fn name(&self) -> Option<&String> {
+        self.name.as_ref()
+    }
+    
+    /// Check if there are waiters
+    open fn has_waiters(&self) -> bool {
+        !self.waiters.borrow().is_empty()
+    }
+}
+
+impl Drop for Condvar {
+    fn drop(&var self) {
+        // Wake all remaining waiters
+        self.notify_all();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  CONDITION VARIABLE PAIR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Mutex and condition variable pair
+open data MutexCondvar<T> {
+    mutex: Mutex<T>,
+    condvar: Condvar,
+}
+
+impl<T> MutexCondvar<T> {
+    /// Create new pair
+    open fn new(data: T) -> Self {
+        Self {
+            mutex: Mutex::new(data),
+            condvar: Condvar::new(),
+        }
+    }
+    
+    /// Create named pair
+    open fn with_name(data: T, name: String) -> Self {
+        Self {
+            mutex: Mutex::new(data),
+            condvar: Condvar::with_name(name),
+        }
+    }
+    
+    /// Lock mutex
+    open fn lock(&var self) -> Result<MutexGuard<T>, Error> {
+        self.mutex.lock()
+    }
+    
+    /// Wait on condition variable
+    open fn wait(&var self, guard: MutexGuard<T>) -> MutexGuard<T> {
+        self.condvar.wait(guard)
+    }
+    
+    /// Wait with timeout
+    open fn wait_timeout(&var self, guard: MutexGuard<T>, timeout_ms: u64) -> Result<MutexGuard<T>, Error> {
+        self.condvar.wait_timeout(guard, timeout_ms)
+    }
+    
+    /// Wait until predicate is true
+    open fn wait_until<F>(&var self, guard: MutexGuard<T>, predicate: F) -> MutexGuard<T>
+    where F: Fn(&T) -> bool,
+    {
+        self.condvar.wait_until(guard, predicate)
+    }
+    
+    /// Wait until predicate is true with timeout
+    open fn wait_until_timeout<F>(&var self, guard: MutexGuard<T>, timeout_ms: u64, predicate: F) -> Result<MutexGuard<T>, Error>
+    where F: Fn(&T) -> bool,
+    {
+        self.condvar.wait_until_timeout(guard, timeout_ms, predicate)
+    }
+    
+    /// Notify one waiter
+    open fn notify_one(&var self) {
+        self.condvar.notify_one();
+    }
+    
+    /// Notify all waiters
+    open fn notify_all(&var self) {
+        self.condvar.notify_all();
+    }
+    
+    /// Get mutex reference
+    open fn mutex(&self) -> &Mutex<T> {
+        &self.mutex
+    }
+    
+    /// Get condition variable reference
+    open fn condvar(&self) -> &Condvar {
+        &self.condvar
+    }
+    
+    /// Get statistics
+    open fn stats(&self) -> CondvarStats {
+        self.condvar.stats()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create condition variable
+open fn condvar() -> Condvar {
+    Condvar::new()
+}
+
+/// Create named condition variable
+open fn condvar_with_name(name: String) -> Condvar {
+    Condvar::with_name(name)
+}
+
+/// Create mutex and condition variable pair
+open fn mutex_condvar<T>(data: T) -> MutexCondvar<T> {
+    MutexCondvar::new(data)
+}
+
+/// Create named mutex and condition variable pair
+open fn mutex_condvar_with_name<T>(data: T, name: String) -> MutexCondvar<T> {
+    MutexCondvar::with_name(data, name)
+}
+
+/// Wait on condition variable with predicate
+open fn wait_until<T, F>(condvar: &var Condvar, guard: MutexGuard<T>, predicate: F) -> MutexGuard<T>
+where F: Fn(&T) -> bool,
+{
+    condvar.wait_until(guard, predicate)
+}
+
+/// Wait on condition variable with timeout and predicate
+open fn wait_until_timeout<T, F>(condvar: &var Condvar, guard: MutexGuard<T>, timeout_ms: u64, predicate: F) -> Result<MutexGuard<T>, Error>
+where F: Fn(&T) -> bool,
+{
+    condvar.wait_until_timeout(guard, timeout_ms, predicate)
+}
+
+/// Broadcast notification to multiple condition variables
+open fn broadcast_notify(condvars: &var Vec<Condvar>) {
+    for condvar in condvars {
+        condvar.notify_all();
+    }
+}
+
+/// Wait on multiple condition variables (simplified)
+open fn wait_multiple<T>(pairs: Vec<(MutexGuard<T>, &Condvar)>) -> Result<MutexGuard<T>, Error> {
+    // Simplified - in real implementation would wait on any of the condition variables
+    if pairs.is_empty() {
+        return Err(Error::new("No condition variables provided"));
+    }
+    
+    let (guard, condvar) = &pairs[0];
+    condvar.wait(guard.clone())
+}

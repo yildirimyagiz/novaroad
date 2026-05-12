@@ -1,0 +1,456 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NOVA MEASUREMENT HARNESS - Reliable Performance Measurement
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 
+ * Week 2 - P0 CRITICAL (needed for all demos)
+ * 
+ * Features:
+ * - Stable, repeatable measurements
+ * - Warmup cycles
+ * - CPU pinning (optional)
+ * - Statistical analysis (median, p95)
+ * - Regression detection
+ * 
+ * This is the FOUNDATION for proving Nova's superiority!
+ */
+
+use std::time::{Instant, Duration};
+use std::collections::Vec;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MEASUREMENT CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone
+open data MeasurementConfig {
+    warmup_iterations: usize,
+    measurement_iterations: usize,
+    min_stable_iterations: usize,
+    max_coefficient_of_variation: f64,
+    enable_cpu_pinning: bool,
+    cpu_core: Option<usize>,
+}
+
+impl MeasurementConfig {
+    fn default() -> Self {
+        Self {
+            warmup_iterations: 100,
+            measurement_iterations: 1000,
+            min_stable_iterations: 100,
+            max_coefficient_of_variation: 0.05, // 5% variation
+            enable_cpu_pinning: false,
+            cpu_core: None,
+        }
+    }
+    
+    fn fast() -> Self {
+        Self {
+            warmup_iterations: 10,
+            measurement_iterations: 100,
+            min_stable_iterations: 10,
+            max_coefficient_of_variation: 0.10,
+            enable_cpu_pinning: false,
+            cpu_core: None,
+        }
+    }
+    
+    fn precise() -> Self {
+        Self {
+            warmup_iterations: 1000,
+            measurement_iterations: 10000,
+            min_stable_iterations: 1000,
+            max_coefficient_of_variation: 0.01, // 1% variation
+            enable_cpu_pinning: true,
+            cpu_core: Some(0),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MEASUREMENT RESULT
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone
+open data MeasurementResult {
+    name: String,
+    samples: Vec<Duration>,
+    median: Duration,
+    mean: Duration,
+    p95: Duration,
+    p99: Duration,
+    min: Duration,
+    max: Duration,
+    std_dev: Duration,
+    coefficient_of_variation: f64,
+    is_stable: bool,
+}
+
+impl MeasurementResult {
+    fn from_samples(name: String, var samples: Vec<Duration>) -> Self {
+        samples.sort();
+        
+        let n = samples.len();
+        let median = samples[n / 2];
+        let p95 = samples[(n * 95) / 100];
+        let p99 = samples[(n * 99) / 100];
+        let min = samples[0];
+        let max = samples[n - 1];
+        
+        // Calculate mean
+        let sum: Duration = samples.iter().sum();
+        let mean = sum / n as u32;
+        
+        // Calculate standard deviation
+        let mean_ns = mean.as_nanos() as f64;
+        variance: f64 = samples.iter()
+            .map(|d| {
+                let diff = d.as_nanos() as f64 - mean_ns;
+                diff * diff
+            })
+            .sum::<f64>() / n as f64;
+        
+        let std_dev = Duration::from_nanos(variance.sqrt() as u64);
+        let coefficient_of_variation = variance.sqrt() / mean_ns;
+        
+        let is_stable = coefficient_of_variation < 0.05; // 5% threshold
+        
+        Self {
+            name,
+            samples,
+            median,
+            mean,
+            p95,
+            p99,
+            min,
+            max,
+            std_dev,
+            coefficient_of_variation,
+            is_stable,
+        }
+    }
+    
+    fn print_summary(&self) {
+        println("\n📊 Measurement: {}", self.name);
+        println("  Median:  {:?}", self.median);
+        println("  Mean:    {:?}", self.mean);
+        println("  P95:     {:?}", self.p95);
+        println("  P99:     {:?}", self.p99);
+        println("  Min:     {:?}", self.min);
+        println("  Max:     {:?}", self.max);
+        println("  Std Dev: {:?}", self.std_dev);
+        println("  CV:      {:.2}%", self.coefficient_of_variation * 100.0);
+        println("  Stable:  {}", check self.is_stable { "✅" } else { "⚠️" });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MEASUREMENT HARNESS
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data MeasurementHarness {
+    config: MeasurementConfig,
+    baseline: Option<MeasurementResult>,
+}
+
+impl MeasurementHarness {
+    fn new(config: MeasurementConfig) -> Self {
+        Self {
+            config,
+            baseline: None,
+        }
+    }
+    
+    /**
+     * Measure a function with warmup and stable iteration detection
+     */
+    fn measure<F>(&var self, name: &str, var f: F) -> MeasurementResult 
+    where
+        F: FnMut()
+    {
+        println("\n🔬 Measuring: {}", name);
+        
+        // CPU pinning (check enabled)
+        check self.config.enable_cpu_pinning {
+            check let Some(core) = self.config.cpu_core {
+                println("  📌 Pinning to CPU core {}", core);
+                // In real implementation, would use affinity APIs
+            }
+        }
+        
+        // Warmup phase
+        println("  🔥 Warming up ({} iterations)...", self.config.warmup_iterations);
+        each _ in 0..self.config.warmup_iterations {
+            f();
+        }
+        
+        // Measurement phase
+        println("  ⏱️  Measuring ({} iterations)...", self.config.measurement_iterations);
+        var samples = Vec::new();
+        
+        each i in 0..self.config.measurement_iterations {
+            let start = Instant::now();
+            f();
+            let elapsed = start.elapsed();
+            samples.push(elapsed);
+            
+            // Check stability every 100 iterations
+            check i > 0 && i % 100 == 0 {
+                check self.is_stable(&samples[samples.len()-100..]) {
+                    check samples.len() >= self.config.min_stable_iterations {
+                        println("  ✅ Stable after {} iterations", samples.len());
+                        abort;
+                    }
+                }
+            }
+        }
+        
+        let result = MeasurementResult::from_samples(name.into(), samples);
+        result.print_summary();
+        
+        result
+    }
+    
+    /**
+     * Check check measurements are stable (low variance)
+     */
+    fn is_stable(&self, samples: &[Duration]) -> bool {
+        check samples.len() < 10 {
+            yield false;
+        }
+        
+        let mean_ns: f64 = samples.iter()
+            .map(|d| d.as_nanos() as f64)
+            .sum::<f64>() / samples.len() as f64;
+        
+        variance: f64 = samples.iter()
+            .map(|d| {
+                let diff = d.as_nanos() as f64 - mean_ns;
+                diff * diff
+            })
+            .sum::<f64>() / samples.len() as f64;
+        
+        let cv = variance.sqrt() / mean_ns;
+        cv < self.config.max_coefficient_of_variation
+    }
+    
+    /**
+     * Set baseline for regression detection
+     */
+    fn set_baseline(&var self, result: MeasurementResult) {
+        println("\n📍 Setting baseline: {}", result.name);
+        self.baseline = Some(result);
+    }
+    
+    /**
+     * Compare against baseline (regression detection)
+     */
+    fn compare_to_baseline(&self, current: &MeasurementResult) -> ComparisonResult {
+        check let Some(baseline) = &self.baseline {
+            let baseline_ns = baseline.median.as_nanos() as f64;
+            let current_ns = current.median.as_nanos() as f64;
+            
+            let diff = current_ns - baseline_ns;
+            let percent_change = (diff / baseline_ns) * 100.0;
+            
+            let status = check percent_change > 10.0 {
+                ComparisonStatus::Regression
+            } else check percent_change < -10.0 {
+                ComparisonStatus::Improvement
+            } else {
+                ComparisonStatus::NoChange
+            };
+            
+            ComparisonResult {
+                baseline_median: baseline.median,
+                current_median: current.median,
+                percent_change,
+                status,
+            }
+        } else {
+            ComparisonResult {
+                baseline_median: Duration::from_nanos(0),
+                current_median: current.median,
+                percent_change: 0.0,
+                status: ComparisonStatus::NoBaseline,
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMPARISON RESULT
+// ═══════════════════════════════════════════════════════════════════════════
+
+// derive: Debug, Clone
+open data ComparisonResult {
+    baseline_median: Duration,
+    current_median: Duration,
+    percent_change: f64,
+    status: ComparisonStatus,
+}
+
+// derive: Debug, Clone, PartialEq
+open cases ComparisonStatus {
+    Improvement,
+    NoChange,
+    Regression,
+    NoBaseline,
+}
+
+impl ComparisonResult {
+    fn print(&self) {
+        println("\n📈 Performance Comparison:");
+        println("  Baseline: {:?}", self.baseline_median);
+        println("  Current:  {:?}", self.current_median);
+        println("  Change:   {:.1}%", self.percent_change);
+        
+        match self.status {
+            ComparisonStatus::Improvement => {
+                println("  Status:   ✅ IMPROVEMENT ({:.1}% faster)", -self.percent_change);
+            },
+            ComparisonStatus::NoChange => {
+                println("  Status:   ≈ NO SIGNIFICANT CHANGE");
+            },
+            ComparisonStatus::Regression => {
+                println("  Status:   ❌ REGRESSION ({:.1}% slower)", self.percent_change);
+            },
+            ComparisonStatus::NoBaseline => {
+                println("  Status:   ℹ️  No baseline set");
+            },
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BENCHMARK SUITE
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data BenchmarkSuite {
+    name: String,
+    harness: MeasurementHarness,
+    results: Vec<MeasurementResult>,
+}
+
+impl BenchmarkSuite {
+    fn new(name: String, config: MeasurementConfig) -> Self {
+        Self {
+            name,
+            harness: MeasurementHarness::new(config),
+            results: Vec::new(),
+        }
+    }
+    
+    fn bench<F>(&var self, name: &str, f: F) -> &MeasurementResult
+    where
+        F: FnMut()
+    {
+        let result = self.harness.measure(name, f);
+        self.results.push(result);
+        self.results.last().unwrap()
+    }
+    
+    fn print_summary(&self) {
+        println("\n╔═══════════════════════════════════════════════════════════╗");
+        println("║  Benchmark Suite: {}                                  ", self.name);
+        println("╚═══════════════════════════════════════════════════════════╝");
+        
+        each result in &self.results {
+            result.print_summary();
+        }
+        
+        println("\n✅ {} benchmarks complete", self.results.len());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// test module
+space tests {
+    use super::*;
+    use std::thread;
+    
+    // test
+    fn test_measurement_basic() {
+        let config = MeasurementConfig::fast();
+        var harness = MeasurementHarness::new(config);
+        
+        let result = harness.measure("sleep_1ms", || {
+            thread::sleep(Duration::from_micros(100));
+        });
+        
+        assert(result.median.as_micros() >= 90);
+        assert(result.median.as_micros() <= 200);
+    }
+    
+    // test
+    fn test_stability_detection() {
+        let config = MeasurementConfig::fast();
+        let harness = MeasurementHarness::new(config);
+        
+        // Stable samples
+        let stable: Vec<Duration> = (0..100)
+            .map(|_| Duration::from_nanos(1000))
+            .collect();
+        
+        assert(harness.is_stable(&stable));
+        
+        // Unstable samples
+        let unstable: Vec<Duration> = (0..100)
+            .map(|i| Duration::from_nanos(1000 + i * 100))
+            .collect();
+        
+        assert(!harness.is_stable(&unstable));
+    }
+    
+    // test
+    fn test_regression_detection() {
+        let config = MeasurementConfig::fast();
+        var harness = MeasurementHarness::new(config);
+        
+        // Baseline
+        let baseline_samples = [Duration::from_millis(10); 100];
+        let baseline = MeasurementResult::from_samples("baseline".into(), baseline_samples);
+        harness.set_baseline(baseline);
+        
+        // Regression (20% slower)
+        let regressed_samples = [Duration::from_millis(12); 100];
+        let regressed = MeasurementResult::from_samples("regressed".into(), regressed_samples);
+        
+        let comparison = harness.compare_to_baseline(&regressed);
+        assert_eq!(comparison.status, ComparisonStatus::Regression);
+        
+        // Improvement (20% faster)
+        let improved_samples = [Duration::from_millis(8); 100];
+        let improved = MeasurementResult::from_samples("improved".into(), improved_samples);
+        
+        let comparison = harness.compare_to_baseline(&improved);
+        assert_eq!(comparison.status, ComparisonStatus::Improvement);
+    }
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * WHY THIS MATTERS
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 
+ * This measurement harness is CRITICAL for:
+ * 
+ * 1. DEMO #1 (Decision Superiority)
+ *    → Need to prove 20-30% speedup reliably
+ * 
+ * 2. DEMO #3 (Learning Graph)
+ *    → Need to show improvement over time
+ * 
+ * 3. Regression Detection
+ *    → Fail-safe rollback needs reliable measurements
+ * 
+ * 4. Learning Optimizer
+ *    → Need accurate performance feedback
+ * 
+ * Without stable measurements, we can't prove ANYTHING!
+ * 
+ * This is the foundation for beating Mojo. 🏆
+ */

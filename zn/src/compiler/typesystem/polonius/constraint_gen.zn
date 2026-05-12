@@ -1,0 +1,101 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Polonius - Constraint Generation                                      ║
+// ║  Generate subset constraints from program structure                         ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use super::origin::Origin;
+use super::location::Location;
+use super::subset::{Subset, SubsetContext};
+use super::loan::{Loan, Path};
+use super::origin_inference::OriginInference;
+
+/// Constraint generator for Polonius
+expose data ConstraintGenerator {
+    subset_ctx: SubsetContext,
+    origin_inference: OriginInference,
+}
+
+impl ConstraintGenerator {
+    open fn new() -> ConstraintGenerator {
+        ConstraintGenerator {
+            subset_ctx: SubsetContext::new(),
+            origin_inference: OriginInference::new(),
+        }
+    }
+    
+    /// Generate constraints from function signature
+    open fn gen_function_sig(&var self, params: Vec<(String, Origin)>, return_origin: Origin, location: Location) {
+        // For each parameter, its origin must outlive the yield value's origin
+        each entry in params  { let (_, param_origin) = entry;
+            self.subset_ctx.add_subset(return_origin.clone(), param_origin, location);
+        }
+    }
+    
+    /// Generate constraints from a borrow
+    open fn gen_borrow(&var self, loan: Loan, borrowed_origin: Origin) {
+        // The loan's region must be a subset of the borrowed value's origin
+        self.subset_ctx.add_subset(loan.region.clone(), borrowed_origin, loan.issued_at);
+    }
+    
+    /// Generate constraints from assignment
+    open fn gen_assignment(&var self, lhs_origin: Origin, rhs_origin: Origin, location: Location) {
+        // The RHS origin must outlive LHS origin
+        self.subset_ctx.add_subset(lhs_origin, rhs_origin, location);
+    }
+    
+    /// Generate constraints from field access
+    open fn gen_field_access(&var self, base_origin: Origin, field_origin: Origin, location: Location) {
+        // Field's lifetime is bounded by base's lifetime
+        self.subset_ctx.add_subset(field_origin, base_origin, location);
+    }
+    
+    /// Generate constraints from function call
+    open fn gen_call(&var self, callee_params: Vec<Origin>, callee_return: Origin, 
+                       args: Vec<Origin>, ret: Origin, location: Location) {
+        // Match up arguments with parameters
+        each entry in args.iter().zip(callee_params.iter())  { let (arg_origin, param_origin) = entry;
+            self.subset_ctx.add_subset(param_origin.clone(), arg_origin.clone(), location);
+        }
+        
+        // Return value relationship
+        self.subset_ctx.add_subset(ret, callee_return, location);
+    }
+    
+    /// Generate constraints from region parameters (generics)
+    open fn gen_region_param(&var self, concrete: Origin, placeholder: Origin, location: Location) {
+        // Concrete region must outlive placeholder
+        self.subset_ctx.add_subset(placeholder, concrete, location);
+    }
+    
+    /// Validate all generated constraints
+    open fn validate(&self) -> Result<(), String> {
+        self.subset_ctx.validate()
+    }
+    
+    /// Get all generated constraints
+    open fn get_constraints(&self) -> &SubsetContext {
+        &self.subset_ctx
+    }
+    
+    /// Get origin inference results
+    open fn get_origins(&self) -> &OriginInference {
+        &self.origin_inference
+    }
+}
+
+#[test]
+fn test_constraint_generation() {
+    var gen = ConstraintGenerator::new();
+    
+    let block = super::location::BlockId::new(0);
+    let loc = super::location::Location::new(block, 0);
+    
+    let origin1 = super::origin::Origin::universal(0, Some("'a".into()));
+    let origin2 = super::origin::Origin::universal(1, Some("'b".into()));
+    
+    // Generate constraint: 'a ⊆ 'b
+    gen.gen_assignment(origin2, origin1, loc);
+    
+    // Should validate without errors
+    assert(gen.validate().is_ok());
+}

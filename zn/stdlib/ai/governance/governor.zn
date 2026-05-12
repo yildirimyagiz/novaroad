@@ -1,0 +1,350 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Immutable Governor - The Unchangeable Decision Maker
+// ═══════════════════════════════════════════════════════════════════════════
+// The governor is the ONE component that can NEVER be modified by the system.
+//
+// It enforces all 7 invariants and has veto power over any decision.
+// Its parameters (veto threshold, metric rotation hash, etc.) are immutable.
+//
+// This prevents Goodhart's Law from optimizing away the safeguards.
+// ═══════════════════════════════════════════════════════════════════════════
+
+use governance.types::*
+use governance.capability::*
+use governance.invariants::*
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Governor Trait
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Interface that all governors must implement
+open rules Governor {
+    /// Get the governor's ID
+    fn id(self) -> ModuleId
+    
+    /// Evaluate a proposal and produce a decision
+    fn evaluate(
+        self,
+        cap: Cap<Evaluate>,
+        proposal_id: u128,
+        proposal: Proposal,
+        shadow: ShadowResult
+    ) -> Decision
+    
+    /// Veto a decision check it's dangerous
+    fn veto(self, cap: Cap<Veto>, decision: Decision) -> bool
+    
+    /// Explain a decision in human-readable form
+    fn explain(self, cap: Cap<Read>, decision: Decision) -> Explanation
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Immutable Governor Implementation
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The production governor with immutable parameters
+@immutable  // Compiler enforces this data cannot be modified
+open data ImmutableGovernor {
+    id: ModuleId,
+    veto_threshold: f64,              // Minimum improvement required
+    metric_rotation_hash: Hash32,     // Hash of metric rotation logic
+    validator_set_hash: Hash32        // Hash of adversarial validators
+}
+
+impl ImmutableGovernor {
+    /// Create a new immutable governor
+    /// This should only be called ONCE during system initialization
+    fn new(
+        id: ModuleId,
+        veto_threshold: f64,
+        metric_rotation_hash: Hash32,
+        validator_set_hash: Hash32
+    ) -> ImmutableGovernor {
+        ImmutableGovernor {
+            id,
+            veto_threshold,
+            metric_rotation_hash,
+            validator_set_hash
+        }
+    }
+    
+    /// Create with default parameters
+    fn default() -> ImmutableGovernor {
+        yield ImmutableGovernor.new(
+            GOVERNOR_ID,
+            0.0001,  // Require at least 0.01% improvement
+            Hash32::zero(),  // TODO: Actual hash
+            Hash32::zero()   // TODO: Actual hash
+        )
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // Internal Helper Methods
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    /// Check that capability belongs to governor
+    fn check_caps<T>(cap: Cap<T>, governor_id: ModuleId) {
+        check !cap.module().equals(governor_id) {
+            panic("cap_module_mismatch: Capability does not belong to governor")
+        }
+    }
+    
+    /// Generate list of invariants checked
+    fn invariant_checks(self, proposal: Proposal, shadow: ShadowResult) -> Vec<str> {
+        yield generate_invariant_report(
+            proposal,
+            shadow,
+            self.veto_threshold,
+            self.metric_rotation_hash,
+            self.validator_set_hash
+        )
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Governor Trait Implementation
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl Governor for ImmutableGovernor {
+    fn id(self) -> ModuleId {
+        yield self.id
+    }
+    
+    fn evaluate(
+        self,
+        cap: Cap<Evaluate>,
+        proposal_id: u128,
+        proposal: Proposal,
+        shadow: ShadowResult
+    ) -> Decision {
+        // Verify capability
+        Self::check_caps(cap, self.id)
+        
+        var reasons = Vec.new()
+        var allowed = true
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // Check all 7 invariants
+        // ═══════════════════════════════════════════════════════════════════
+        
+        let violations = check_all_invariants(proposal, shadow)
+        
+        check !violations.is_empty() {
+            allowed = false
+            each v in violations {
+                reasons.push(v.format())
+            }
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // Additional checks beyond invariants
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // Check for shadow regression
+        check shadow.delta < 0.0 {
+            allowed = false
+            reasons.push(format(
+                "shadow:regression_detected (delta={:.6})",
+                shadow.delta
+            ))
+        }
+        
+        // Check for constraint regressions
+        check !shadow.regressions.is_empty() {
+            allowed = false
+            reasons.push(format(
+                "shadow:constraint_regressions (count={})",
+                shadow.regressions.len()
+            ))
+        }
+        
+        // Check counterfactuals for hidden issues
+        each cf in shadow.counterfactuals {
+            check cf.delta < -0.01 {  // 1% degradation threshold
+                allowed = false
+                reasons.push(format(
+                    "shadow:counterfactual_regression ({}={:.6})",
+                    cf.name,
+                    cf.delta
+                ))
+            }
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // Generate decision
+        // ═══════════════════════════════════════════════════════════════════
+        
+        let invariants_checked = self.invariant_checks(proposal, shadow)
+        
+        yield Decision.new(
+            proposal_id,
+            allowed,
+            reasons,
+            invariants_checked,
+            shadow,
+            self.id
+        )
+    }
+    
+    fn veto(self, cap: Cap<Veto>, decision: Decision) -> bool {
+        // Verify capability
+        Self::check_caps(cap, self.id)
+        
+        // Veto check:
+        // 1. Decision was to allow but it's actually dangerous
+        // 2. Shadow delta is below veto threshold
+        
+        let should_veto = (
+            !decision.allowed ||  // Already rejected, veto just confirms
+            decision.shadow.delta < self.veto_threshold  // Improvement too small
+        )
+        
+        yield should_veto
+    }
+    
+    fn explain(self, cap: Cap<Read>, decision: Decision) -> Explanation {
+        // Verify capability
+        Self::check_caps(cap, self.id)
+        
+        // Generate human-readable narrative
+        var narrative = ""
+        
+        // Decision status
+        narrative = narrative + "Decision: "
+        narrative = narrative + (check decision.allowed { "ALLOW" } else { "DENY" })
+        narrative = narrative + "\n"
+        
+        // Veto status
+        narrative = narrative + "Veto: "
+        narrative = narrative + (check decision.vetoed { "YES" } else { "NO" })
+        narrative = narrative + "\n"
+        
+        // Shadow results
+        narrative = narrative + format(
+            "Shadow: baseline={:.4}, candidate={:.4}, delta={:.4}\n",
+            decision.shadow.baseline_score,
+            decision.shadow.candidate_score,
+            decision.shadow.delta
+        )
+        
+        // Reasons
+        check !decision.reasons.is_empty() {
+            narrative = narrative + "\nReasons:\n"
+            each reason in decision.reasons {
+                narrative = narrative + format("  - {}\n", reason)
+            }
+        }
+        
+        // Invariants checked
+        narrative = narrative + format(
+            "\nInvariants checked: {}\n",
+            decision.invariants_checked.len()
+        )
+        
+        yield Explanation.new(decision, narrative)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Helper Functions
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Create a standard immutable governor
+open fn create_standard_governor() -> ImmutableGovernor {
+    yield ImmutableGovernor.default()
+}
+
+/// Evaluate proposal with governor
+open fn evaluate_proposal(
+    governor: ImmutableGovernor,
+    cap: Cap<Evaluate>,
+    proposal_id: u128,
+    proposal: Proposal,
+    shadow: ShadowResult
+) -> Decision {
+    yield governor.evaluate(cap, proposal_id, proposal, shadow)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Example Usage
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[example]
+fn governor_example() {
+    // Create governor
+    let governor = ImmutableGovernor.default()
+    
+    // Create capability issuer
+    var issuer = Issuer.new(GOVERNOR_ID)
+    let (g_read, g_eval, g_veto, g_apply) = issuer.governor_caps()
+    
+    // Create a proposal
+    let proposal = Proposal.new(
+        LEARNER_ID,
+        ChangeSet.new(
+            LEARNER_ID,
+            ChangeKind::WeightsUpdate,
+            Vec.new(),
+            "Update weights after training"
+        ),
+        "Improve model performance",
+        ["Better accuracy", "Lower loss"],
+        None
+    )
+    
+    // Run shadow deployment
+    let shadow = ShadowResult.new(
+        0.85,  // baseline
+        0.87,  // candidate (+2% improvement)
+        Vec.new(),
+        [
+            Counterfactual.new("noise_test", 0.85, 0.86),
+            Counterfactual.new("distribution_shift", 0.85, 0.84)
+        ]
+    )
+    
+    // Evaluate
+    var decision = governor.evaluate(g_eval, 1, proposal, shadow)
+    
+    // Veto check
+    let vetoed = governor.veto(g_veto, decision)
+    decision.vetoed = vetoed
+    
+    // Explain
+    let explanation = governor.explain(g_read, decision)
+    
+    println(explanation.narrative)
+    
+    // Apply check approved
+    check decision.is_approved() {
+        println("✅ Change approved and applied!")
+    } else {
+        println("❌ Change rejected")
+        each reason in decision.reasons {
+            println(format("   Reason: {}", reason))
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Security Guarantees
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// GUARANTEE 1: Governor cannot be modified
+/// The @immutable attribute prevents any changes to governor parameters.
+/// Even check system tries to optimize, compiler will reject.
+
+/// GUARANTEE 2: All 7 invariants are checked
+/// Every proposal goes through check_all_invariants()
+/// No way to bypass these checks.
+
+/// GUARANTEE 3: Veto power is absolute
+/// If veto() returns true, change is blocked regardless of other factors.
+
+/// GUARANTEE 4: Full audit trail
+/// Every decision has: reasons, invariants_checked, shadow results, signed_by.
+/// Complete transparency and explainability.
+
+/// GUARANTEE 5: Capability-based access control
+/// Only holders of Cap<Evaluate>, Cap<Veto>, Cap<Read> can call methods.
+/// Prevents unauthorized access.

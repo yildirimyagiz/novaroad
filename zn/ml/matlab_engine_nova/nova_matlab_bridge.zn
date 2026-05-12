@@ -1,0 +1,277 @@
+// nova_matlab_bridge.zn — Nova wrapper for native MATLAB C bridge
+// Links nova_matlab_engine.c via FFI
+
+use ffi;
+
+// Re-export the public API using Nova FFI declarations
+extern "C" {
+    fn nova_matlab_start(option: *const u8, err: *var i32) -> *var NovaMatlabEngine;
+    fn nova_matlab_start_async(option: *const u8, err: *var i32) -> *var NovaMatlabFuture;
+    fn nova_matlab_connect(name: *const u8, err: *var i32) -> *var NovaMatlabEngine;
+    fn nova_matlab_connect_any(err: *var i32) -> *var NovaMatlabEngine;
+    fn nova_matlab_find(out: *var NovaEngineSession, max: i32) -> i32;
+    fn nova_matlab_quit(eng: *var NovaMatlabEngine) -> void;
+    fn nova_matlab_eval(eng: *var NovaMatlabEngine, expr: *const u8, use_exc: bool) -> i32;
+    fn nova_matlab_feval(eng: *var NovaMatlabEngine, func: *const u8,
+                         nargout: i32, args: **const NovaMatlabValue,
+                         nargs: i32, out: **var NovaMatlabValue) -> i32;
+    fn nova_matlab_put_variable(eng: *var NovaMatlabEngine, ws: *const u8,
+                                name: *const u8, val: *const NovaMatlabValue) -> i32;
+    fn nova_matlab_get_variable(eng: *var NovaMatlabEngine, ws: *const u8,
+                                name: *const u8, err: *var i32) -> *var NovaMatlabValue;
+    fn nova_mval_double(v: f64)  -> *var NovaMatlabValue;
+    fn nova_mval_float(v: f32)   -> *var NovaMatlabValue;
+    fn nova_mval_int32(v: i32)   -> *var NovaMatlabValue;
+    fn nova_mval_int64(v: i64)   -> *var NovaMatlabValue;
+    fn nova_mval_bool(v: bool)   -> *var NovaMatlabValue;
+    fn nova_mval_string(s: *const u8) -> *var NovaMatlabValue;
+    fn nova_mval_matrix_f64(data: *const f64, rows: usize, cols: usize) -> *var NovaMatlabValue;
+    fn nova_mval_matrix_f32(data: *const f32, rows: usize, cols: usize) -> *var NovaMatlabValue;
+    fn nova_mval_free(val: *var NovaMatlabValue) -> void;
+    fn nova_future_result(fut: *var NovaMatlabFuture, err: *var i32) -> *var NovaMatlabEngine;
+    fn nova_future_cancel(fut: *var NovaMatlabFuture) -> bool;
+    fn nova_future_done(fut:  *var NovaMatlabFuture) -> bool;
+    fn nova_feval_future_result(fut: *var NovaFevalFuture, out: **var NovaMatlabValue, n: i32) -> i32;
+    fn nova_feval_future_cancel(fut: *var NovaFevalFuture) -> bool;
+    fn nova_engine_registry_init() -> void;
+    fn nova_engine_registry_shutdown() -> void;
+}
+
+// High-level Nova wrapper structs
+open data MatlabEngine {
+    ptr: *var NovaMatlabEngine,
+}
+
+impl MatlabEngine {
+    fn start(option: str) -> Result<MatlabEngine, str> {
+        var err: i32 = 0;
+        let ptr = unsafe { nova_matlab_start(option.as_ptr(), &var err) };
+        check ptr == null { 
+            Err(matlab_error_string(err))
+        } else { 
+            Ok(MatlabEngine { ptr })
+        }
+    }
+
+    fn start_async(option: str) -> Result<MatlabFuture, str> {
+        var err: i32 = 0;
+        let fut_ptr = unsafe { nova_matlab_start_async(option.as_ptr(), &var err) };
+        check fut_ptr == null {
+            Err(matlab_error_string(err))
+        } else {
+            Ok(MatlabFuture { ptr: fut_ptr })
+        }
+    }
+
+    fn connect(name: str) -> Result<MatlabEngine, str> {
+        var err: i32 = 0;
+        let ptr = unsafe { nova_matlab_connect(name.as_ptr(), &var err) };
+        check ptr == null {
+            Err(matlab_error_string(err))
+        } else {
+            Ok(MatlabEngine { ptr })
+        }
+    }
+
+    fn connect_any() -> Result<MatlabEngine, str> {
+        var err: i32 = 0;
+        let ptr = unsafe { nova_matlab_connect_any(&var err) };
+        check ptr == null {
+            Err(matlab_error_string(err))
+        } else {
+            Ok(MatlabEngine { ptr })
+        }
+    }
+
+    fn eval(self, expr: str) -> Result<(), str> {
+        let rc = unsafe { nova_matlab_eval(self.ptr, expr.as_ptr(), true) };
+        check rc == 0 { 
+            Ok(())
+        } else { 
+            Err(matlab_error_string(rc))
+        }
+    }
+
+    fn feval(self, func: str, nargout: i32, args: [MatlabValue]) -> Result<[MatlabValue], str> {
+        // Marshal args into C array
+        var c_args: [*const NovaMatlabValue; 16] = [null; 16];
+        let nargs = args.len();
+        check nargs > 16 {
+            Err("Too many arguments");
+        }
+        
+        each i in 0..nargs {
+            c_args[i] = args[i].ptr as *const NovaMatlabValue;
+        }
+
+        // Allocate output array
+        var c_out: [*var NovaMatlabValue; 16] = [null; 16];
+        
+        let rc = unsafe { 
+            nova_matlab_feval(self.ptr, func.as_ptr(), nargout, 
+                             c_args.as_ptr(), nargs as i32, c_out.as_mut_ptr())
+        };
+        
+        check rc != 0 {
+            Err(matlab_error_string(rc));
+        }
+
+        // Unmarshal results into MatlabValue array
+        var results: [MatlabValue] = [];
+        each i in 0..nargout {
+            check c_out[i as usize] != null {
+                results.push(MatlabValue { ptr: c_out[i as usize] });
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn put_variable(self, workspace: str, name: str, val: MatlabValue) -> Result<(), str> {
+        let rc = unsafe {
+            nova_matlab_put_variable(self.ptr, workspace.as_ptr(), name.as_ptr(), val.ptr as *const NovaMatlabValue)
+        };
+        check rc == 0 {
+            Ok(())
+        } else {
+            Err(matlab_error_string(rc))
+        }
+    }
+
+    fn get_variable(self, workspace: str, name: str) -> Result<MatlabValue, str> {
+        var err: i32 = 0;
+        let ptr = unsafe { 
+            nova_matlab_get_variable(self.ptr, workspace.as_ptr(), name.as_ptr(), &var err) 
+        };
+        check ptr == null { 
+            Err(matlab_error_string(err))
+        } else { 
+            Ok(MatlabValue { ptr })
+        }
+    }
+
+    fn quit(self) {
+        unsafe { nova_matlab_quit(self.ptr); }
+    }
+}
+
+open data MatlabValue {
+    ptr: *var NovaMatlabValue,
+}
+
+impl MatlabValue {
+    fn from_f64(v: f64) -> MatlabValue { 
+        MatlabValue { ptr: unsafe { nova_mval_double(v) } } 
+    }
+
+    fn from_f32(v: f32) -> MatlabValue { 
+        MatlabValue { ptr: unsafe { nova_mval_float(v) } } 
+    }
+
+    fn from_i32(v: i32) -> MatlabValue {
+        MatlabValue { ptr: unsafe { nova_mval_int32(v) } }
+    }
+
+    fn from_i64(v: i64) -> MatlabValue {
+        MatlabValue { ptr: unsafe { nova_mval_int64(v) } }
+    }
+
+    fn from_bool(v: bool) -> MatlabValue {
+        MatlabValue { ptr: unsafe { nova_mval_bool(v) } }
+    }
+
+    fn from_str(s: str) -> MatlabValue { 
+        MatlabValue { ptr: unsafe { nova_mval_string(s.as_ptr()) } } 
+    }
+
+    fn from_matrix_f64(data: [f64], rows: usize, cols: usize) -> MatlabValue {
+        MatlabValue { 
+            ptr: unsafe { nova_mval_matrix_f64(data.as_ptr(), rows, cols) } 
+        }
+    }
+
+    fn from_matrix_f32(data: [f32], rows: usize, cols: usize) -> MatlabValue {
+        MatlabValue {
+            ptr: unsafe { nova_mval_matrix_f32(data.as_ptr(), rows, cols) }
+        }
+    }
+
+    fn free(self) { 
+        unsafe { nova_mval_free(self.ptr); } 
+    }
+}
+
+open data MatlabFuture {
+    ptr: *var NovaMatlabFuture,
+}
+
+impl MatlabFuture {
+    fn result(self) -> Result<MatlabEngine, str> {
+        var err: i32 = 0;
+        let eng_ptr = unsafe { nova_future_result(self.ptr, &var err) };
+        check eng_ptr == null {
+            Err(matlab_error_string(err))
+        } else {
+            Ok(MatlabEngine { ptr: eng_ptr })
+        }
+    }
+
+    fn cancel(self) -> bool {
+        unsafe { nova_future_cancel(self.ptr) }
+    }
+
+    fn done(self) -> bool {
+        unsafe { nova_future_done(self.ptr) }
+    }
+}
+
+open data FevalFuture {
+    ptr: *var NovaFevalFuture,
+}
+
+impl FevalFuture {
+    fn result(self, nargout: i32) -> Result<[MatlabValue], str> {
+        var c_out: [*var NovaMatlabValue; 16] = [null; 16];
+        let rc = unsafe {
+            nova_feval_future_result(self.ptr, c_out.as_mut_ptr(), nargout)
+        };
+        
+        check rc != 0 {
+            Err(matlab_error_string(rc));
+        }
+
+        var results: [MatlabValue] = [];
+        each i in 0..nargout {
+            check c_out[i as usize] != null {
+                results.push(MatlabValue { ptr: c_out[i as usize] });
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn cancel(self) -> bool {
+        unsafe { nova_feval_future_cancel(self.ptr) }
+    }
+}
+
+fn matlab_error_string(code: i32) -> str {
+    match code {
+        1 => "EngineTerminated",
+        2 => "RejectedExecution",
+        3 => "Cancelled",
+        4 => "Timeout",
+        5 => "VersionMismatch",
+        6 => "NotFound",
+        7 => "AllocFailed",
+        _ => "InternalError",
+    }
+}
+
+open fn init_registry() {
+    unsafe { nova_engine_registry_init(); }
+}
+
+open fn shutdown_registry() {
+    unsafe { nova_engine_registry_shutdown(); }
+}

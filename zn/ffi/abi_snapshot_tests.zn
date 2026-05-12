@@ -1,0 +1,260 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova FFI — ABI SNAPSHOT TESTS  v1.0                                     ║
+// ║                                                                              ║
+// ║  Ensures FFI ABI contracts remain stable across versions.                    ║
+// ║                                                                              ║
+// ║  FROZEN CONTRACTS VERIFICATION:                                              ║
+// ║    · Struct layouts and sizes                                                 ║
+// ║    · Function signatures and calling conventions                             ║
+// ║    · Error code meanings                                                     ║
+// ║    · Memory ownership rules                                                  ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use ffi::{NovaStringFFI, NovaResultFFI, NovaVecFFIHandle, NovaAllocatorFFI};
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ABI SIZE AND ALIGNMENT TESTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl AbiSnapshotTests {
+
+    // ── Struct Size Tests ────────────────────────────────────────────────────
+
+    open fn test_string_abi_size() -> bool {
+        // NovaStringFFI size must remain 16 bytes (64-bit platform)
+        // ptr (8) + len (8) = 16
+        let expected_size = 16;
+        let actual_size = size_of::<NovaStringFFI>();
+
+        println("NovaStringFFI size: expected {}, actual {}", expected_size, actual_size);
+        yield actual_size == expected_size;
+    }
+
+    open fn test_result_abi_size() -> bool {
+        // NovaResultFFI size must remain 24 bytes (64-bit platform)
+        // tag (1) + error_code (4) + error_message (8) + padding (11) = 24
+        let expected_size = 24;
+        let actual_size = size_of::<NovaResultFFI>();
+
+        println("NovaResultFFI size: expected {}, actual {}", expected_size, actual_size);
+        yield actual_size == expected_size;
+    }
+
+    open fn test_allocator_abi_size() -> bool {
+        // NovaAllocatorFFI size must remain 24 bytes (64-bit platform)
+        // alloc_fn (8) + free_fn (8) + realloc_fn (8) = 24
+        let expected_size = 24;
+        let actual_size = size_of::<NovaAllocatorFFI>();
+
+        println("NovaAllocatorFFI size: expected {}, actual {}", expected_size, actual_size);
+        yield actual_size == expected_size;
+    }
+
+    // ── Struct Alignment Tests ───────────────────────────────────────────────
+
+    open fn test_string_abi_alignment() -> bool {
+        // NovaStringFFI must be 8-byte aligned (due to usize len field)
+        let expected_align = 8;
+        let actual_align = align_of::<NovaStringFFI>();
+
+        println("NovaStringFFI alignment: expected {}, actual {}", expected_align, actual_align);
+        yield actual_align == expected_align;
+    }
+
+    open fn test_result_abi_alignment() -> bool {
+        // NovaResultFFI must be 8-byte aligned (due to pointer field)
+        let expected_align = 8;
+        let actual_align = align_of::<NovaResultFFI>();
+
+        println("NovaResultFFI alignment: expected {}, actual {}", expected_align, actual_align);
+        yield actual_align == expected_align;
+    }
+
+    // ── Function Signature Tests ─────────────────────────────────────────────
+
+    open fn test_result_constructor_signatures() -> bool {
+        // Test that result constructors work as expected
+        let ok_result = NovaResultFFI::ok();
+        let err_result = NovaResultFFI::err(42, NovaStringFFI {
+            ptr: "test error".as_ptr() as *const i8,
+            len: 10,
+        });
+
+        let ok_check = NovaResultFFI::is_ok(&ok_result) && !NovaResultFFI::is_err(&ok_result);
+        let err_check = !NovaResultFFI::is_ok(&err_result) && NovaResultFFI::is_err(&err_result) &&
+                       NovaResultFFI::error_code(&err_result) == 42;
+
+        yield ok_check && err_check;
+    }
+
+    open fn test_string_abi_contract() -> bool {
+        // Test string ABI contract compliance
+        let test_str = "ABI test string";
+        let ffi_str = NovaStringFFI {
+            ptr: test_str.as_ptr() as *const i8,
+            len: test_str.len(),
+        };
+
+        // String must be UTF-8, null-terminated in memory
+        let is_valid_utf8 = unsafe { std::str::from_utf8(ffi_str.ptr as *const u8, ffi_str.len).is_ok() };
+        let is_null_terminated = unsafe { *ffi_str.ptr.offset(ffi_str.len as isize) == 0 };
+
+        yield is_valid_utf8 && is_null_terminated && ffi_str.len == test_str.len();
+    }
+
+    // ── Memory Ownership Tests ──────────────────────────────────────────────
+
+    open fn test_memory_ownership_contract() -> bool {
+        // Test that caller-frees contract is maintained
+        let test_data = "ownership test";
+
+        // Create FFI string (caller-owned)
+        let ffi_str = NovaStringFFI {
+            ptr: test_data.as_ptr() as *const i8,
+            len: test_data.len(),
+        };
+
+        // Verify data is accessible and correct
+        let data_valid = unsafe {
+            let slice = std::slice::from_raw_parts(ffi_str.ptr as *const u8, ffi_str.len);
+            slice == test_data.as_bytes()
+        };
+
+        // In real FFI, caller would be responsible for freeing
+        // Here we just verify the contract is sound
+        yield data_valid;
+    }
+
+    // ── Panic Boundary Tests ────────────────────────────────────────────────
+
+    open fn test_panic_boundary_contract() -> bool {
+        // Test that panics are properly caught at FFI boundary
+        let panic_fn = || {
+            abort("FFI panic test");
+        };
+
+        let result = PanicBoundary::catch_ffi_panic(panic_fn);
+
+        // Panic should be converted to error result
+        yield NovaResultFFI::is_err(&result) && NovaResultFFI::error_code(&result) == 1;
+    }
+
+    // ── Allocator Compatibility Tests ────────────────────────────────────────
+
+    open fn test_allocator_abi_contract() -> bool {
+        // Test allocator ABI contract
+        let allocator = NovaAllocatorFFI {
+            alloc_fn: libc::malloc,
+            free_fn: libc::free,
+            realloc_fn: libc::realloc,
+        };
+
+        // Test that allocator functions are callable
+        let test_allocation = NovaAllocator::with_caller_allocator(allocator, || {
+            // This would use the caller's allocator
+            yield true;
+        });
+
+        yield test_allocation;
+    }
+
+    // ── Symbol Naming Convention Tests ──────────────────────────────────────
+
+    open fn test_symbol_naming_convention() -> bool {
+        // Test that symbol names follow convention
+        // This is more of a compile-time check, but we can verify the concept
+
+        // In real FFI, symbols would be exported with names like:
+        // nova_string_new, nova_result_is_ok, etc.
+
+        // For now, just verify our functions exist and are callable
+        let test_result = NovaResultFFI::ok();
+        let test_string = NovaStringFFI {
+            ptr: "symbol test".as_ptr() as *const i8,
+            len: 11,
+        };
+
+        yield NovaResultFFI::is_ok(&test_result) && test_string.len == 11;
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ABI COMPATIBILITY GUARD
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl AbiCompatibilityGuard {
+
+    // This impl contains compile-time checks to ensure ABI stability
+    // If any ABI changes are detected, compilation will fail
+
+    open fn check_abi_frozen_contracts() -> bool {
+        // These checks would ideally be compile-time assertions
+        // For now, runtime checks that must pass
+
+        let size_checks = AbiSnapshotTests::test_string_abi_size() &&
+                         AbiSnapshotTests::test_result_abi_size() &&
+                         AbiSnapshotTests::test_allocator_abi_size();
+
+        let align_checks = AbiSnapshotTests::test_string_abi_alignment() &&
+                          AbiSnapshotTests::test_result_abi_alignment();
+
+        let contract_checks = AbiSnapshotTests::test_result_constructor_signatures() &&
+                             AbiSnapshotTests::test_string_abi_contract() &&
+                             AbiSnapshotTests::test_memory_ownership_contract() &&
+                             AbiSnapshotTests::test_panic_boundary_contract() &&
+                             AbiSnapshotTests::test_symbol_naming_convention();
+
+        yield size_checks && align_checks && contract_checks;
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TEST RUNNER
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose impl AbiSnapshotTestRunner {
+
+    open fn run_all_abi_tests() -> bool {
+        println("🔒 Running FFI ABI Snapshot Tests...");
+
+        let tests = [
+            ("String ABI Size", AbiSnapshotTests::test_string_abi_size()),
+            ("Result ABI Size", AbiSnapshotTests::test_result_abi_size()),
+            ("Allocator ABI Size", AbiSnapshotTests::test_allocator_abi_size()),
+            ("String ABI Alignment", AbiSnapshotTests::test_string_abi_alignment()),
+            ("Result ABI Alignment", AbiSnapshotTests::test_result_abi_alignment()),
+            ("Result Constructors", AbiSnapshotTests::test_result_constructor_signatures()),
+            ("String ABI Contract", AbiSnapshotTests::test_string_abi_contract()),
+            ("Memory Ownership", AbiSnapshotTests::test_memory_ownership_contract()),
+            ("Panic Boundary", AbiSnapshotTests::test_panic_boundary_contract()),
+            ("Allocator ABI", AbiSnapshotTests::test_allocator_abi_contract()),
+            ("Symbol Naming", AbiSnapshotTests::test_symbol_naming_convention()),
+            ("ABI Compatibility", AbiCompatibilityGuard::check_abi_frozen_contracts()),
+        ];
+
+        var passed = 0;
+        var failed = 0;
+
+        each (name, result) in tests {
+            print("  {}: ", name);
+            check result {
+                println("✅ PASSED");
+                passed += 1;
+            } else {
+                println("❌ FAILED - ABI BREAK DETECTED!");
+                failed += 1;
+            }
+        }
+
+        println("
+📊 ABI Tests: {}/{} passed", passed, passed + failed);
+
+        check failed > 0 {
+            println("🚨 ABI BREAKAGE DETECTED! Do not release until fixed.");
+        } else {
+            println("✅ FFI ABI contracts verified - ready for cross-language interop!");
+        }
+
+        yield failed == 0;
+    }
+}

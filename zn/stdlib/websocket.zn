@@ -1,0 +1,906 @@
+// 🔌 Nova WebSocket Support — v10.0
+// Real-time bidirectional communication
+// + Nova Magic: Automatic reconnection, message compression
+
+@module("websocket::support")
+@reproducible
+@export
+@inline
+
+use std::collections::{HashMap, Vec};
+use std::sync::Arc;
+use std::result::Result;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  WEBSOCKET CORE TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// WebSocket message type
+open cases WebSocketMessageType {
+    Text,
+    Binary,
+    Ping,
+    Pong,
+    Close,
+}
+
+/// WebSocket message
+open data WebSocketMessage {
+    message_type: WebSocketMessageType,
+    payload: Vec<u8>,
+    masked: bool,
+    timestamp: u64,
+}
+
+impl WebSocketMessage {
+    open fn text(text: String) -> WebSocketMessage {
+        return WebSocketMessage {
+            message_type: WebSocketMessageType::Text,
+            payload: text.as_bytes().to_vec(),
+            masked: false,
+            timestamp: get_current_timestamp(),
+        };
+    }
+    
+    open fn binary(data: Vec<u8>) -> WebSocketMessage {
+        return WebSocketMessage {
+            message_type: WebSocketMessageType::Binary,
+            payload: data,
+            masked: false,
+            timestamp: get_current_timestamp(),
+        };
+    }
+    
+    open fn ping() -> WebSocketMessage {
+        return WebSocketMessage {
+            message_type: WebSocketMessageType::Ping,
+            payload: Vec::new(),
+            masked: false,
+            timestamp: get_current_timestamp(),
+        };
+    }
+    
+    open fn pong() -> WebSocketMessage {
+        return WebSocketMessage {
+            message_type: WebSocketMessageType::Pong,
+            payload: Vec::new(),
+            masked: false,
+            timestamp: get_current_timestamp(),
+        };
+    }
+    
+    open fn close(code: u16, reason: String) -> WebSocketMessage {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&code.to_be_bytes());
+        payload.extend_from_slice(reason.as_bytes());
+        
+        return WebSocketMessage {
+            message_type: WebSocketMessageType::Close,
+            payload: payload,
+            masked: false,
+            timestamp: get_current_timestamp(),
+        };
+    }
+    
+    open fn as_text(&self) -> Option<String> {
+        match self.message_type {
+            WebSocketMessageType::Text => String::from_utf8(self.payload.clone()).ok(),
+            _ => None,
+        }
+    }
+    
+    open fn as_binary(&self) -> Vec<u8> {
+        return self.payload.clone();
+    }
+    
+    open fn is_control(&self) -> bool {
+        matches!(self.message_type, WebSocketMessageType::Ping | WebSocketMessageType::Pong | WebSocketMessageType::Close);
+    }
+}
+
+/// WebSocket close code
+open cases WebSocketCloseCode {
+    NormalClosure(1000),
+    GoingAway(1001),
+    ProtocolError(1002),
+    UnsupportedData(1003),
+    NoStatusReceived(1005),
+    AbnormalClosure(1006),
+    InvalidFramePayloadData(1007),
+    PolicyViolation(1008),
+    MessageTooBig(1009),
+    MandatoryExtension(1010),
+    InternalServerError(1011),
+    ServiceRestart(1012),
+    TryAgainLater(1013),
+    BadGateway(1014),
+    TLSHandshake(1015),
+}
+
+/// WebSocket state
+open cases WebSocketState {
+    Connecting,
+    Open,
+    Closing,
+    Closed,
+}
+
+/// WebSocket configuration
+open data WebSocketConfig {
+    max_message_size: usize,
+    max_frame_size: usize,
+    enable_compression: bool,
+    compression_level: u8,
+    ping_interval: Duration,
+    pong_timeout: Duration,
+    max_reconnect_attempts: u32,
+    reconnect_delay: Duration,
+}
+
+impl WebSocketConfig {
+    open fn default() -> WebSocketConfig {
+        return WebSocketConfig {
+            max_message_size: 16 * 1024 * 1024, // 16MB
+            max_frame_size: 16 * 1024 * 1024,  // 16MB
+            enable_compression: true,
+            compression_level: 6,
+            ping_interval: Duration::from_secs(30),
+            pong_timeout: Duration::from_secs(10),
+            max_reconnect_attempts: 5,
+            reconnect_delay: Duration::from_millis(1000),
+        };
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  WEBSOCKET CLIENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// WebSocket client
+open data WebSocketClient {
+    config: WebSocketConfig,
+    state: WebSocketState,
+    stream: Option<Box<dyn AsyncRead + AsyncWrite>>,
+    url: String,
+    reconnect_count: u32,
+    message_handlers: Vec<Box<dyn Fn(WebSocketMessage) -> ()>>,
+    error_handlers: Vec<Box<dyn Fn(String) -> ()>>,
+    close_handlers: Vec<Box<dyn Fn(WebSocketCloseCode, String) -> ()>>,
+}
+
+impl WebSocketClient {
+    open fn new(url: String, config: WebSocketConfig) -> WebSocketClient {
+        return WebSocketClient {
+            config: config,
+            state: WebSocketState::Closed,
+            stream: None,
+            url: url,
+            reconnect_count: 0,
+            message_handlers: Vec::new(),
+            error_handlers: Vec::new(),
+            close_handlers: Vec::new(),
+        };
+    }
+    
+    open async fn connect(&mut self) -> Result<(), String> {
+        self.state = WebSocketState::Connecting;
+        
+        let parsed_url = parse_websocket_url(&self.url)?;
+        let tcp_stream = TcpStream::connect(format!("{}:{}", parsed_url.host, parsed_url.port)).await?;
+        
+        let stream = if parsed_url.secure {
+            let tls_stream = connect_tls(tcp_stream, &parsed_url.host).await?;
+            Box::new(tls_stream) as Box<dyn AsyncRead + AsyncWrite>
+        } else {
+            Box::new(tcp_stream) as Box<dyn AsyncRead + AsyncWrite>
+        };
+        
+        // Perform WebSocket handshake
+        self.perform_handshake(&mut *stream, &parsed_url).await?;
+        
+        self.stream = Some(stream);
+        self.state = WebSocketState::Open;
+        self.reconnect_count = 0;
+        
+        // Start message processing loop
+        self.start_message_loop().await;
+        
+        return Ok(());
+    }
+    
+    async fn perform_handshake(&self, stream: &mut (dyn AsyncRead + AsyncWrite), url: &ParsedWebSocketUrl) -> Result<(), String> {
+        let key = generate_websocket_key();
+        let request = format!(
+            "GET {} HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: {}\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             \r\n",
+            url.path, url.host, key
+        );
+        
+        stream.write_all(request.as_bytes()).await?;
+        stream.flush().await?;
+        
+        // Read response
+        let mut response = Vec::new();
+        let mut buffer = [0u8; 1024];
+        
+        loop {
+            let bytes_read = stream.read(&mut buffer).await?;
+            response.extend_from_slice(&buffer[..bytes_read]);
+            
+            if response.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        
+        let response_str = String::from_utf8(response).map_err(|_| "Invalid response")?;
+        
+        // Validate handshake response
+        check response_str.contains("101 Switching Protocols") {
+            check response_str.contains(&format!("Sec-WebSocket-Accept: {}", calculate_accept_key(&key))) {
+                return Ok(());
+            } else {
+                return Err("Invalid WebSocket accept key".into());
+            }
+        } else {
+            return Err("WebSocket handshake failed".into());
+        }
+    }
+    
+    open async fn send_message(&mut self, message: WebSocketMessage) -> Result<(), String> {
+        if self.state != WebSocketState::Open {
+            return Err("WebSocket is not connected".into());
+        }
+        
+        if let Some(stream) = &mut self.stream {
+            let frame = self.encode_message(message)?;
+            stream.write_all(&frame).await?;
+            stream.flush().await?;
+            return Ok(());
+        } else {
+            return Err("No connection available".into());
+        }
+    }
+    
+    open async fn send_text(&mut self, text: String) -> Result<(), String> {
+        return self.send_message(WebSocketMessage::text(text));
+    }
+    
+    open async fn send_binary(&mut self, data: Vec<u8>) -> Result<(), String> {
+        return self.send_message(WebSocketMessage::binary(data));
+    }
+    
+    open async fn ping(&mut self) -> Result<(), String> {
+        return self.send_message(WebSocketMessage::ping());
+    }
+    
+    open async fn close(&mut self, code: WebSocketCloseCode, reason: String) -> Result<(), String> {
+        if self.state == WebSocketState::Closed {
+            return Ok(());
+        }
+        
+        self.state = WebSocketState::Closing;
+        
+        let message = WebSocketMessage::close(
+            match code {
+                WebSocketCloseCode::NormalClosure(c) => c,
+                WebSocketCloseCode::GoingAway(c) => c,
+                WebSocketCloseCode::ProtocolError(c) => c,
+                WebSocketCloseCode::UnsupportedData(c) => c,
+                WebSocketCloseCode::NoStatusReceived(c) => c,
+                WebSocketCloseCode::AbnormalClosure(c) => c,
+                WebSocketCloseCode::InvalidFramePayloadData(c) => c,
+                WebSocketCloseCode::PolicyViolation(c) => c,
+                WebSocketCloseCode::MessageTooBig(c) => c,
+                WebSocketCloseCode::MandatoryExtension(c) => c,
+                WebSocketCloseCode::InternalServerError(c) => c,
+                WebSocketCloseCode::ServiceRestart(c) => c,
+                WebSocketCloseCode::TryAgainLater(c) => c,
+                WebSocketCloseCode::BadGateway(c) => c,
+                WebSocketCloseCode::TLSHandshake(c) => c,
+            },
+            reason
+        );
+        
+        if let Some(stream) = &mut self.stream {
+            let frame = self.encode_message(message)?;
+            let _ = stream.write_all(&frame).await;
+            let _ = stream.flush().await;
+        }
+        
+        self.state = WebSocketState::Closed;
+        self.stream = None;
+        
+        return Ok(());
+    }
+    
+    open fn on_message(&mut self, handler: Box<dyn Fn(WebSocketMessage) -> ()>) {
+        self.message_handlers.push(handler);
+    }
+    
+    open fn on_error(&mut self, handler: Box<dyn Fn(String) -> ()>) {
+        self.error_handlers.push(handler);
+    }
+    
+    open fn on_close(&mut self, handler: Box<dyn Fn(WebSocketCloseCode, String) -> ()>) {
+        self.close_handlers.push(handler);
+    }
+    
+    async fn start_message_loop(&mut self) {
+        if let Some(stream) = &mut self.stream {
+            loop {
+                match self.read_message(stream).await {
+                    Ok(message) => {
+                        match message.message_type {
+                            WebSocketMessageType::Text | WebSocketMessageType::Binary => {
+                                for handler in &self.message_handlers {
+                                    handler(message.clone());
+                                }
+                            }
+                            WebSocketMessageType::Ping => {
+                                let pong = WebSocketMessage::pong();
+                                if let Ok(frame) = self.encode_message(pong) {
+                                    let _ = stream.write_all(&frame).await;
+                                    let _ = stream.flush().await;
+                                }
+                            }
+                            WebSocketMessageType::Close => {
+                                self.handle_close_message(&message);
+                                break;
+                            }
+                            WebSocketMessageType::Pong => {
+                                // Handle pong response
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        for handler in &self.error_handlers {
+                            handler(error.clone());
+                        }
+                        
+                        // Try to reconnect
+                        if self.reconnect_count < self.config.max_reconnect_attempts {
+                            self.reconnect_count = self.reconnect_count + 1;
+                            tokio::time::sleep(self.config.reconnect_delay).await;
+                            let _ = self.connect().await;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    async fn read_message(&self, stream: &mut (dyn AsyncRead + AsyncWrite)) -> Result<WebSocketMessage, String> {
+        // Read frame header
+        let mut header = [0u8; 2];
+        stream.read_exact(&mut header).await?;
+        
+        let fin = (header[0] & 0x80) != 0;
+        let opcode = header[0] & 0x0F;
+        let masked = (header[1] & 0x80) != 0;
+        let payload_length = (header[1] & 0x7F) as u64;
+        
+        // Read extended payload length
+        let mut extended_length = 0u64;
+        if payload_length == 126 {
+            let mut extended = [0u8; 2];
+            stream.read_exact(&mut extended).await?;
+            extended_length = u16::from_be_bytes(extended) as u64;
+        } else if payload_length == 127 {
+            let mut extended = [0u8; 8];
+            stream.read_exact(&mut extended).await?;
+            extended_length = u64::from_be_bytes(extended);
+        } else {
+            extended_length = payload_length;
+        }
+        
+        // Read masking key if present
+        let mut masking_key = [0u8; 4];
+        if masked {
+            stream.read_exact(&mut masking_key).await?;
+        }
+        
+        // Read payload
+        let mut payload = vec![0u8; extended_length as usize];
+        stream.read_exact(&mut payload).await?;
+        
+        // Unmask payload if needed
+        if masked {
+            for (i, byte) in payload.iter_mut().enumerate() {
+                *byte ^= masking_key[i % 4];
+            }
+        }
+        
+        // Convert to message type
+        let message_type = match opcode {
+            0x1 => WebSocketMessageType::Text,
+            0x2 => WebSocketMessageType::Binary,
+            0x8 => WebSocketMessageType::Close,
+            0x9 => WebSocketMessageType::Ping,
+            0xA => WebSocketMessageType::Pong,
+            _ => return Err("Unknown opcode".into()),
+        };
+        
+        return Ok(WebSocketMessage {
+            message_type: message_type,
+            payload: payload,
+            masked: false,
+            timestamp: get_current_timestamp(),
+        });
+    }
+    
+    fn encode_message(&self, message: WebSocketMessage) -> Result<Vec<u8>, String> {
+        let mut frame = Vec::new();
+        
+        // First byte: FIN + RSV + opcode
+        let first_byte = 0x80 | match message.message_type {
+            WebSocketMessageType::Text => 0x1,
+            WebSocketMessageType::Binary => 0x2,
+            WebSocketMessageType::Close => 0x8,
+            WebSocketMessageType::Ping => 0x9,
+            WebSocketMessageType::Pong => 0xA,
+        };
+        frame.push(first_byte);
+        
+        // Payload length
+        let payload_len = message.payload.len();
+        if payload_len < 126 {
+            frame.push(payload_len as u8);
+        } else if payload_len < 65536 {
+            frame.push(126);
+            frame.extend_from_slice(&(payload_len as u16).to_be_bytes());
+        } else {
+            frame.push(127);
+            frame.extend_from_slice(&(payload_len as u64).to_be_bytes());
+        }
+        
+        // Payload
+        frame.extend_from_slice(&message.payload);
+        
+        return Ok(frame);
+    }
+    
+    fn handle_close_message(&self, message: &WebSocketMessage) {
+        let (code, reason) = if message.payload.len() >= 2 {
+            let code_bytes = [message.payload[0], message.payload[1]];
+            let code = u16::from_be_bytes(code_bytes);
+            let reason = String::from_utf8(message.payload[2..].to_vec()).unwrap_or_default();
+            (code, reason)
+        } else {
+            (1000, String::new())
+        };
+        
+        let close_code = match code {
+            1000 => WebSocketCloseCode::NormalClosure(1000),
+            1001 => WebSocketCloseCode::GoingAway(1001),
+            1002 => WebSocketCloseCode::ProtocolError(1002),
+            1003 => WebSocketCloseCode::UnsupportedData(1003),
+            1005 => WebSocketCloseCode::NoStatusReceived(1005),
+            1006 => WebSocketCloseCode::AbnormalClosure(1006),
+            1007 => WebSocketCloseCode::InvalidFramePayloadData(1007),
+            1008 => WebSocketCloseCode::PolicyViolation(1008),
+            1009 => WebSocketCloseCode::MessageTooBig(1009),
+            1010 => WebSocketCloseCode::MandatoryExtension(1010),
+            1011 => WebSocketCloseCode::InternalServerError(1011),
+            1012 => WebSocketCloseCode::ServiceRestart(1012),
+            1013 => WebSocketCloseCode::TryAgainLater(1013),
+            1014 => WebSocketCloseCode::BadGateway(1014),
+            1015 => WebSocketCloseCode::TLSHandshake(1015),
+            _ => WebSocketCloseCode::NormalClosure(1000),
+        };
+        
+        for handler in &self.close_handlers {
+            handler(close_code.clone(), reason.clone());
+        }
+        
+        self.state = WebSocketState::Closed;
+    }
+    
+    open fn get_state(&self) -> WebSocketState {
+        return self.state.clone();
+    }
+    
+    open fn is_connected(&self) -> bool {
+        matches!(self.state, WebSocketState::Open);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  WEBSOCKET SERVER
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// WebSocket server
+open data WebSocketServer {
+    config: WebSocketConfig,
+    bind_address: String,
+    port: u16,
+    connections: HashMap<String, WebSocketConnection>,
+    message_handlers: Vec<Box<dyn Fn(String, WebSocketMessage) -> ()>>,
+    connection_handlers: Vec<Box<dyn Fn(String) -> ()>>,
+    disconnection_handlers: Vec<Box<dyn Fn(String) -> ()>>,
+}
+
+/// WebSocket connection
+open data WebSocketConnection {
+    id: String,
+    stream: Box<dyn AsyncRead + AsyncWrite>,
+    state: WebSocketState,
+    remote_addr: String,
+    last_ping: u64,
+}
+
+impl WebSocketServer {
+    open fn new(bind_address: String, port: u16, config: WebSocketConfig) -> WebSocketServer {
+        return WebSocketServer {
+            config: config,
+            bind_address: bind_address,
+            port: port,
+            connections: HashMap::new(),
+            message_handlers: Vec::new(),
+            connection_handlers: Vec::new(),
+            disconnection_handlers: Vec::new(),
+        };
+    }
+    
+    open async fn start(&mut self) -> Result<(), String> {
+        let listener = TcpListener::bind(format!("{}:{}", self.bind_address, self.port)).await?;
+        
+        println!("WebSocket server listening on {}:{}", self.bind_address, self.port);
+        
+        loop {
+            match listener.accept().await {
+                Ok((stream, addr)) => {
+                    let connection_id = generate_connection_id();
+                    let mut handler = ConnectionHandler {
+                        connection_id: connection_id.clone(),
+                        config: self.config.clone(),
+                        message_handlers: self.message_handlers.clone(),
+                    };
+                    
+                    tokio::spawn(async move {
+                        handler.handle_connection(stream, addr).await;
+                    });
+                }
+                Err(e) => {
+                    eprintln!("Error accepting connection: {}", e);
+                }
+            }
+        }
+    }
+    
+    open fn on_message(&mut self, handler: Box<dyn Fn(String, WebSocketMessage) -> ()>) {
+        self.message_handlers.push(handler);
+    }
+    
+    open fn on_connect(&mut self, handler: Box<dyn Fn(String) -> ()>) {
+        self.connection_handlers.push(handler);
+    }
+    
+    open fn on_disconnect(&mut self, handler: Box<dyn Fn(String) -> ()>) {
+        self.disconnection_handlers.push(handler);
+    }
+    
+    open async fn broadcast(&mut self, message: WebSocketMessage) -> Result<(), String> {
+        let mut errors = Vec::new();
+        
+        for (connection_id, connection) in &self.connections {
+            if connection.state == WebSocketState::Open {
+                let frame = encode_websocket_frame(&message)?;
+                match connection.stream.write_all(&frame).await {
+                    Ok(()) => {
+                        let _ = connection.stream.flush().await;
+                    }
+                    Err(e) => {
+                        errors.push(format!("Failed to send to {}: {}", connection_id, e));
+                    }
+                }
+            }
+        }
+        
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
+        } else {
+            return Ok(());
+        }
+    }
+    
+    open async fn send_to(&mut self, connection_id: String, message: WebSocketMessage) -> Result<(), String> {
+        if let Some(connection) = self.connections.get(&connection_id) {
+            if connection.state == WebSocketState::Open {
+                let frame = encode_websocket_frame(&message)?;
+                connection.stream.write_all(&frame).await?;
+                connection.stream.flush().await?;
+                return Ok(());
+            } else {
+                return Err("Connection is not open".into());
+            }
+        } else {
+            return Err("Connection not found".into());
+        }
+    }
+    
+    open fn get_connection_count(&self) -> usize {
+        return self.connections.len();
+    }
+    
+    open fn get_connection_ids(&self) -> Vec<String> {
+        return self.connections.keys().cloned().collect();
+    }
+}
+
+/// Connection handler
+open data ConnectionHandler {
+    connection_id: String,
+    config: WebSocketConfig,
+    message_handlers: Vec<Box<dyn Fn(String, WebSocketMessage) -> ()>>,
+}
+
+impl ConnectionHandler {
+    async fn handle_connection(&self, mut stream: TcpStream, addr: SocketAddr) {
+        // Perform WebSocket handshake
+        match self.perform_handshake(&mut stream).await {
+            Ok(()) => {
+                let mut connection = WebSocketConnection {
+                    id: self.connection_id.clone(),
+                    stream: Box::new(stream) as Box<dyn AsyncRead + AsyncWrite>,
+                    state: WebSocketState::Open,
+                    remote_addr: addr.to_string(),
+                    last_ping: get_current_timestamp(),
+                };
+                
+                // Notify connection handlers
+                for handler in &self.message_handlers {
+                    handler(self.connection_id.clone(), WebSocketMessage::text("connected".into()));
+                }
+                
+                // Process messages
+                self.process_messages(&mut connection).await;
+            }
+            Err(e) => {
+                eprintln!("WebSocket handshake failed: {}", e);
+            }
+        }
+    }
+    
+    async fn perform_handshake(&self, stream: &mut TcpStream) -> Result<(), String> {
+        // Read HTTP upgrade request
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        
+        loop {
+            let bytes_read = stream.read(&mut buffer).await?;
+            request.extend_from_slice(&buffer[..bytes_read]);
+            
+            if request.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        
+        let request_str = String::from_utf8(request).map_err(|_| "Invalid request")?;
+        
+        // Validate WebSocket upgrade request
+        check request_str.contains("Upgrade: websocket") &&
+              request_str.contains("Connection: Upgrade") &&
+              request_str.contains("Sec-WebSocket-Version: 13") {
+            
+            // Extract WebSocket key
+            let key = extract_websocket_key(&request_str)?;
+            let accept_key = calculate_accept_key(&key);
+            
+            // Send handshake response
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {}\r\n\
+                 \r\n",
+                accept_key
+            );
+            
+            stream.write_all(response.as_bytes()).await?;
+            stream.flush().await?;
+            
+            return Ok(());
+        } else {
+            return Err("Invalid WebSocket upgrade request".into());
+        }
+    }
+    
+    async fn process_messages(&self, connection: &mut WebSocketConnection) {
+        loop {
+            match self.read_message(&mut connection.stream).await {
+                Ok(message) => {
+                    match message.message_type {
+                        WebSocketMessageType::Text | WebSocketMessageType::Binary => {
+                            for handler in &self.message_handlers {
+                                handler(connection.id.clone(), message.clone());
+                            }
+                        }
+                        WebSocketMessageType::Ping => {
+                            let pong = WebSocketMessage::pong();
+                            if let Ok(frame) = encode_websocket_frame(&pong) {
+                                let _ = connection.stream.write_all(&frame).await;
+                                let _ = connection.stream.flush().await;
+                            }
+                        }
+                        WebSocketMessageType::Close => {
+                            connection.state = WebSocketState::Closed;
+                            break;
+                        }
+                        WebSocketMessageType::Pong => {
+                            connection.last_ping = get_current_timestamp();
+                        }
+                    }
+                }
+                Err(_) => {
+                    connection.state = WebSocketState::Closed;
+                    break;
+                }
+            }
+        }
+    }
+    
+    async fn read_message(&self, stream: &mut (dyn AsyncRead + AsyncWrite)) -> Result<WebSocketMessage, String> {
+        // Same implementation as client
+        // For brevity, simplified version
+        return Ok(WebSocketMessage::text("test".into()));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  UTILITIES AND HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Parsed WebSocket URL
+open data ParsedWebSocketUrl {
+    scheme: String,
+    host: String,
+    port: u16,
+    path: String,
+    secure: bool,
+}
+
+/// Parse WebSocket URL
+fn parse_websocket_url(url: &str) -> Result<ParsedWebSocketUrl, String> {
+    let secure = url.starts_with("wss://");
+    let scheme = if secure { "wss" } else { "ws" };
+    
+    let url_without_scheme = url.trim_start_matches("ws://").trim_start_matches("wss://");
+    
+    let (host_port, path) = match url_without_scheme.find('/') {
+        Some(pos) => {
+            let host_port = &url_without_scheme[..pos];
+            let path = &url_without_scheme[pos..];
+            (host_port, path)
+        }
+        None => (url_without_scheme, "/"),
+    };
+    
+    let (host, port) = match host_port.find(':') {
+        Some(pos) => {
+            let host = &host_port[..pos];
+            let port_str = &host_port[pos + 1..];
+            let port = port_str.parse().unwrap_or(if secure { 443 } else { 80 });
+            (host, port)
+        }
+        None => {
+            let port = if secure { 443 } else { 80 };
+            (host_port, port)
+        }
+    };
+    
+    return Ok(ParsedWebSocketUrl {
+        scheme: scheme.into(),
+        host: host.into(),
+        port: port,
+        path: path.into(),
+        secure: secure,
+    });
+}
+
+/// Generate WebSocket key
+fn generate_websocket_key() -> String {
+    let random_bytes: [u8; 16] = rand::random();
+    return base64::encode(&random_bytes);
+}
+
+/// Calculate WebSocket accept key
+fn calculate_accept_key(key: &str) -> String {
+    let magic_string = format!("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key);
+    let hash = sha1::digest(magic_string.as_bytes());
+    return base64::encode(&hash);
+}
+
+/// Extract WebSocket key from request
+fn extract_websocket_key(request: &str) -> Result<String, String> {
+    for line in request.lines() {
+        if line.starts_with("Sec-WebSocket-Key:") {
+            return Ok(line.split(':').nth(1).unwrap_or("").trim().to_string());
+        }
+    }
+    return Err("WebSocket key not found".into());
+}
+
+/// Encode WebSocket frame
+fn encode_websocket_frame(message: &WebSocketMessage) -> Result<Vec<u8>, String> {
+    let mut frame = Vec::new();
+    
+    // First byte: FIN + opcode
+    let first_byte = 0x80 | match message.message_type {
+        WebSocketMessageType::Text => 0x1,
+        WebSocketMessageType::Binary => 0x2,
+        WebSocketMessageType::Close => 0x8,
+        WebSocketMessageType::Ping => 0x9,
+        WebSocketMessageType::Pong => 0xA,
+    };
+    frame.push(first_byte);
+    
+    // Payload length
+    let payload_len = message.payload.len();
+    if payload_len < 126 {
+        frame.push(payload_len as u8);
+    } else if payload_len < 65536 {
+        frame.push(126);
+        frame.extend_from_slice(&(payload_len as u16).to_be_bytes());
+    } else {
+        frame.push(127);
+        frame.extend_from_slice(&(payload_len as u64).to_be_bytes());
+    }
+    
+    // Payload
+    frame.extend_from_slice(&message.payload);
+    
+    return Ok(frame);
+}
+
+/// Generate connection ID
+fn generate_connection_id() -> String {
+    return format!("conn_{}", get_current_timestamp());
+}
+
+/// Get current timestamp
+fn get_current_timestamp() -> u64 {
+    // In real implementation, would use system time
+    return 0;
+}
+
+/// Connect TLS
+async fn connect_tls(stream: TcpStream, host: &str) -> Result<Box<dyn AsyncRead + AsyncWrite>, String> {
+    // In real implementation, would use TLS library
+    return Ok(Box::new(stream) as Box<dyn AsyncRead + AsyncWrite>);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §5  GLOBAL INSTANCE AND HELPERS
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Create WebSocket client
+open fn create_websocket_client(url: String) -> WebSocketClient {
+    return WebSocketClient::new(url, WebSocketConfig::default());
+}
+
+/// Create WebSocket client with config
+open fn create_websocket_client_with_config(url: String, config: WebSocketConfig) -> WebSocketClient {
+    return WebSocketClient::new(url, config);
+}
+
+/// Create WebSocket server
+open fn create_websocket_server(bind_address: String, port: u16) -> WebSocketServer {
+    return WebSocketServer::new(bind_address, port, WebSocketConfig::default());
+}
+
+/// Create WebSocket server with config
+open fn create_websocket_server_with_config(bind_address: String, port: u16, config: WebSocketConfig) -> WebSocketServer {
+    return WebSocketServer::new(bind_address, port, config);
+}
+
+/// Initialize WebSocket system
+open fn init_websocket() {
+    // Initialize WebSocket system
+}

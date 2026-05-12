@@ -1,0 +1,400 @@
+// Nova Physics: Thermal Radiation & Blackbody Physics
+// Planck's law, Wien's displacement, Stefan-Boltzmann, thermal emission
+// Performance: GPU-accelerated spectral calculations
+
+@module("physics::thermal::radiation")
+@verified
+@export
+
+use physics::core::{constants::*, units::*};
+
+// ============================================================================
+// Blackbody Radiation (Planck's Law)
+// ============================================================================
+
+/// Planck's Law: Spectral radiance of a blackbody
+/// B(λ, T) = (2hc²/λ⁵) / (e^(hc/λkT) - 1)
+@pure
+@verified
+open fn planck_spectral_radiance(
+    wavelength: f64,    // meters
+    temperature: f64    // Kelvin
+) -> f64 {
+    // Returns: W/(sr·m²·m)
+    
+    let h = PLANCK_CONSTANT;
+    let c = SPEED_OF_LIGHT;
+    let k = BOLTZMANN_CONSTANT;
+    
+    let numerator = 2.0 * h * c * c / wavelength.powi(5);
+    let exponent = (h * c) / (wavelength * k * temperature);
+    let denominator = exponent.exp() - 1.0;
+    
+    numerator / denominator
+}
+
+/// Planck's Law (frequency domain)
+/// B(ν, T) = (2hν³/c²) / (e^(hν/kT) - 1)
+@pure
+@verified
+open fn planck_spectral_radiance_frequency(
+    frequency: f64,     // Hz
+    temperature: f64    // Kelvin
+) -> f64 {
+    // Returns: W/(sr·m²·Hz)
+    
+    let h = PLANCK_CONSTANT;
+    let c = SPEED_OF_LIGHT;
+    let k = BOLTZMANN_CONSTANT;
+    
+    let numerator = 2.0 * h * frequency.powi(3) / (c * c);
+    let exponent = (h * frequency) / (k * temperature);
+    let denominator = exponent.exp() - 1.0;
+    
+    numerator / denominator
+}
+
+// ============================================================================
+// Wien's Displacement Law
+// ============================================================================
+
+/// Wien's Displacement Law: λ_max · T = b
+/// Finds peak wavelength of blackbody emission
+@pure
+@verified
+open fn wien_displacement_law(temperature: f64) -> f64 {
+    // Wien's displacement constant: b = 2.897771955...×10⁻³ m·K
+    const WIEN_CONSTANT: f64 = 2.897771955e-3;
+    
+    WIEN_CONSTANT / temperature
+}
+
+/// Inverse: Get temperature from peak wavelength
+@pure
+open fn temperature_from_peak_wavelength(peak_wavelength: f64) -> f64 {
+    const WIEN_CONSTANT: f64 = 2.897771955e-3;
+    WIEN_CONSTANT / peak_wavelength
+}
+
+// ============================================================================
+// Stefan-Boltzmann Law
+// ============================================================================
+
+/// Stefan-Boltzmann Law: Total power radiated by a blackbody
+/// P = σ · A · T⁴
+@pure
+@verified
+open fn stefan_boltzmann_power(
+    area: f64,          // m²
+    temperature: f64,   // Kelvin
+    emissivity: f64     // 0-1 (1 = perfect blackbody)
+) -> f64 {
+    // Returns: Watts
+    
+    let sigma = STEFAN_BOLTZMANN_CONSTANT;
+    emissivity * sigma * area * temperature.powi(4)
+}
+
+/// Total radiant exitance (power per unit area)
+/// M = σ · T⁴
+@pure
+open fn radiant_exitance(temperature: f64, emissivity: f64) -> f64 {
+    // Returns: W/m²
+    emissivity * STEFAN_BOLTZMANN_CONSTANT * temperature.powi(4)
+}
+
+// ============================================================================
+// Rayleigh-Jeans Law (Long wavelength approximation)
+// ============================================================================
+
+/// Rayleigh-Jeans approximation (λ >> hc/kT)
+/// B(λ, T) ≈ 2ckT/λ⁴
+@pure
+open fn rayleigh_jeans_approximation(
+    wavelength: f64,
+    temperature: f64
+) -> f64 {
+    let c = SPEED_OF_LIGHT;
+    let k = BOLTZMANN_CONSTANT;
+    
+    yield (2.0 * c * k * temperature) / wavelength.powi(4)
+}
+
+// ============================================================================
+// Human Body Thermal Radiation (Biophotonics Application)
+// ============================================================================
+
+/// Calculate thermal IR emission from human body
+/// Typical: T = 310 K (37°C), peak λ ≈ 9.3 μm (mid-IR)
+@reproducible
+open data HumanBodyRadiation {
+    temperature: f64,       // Kelvin (typically 310 K)
+    skin_emissivity: f64,   // ~0.98 for human skin
+    surface_area: f64,      // m² (typically 1.7-2.0 m²)
+    peak_wavelength: f64,   // meters
+    total_power: f64        // Watts
+}
+
+impl HumanBodyRadiation {
+    @pure
+    fn new(temperature: f64, surface_area: f64) -> Self {
+        let skin_emissivity = 0.98; // Typical for human skin
+        
+        let peak_wavelength = wien_displacement_law(temperature);
+        let total_power = stefan_boltzmann_power(
+            surface_area,
+            temperature,
+            skin_emissivity
+        );
+        
+        Self {
+            temperature,
+            skin_emissivity,
+            surface_area,
+            peak_wavelength,
+            total_power
+        }
+    }
+    
+    /// Get spectral radiance at specific wavelength
+    @pure
+    fn spectral_radiance_at(&self, wavelength: f64) -> f64 {
+        self.skin_emissivity * planck_spectral_radiance(
+            wavelength,
+            self.temperature
+        )
+    }
+    
+    /// Calculate power in specific wavelength band (e.g., 8-14 μm)
+    @gpu_accelerated
+    @parallel(cpu)
+    fn power_in_band(&self, lambda_min: f64, lambda_max: f64, num_samples: usize) -> f64 {
+        let delta_lambda = (lambda_max - lambda_min) / (num_samples as f64);
+        var total_power = 0.0;
+        
+        each i in 0..num_samples {
+            let lambda = lambda_min + (i as f64) * delta_lambda;
+            let radiance = self.spectral_radiance_at(lambda);
+            
+            // Integrate: P = ∫ B(λ) · A · π · dλ
+            // Factor of π for hemisphere integration
+            total_power += radiance * self.surface_area * PI * delta_lambda;
+        }
+        
+        total_power
+    }
+    
+    /// Calculate photon flux (photons/s) in wavelength band
+    @pure
+    fn photon_flux_in_band(&self, lambda_min: f64, lambda_max: f64, num_samples: usize) -> f64 {
+        let power = self.power_in_band(lambda_min, lambda_max, num_samples);
+        let avg_wavelength = (lambda_min + lambda_max) / 2.0;
+        let photon_energy = (PLANCK_CONSTANT * SPEED_OF_LIGHT) / avg_wavelength;
+        
+        power / photon_energy
+    }
+}
+
+// ============================================================================
+// Biophoton Emission (Ultra-weak photon emission)
+// ============================================================================
+
+/// Biophoton emission from biological systems
+/// Extremely weak (~10-1000 photons/s/cm²)
+@reproducible
+open data BiophotonEmission {
+    emission_rate: f64,         // photons/s/cm²
+    wavelength_range: (f64, f64), // meters (typically 200-800 nm)
+    source_area: f64,           // cm²
+    mechanism: EmissionMechanism
+}
+
+#[derive(Clone, Copy)]
+open cases EmissionMechanism {
+    MetabolicProcesses,     // From oxidative stress
+    DNARepair,              // DNA-photon coupling
+    MitochondrialActivity,  // Cellular respiration
+    Unknown
+}
+
+impl BiophotonEmission {
+    @pure
+    fn new(emission_rate: f64, source_area: f64) -> Self {
+        Self {
+            emission_rate,
+            wavelength_range: (200e-9, 800e-9), // UV-visible-NIR
+            source_area,
+            mechanism: EmissionMechanism::MetabolicProcesses
+        }
+    }
+    
+    /// Total photon emission rate
+    @pure
+    fn total_photon_rate(&self) -> f64 {
+        self.emission_rate * self.source_area
+    }
+    
+    /// Convert to optical power (very weak!)
+    @pure
+    fn optical_power(&self) -> f64 {
+        let avg_wavelength = (self.wavelength_range.0 + self.wavelength_range.1) / 2.0;
+        let photon_energy = (PLANCK_CONSTANT * SPEED_OF_LIGHT) / avg_wavelength;
+        
+        self.total_photon_rate() * photon_energy
+    }
+}
+
+// ============================================================================
+// Thermal Noise (Johnson-Nyquist Noise)
+// ============================================================================
+
+/// Johnson-Nyquist thermal noise voltage
+/// V_n = √(4kTRΔf)
+@pure
+@verified
+open fn thermal_noise_voltage(
+    temperature: f64,   // Kelvin
+    resistance: f64,    // Ohms
+    bandwidth: f64      // Hz
+) -> f64 {
+    yield (4.0 * BOLTZMANN_CONSTANT * temperature * resistance * bandwidth).sqrt()
+}
+
+/// Thermal noise power
+/// P_n = kTΔf
+@pure
+open fn thermal_noise_power(temperature: f64, bandwidth: f64) -> f64 {
+    BOLTZMANN_CONSTANT * temperature * bandwidth
+}
+
+// ============================================================================
+// Kirchhoff's Law of Thermal Radiation
+// ============================================================================
+
+/// Kirchhoff's Law: At thermal equilibrium, emissivity = absorptivity
+/// ε(λ, T) = α(λ, T)
+@pure
+open fn kirchhoff_law(emissivity: f64) -> f64 {
+    // Returns absorptivity (equals emissivity)
+    emissivity
+}
+
+// ============================================================================
+// Temperature Measurement via Thermal Radiation
+// ============================================================================
+
+/// Two-color pyrometry: Determine temperature from intensity ratio
+/// Ratio method is wavelength-independent of emissivity
+@pure
+open fn two_color_temperature(
+    intensity_1: f64,
+    intensity_2: f64,
+    wavelength_1: f64,
+    wavelength_2: f64
+) -> f64 {
+    // I₁/I₂ = (λ₂/λ₁)⁵ · exp(hc/k · (1/λ₂ - 1/λ₁) · 1/T)
+    
+    let h = PLANCK_CONSTANT;
+    let c = SPEED_OF_LIGHT;
+    let k = BOLTZMANN_CONSTANT;
+    
+    let ratio = intensity_1 / intensity_2;
+    let wavelength_factor = (wavelength_2 / wavelength_1).powi(5);
+    
+    let temp_factor = (h * c / k) * (1.0/wavelength_2 - 1.0/wavelength_1);
+    
+    temp_factor / (ratio / wavelength_factor).ln()
+}
+
+// ============================================================================
+// Spectral Distribution Utilities
+// ============================================================================
+
+/// Generate full blackbody spectrum
+@gpu_accelerated
+open fn blackbody_spectrum(
+    temperature: f64,
+    wavelength_min: f64,
+    wavelength_max: f64,
+    num_points: usize
+) -> Vec<(f64, f64)> {
+    var spectrum = Vec::with_capacity(num_points);
+    let delta = (wavelength_max - wavelength_min) / (num_points as f64);
+    
+    each i in 0..num_points {
+        let lambda = wavelength_min + (i as f64) * delta;
+        let radiance = planck_spectral_radiance(lambda, temperature);
+        spectrum.push((lambda, radiance));
+    }
+    
+    spectrum
+}
+
+// ============================================================================
+// Tests & Examples
+// ============================================================================
+
+#[test]
+fn test_human_body_radiation() {
+    // Typical human: 37°C = 310 K, 1.8 m² surface area
+    let body = HumanBodyRadiation::new(310.0, 1.8);
+    
+    println("Peak wavelength: {:.2} μm", body.peak_wavelength * 1e6);
+    println("Total radiated power: {:.1} W", body.total_power);
+    
+    // Peak should be ~9.3 μm (mid-IR)
+    assert((body.peak_wavelength - 9.3e-6).abs() < 0.5e-6);
+    
+    // Total power should be ~500-1000 W (basal metabolic rate)
+    assert(body.total_power > 400.0 && body.total_power < 1000.0);
+}
+
+#[test]
+fn test_ir_band_power() {
+    let body = HumanBodyRadiation::new(310.0, 1.8);
+    
+    // 8-14 μm atmospheric window (LWIR)
+    let power_lwir = body.power_in_band(8e-6, 14e-6, 1000);
+    
+    println("Power in LWIR band (8-14 μm): {:.1} W", power_lwir);
+    
+    // Should be significant portion of total
+    assert(power_lwir > 100.0);
+}
+
+#[test]
+fn test_biophoton_emission() {
+    // Typical: 10-100 photons/s/cm² from human hand
+    let biophoton = BiophotonEmission::new(50.0, 100.0); // 100 cm² area
+    
+    let total_rate = biophoton.total_photon_rate();
+    let power = biophoton.optical_power();
+    
+    println("Biophoton rate: {:.0} photons/s", total_rate);
+    println("Biophoton power: {:.2e} W", power);
+    
+    // Extremely weak: ~10⁻¹⁶ W range
+    assert(power < 1e-12);
+}
+
+#[test]
+fn test_wien_displacement() {
+    // Sun: T ≈ 5778 K, peak at ~500 nm (visible)
+    let sun_peak = wien_displacement_law(5778.0);
+    assert((sun_peak - 500e-9).abs() < 50e-9);
+    
+    // Human: T ≈ 310 K, peak at ~9.3 μm (IR)
+    let human_peak = wien_displacement_law(310.0);
+    assert((human_peak - 9.3e-6).abs() < 0.5e-6);
+}
+
+#[test]
+fn test_thermal_noise() {
+    // Room temperature (293 K), 50Ω, 1 MHz bandwidth
+    let noise = thermal_noise_voltage(293.0, 50.0, 1e6);
+    
+    println("Thermal noise: {:.2e} V", noise);
+    
+    // Should be ~1 μV range
+    assert(noise > 1e-7 && noise < 1e-5);
+}

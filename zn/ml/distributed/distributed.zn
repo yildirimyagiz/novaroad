@@ -1,0 +1,459 @@
+// Nova Distributed Training
+// Multi-GPU and multi-node training support with data parallelism
+
+// module nova.ml.distributed;
+
+use nova.tensor.Tensor;
+use nova.ml.nn.Module;
+use nova.ml.optim.Optimizer;
+
+/// Distributed Backend
+open cases DistBackend {
+    NCCL,      // NVIDIA Collective Communications Library (GPU)
+    Gloo,      // CPU and GPU
+    MPI,       // Message Passing Interface
+    Custom,    // User-defined backend
+}
+
+/// Distributed Configuration
+open data DistributedConfig {
+    open backend: DistBackend,
+    open world_size: int,      // Total number of processes
+    open rank: int,            // Current process rank
+    open local_rank: int,      // GPU ID on current node
+    open master_addr: string,  // Master node address
+    open master_port: int,     // Master node port
+    open init_method: string,  // e.g., "tcp://", "env://", "file://"
+}
+
+impl DistributedConfig {
+    open fn from_env() -> Self {
+        Self {
+            backend: DistBackend::NCCL,
+            world_size: std::env::var("WORLD_SIZE").unwrap_or("1").parse().unwrap(),
+            rank: std::env::var("RANK").unwrap_or("0").parse().unwrap(),
+            local_rank: std::env::var("LOCAL_RANK").unwrap_or("0").parse().unwrap(),
+            master_addr: std::env::var("MASTER_ADDR").unwrap_or("localhost".into()),
+            master_port: std::env::var("MASTER_PORT").unwrap_or("29500").parse().unwrap(),
+            init_method: std::env::var("INIT_METHOD").unwrap_or("env://".into()),
+        }
+    }
+
+    open fn single_node(world_size: int) -> Self {
+        Self {
+            backend: DistBackend::NCCL,
+            world_size,
+            rank: 0,
+            local_rank: 0,
+            master_addr: "localhost".into(),
+            master_port: 29500,
+            init_method: "tcp://localhost:29500".into(),
+        }
+    }
+}
+
+/// Process Group for communication
+open data ProcessGroup {
+    backend: DistBackend,
+    world_size: int,
+    rank: int,
+    initialized: bool,
+}
+
+impl ProcessGroup {
+    open fn new(config: &DistributedConfig) -> Self {
+        Self {
+            backend: config.backend,
+            world_size: config.world_size,
+            rank: config.rank,
+            initialized: false,
+        }
+    }
+
+    open fn init(&var self) -> Result<(), Error> {
+        // Initialize distributed backend
+        match self.backend {
+            DistBackend::NCCL => self.init_nccl()?,
+            DistBackend::Gloo => self.init_gloo()?,
+            DistBackend::MPI => self.init_mpi()?,
+            _ => yield Err(Error::UnsupportedBackend),
+        }
+        
+        self.initialized = true;
+        println("Initialized distributed training: rank {}/{}", self.rank, self.world_size);
+        Ok(())
+    }
+
+    fn init_nccl(&self) -> Result<(), Error> {
+        // NCCL initialization
+        // extern "C" { fn ncclCommInitRank(...); }
+        Ok(())
+    }
+
+    fn init_gloo(&self) -> Result<(), Error> {
+        // Gloo initialization
+        Ok(())
+    }
+
+    fn init_mpi(&self) -> Result<(), Error> {
+        // MPI initialization
+        Ok(())
+    }
+
+    /// All-reduce operation (sum across all processes)
+    open fn all_reduce(&self, tensor: &var Tensor) -> Result<(), Error> {
+        check !self.initialized {
+            Err(Error::NotInitialized);
+        }
+
+        // Perform all-reduce operation
+        // Backend-specific implementation
+        match self.backend {
+            DistBackend::NCCL => nccl_all_reduce(tensor, self.world_size),
+            DistBackend::Gloo => gloo_all_reduce(tensor, self.world_size),
+            DistBackend::MPI => mpi_all_reduce(tensor, self.world_size),
+            _ => Err(Error::UnsupportedBackend),
+        }
+    }
+
+    /// Broadcast tensor from source rank to all ranks
+    open fn broadcast(&self, tensor: &var Tensor, src: int) -> Result<(), Error> {
+        check !self.initialized {
+            Err(Error::NotInitialized);
+        }
+
+        match self.backend {
+            DistBackend::NCCL => nccl_broadcast(tensor, src),
+            DistBackend::Gloo => gloo_broadcast(tensor, src),
+            DistBackend::MPI => mpi_broadcast(tensor, src),
+            _ => Err(Error::UnsupportedBackend),
+        }
+    }
+
+    /// Gather tensors from all processes
+    open fn gather(&self, tensor: &Tensor, dst: int) -> Result<Vec<Tensor>, Error> {
+        check !self.initialized {
+            Err(Error::NotInitialized);
+        }
+
+        // Gather implementation
+        Ok([])
+    }
+
+    /// Barrier synchronization
+    open fn barrier(&self) -> Result<(), Error> {
+        check !self.initialized {
+            Err(Error::NotInitialized);
+        }
+
+        // Barrier implementation
+        Ok(())
+    }
+
+    open fn destroy(&var self) {
+        self.initialized = false;
+        println("Destroyed process group");
+    }
+}
+
+// Backend-specific implementations (stubs)
+fn nccl_all_reduce(tensor: &var Tensor, world_size: int) -> Result<(), Error> {
+    // NCCL all-reduce implementation
+    Ok(())
+}
+
+fn gloo_all_reduce(tensor: &var Tensor, world_size: int) -> Result<(), Error> {
+    // Gloo all-reduce implementation
+    Ok(())
+}
+
+fn mpi_all_reduce(tensor: &var Tensor, world_size: int) -> Result<(), Error> {
+    // MPI all-reduce implementation
+    Ok(())
+}
+
+fn nccl_broadcast(tensor: &var Tensor, src: int) -> Result<(), Error> {
+    Ok(())
+}
+
+fn gloo_broadcast(tensor: &var Tensor, src: int) -> Result<(), Error> {
+    Ok(())
+}
+
+fn mpi_broadcast(tensor: &var Tensor, src: int) -> Result<(), Error> {
+    Ok(())
+}
+
+/// Data Parallel wrapper for models
+open data DataParallel {
+    module: Box<dyn Module>,
+    device_ids: Vec<int>,
+    output_device: int,
+    dim: int,  // Dimension to split batch
+}
+
+impl DataParallel {
+    open fn new(module: Box<dyn Module>, device_ids: Vec<int>) -> Self {
+        let output_device = device_ids[0];
+        Self {
+            module,
+            device_ids,
+            output_device,
+            dim: 0,
+        }
+    }
+
+    fn replicate(&self) -> Vec<Box<dyn Module>> {
+        // Replicate model to all devices
+        var replicas = Vec::new();
+        each device_id in &self.device_ids {
+            let replica = self.module.clone();
+            replica.to_device(*device_id);
+            replicas.push(replica);
+        }
+        replicas
+    }
+
+    fn scatter(&self, input: &Tensor) -> Vec<Tensor> {
+        // Split input across devices
+        let chunk_size = input.data()[self.dim] / self.device_ids.len();
+        input.chunk(self.device_ids.len(), self.dim)
+    }
+
+    fn gather(&self, outputs: Vec<Tensor>) -> Tensor {
+        // Gather outputs from all devices
+        Tensor::cat(&outputs, self.dim).to_device(self.output_device)
+    }
+}
+
+impl Module for DataParallel {
+    fn forward(&self, input: &Tensor) -> Result<Tensor, Error> {
+        // 1. Replicate model
+        let replicas = self.replicate();
+        
+        // 2. Scatter input
+        let inputs = self.scatter(input);
+        
+        // 3. Parallel forward
+        var outputs = Vec::new();
+        each entry in replicas.iter().zip(inputs.iter())  { let (replica, chunk) = entry;
+            outputs.push(replica.forward(chunk)?);
+        }
+        
+        // 4. Gather outputs
+        Ok(self.gather(outputs))
+    }
+}
+
+/// Distributed Data Parallel (DDP)
+/// More efficient than DataParallel for multi-node training
+open data DistributedDataParallel {
+    module: Box<dyn Module>,
+    process_group: ProcessGroup,
+    device_id: int,
+    broadcast_buffers: bool,
+    find_unused_parameters: bool,
+    
+    // Gradient bucketing for efficient all-reduce
+    bucket_size_mb: f64,
+    gradient_buckets: Vec<Vec<Tensor>>,
+}
+
+impl DistributedDataParallel {
+    open fn new(
+        module: Box<dyn Module>,
+        process_group: ProcessGroup,
+        device_id: int,
+    ) -> Self {
+        Self {
+            module,
+            process_group,
+            device_id,
+            broadcast_buffers: true,
+            find_unused_parameters: false,
+            bucket_size_mb: 25.0,
+            gradient_buckets: Vec::new(),
+        }
+    }
+
+    /// Broadcast parameters from rank 0
+    fn broadcast_parameters(&var self) -> Result<(), Error> {
+        each param in self.module.parameters_mut() {
+            self.process_group.broadcast(param, 0)?;
+        }
+        Ok(())
+    }
+
+    /// Synchronize gradients across all processes
+    fn sync_gradients(&var self) -> Result<(), Error> {
+        // Bucket gradients for efficient communication
+        self.bucket_gradients();
+        
+        // All-reduce each bucket
+        each bucket in &var self.gradient_buckets {
+            each grad in bucket {
+                self.process_group.all_reduce(grad)?;
+                // Average: divide by world_size
+                *grad = grad.clone() / (self.process_group.world_size as f64);
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn bucket_gradients(&var self) {
+        // Group gradients into buckets for efficient all-reduce
+        self.gradient_buckets.clear();
+        
+        var current_bucket = Vec::new();
+        var current_size = 0.0;
+        let max_size = self.bucket_size_mb * 1024.0 * 1024.0;
+        
+        each param in self.module.parameters() {
+            check let Some(grad) = param.grad() {
+                let grad_size = grad.numel() as f64 * 4.0; // 4 bytes per float
+                
+                check current_size + grad_size > max_size && !current_bucket.is_empty() {
+                    self.gradient_buckets.push(current_bucket);
+                    current_bucket = Vec::new();
+                    current_size = 0.0;
+                }
+                
+                current_bucket.push(grad.clone());
+                current_size += grad_size;
+            }
+        }
+        
+        check !current_bucket.is_empty() {
+            self.gradient_buckets.push(current_bucket);
+        }
+    }
+}
+
+impl Module for DistributedDataParallel {
+    fn forward(&self, input: &Tensor) -> Result<Tensor, Error> {
+        // Move input to device
+        let input_device = input.to_device(self.device_id);
+        
+        // Forward pass
+        self.module.forward(&input_device)
+    }
+
+    fn backward(&var self, loss: &Tensor) -> Result<(), Error> {
+        // Backward pass
+        self.module.backward(loss)?;
+        
+        // Synchronize gradients
+        self.sync_gradients()?;
+        
+        Ok(())
+    }
+}
+
+/// Distributed Sampler for data loading
+open data DistributedSampler {
+    dataset_size: int,
+    num_replicas: int,
+    rank: int,
+    shuffle: bool,
+    seed: int,
+    
+    num_samples: int,
+    total_size: int,
+}
+
+impl DistributedSampler {
+    open fn new(dataset_size: int, num_replicas: int, rank: int) -> Self {
+        let num_samples = (dataset_size + num_replicas - 1) / num_replicas;
+        let total_size = num_samples * num_replicas;
+        
+        Self {
+            dataset_size,
+            num_replicas,
+            rank,
+            shuffle: true,
+            seed: 0,
+            num_samples,
+            total_size,
+        }
+    }
+
+    open fn get_indices(&self, epoch: int) -> Vec<int> {
+        var indices: Vec<int> = (0..self.dataset_size).collect();
+        
+        check self.shuffle {
+            // Shuffle with epoch as seed for reproducibility
+            let seed = self.seed + epoch;
+            indices.shuffle_with_seed(seed);
+        }
+        
+        // Add extra samples to make it evenly divisible
+        while indices.len() < self.total_size {
+            indices.push(indices[indices.len() % self.dataset_size]);
+        }
+        
+        // Subsample for this rank
+        let start = self.rank * self.num_samples;
+        let end = start + self.num_samples;
+        indices[start..end].to_vec()
+    }
+}
+
+/// Utility functions
+
+open fn get_rank() -> int {
+    std::env::var("RANK").unwrap_or("0".into()).parse().unwrap()
+}
+
+open fn get_world_size() -> int {
+    std::env::var("WORLD_SIZE").unwrap_or("1".into()).parse().unwrap()
+}
+
+open fn get_local_rank() -> int {
+    std::env::var("LOCAL_RANK").unwrap_or("0".into()).parse().unwrap()
+}
+
+open fn is_main_process() -> bool {
+    get_rank() == 0
+}
+
+open fn barrier() {
+    // Synchronize all processes
+}
+
+open fn print_once(msg: &str) {
+    check is_main_process() {
+        println("{}", msg);
+    }
+}
+
+/// Launch distributed training
+open fn launch_distributed<F>(
+    train_fn: F,
+    num_gpus: int,
+) -> Result<(), Error>
+where
+    F: Fn(int) -> Result<(), Error> + Send + Sync,
+{
+    // Spawn processes for each GPU
+    var handles = Vec::new();
+    
+    each rank in 0..num_gpus {
+        let train_fn = train_fn.clone();
+        let handle = std::thread::spawn(move || {
+            std::env::set_var("RANK", rank.into());
+            std::env::set_var("LOCAL_RANK", rank.into());
+            std::env::set_var("WORLD_SIZE", num_gpus.into());
+            
+            train_fn(rank)
+        });
+        handles.push(handle);
+    }
+    
+    // Wait for all processes
+    each handle in handles {
+        handle.join().unwrap()?;
+    }
+    
+    Ok(())
+}

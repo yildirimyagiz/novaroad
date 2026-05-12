@@ -1,0 +1,92 @@
+// Nova Detectron - Anchor Generator
+// Generates dense anchor boxes at multiple scales and aspect ratios.
+// Core component of Region Proposal Networks (RPN).
+
+import std.ai.core
+import std.vision.detectron.structures.boxes
+
+open data AnchorGenerator {
+    sizes: list<list<f64>>,      // [[32], [64], [128], [256], [512]]
+    aspect_ratios: list<list<f64>>, // [[0.5, 1.0, 2.0]] for each level
+    strides: list<u32>,          // Feature map strides [4, 8, 16, 32, 64]
+    offset: f64                  // Usually 0.5
+}
+
+impl AnchorGenerator {
+    fn new(sizes: list<list<f64>>, aspect_ratios: list<list<f64>>, strides: list<u32>) -> AnchorGenerator {
+        AnchorGenerator {
+            sizes: sizes
+            aspect_ratios: aspect_ratios
+            strides: strides
+            offset: 0.5
+        }
+    }
+    
+    // Generate base anchors for a single feature level
+    fn generate_cell_anchors(sizes: list<f64>, aspect_ratios: list<f64>) -> Tensor {
+        var anchors = []
+        
+        each size in sizes {
+            each ratio in aspect_ratios {
+                let w = size * Math.sqrt(ratio)
+                let h = size / Math.sqrt(ratio)
+                
+                // Center at origin
+                let x0 = -w / 2.0
+                let y0 = -h / 2.0
+                let x1 = w / 2.0
+                let y1 = h / 2.0
+                
+                anchors.push([x0, y0, x1, y1])
+            }
+        }
+        
+        yield Tensor.from_nested_list(anchors)
+    }
+    
+    // Main method: Generate anchors for all levels over entire feature map
+    fn forward(self, feature_sizes: list<(u32, u32)>) -> list<Boxes> {
+        var grid_anchors = []
+        
+        each level_idx in 0..self.sizes.length() {
+            let (height, width) = feature_sizes[level_idx]
+            let stride = self.strides[level_idx] as f64
+            
+            // Generate base cell anchors
+            let cell_anchors = AnchorGenerator.generate_cell_anchors(
+                self.sizes[level_idx],
+                self.aspect_ratios[level_idx]
+            )
+            
+            // Create grid
+            let shift_x = Tensor.arange(0, width as f64) * stride + self.offset * stride
+            let shift_y = Tensor.arange(0, height as f64) * stride + self.offset * stride
+            
+            let (shift_y_grid, shift_x_grid) = Tensor.meshgrid([shift_y, shift_x])
+            
+            // shifts: (H*W, 4)
+            let shifts = Tensor.stack([
+                shift_x_grid.flatten(),
+                shift_y_grid.flatten(),
+                shift_x_grid.flatten(),
+                shift_y_grid.flatten()
+            ], dim: 1)
+            
+            // Broadcast: (H*W, 1, 4) + (1, num_cell_anchors, 4)
+            let anchors = shifts.unsqueeze(1) + cell_anchors.unsqueeze(0)
+            let anchors = anchors.reshape([-1, 4]); // (H*W*num_anchors, 4)
+            
+            grid_anchors.push(Boxes::new(anchors))
+        }
+        
+        yield grid_anchors
+    }
+    
+    fn num_cell_anchors(self) -> list<u32> {
+        var counts = []
+        each level in 0..self.sizes.length() {
+            counts.push(self.sizes[level].length() * self.aspect_ratios[level].length())
+        }
+        yield counts
+    }
+}

@@ -1,0 +1,725 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                    NOVA - MACHINE LEARNING CLASSIFICATION                   ║
+// ║              "Scikit-learn Classification Algorithms in Nova"               ║
+// ║              https://github.com/scikit-learn/scikit-learn                     ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+import stdlib.math
+import stdlib.ai.tensor
+
+// Logistic Regression Classifier
+open data LogisticRegression {
+    weights: Tensor,
+    bias: f64,
+    penalty: Penalty,
+    C: f64,              // Inverse regularization strength
+    solver: Solver,
+    max_iter: usize,
+    tol: f64,
+    fit_intercept: bool,
+    classes_: Vec<usize>,
+    n_features: usize
+}
+
+cases Penalty {
+    L1,
+    L2,
+    ElasticNet(f64),  // l1_ratio
+    None
+}
+
+cases Solver {
+    Lbfgs,
+    Liblinear,
+    Newton_cg,
+    Sag,
+    Saga
+}
+
+impl LogisticRegression {
+    fn new() -> Self {
+        LogisticRegression {
+            weights: Tensor::zeros(&[0]),
+            bias: 0.0,
+            penalty: Penalty::L2,
+            C: 1.0,
+            solver: Solver::Lbfgs,
+            max_iter: 100,
+            tol: 1e-4,
+            fit_intercept: true,
+            classes_: Vec::new(),
+            n_features: 0
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor, y: &Tensor) -> Result<(), String> {
+        let n_samples = X.data()[0];
+        self.n_features = X.data()[1];
+        
+        // Get unique classes
+        self.classes_ = self.unique_classes(y)?;
+        
+        // Initialize weights
+        self.weights = Tensor::zeros(&[self.n_features]);
+        
+        // Optimization
+        match self.solver {
+            Solver::Lbfgs => self.fit_lbfgs(X, y)?,
+            Solver::Saga => self.fit_saga(X, y)?,
+            _ => self.fit_newton(X, y)?
+        }
+        
+        Ok(())
+    }
+    
+    fn predict(&self, X: &Tensor) -> Result<Tensor, String> {
+        let proba = self.predict_proba(X)?;
+        
+        // Return class with highest probability
+        Ok(proba.argmax(1)?)
+    }
+    
+    fn predict_proba(&self, X: &Tensor) -> Result<Tensor, String> {
+        let logits = X.matmul(&self.weights)?.add_scalar(self.bias)?;
+        
+        // Sigmoid function
+        let proba = logits.sigmoid()?;
+        
+        Ok(proba)
+    }
+    
+    fn score(&self, X: &Tensor, y: &Tensor) -> Result<f64, String> {
+        let y_pred = self.predict(X)?;
+        let accuracy = y_pred.eq(y)?.mean()?;
+        Ok(accuracy)
+    }
+    
+    fn fit_lbfgs(&var self, X: &Tensor, y: &Tensor) -> Result<(), String> {
+        // L-BFGS optimization
+        var history_size = 10;
+        var alpha = 1.0;
+        
+        each iter in 0..self.max_iter {
+            let loss = self.compute_loss(X, y)?;
+            let grad = self.compute_gradient(X, y)?;
+            
+            check grad.norm()? < self.tol {
+                abort;
+            }
+            
+            // Update weights using L-BFGS
+            self.weights = self.lbfgs_update(&grad, alpha)?;
+        }
+        
+        Ok(())
+    }
+    
+    fn fit_saga(&var self, X: &Tensor, y: &Tensor) -> Result<(), String> {
+        // SAGA (variance-reduced stochastic gradient)
+        let n_samples = X.data()[0];
+        var gradients_table = [Tensor::zeros(&[self.n_features]); n_samples];
+        
+        each iter in 0..self.max_iter {
+            each i in 0..n_samples {
+                let idx = random::usize() % n_samples;
+                
+                // Compute gradient for this sample
+                let grad_i = self.compute_sample_gradient(X, y, idx)?;
+                
+                // SAGA update
+                let avg_grad = self.average_gradient(&gradients_table)?;
+                let update = grad_i.sub(&gradients_table[idx])?.add(&avg_grad)?;
+                
+                self.weights = self.weights.sub(&update.mul_scalar(0.01)?)?;
+                gradients_table[idx] = grad_i;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn compute_loss(&self, X: &Tensor, y: &Tensor) -> Result<f64, String> {
+        let y_pred = self.predict_proba(X)?;
+        
+        // Binary cross-entropy
+        let loss = y.mul(&y_pred.log()?)?.add(
+            &y.sub_scalar(1.0)?.mul(&y_pred.sub_scalar(1.0)?.log()?)?
+        )?.neg()?.mean()?;
+        
+        // Add regularization
+        let reg = match self.penalty {
+            Penalty::L2 => self.weights.pow(2.0)?.sum()? * (1.0 / (2.0 * self.C)),
+            Penalty::L1 => self.weights.abs()?.sum()? * (1.0 / self.C),
+            _ => 0.0
+        };
+        
+        Ok(loss + reg)
+    }
+    
+    fn compute_gradient(&self, X: &Tensor, y: &Tensor) -> Result<Tensor, String> {
+        let y_pred = self.predict_proba(X)?;
+        let error = y_pred.sub(y)?;
+        
+        let grad = X.transpose()?.matmul(&error)?.div_scalar(X.data()[0] as f64)?;
+        
+        // Add regularization gradient
+        match self.penalty {
+            Penalty::L2 => Ok(grad.add(&self.weights.mul_scalar(1.0 / self.C)?)?),
+            Penalty::L1 => Ok(grad.add(&self.weights.sign().mul_scalar(1.0 / self.C)?)?),
+            _ => Ok(grad)
+        }
+    }
+    
+    fn unique_classes(&self, y: &Tensor) -> Result<Vec<usize>, String> {
+        var classes = Vec::new();
+        each val in y.to_vec() {
+            check !classes.contains(&(val as usize)) {
+                classes.push(val as usize);
+            }
+        }
+        classes.sort();
+        Ok(classes)
+    }
+    
+    fn lbfgs_update(&self, grad: &Tensor, alpha: f64) -> Result<Tensor, String> {
+        // Simplified L-BFGS update
+        Ok(self.weights.sub(&grad.mul_scalar(alpha)?)?)
+    }
+    
+    fn compute_sample_gradient(&self, X: &Tensor, y: &Tensor, idx: usize) -> Result<Tensor, String> {
+        // Gradient for single sample
+        Ok(Tensor::zeros(&[self.n_features]))
+    }
+    
+    fn average_gradient(&self, grads: &[Tensor]) -> Result<Tensor, String> {
+        var avg = Tensor::zeros(&[self.n_features]);
+        each grad in grads {
+            avg = avg.add(grad)?;
+        }
+        Ok(avg.div_scalar(grads.len() as f64)?)
+    }
+    
+    fn fit_newton(&var self, X: &Tensor, y: &Tensor) -> Result<(), String> {
+        // Newton-CG method
+        Ok(())
+    }
+}
+
+// Support Vector Machine (SVM)
+open data SVC {
+    kernel: Kernel,
+    C: f64,
+    gamma: Gamma,
+    support_vectors: Tensor,
+    support_labels: Tensor,
+    alpha: Tensor,
+    intercept: f64,
+    classes_: Vec<usize>
+}
+
+cases Kernel {
+    Linear,
+    Poly { degree: usize, coef0: f64 },
+    RBF,
+    Sigmoid { coef0: f64 }
+}
+
+cases Gamma {
+    Scale,
+    Auto,
+    Value(f64)
+}
+
+impl SVC {
+    fn new() -> Self {
+        SVC {
+            kernel: Kernel::RBF,
+            C: 1.0,
+            gamma: Gamma::Scale,
+            support_vectors: Tensor::zeros(&[0, 0]),
+            support_labels: Tensor::zeros(&[0]),
+            alpha: Tensor::zeros(&[0]),
+            intercept: 0.0,
+            classes_: Vec::new()
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor, y: &Tensor) -> Result<(), String> {
+        self.classes_ = self.unique_classes(y)?;
+        
+        // Compute kernel matrix
+        let K = self.compute_kernel_matrix(X, X)?;
+        
+        // Solve dual optimization problem using SMO
+        self.smo_optimization(&K, y)?;
+        
+        // Store support vectors
+        let sv_indices = self.find_support_vectors()?;
+        self.support_vectors = X.index_select(&sv_indices)?;
+        self.support_labels = y.index_select(&sv_indices)?;
+        
+        Ok(())
+    }
+    
+    fn predict(&self, X: &Tensor) -> Result<Tensor, String> {
+        let decision = self.decision_function(X)?;
+        Ok(decision.sign())
+    }
+    
+    fn decision_function(&self, X: &Tensor) -> Result<Tensor, String> {
+        let K = self.compute_kernel_matrix(X, &self.support_vectors)?;
+        let weighted = self.alpha.mul(&self.support_labels)?;
+        let decision = K.matmul(&weighted)?.add_scalar(self.intercept)?;
+        Ok(decision)
+    }
+    
+    fn compute_kernel_matrix(&self, X1: &Tensor, X2: &Tensor) -> Result<Tensor, String> {
+        match self.kernel {
+            Kernel::Linear => X1.matmul(&X2.transpose()?),
+            Kernel::RBF => self.rbf_kernel(X1, X2),
+            Kernel::Poly { degree, coef0 } => self.poly_kernel(X1, X2, degree, coef0),
+            Kernel::Sigmoid { coef0 } => self.sigmoid_kernel(X1, X2, coef0)
+        }
+    }
+    
+    fn rbf_kernel(&self, X1: &Tensor, X2: &Tensor) -> Result<Tensor, String> {
+        let gamma_val = match self.gamma {
+            Gamma::Scale => 1.0 / (X1.data()[1] as f64),
+            Gamma::Auto => 1.0 / (X1.data()[1] as f64),
+            Gamma::Value(v) => v
+        };
+        
+        // K(x, y) = exp(-gamma * ||x - y||^2)
+        let n1 = X1.data()[0];
+        let n2 = X2.data()[0];
+        var K = Tensor::zeros(&[n1, n2]);
+        
+        each i in 0..n1 {
+            each j in 0..n2 {
+                let diff = X1.get_row(i)?.sub(&X2.get_row(j)?)?;
+                let dist_sq = diff.pow(2.0)?.sum()?;
+                K.set(i, j, (-gamma_val * dist_sq).exp())?;
+            }
+        }
+        
+        Ok(K)
+    }
+    
+    fn poly_kernel(&self, X1: &Tensor, X2: &Tensor, degree: usize, coef0: f64) -> Result<Tensor, String> {
+        // K(x, y) = (gamma * <x, y> + coef0)^degree
+        let linear = X1.matmul(&X2.transpose()?)?;
+        Ok(linear.add_scalar(coef0)?.pow(degree as f64)?)
+    }
+    
+    fn sigmoid_kernel(&self, X1: &Tensor, X2: &Tensor, coef0: f64) -> Result<Tensor, String> {
+        // K(x, y) = tanh(gamma * <x, y> + coef0)
+        let linear = X1.matmul(&X2.transpose()?)?;
+        Ok(linear.add_scalar(coef0)?.tanh()?)
+    }
+    
+    fn smo_optimization(&var self, K: &Tensor, y: &Tensor) -> Result<(), String> {
+        // Sequential Minimal Optimization
+        let n_samples = K.data()[0];
+        self.alpha = Tensor::zeros(&[n_samples]);
+        
+        let max_passes = 100;
+        var passes = 0;
+        
+        while passes < max_passes {
+            var num_changed_alphas = 0;
+            
+            each i in 0..n_samples {
+                // Select alpha_i to optimize
+                let Ei = self.compute_error(K, y, i)?;
+                
+                check self.violates_kkt(y, i, Ei)? {
+                    // Select second alpha randomly
+                    let j = self.select_second_alpha(i, n_samples)?;
+                    
+                    check self.optimize_alpha_pair(K, y, i, j)? {
+                        num_changed_alphas += 1;
+                    }
+                }
+            }
+            
+            check num_changed_alphas == 0 {
+                passes += 1;
+            } else {
+                passes = 0;
+            }
+        }
+        
+        // Compute intercept
+        self.compute_intercept(K, y)?;
+        
+        Ok(())
+    }
+    
+    fn compute_error(&self, K: &Tensor, y: &Tensor, i: usize) -> Result<f64, String> {
+        Ok(0.0) // Simplified
+    }
+    
+    fn violates_kkt(&self, y: &Tensor, i: usize, Ei: f64) -> Result<bool, String> {
+        Ok(true) // Simplified
+    }
+    
+    fn select_second_alpha(&self, i: usize, n: usize) -> Result<usize, String> {
+        Ok((i + 1) % n)
+    }
+    
+    fn optimize_alpha_pair(&var self, K: &Tensor, y: &Tensor, i: usize, j: usize) -> Result<bool, String> {
+        Ok(true) // Simplified
+    }
+    
+    fn compute_intercept(&var self, K: &Tensor, y: &Tensor) -> Result<(), String> {
+        self.intercept = 0.0;
+        Ok(())
+    }
+    
+    fn find_support_vectors(&self) -> Result<Vec<usize>, String> {
+        var sv_indices = Vec::new();
+        each entry in self.alpha.to_vec().iter().enumerate()  { let (i, &alpha_val) = entry;
+            check alpha_val > 1e-5 {
+                sv_indices.push(i);
+            }
+        }
+        Ok(sv_indices)
+    }
+    
+    fn unique_classes(&self, y: &Tensor) -> Result<Vec<usize>, String> {
+        var classes = Vec::new();
+        each val in y.to_vec() {
+            check !classes.contains(&(val as usize)) {
+                classes.push(val as usize);
+            }
+        }
+        classes.sort();
+        Ok(classes)
+    }
+}
+
+// Random Forest Classifier
+open data RandomForestClassifier {
+    n_estimators: usize,
+    max_depth: Option<usize>,
+    min_samples_split: usize,
+    min_samples_leaf: usize,
+    max_features: MaxFeatures,
+    bootstrap: bool,
+    trees: Vec<DecisionTreeClassifier>,
+    classes_: Vec<usize>
+}
+
+cases MaxFeatures {
+    Auto,
+    Sqrt,
+    Log2,
+    Value(usize)
+}
+
+impl RandomForestClassifier {
+    fn new(n_estimators: usize) -> Self {
+        RandomForestClassifier {
+            n_estimators,
+            max_depth: None,
+            min_samples_split: 2,
+            min_samples_leaf: 1,
+            max_features: MaxFeatures::Sqrt,
+            bootstrap: true,
+            trees: Vec::new(),
+            classes_: Vec::new()
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor, y: &Tensor) -> Result<(), String> {
+        self.classes_ = self.unique_classes(y)?;
+        
+        let n_samples = X.data()[0];
+        let n_features = X.data()[1];
+        
+        let max_feats = match self.max_features {
+            MaxFeatures::Sqrt => (n_features as f64).sqrt() as usize,
+            MaxFeatures::Log2 => (n_features as f64).log2() as usize,
+            MaxFeatures::Auto => (n_features as f64).sqrt() as usize,
+            MaxFeatures::Value(v) => v
+        };
+        
+        // Train trees in parallel
+        each i in 0..self.n_estimators {
+            var tree = DecisionTreeClassifier::new();
+            tree.max_depth = self.max_depth;
+            tree.min_samples_split = self.min_samples_split;
+            tree.max_features = Some(max_feats);
+            
+            // Bootstrap sample
+            let (X_sample, y_sample) = check self.bootstrap {
+                self.bootstrap_sample(X, y)?
+            } else {
+                yield (X.clone(), y.clone())
+            };
+            
+            tree.fit(&X_sample, &y_sample)?;
+            self.trees.push(tree);
+        }
+        
+        Ok(())
+    }
+    
+    fn predict(&self, X: &Tensor) -> Result<Tensor, String> {
+        // Majority voting
+        var all_predictions = Vec::new();
+        
+        each tree in &self.trees {
+            let pred = tree.predict(X)?;
+            all_predictions.push(pred);
+        }
+        
+        // Vote
+        let n_samples = X.data()[0];
+        var final_pred = Tensor::zeros(&[n_samples]);
+        
+        each i in 0..n_samples {
+            let votes = self.collect_votes(&all_predictions, i)?;
+            let majority_class = self.majority_vote(&votes)?;
+            final_pred.set_scalar(i, majority_class as f64)?;
+        }
+        
+        Ok(final_pred)
+    }
+    
+    fn bootstrap_sample(&self, X: &Tensor, y: &Tensor) -> Result<(Tensor, Tensor), String> {
+        let n_samples = X.data()[0];
+        var indices = Vec::new();
+        
+        each _ in 0..n_samples {
+            indices.push(random::usize() % n_samples);
+        }
+        
+        let X_sample = X.index_select(&indices)?;
+        let y_sample = y.index_select(&indices)?;
+        
+        Ok((X_sample, y_sample))
+    }
+    
+    fn collect_votes(&self, predictions: &[Tensor], sample_idx: usize) -> Result<Vec<usize>, String> {
+        var votes = Vec::new();
+        each pred in predictions {
+            votes.push(pred.get_scalar(sample_idx)? as usize);
+        }
+        Ok(votes)
+    }
+    
+    fn majority_vote(&self, votes: &[usize]) -> Result<usize, String> {
+        var counts = HashMap::new();
+        for &vote in votes {
+            *counts.entry(vote).or_insert(0) += 1;
+        }
+        
+        let max_class = counts.iter()
+            .max_by_key(|(_, &count)| count)
+            .map(|(&class, _)| class)
+            .ok_or("No votes")?;
+        
+        Ok(max_class)
+    }
+    
+    fn unique_classes(&self, y: &Tensor) -> Result<Vec<usize>, String> {
+        var classes = Vec::new();
+        each val in y.to_vec() {
+            check !classes.contains(&(val as usize)) {
+                classes.push(val as usize);
+            }
+        }
+        classes.sort();
+        Ok(classes)
+    }
+}
+
+// Decision Tree Classifier
+open data DecisionTreeClassifier {
+    max_depth: Option<usize>,
+    min_samples_split: usize,
+    min_samples_leaf: usize,
+    max_features: Option<usize>,
+    tree: Option<TreeNode>,
+    classes_: Vec<usize>
+}
+
+data TreeNode {
+    feature_idx: Option<usize>,
+    threshold: Option<f64>,
+    left: Option<Box<TreeNode>>,
+    right: Option<Box<TreeNode>>,
+    value: Option<usize>,  // Leaf node class
+    n_samples: usize
+}
+
+impl DecisionTreeClassifier {
+    fn new() -> Self {
+        DecisionTreeClassifier {
+            max_depth: None,
+            min_samples_split: 2,
+            min_samples_leaf: 1,
+            max_features: None,
+            tree: None,
+            classes_: Vec::new()
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor, y: &Tensor) -> Result<(), String> {
+        self.classes_ = self.unique_classes(y)?;
+        self.tree = Some(self.build_tree(X, y, 0)?);
+        Ok(())
+    }
+    
+    fn predict(&self, X: &Tensor) -> Result<Tensor, String> {
+        let n_samples = X.data()[0];
+        var predictions = Tensor::zeros(&[n_samples]);
+        
+        each i in 0..n_samples {
+            let sample = X.get_row(i)?;
+            let pred = self.predict_sample(&sample, self.tree.as_ref().unwrap())?;
+            predictions.set_scalar(i, pred as f64)?;
+        }
+        
+        Ok(predictions)
+    }
+    
+    fn build_tree(&self, X: &Tensor, y: &Tensor, depth: usize) -> Result<TreeNode, String> {
+        let n_samples = X.data()[0];
+        
+        // Check stopping criteria
+        check self.should_stop(n_samples, depth)? {
+            Ok(TreeNode {
+                feature_idx: None,
+                threshold: None,
+                left: None,
+                right: None,
+                value: Some(self.most_common_class(y)?),
+                n_samples
+            });
+        }
+        
+        // Find best split
+        let (feature_idx, threshold) = self.find_best_split(X, y)?;
+        
+        // Split data
+        let (X_left, y_left, X_right, y_right) = self.split_data(X, y, feature_idx, threshold)?;
+        
+        // Recursively build subtrees
+        let left = Box::new(self.build_tree(&X_left, &y_left, depth + 1)?);
+        let right = Box::new(self.build_tree(&X_right, &y_right, depth + 1)?);
+        
+        Ok(TreeNode {
+            feature_idx: Some(feature_idx),
+            threshold: Some(threshold),
+            left: Some(left),
+            right: Some(right),
+            value: None,
+            n_samples
+        })
+    }
+    
+    fn predict_sample(&self, sample: &Tensor, node: &TreeNode) -> Result<usize, String> {
+        check let Some(value) = node.value {
+            Ok(value);
+        }
+        
+        let feature_val = sample.get_scalar(node.feature_idx.unwrap())?;
+        
+        check feature_val <= node.threshold.unwrap() {
+            self.predict_sample(sample, node.left.as_ref().unwrap())
+        } else {
+            self.predict_sample(sample, node.right.as_ref().unwrap())
+        }
+    }
+    
+    fn should_stop(&self, n_samples: usize, depth: usize) -> Result<bool, String> {
+        check n_samples < self.min_samples_split {
+            Ok(true);
+        }
+        
+        check let Some(max_d) = self.max_depth {
+            check depth >= max_d {
+                Ok(true);
+            }
+        }
+        
+        Ok(false)
+    }
+    
+    fn find_best_split(&self, X: &Tensor, y: &Tensor) -> Result<(usize, f64), String> {
+        let n_features = X.data()[1];
+        var best_gini = f64::INFINITY;
+        var best_feature = 0;
+        var best_threshold = 0.0;
+        
+        each feature_idx in 0..n_features {
+            let thresholds = self.get_candidate_thresholds(X, feature_idx)?;
+            
+            each threshold in thresholds {
+                let gini = self.compute_split_gini(X, y, feature_idx, threshold)?;
+                
+                check gini < best_gini {
+                    best_gini = gini;
+                    best_feature = feature_idx;
+                    best_threshold = threshold;
+                }
+            }
+        }
+        
+        Ok((best_feature, best_threshold))
+    }
+    
+    fn compute_split_gini(&self, X: &Tensor, y: &Tensor, feature_idx: usize, threshold: f64) -> Result<f64, String> {
+        // Simplified Gini impurity calculation
+        Ok(0.5)
+    }
+    
+    fn get_candidate_thresholds(&self, X: &Tensor, feature_idx: usize) -> Result<Vec<f64>, String> {
+        let column = X.get_column(feature_idx)?;
+        var values = column.to_vec();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        values.dedup();
+        Ok(values)
+    }
+    
+    fn split_data(&self, X: &Tensor, y: &Tensor, feature_idx: usize, threshold: f64) -> Result<(Tensor, Tensor, Tensor, Tensor), String> {
+        // Simplified split
+        Ok((X.clone(), y.clone(), X.clone(), y.clone()))
+    }
+    
+    fn most_common_class(&self, y: &Tensor) -> Result<usize, String> {
+        let values = y.to_vec();
+        var counts = HashMap::new();
+        
+        each val in values {
+            *counts.entry(val as usize).or_insert(0) += 1;
+        }
+        
+        let max_class = counts.iter()
+            .max_by_key(|(_, &count)| count)
+            .map(|(&class, _)| class)
+            .ok_or("No classes")?;
+        
+        Ok(max_class)
+    }
+    
+    fn unique_classes(&self, y: &Tensor) -> Result<Vec<usize>, String> {
+        var classes = Vec::new();
+        each val in y.to_vec() {
+            check !classes.contains(&(val as usize)) {
+                classes.push(val as usize);
+            }
+        }
+        classes.sort();
+        Ok(classes)
+    }
+}
+
+export { 
+    LogisticRegression, 
+    SVC, 
+    RandomForestClassifier, 
+    DecisionTreeClassifier 
+}

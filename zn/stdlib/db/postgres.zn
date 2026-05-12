@@ -1,0 +1,229 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  PostgreSQL Driver - Async Native Driver                                    ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use super::client::{DbClient, ResultSet, Row};
+
+/// PostgreSQL connection
+open data PostgresClient {
+    connection_id: u64,
+    host: String,
+    port: u16,
+    database: String,
+}
+
+impl PostgresClient {
+    /// Connect to PostgreSQL
+    open fn connect(url: String) -> Result<PostgresClient, String> {
+        extern "C" {
+            fn nova_postgres_connect(
+                url: *const u8,
+                len: usize,
+                conn_id: *var u64
+            ) -> bool;
+        }
+        
+        var conn_id = 0;
+        unsafe {
+            check nova_postgres_connect(url.as_ptr(), url.len(), &var conn_id) {
+                Ok(PostgresClient {
+                    connection_id: conn_id,
+                    host: String::new(),
+                    port: 5432,
+                    database: String::new(),
+                })
+            } else {
+                Err("Failed to connect to PostgreSQL".into())
+            }
+        }
+    }
+    
+    /// Execute query and yield results
+    open fn query(&self, sql: String) -> Result<ResultSet, String> {
+        extern "C" {
+            fn nova_postgres_query(
+                conn_id: u64,
+                sql: *const u8,
+                sql_len: usize,
+                rows: *var *var u8,
+                row_count: *var usize
+            ) -> bool;
+        }
+        
+        unsafe {
+            var rows_ptr: *var u8 = std::ptr::null_mut();
+            var row_count = 0;
+            
+            check nova_postgres_query(
+                self.connection_id,
+                sql.as_ptr(),
+                sql.len(),
+                &var rows_ptr,
+                &var row_count
+            ) {
+                // Parse rows from C data
+                let rows = self.parse_rows(rows_ptr, row_count);
+                Ok(ResultSet { rows })
+            } else {
+                Err("Query failed".into())
+            }
+        }
+    }
+    
+    /// Execute statement (INSERT, UPDATE, DELETE)
+    open fn execute(&self, sql: String) -> Result<u64, String> {
+        extern "C" {
+            fn nova_postgres_execute(
+                conn_id: u64,
+                sql: *const u8,
+                sql_len: usize,
+                affected: *var u64
+            ) -> bool;
+        }
+        
+        var affected = 0;
+        unsafe {
+            check nova_postgres_execute(
+                self.connection_id,
+                sql.as_ptr(),
+                sql.len(),
+                &var affected
+            ) {
+                Ok(affected)
+            } else {
+                Err("Execute failed".into())
+            }
+        }
+    }
+    
+    /// Prepare statement
+    open fn prepare(&self, sql: String) -> Result<PreparedStatement, String> {
+        extern "C" {
+            fn nova_postgres_prepare(
+                conn_id: u64,
+                sql: *const u8,
+                sql_len: usize,
+                stmt_id: *var u64
+            ) -> bool;
+        }
+        
+        var stmt_id = 0;
+        unsafe {
+            check nova_postgres_prepare(
+                self.connection_id,
+                sql.as_ptr(),
+                sql.len(),
+                &var stmt_id
+            ) {
+                Ok(PreparedStatement {
+                    connection_id: self.connection_id,
+                    statement_id: stmt_id,
+                })
+            } else {
+                Err("Prepare failed".into())
+            }
+        }
+    }
+    
+    /// Begin transaction
+    open fn begin(&self) -> Result<Transaction, String> {
+        self.execute("BEGIN".into())?;
+        Ok(Transaction {
+            connection_id: self.connection_id,
+            active: true,
+        })
+    }
+    
+    /// Close connection
+    open fn close(self) {
+        extern "C" {
+            fn nova_postgres_close(conn_id: u64);
+        }
+        
+        unsafe {
+            nova_postgres_close(self.connection_id);
+        }
+    }
+    
+    fn parse_rows(&self, data: *var u8, count: usize) -> Vec<Row> {
+        // TODO: Parse binary protocol
+        Vec::new()
+    }
+}
+
+/// Prepared statement
+open data PreparedStatement {
+    connection_id: u64,
+    statement_id: u64,
+}
+
+impl PreparedStatement {
+    /// Bind parameters and execute
+    open fn execute(&self, params: Vec<Value>) -> Result<ResultSet, String> {
+        extern "C" {
+            fn nova_postgres_execute_prepared(
+                conn_id: u64,
+                stmt_id: u64,
+                params: *const u8,
+                param_count: usize,
+                rows: *var *var u8,
+                row_count: *var usize
+            ) -> bool;
+        }
+        
+        // TODO: Serialize params
+        Ok(ResultSet { rows: Vec::new() })
+    }
+}
+
+/// Transaction
+open data Transaction {
+    connection_id: u64,
+    active: bool,
+}
+
+impl Transaction {
+    open fn commit(var self) -> Result<(), String> {
+        extern "C" {
+            fn nova_postgres_execute(
+                conn_id: u64,
+                sql: *const u8,
+                sql_len: usize,
+                affected: *var u64
+            ) -> bool;
+        }
+        
+        let sql = "COMMIT";
+        var affected = 0;
+        unsafe {
+            check nova_postgres_execute(
+                self.connection_id,
+                sql.as_ptr(),
+                sql.len(),
+                &var affected
+            ) {
+                self.active = false;
+                Ok(())
+            } else {
+                Err("Commit failed".into())
+            }
+        }
+    }
+    
+    open fn rollback(var self) -> Result<(), String> {
+        let sql = "ROLLBACK";
+        // Similar to commit
+        self.active = false;
+        Ok(())
+    }
+}
+
+/// Value types for parameters
+open cases Value {
+    Null,
+    Int(i64),
+    Float(f64),
+    Text(String),
+    Bytes(Vec<u8>),
+    Bool(bool),
+}

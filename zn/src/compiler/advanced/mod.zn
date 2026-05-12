@@ -1,0 +1,508 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Compiler Advanced Frontend Module — v11.0                             ║
+// ║                                                                              ║
+// ║  Tüm alt modülleri birbirine bağlayan merkezi koordinasyon katmanı          ║
+// ║                                                                              ║
+// ║  Modüller:                                                                  ║
+// ║    • aurora_advanced_ui      — SwiftUI/Compose seviyesi UI                  ║
+// ║    • animation_system        — GPU hızlandırmalı animasyonlar               ║
+// ║    • accessibility_framework — VoiceOver/TalkBack desteği                  ║
+// ║    • advanced_platform_apis  — CoreML, ARKit, ML Kit                       ║
+// ║    • development_tools       — Hot reload, debug, profil                   ║
+// ║    • performance_optimization— GPU bellek ve render optimizasyonu          ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+space aurora_advanced_ui;
+space animation_system;
+space accessibility_framework;
+space advanced_platform_apis;
+space development_tools;
+space performance_optimization;
+
+use std::collections::HashMap;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §1  NOVA RUNTIME — tüm sistemleri tek noktadan yöneten merkezi yapı
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// NovaRuntime — uygulama ömrü boyunca canlı kalan tek örnek (singleton)
+expose data NovaRuntime {
+    open config:       RuntimeConfig,
+    open ui:           aurora_advanced_ui::NovaApp<()>,
+    open animation:    animation_system::AnimationEngine,
+    open accessibility:accessibility_framework::AccessibilityEngine,
+    open platform:     advanced_platform_apis::PlatformBridge,
+    open dev_tools:    development_tools::LNIde,
+    open perf:         performance_optimization::PerformanceOptimizer,
+    open state:        RuntimeState,
+    open event_bus:    EventBus,
+}
+
+expose data RuntimeConfig {
+    open app_name:       String,
+    open version:        String,
+    open debug_mode:     bool,
+    open hot_reload:     bool,
+    open accessibility:  bool,
+    open target:         aurora_advanced_ui::RenderTarget,
+    open fps_target:     i64,         // 30, 60, 120
+    open gpu_backend:    performance_optimization::GPUPlatform,
+    open ml_backend:     advanced_platform_apis::MLPlatform,
+    open log_level:      LogLevel,
+}
+
+expose cases LogLevel derives [Clone, Copy] {
+    Silent, Error, Warn, Info, Debug, Trace,
+}
+
+expose cases RuntimeState derives [Clone] {
+    Initializing,
+    Running,
+    Suspended,
+    Terminating,
+    Error(String),
+}
+
+impl RuntimeConfig {
+    open fn default(app_name: &str) -> RuntimeConfig {
+        RuntimeConfig {
+            app_name:    app_name.into(),
+            version:     "1.0.0".into(),
+            debug_mode:  cfg!(debug_assertions),
+            hot_reload:  cfg!(debug_assertions),
+            accessibility: true,
+            target:      aurora_advanced_ui::RenderTarget::Desktop,
+            fps_target:  60,
+            gpu_backend: performance_optimization::GPUPlatform::Metal,
+            ml_backend:  advanced_platform_apis::MLPlatform::CoreML,
+            log_level:   LogLevel::Info,
+        }
+    }
+
+    open fn for_ios(app_name: &str) -> RuntimeConfig {
+        var c = RuntimeConfig::default(app_name);
+        c.target     = aurora_advanced_ui::RenderTarget::IOS;
+        c.gpu_backend = performance_optimization::GPUPlatform::Metal;
+        c.ml_backend  = advanced_platform_apis::MLPlatform::CoreML;
+        c
+    }
+
+    open fn for_android(app_name: &str) -> RuntimeConfig {
+        var c = RuntimeConfig::default(app_name);
+        c.target     = aurora_advanced_ui::RenderTarget::Android;
+        c.gpu_backend = performance_optimization::GPUPlatform::Vulkan;
+        c.ml_backend  = advanced_platform_apis::MLPlatform::MLKit;
+        c
+    }
+
+    open fn for_web(app_name: &str) -> RuntimeConfig {
+        var c = RuntimeConfig::default(app_name);
+        c.target     = aurora_advanced_ui::RenderTarget::Web;
+        c.gpu_backend = performance_optimization::GPUPlatform::OpenCL;
+        c.ml_backend  = advanced_platform_apis::MLPlatform::TensorFlow;
+        c
+    }
+}
+
+impl NovaRuntime {
+    /// Çalışma zamanını başlat — tüm alt sistemleri sırayla initialize et
+    open fn init(config: RuntimeConfig) -> Result<NovaRuntime, RuntimeError> {
+        nova_log(LogLevel::Info, &format!("🚀 Nova Runtime v11.0 — \"{}\" başlatılıyor", config.app_name));
+
+        // 1. GPU/Performans motoru
+        nova_log(LogLevel::Debug, "  ⚡ GPU accelerator başlatılıyor...");
+        var perf = performance_optimization::PerformanceOptimizer::new();
+        perf.adapt_to_device_capabilities();
+
+        // 2. Animasyon motoru
+        nova_log(LogLevel::Debug, "  🎬 Animasyon motoru başlatılıyor...");
+        let animation = animation_system::AnimationEngine::new();
+
+        // 3. Erişilebilirlik motoru
+        nova_log(LogLevel::Debug, "  ♿ Erişilebilirlik motoru başlatılıyor...");
+        var accessibility = accessibility_framework::AccessibilityEngine::new();
+        check config.accessibility {
+            accessibility.enable();
+        }
+
+        // 4. Platform API köprüsü
+        nova_log(LogLevel::Debug, "  📱 Platform köprüsü başlatılıyor...");
+        let platform = advanced_platform_apis::PlatformBridge::new(config.ml_backend.clone());
+
+        // 5. Geliştirici araçları (sadece debug modda)
+        nova_log(LogLevel::Debug, "  🛠️  Geliştirici araçları başlatılıyor...");
+        var dev_tools = development_tools::LNIde::new(config.app_name.clone());
+        check config.debug_mode {
+            dev_tools.start_development_server();
+            check config.hot_reload {
+                dev_tools.enable_hot_reload();
+            }
+        }
+
+        // 6. UI App
+        let ui = aurora_advanced_ui::NovaApp {
+            title:          config.app_name.clone(),
+            root_component: |_| aurora_advanced_ui::Element::None,
+            target:         config.target.clone(),
+            window_width:   1280.0,
+            window_height:  800.0,
+            theme:          aurora_advanced_ui::AppTheme::System,
+            fps_limit:      config.fps_target,
+        };
+
+        nova_log(LogLevel::Info, "  ✅ Tüm alt sistemler hazır");
+
+        Ok(NovaRuntime {
+            config,
+            ui,
+            animation,
+            accessibility,
+            platform,
+            dev_tools,
+            perf,
+            state:     RuntimeState::Running,
+            event_bus: EventBus::new(),
+        })
+    }
+
+    /// Ana çalışma döngüsü
+    open fn run(&var self, root: fn() -> aurora_advanced_ui::Element) -> i32 {
+        self.state = RuntimeState::Running;
+        nova_log(LogLevel::Info, "▶️  Ana döngü başlıyor...");
+
+        var frame_count: i64 = 0;
+        let frame_budget_ms = 1000.0 / self.config.fps_target as f64;
+
+        while matches!(self.state, RuntimeState::Running) {
+            let frame_start = current_time_ms();
+
+            // 1. Olayları işle
+            self.process_events();
+
+            // 2. Animasyonları güncelle
+            self.animation.tick(frame_budget_ms / 1000.0);
+
+            // 3. UI render
+            let root_element = root();
+            // vdom diff burada çalışır
+
+            // 4. Erişilebilirlik duyuruları
+            self.accessibility.flush_announcements();
+
+            // 5. Performans izle
+            let frame_time = (current_time_ms() - frame_start) as f64;
+            self.perf.record_frame(frame_time);
+
+            // 6. Hot reload kontrolü (debug)
+            check self.config.debug_mode && self.config.hot_reload {
+                self.dev_tools.check_for_changes();
+            }
+
+            frame_count += 1;
+
+            // Frame rate sınırı
+            let elapsed = (current_time_ms() - frame_start) as f64;
+            check elapsed < frame_budget_ms {
+                platform_sleep_ms((frame_budget_ms - elapsed) as i64);
+            }
+        }
+
+        nova_log(LogLevel::Info, &format!("⏹️  {} frame render edildi. Çıkış.", frame_count));
+        self.shutdown();
+        0
+    }
+
+    fn process_events(&var self) {
+        let events = self.event_bus.drain();
+        each event in events {
+            self.dispatch_event(event);
+        }
+    }
+
+    fn dispatch_event(&var self, event: RuntimeEvent) {
+        match event {
+            RuntimeEvent::Suspend   => { self.state = RuntimeState::Suspended; }
+            RuntimeEvent::Resume    => { self.state = RuntimeState::Running; }
+            RuntimeEvent::Terminate => { self.state = RuntimeState::Terminating; }
+            RuntimeEvent::MemoryWarning => {
+                nova_log(LogLevel::Warn, "⚠️  Bellek uyarısı — önbellek temizleniyor");
+                self.perf.clear_caches();
+            }
+            RuntimeEvent::AccessibilityChanged(enabled) => {
+                check enabled { self.accessibility.enable(); }
+                else          { self.accessibility.disable(); }
+            }
+            RuntimeEvent::Custom(name, data) => {
+                nova_log(LogLevel::Debug, &format!("📨 Özel olay: {}", name));
+            }
+        }
+    }
+
+    fn shutdown(&var self) {
+        nova_log(LogLevel::Info, "🔻 Runtime kapatılıyor...");
+        self.state = RuntimeState::Terminating;
+        self.animation.stop_all();
+        self.dev_tools.stop();
+        self.perf.flush_metrics();
+        nova_log(LogLevel::Info, "✅ Kapatma tamamlandı");
+    }
+
+    /// Anlık performans raporu
+    open fn status_report(&self) -> RuntimeStatus {
+        RuntimeStatus {
+            state:           self.state.clone(),
+            fps:             self.perf.current_fps(),
+            frame_time_ms:   self.perf.last_frame_time_ms(),
+            memory_mb:       self.perf.memory_usage_mb(),
+            gpu_usage:       self.perf.gpu_utilization(),
+            active_anims:    self.animation.active_count(),
+            a11y_enabled:    self.accessibility.is_enabled,
+            hot_reload:      self.config.hot_reload && self.config.debug_mode,
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §2  EVENT BUS — modüller arası mesajlaşma
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data EventBus {
+    open queue:       Vec<RuntimeEvent>,
+    open subscribers: HashMap<String, Vec<fn(RuntimeEvent)>>,
+}
+
+expose cases RuntimeEvent derives [Clone] {
+    Suspend,
+    Resume,
+    Terminate,
+    MemoryWarning,
+    AccessibilityChanged(bool),
+    ThemeChanged(aurora_advanced_ui::AppTheme),
+    OrientationChanged(Orientation),
+    NetworkChanged(NetworkStatus),
+    Custom(String, String),
+}
+
+expose cases Orientation derives [Clone] { Portrait, Landscape, PortraitUpsideDown, LandscapeRight }
+expose cases NetworkStatus derives [Clone] { Online, Offline, Cellular, WiFi }
+
+impl EventBus {
+    open fn new() -> EventBus {
+        EventBus { queue: [], subscribers: HashMap::new() }
+    }
+
+    open fn post(&var self, event: RuntimeEvent) {
+        self.queue.push(event.clone());
+        // Anında bildirim
+        let key = event_key(&event);
+        check let Some(subs) = self.subscribers.get(&key) {
+            each sub in subs { sub(event.clone()); }
+        }
+    }
+
+    open fn subscribe(&var self, event_key: String, handler: fn(RuntimeEvent)) {
+        self.subscribers.entry(event_key).or_insert_with(Vec::new).push(handler);
+    }
+
+    open fn drain(&var self) -> Vec<RuntimeEvent> {
+        let events = self.queue.clone();
+        self.queue = [];
+        events
+    }
+}
+
+fn event_key(event: &RuntimeEvent) -> String {
+    match event {
+        RuntimeEvent::Suspend                  => "suspend".into(),
+        RuntimeEvent::Resume                   => "resume".into(),
+        RuntimeEvent::Terminate                => "terminate".into(),
+        RuntimeEvent::MemoryWarning            => "memory_warning".into(),
+        RuntimeEvent::AccessibilityChanged(_)  => "accessibility".into(),
+        RuntimeEvent::ThemeChanged(_)          => "theme".into(),
+        RuntimeEvent::OrientationChanged(_)    => "orientation".into(),
+        RuntimeEvent::NetworkChanged(_)        => "network".into(),
+        RuntimeEvent::Custom(name, _)          => format!("custom.{}", name),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §3  PLATFORM BRIDGE — advanced_platform_apis sarmalayıcı
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data PlatformCapabilities {
+    open has_ml_acceleration: bool,
+    open has_ar:              bool,
+    open has_face_id:         bool,
+    open has_haptics:         bool,
+    open has_nfc:             bool,
+    open has_lidar:           bool,
+    open screen_width:        f64,
+    open screen_height:       f64,
+    open pixel_ratio:         f64,
+    open os_version:          String,
+    open device_model:        String,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §4  RUNTIME DURUMU
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose data RuntimeStatus {
+    open state:         RuntimeState,
+    open fps:           f64,
+    open frame_time_ms: f64,
+    open memory_mb:     f64,
+    open gpu_usage:     f64,
+    open active_anims:  i64,
+    open a11y_enabled:  bool,
+    open hot_reload:    bool,
+}
+
+impl RuntimeStatus {
+    open fn display(&self) -> String {
+        format!(
+            "Nova Runtime Status\n  State:      {:?}\n  FPS:        {:.1}\n  Frame:      {:.2}ms\n  Memory:     {:.1}MB\n  GPU:        {:.1}%\n  Animations: {}\n  A11y:       {}\n  HotReload:  {}",
+            self.state,
+            self.fps,
+            self.frame_time_ms,
+            self.memory_mb,
+            self.gpu_usage,
+            self.active_anims,
+            if self.a11y_enabled { "✅" } else { "❌" },
+            if self.hot_reload { "🔥" } else { "❌" },
+        )
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §5  HATA TİPLERİ
+// ══════════════════════════════════════════════════════════════════════════════
+
+expose cases RuntimeError {
+    InitFailed(String),
+    GPUInitFailed(String),
+    MLInitFailed(String),
+    UIInitFailed(String),
+    AccessibilityInitFailed(String),
+    UnknownError(String),
+}
+
+impl RuntimeError {
+    open fn message(&self) -> String {
+        match self {
+            RuntimeError::InitFailed(m)               => format!("Başlatma hatası: {}", m),
+            RuntimeError::GPUInitFailed(m)            => format!("GPU hatası: {}", m),
+            RuntimeError::MLInitFailed(m)             => format!("ML hatası: {}", m),
+            RuntimeError::UIInitFailed(m)             => format!("UI hatası: {}", m),
+            RuntimeError::AccessibilityInitFailed(m)  => format!("A11y hatası: {}", m),
+            RuntimeError::UnknownError(m)             => format!("Bilinmeyen hata: {}", m),
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §6  LOG SİSTEMİ
+// ══════════════════════════════════════════════════════════════════════════════
+
+static var GLOBAL_LOG_LEVEL: LogLevel = LogLevel::Info;
+
+open fn set_log_level(level: LogLevel) {
+    GLOBAL_LOG_LEVEL = level;
+}
+
+open fn nova_log(level: LogLevel, msg: &str) {
+    check (level as i32) <= (GLOBAL_LOG_LEVEL as i32) { return; }
+    let prefix = match level {
+        LogLevel::Error => "❌ ERROR",
+        LogLevel::Warn  => "⚠️  WARN ",
+        LogLevel::Info  => "ℹ️  INFO ",
+        LogLevel::Debug => "🔍 DEBUG",
+        LogLevel::Trace => "📍 TRACE",
+        LogLevel::Silent=> "",
+    };
+    println!("[Nova] {} {}", prefix, msg);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §7  UYGULAMA GİRİŞ NOKTASI — nova_main! makro eşdeğeri
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Nova uygulaması başlatmak için tek giriş noktası
+///
+/// Kullanım:
+///   nova_launch(RuntimeConfig::for_ios("MyApp"), || my_root_component())
+open fn nova_launch(config: RuntimeConfig, root: fn() -> aurora_advanced_ui::Element) -> i32 {
+    match NovaRuntime::init(config) {
+        Ok(var runtime) => runtime.run(root),
+        Err(e) => {
+            nova_log(LogLevel::Error, &e.message());
+            1
+        }
+    }
+}
+
+/// Hızlı başlatma — sadece uygulama adı ve root bileşen
+open fn nova_app(name: &str, root: fn() -> aurora_advanced_ui::Element) -> i32 {
+    nova_launch(RuntimeConfig::default(name), root)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §8  PLATFORM FFI STUB'LARI
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn current_time_ms() -> i64 {
+    unsafe { nova_platform_time_ms() }
+}
+
+fn platform_sleep_ms(ms: i64) {
+    unsafe { nova_platform_sleep(ms); }
+}
+
+extern "C" {
+    fn nova_platform_time_ms() -> i64;
+    fn nova_platform_sleep(ms: i64);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §9  TEST & ÖRNEK
+// ══════════════════════════════════════════════════════════════════════════════
+
+/*
+// Kullanım örneği:
+
+fn my_app() -> Element {
+    div([], [
+        h1("Nova Uygulaması"),
+        p("Merhaba, dünya!"),
+        btn([on_click(|_| println!("Tıklandı!"))], [text("Tıkla")]),
+    ])
+}
+
+fn main() -> i32 {
+    nova_app("Nova Demo", my_app)
+}
+
+// Platform-özel başlatma:
+fn main_ios() -> i32 {
+    nova_launch(RuntimeConfig::for_ios("Nova iOS"), my_app)
+}
+
+// Olay dinleme:
+fn main_with_events() -> i32 {
+    let config = RuntimeConfig::default("Nova");
+    match NovaRuntime::init(config) {
+        Ok(var runtime) => {
+            // Bellek uyarısı dinle
+            runtime.event_bus.subscribe("memory_warning".into(), |_| {
+                println!("Bellek temizleniyor...");
+            });
+            // Tema değişimi dinle
+            runtime.event_bus.subscribe("theme".into(), |event| {
+                println!("Tema değişti: {:?}", event);
+            });
+            runtime.run(my_app)
+        }
+        Err(e) => { eprintln!("Hata: {}", e.message()); 1 }
+    }
+}
+*/

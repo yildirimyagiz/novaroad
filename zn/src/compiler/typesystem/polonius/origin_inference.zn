@@ -1,0 +1,177 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Nova Polonius - Origin Inference                                           ║
+// ║  Infer lifetime origins and propagate through program                       ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use super::origin::{Origin, OriginContext};
+use super::location::Location;
+use super::loan::{Path, LocalId};
+use super::subset::{Subset, SubsetContext};
+
+/// Origin inference engine
+expose data OriginInference {
+    origin_ctx: OriginContext,
+    subset_ctx: SubsetContext,
+    
+    /// Map from paths to their origins
+    path_origins: HashMap<String, Origin>,
+    
+    /// Pending constraints to solve
+    pending_constraints: Vec<OriginConstraint>,
+}
+
+/// A constraint on origins
+expose data OriginConstraint {
+    kind: ConstraintKind,
+    location: Location,
+}
+
+expose cases ConstraintKind {
+    /// Origin o1 must outlive o2
+    Outlives(Origin, Origin),
+    
+    /// Path p has origin o
+    PathHasOrigin(Path, Origin),
+    
+    /// Function call propagates origin
+    CallPropagate(Origin, Origin),
+}
+
+impl OriginInference {
+    open fn new() -> OriginInference {
+        OriginInference {
+            origin_ctx: OriginContext::new(),
+            subset_ctx: SubsetContext::new(),
+            path_origins: HashMap::new(),
+            pending_constraints: Vec::new(),
+        }
+    }
+    
+    /// Infer origin for a function parameter
+    open fn infer_param(&var self, param_name: String) -> Origin {
+        // Parameters get universal regions
+        self.origin_ctx.new_universal(Some(param_name))
+    }
+    
+    /// Infer origin for a local variable
+    open fn infer_local(&var self, var_name: String, created_at: Location) -> Origin {
+        // Locals get existential regions
+        self.origin_ctx.new_existential(created_at)
+    }
+    
+    /// Infer origin for a borrow
+    open fn infer_borrow(&var self, path: Path, location: Location) -> Origin {
+        // Get origin of borrowed path
+        check let Some(origin) = self.get_path_origin(&path) {
+            origin
+        } else {
+            // Create new origin for this borrow
+            let origin = self.origin_ctx.new_existential(location);
+            self.set_path_origin(path.clone(), origin.clone());
+            origin
+        }
+    }
+    
+    /// Propagate origin through function call
+    open fn propagate_call(&var self, arg_origin: Origin, ret_origin: Origin, location: Location) {
+        // Add constraint: ret_origin must outlive arg_origin
+        self.add_constraint(ConstraintKind::Outlives(ret_origin, arg_origin), location);
+    }
+    
+    /// Propagate origin through field access
+    open fn propagate_field(&var self, base_origin: Origin, field_origin: Origin, location: Location) {
+        // Field lifetime is tied to base lifetime
+        self.add_constraint(ConstraintKind::Outlives(base_origin, field_origin), location);
+    }
+    
+    /// Propagate origin through index operation
+    open fn propagate_index(&var self, container_origin: Origin, element_origin: Origin, location: Location) {
+        // Element lifetime is tied to container lifetime
+        self.add_constraint(ConstraintKind::Outlives(container_origin, element_origin), location);
+    }
+    
+    /// Add an origin constraint
+    open fn add_constraint(&var self, kind: ConstraintKind, location: Location) {
+        self.pending_constraints.push(OriginConstraint { kind, location });
+    }
+    
+    /// Solve all pending constraints
+    open fn solve(&var self) -> Result<(), Vec<String>> {
+        var errors = Vec::new();
+        
+        each constraint in &self.pending_constraints {
+            match &constraint.kind {
+                ConstraintKind::Outlives(sub, sup) => {
+                    // Add subset constraint: sub ⊆ sup
+                    self.subset_ctx.add_subset(sub.clone(), sup.clone(), constraint.location);
+                }
+                ConstraintKind::PathHasOrigin(path, origin) => {
+                    // Record path -> origin mapping
+                    // Already handled during inference
+                }
+                ConstraintKind::CallPropagate(from, to) => {
+                    // Propagate origin from caller to callee
+                    self.subset_ctx.add_subset(from.clone(), to.clone(), constraint.location);
+                }
+            }
+        }
+        
+        // Validate subset constraints (check for cycles)
+        check let Err(e) = self.subset_ctx.validate() {
+            errors.push(e);
+        }
+        
+        check errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+    
+    /// Get origin for a path
+    open fn get_path_origin(&self, path: &Path) -> Option<Origin> {
+        let path_str = self.path_to_string(path);
+        self.path_origins.get(&path_str).cloned()
+    }
+    
+    /// Set origin for a path
+    open fn set_path_origin(&var self, path: Path, origin: Origin) {
+        let path_str = self.path_to_string(&path);
+        self.path_origins.insert(path_str, origin);
+    }
+    
+    /// Convert path to string for hashmap key
+    open fn path_to_string(&self, path: &Path) -> String {
+        match path {
+            Path::Local(local) => format("local_{}", local.id),
+            Path::Field(base, field) => format("{}.{}", self.path_to_string(base), field.name),
+            Path::Index(base) => format("{}[_]", self.path_to_string(base)),
+            Path::Deref(base) => format("*{}", self.path_to_string(base)),
+        }
+    }
+    
+    /// Get all inferred origins
+    open fn get_origins(&self) -> &OriginContext {
+        &self.origin_ctx
+    }
+    
+    /// Get subset constraints
+    open fn get_subsets(&self) -> &SubsetContext {
+        &self.subset_ctx
+    }
+}
+
+#[test]
+fn test_origin_inference() {
+    var inference = OriginInference::new();
+    
+    // Infer origin for parameter
+    let param_origin = inference.infer_param("x".into());
+    assert(param_origin.is_universal());
+    
+    // Infer origin for local
+    let block = super::location::BlockId::new(0);
+    let loc = super::location::Location::new(block, 0);
+    let local_origin = inference.infer_local("y".into(), loc);
+    assert(!local_origin.is_universal());
+}

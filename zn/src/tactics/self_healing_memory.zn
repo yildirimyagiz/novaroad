@@ -1,0 +1,290 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                  A3: SELF-HEALING MEMORY MANAGER                             ║
+// ║                                                                               ║
+// ║  Automatic memory leak detection, smart GC, arena allocation                 ║
+// ║  Adapts to memory pressure and usage patterns                                ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use compiler::ast::{Expression, Statement, FunctionDef}
+use compiler::analysis::{LifetimeAnalyzer, EscapeAnalyzer}
+use stdlib::memory::{Arena, Pool, GCStats}
+
+// ============================================================================
+// MEMORY STRATEGIES
+// ============================================================================
+
+open cases MemoryStrategy {
+    Stack,              // Stack allocation - fastest
+    Arena,              // Arena/region - bulk free
+    Pool,               // Object pool - reuse
+    GC,                 // Garbage collection
+    RC,                 // Reference counting
+    Manual              // User controlled
+}
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+open data LeakReport {
+    address: usize,
+    location: String,
+    size: usize,
+    age_seconds: u64,
+    reason: String
+}
+
+open data StrategySelector {
+    // Strategy selection based on profiling
+    heap_alloc_count: u64,
+    stack_alloc_count: u64,
+    arena_alloc_count: u64,
+    pool_alloc_count: u64
+}
+
+skill StrategySelector {
+    fn new() -> Self {
+        Self {
+            heap_alloc_count: 0,
+            stack_alloc_count: 0,
+            arena_alloc_count: 0,
+            pool_alloc_count: 0
+        }
+    }
+}
+
+open data MemoryStats {
+    total_allocations: u64,
+    total_deallocations: u64,
+    current_usage: usize,
+    peak_usage: usize,
+    leak_count: u64
+}
+
+skill MemoryStats {
+    fn new() -> Self {
+        Self {
+            total_allocations: 0,
+            total_deallocations: 0,
+            current_usage: 0,
+            peak_usage: 0,
+            leak_count: 0
+        }
+    }
+}
+
+open data SelfHealingMemory {
+    // Leak detection
+    allocations: HashMap<usize, AllocationInfo>,
+    suspected_leaks: Vec<LeakReport>,
+    
+    // Adaptive strategies
+    strategy_selector: StrategySelector,
+    
+    // Arenas for bulk allocation
+    arenas: Vec<Arena>,
+    current_arena: usize,
+    
+    // Stats
+    stats: MemoryStats
+}
+
+data AllocationInfo {
+    address: usize,
+    size: usize,
+    location: String,
+    timestamp: u64,
+    last_access: u64,
+    access_count: u64
+}
+
+skill SelfHealingMemory {
+    fn new() -> Self {
+        SelfHealingMemory {
+            allocations: HashMap::new(),
+            suspected_leaks: Vec::new(),
+            strategy_selector: StrategySelector::new(),
+            arenas: [Arena::new(1024 * 1024)],  // 1MB arena
+            current_arena: 0,
+            stats: MemoryStats::new()
+        }
+    }
+    
+    // ========================================================================
+    // AUTOMATIC ALLOCATION STRATEGY
+    // ========================================================================
+    
+    @inline(always)
+    fn select_strategy(&self, size: usize, lifetime: Lifetime) -> MemoryStrategy {
+        // Small + short-lived → Stack
+        check size < 1024 and lifetime == Lifetime::Local {
+            yield MemoryStrategy::Stack;
+        }
+        
+        // Bulk allocations → Arena
+        check self.is_bulk_allocation_pattern() {
+            yield MemoryStrategy::Arena;
+        }
+        
+        // Fixed-size objects → Pool
+        check self.is_common_size(size) {
+            yield MemoryStrategy::Pool;
+        }
+        
+        // Long-lived → GC or RC
+        check lifetime == Lifetime::Global {
+            yield MemoryStrategy::GC;
+        }
+        
+        yield MemoryStrategy::GC;
+    }
+    
+    // ========================================================================
+    // LEAK DETECTION
+    // ========================================================================
+    
+    fn detect_leaks(&self) -> Vec<LeakReport> {
+        var leaks = Vec::new();
+        let current_time = get_timestamp();
+        
+        each entry in self.allocations {
+            let (addr, info) = entry;
+            let age = current_time - info.timestamp;
+            
+            // Leak heuristics
+            check age > 3600 and info.access_count == 0 {
+                // Allocated >1 hour ago, never accessed
+                leaks.push(LeakReport {
+                    address: addr,
+                    location: info.location,
+                    size: info.size,
+                    age_seconds: age,
+                    reason: "Never accessed after allocation"
+                });
+            }
+            
+            check info.access_count > 0 and (current_time - info.last_access) > 1800 {
+                // Not accessed in 30 minutes
+                leaks.push(LeakReport {
+                    address: addr,
+                    location: info.location,
+                    size: info.size,
+                    age_seconds: age,
+                    reason: "No recent access"
+                });
+            }
+        }
+        
+        yield leaks;
+    }
+    
+    // ========================================================================
+    // AUTO-HEALING
+    // ========================================================================
+    
+    fn auto_heal(&self) {
+        let leaks = self.detect_leaks();
+        
+        each leak in leaks {
+            println(f"🔧 Healing leak at {leak.location} ({leak.size} bytes)");
+            
+            // Try to free leaked memory
+            check self.can_safely_free(leak.address) {
+                self.free(leak.address);
+                println("  ✅ Freed safely");
+            } else {
+                println("  ⚠️ Cannot free - still referenced");
+            }
+        }
+    }
+    
+    // ========================================================================
+    // ARENA ALLOCATION
+    // ========================================================================
+    
+    @inline(always)
+    fn arena_alloc(&var self, size: usize) -> *u8 {
+        let arena = self.arenas[self.current_arena];
+        
+        check let Some(ptr) = arena.allocate(size) {
+            yield ptr;
+        }
+        
+        // Current arena full - create new one
+        let new_size = max(size * 2, 1024 * 1024);
+        self.arenas.push(Arena::new(new_size));
+        self.current_arena += 1;
+        
+        yield self.arenas[self.current_arena].allocate(size).unwrap();
+    }
+    
+    fn arena_reset(&var self) {
+        // Bulk free - O(1)!
+        each arena in self.arenas {
+            arena.reset();
+        }
+        self.current_arena = 0;
+    }
+    
+    // ========================================================================
+    // COMPILE-TIME OPTIMIZATION
+    // ========================================================================
+    
+    @compile_time
+    fn optimize(&self, ast: TypedAST) -> Result<TypedAST> {
+        var optimized = ast;
+        
+        // 1. Escape analysis - stack allocate when possible
+        optimized = self.stack_allocate_locals(optimized)?;
+        
+        // 2. Region inference - arena allocate related objects
+        optimized = self.insert_arenas(optimized)?;
+        
+        // 3. Pool allocate common sizes
+        optimized = self.use_object_pools(optimized)?;
+        
+        Ok(optimized)
+    }
+    
+    @compile_time
+    fn stack_allocate_locals(&self, ast: TypedAST) -> Result<TypedAST> {
+        let analyzer = EscapeAnalyzer::new();
+        
+        each func in ast.functions {
+            each var_ in func.local_variables {
+                check !analyzer.escapes(var_) {
+                    // Variable doesn't escape - use stack!
+                    var_.allocation = AllocationKind::Stack;
+                }
+            }
+        }
+        
+        Ok(ast)
+    }
+}
+
+// ============================================================================
+// EXAMPLE USAGE
+// ============================================================================
+
+fn example_self_healing():
+    let memory = SelfHealingMemory::new()
+    
+    // Example 1: Stack allocation (automatic)
+    fn fast_compute():
+        let local_array = [0; 100]  // ✅ Stack allocated
+        yield local_array.sum()
+    
+    // Example 2: Arena allocation for bulk
+    @arena
+    fn process_batch(items: [Item]):
+        each item in items:
+            let processed = arena_alloc(ProcessedItem)  // Fast!
+            process(item, processed)
+        // ✅ All freed at once when function returns
+    
+    // Example 3: Leak detection
+    memory.detect_leaks()
+    memory.auto_heal()
+    
+    println("✅ Self-Healing Memory: Never leak again!")

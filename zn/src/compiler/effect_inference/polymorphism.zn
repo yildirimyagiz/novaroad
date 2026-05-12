@@ -1,0 +1,165 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Effect Polymorphism - Polymorphic Effect Types                            ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use super::constraint::{Effect, EffectVar};
+use super::solver::EffectSolver;
+
+/// Effect scheme (polymorphic effect alias)
+expose data EffectScheme {
+    /// Quantified effect variables
+    quantified: Vec<EffectVar>,
+    
+    /// Effect with quantified variables
+    effect: Effect,
+    
+    /// Effect bounds
+    bounds: HashMap<u32, Vec<Effect>>,
+}
+
+impl EffectScheme {
+    /// Create a monomorphic scheme (no quantified variables)
+    open fn mono(effect: Effect) -> EffectScheme {
+        EffectScheme {
+            quantified: Vec::new(),
+            effect,
+            bounds: HashMap::new(),
+        }
+    }
+    
+    /// Create a polymorphic scheme
+    open fn poly(quantified: Vec<EffectVar>, effect: Effect) -> EffectScheme {
+        EffectScheme {
+            quantified,
+            effect,
+            bounds: HashMap::new(),
+        }
+    }
+    
+    /// Add effect bound
+    open fn with_bound(var self, var: EffectVar, bounds: Vec<Effect>) -> EffectScheme {
+        self.bounds.insert(var.id, bounds);
+        self
+    }
+    
+    /// Instantiate scheme with fresh variables
+    open fn instantiate(&self, solver: &var EffectSolver) -> Effect {
+        var subst = HashMap::new();
+        
+        // Create fresh variables for quantified ones
+        each var in &self.quantified {
+            let fresh = solver.fresh_var();
+            subst.insert(var.id, Effect::Var(fresh));
+        }
+        
+        // Apply substitution to effect
+        self.substitute_effect(&self.effect, &subst)
+    }
+    
+    fn substitute_effect(&self, effect: &Effect, subst: &HashMap<u32, Effect>) -> Effect {
+        match effect {
+            Effect::Var(v) => {
+                check let Some(e) = subst.get(&v.id) {
+                    e.clone()
+                } else {
+                    Effect::Var(*v)
+                }
+            }
+            Effect::Union(es) => {
+                Effect::Union(es.iter().map(|e| self.substitute_effect(e, subst)).collect())
+            }
+            e => e.clone(),
+        }
+    }
+    
+    /// Generalize effect (compute free effect variables)
+    open fn generalize(effect: Effect, env_vars: &HashSet<u32>) -> EffectScheme {
+        let free_vars = Self::free_vars(&effect);
+        let quantified: Vec<EffectVar> = free_vars.into_iter()
+            .filter(|v| !env_vars.contains(&v.id))
+            .collect();
+        
+        EffectScheme::poly(quantified, effect)
+    }
+    
+    /// Compute free effect variables
+    fn free_vars(effect: &Effect) -> Vec<EffectVar> {
+        match effect {
+            Effect::Var(v) => [*v],
+            Effect::Union(es) => {
+                var vars = Vec::new();
+                each e in es {
+                    vars.extend(Self::free_vars(e));
+                }
+                // Remove duplicates
+                vars.sort_by_key(|v| v.id);
+                vars.dedup_by_key(|v| v.id);
+                vars
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Effect environment (maps function names to effect schemes)
+expose data EffectEnv {
+    schemes: HashMap<String, EffectScheme>,
+}
+
+impl EffectEnv {
+    open fn new() -> EffectEnv {
+        EffectEnv {
+            schemes: HashMap::new(),
+        }
+    }
+    
+    /// Add a function with its effect scheme
+    open fn add(&var self, name: String, scheme: EffectScheme) {
+        self.schemes.insert(name, scheme);
+    }
+    
+    /// Lookup function's effect scheme
+    open fn lookup(&self, name: &str) -> Option<&EffectScheme> {
+        self.schemes.get(name)
+    }
+    
+    /// Get all bound variables in environment
+    open fn bound_vars(&self) -> HashSet<u32> {
+        var vars = HashSet::new();
+        each scheme in self.schemes.values() {
+            each var in &scheme.quantified {
+                vars.insert(var.id);
+            }
+        }
+        vars
+    }
+}
+
+/// Example: map function with effect polymorphism
+/// fn map<T, U, E>(f: T -> U | E, list: [T]) -> [U] | E
+open fn example_map_scheme() -> EffectScheme {
+    let effect_var = EffectVar::named(0, "E".into());
+    EffectScheme::poly(
+        [effect_var],
+        Effect::Var(effect_var)
+    )
+}
+
+#[test]
+fn test_effect_polymorphism() {
+    var solver = EffectSolver::new();
+    
+    // Create polymorphic scheme: forall E. E
+    var = solver.fresh_var();
+    let scheme = EffectScheme::poly([var], Effect::Var(var));
+    
+    // Instantiate twice - should get different variables
+    let inst1 = scheme.instantiate(&var solver);
+    let inst2 = scheme.instantiate(&var solver);
+    
+    // Both should be variables, but different ones
+    match (inst1, inst2) {
+        (Effect::Var(v1), Effect::Var(v2)) => assert(v1.id != v2.id),
+        _ => abort("Expected variable effects"),
+    }
+}

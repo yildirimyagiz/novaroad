@@ -1,0 +1,480 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// POET - Paired Open-Ended Trailblazer
+// ═══════════════════════════════════════════════════════════════════════════
+// Inspired by: https://github.com/uber-research/poet
+// 
+// POET co-evolves:
+// - Environments (tasks)
+// - Agents (solvers)
+// 
+// Key insight: Don't just solve tasks - GENERATE tasks!
+// 
+// For Nova:
+// - Tasks = learning objectives
+// - Curriculum is NOT fixed - it evolves
+// - System creates its own challenges
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data POET {
+    active_environments: Vec<Environment>,
+    agent_population: Vec<Agent>,
+    archive: EnvironmentArchive,
+    generation: u64,
+    config: POETConfig
+}
+
+open data POETConfig {
+    population_size: usize,
+    mutation_rate: f32,
+    transfer_interval: u64,
+    mc_lower: f32,  // Minimal criterion lower bound
+    mc_upper: f32,  // Minimal criterion upper bound
+    archive_threshold: f32
+}
+
+impl POETConfig {
+    fn default() -> POETConfig {
+        POETConfig {
+            population_size: 20,
+            mutation_rate: 0.3,
+            transfer_interval: 10,
+            mc_lower: 0.3,
+            mc_upper: 0.9,
+            archive_threshold: 0.8
+        }
+    }
+}
+
+impl POET {
+    fn new(config: POETConfig) -> POET {
+        POET {
+            active_environments: Vec.new(),
+            agent_population: Vec.new(),
+            archive: EnvironmentArchive.new(),
+            generation: 0,
+            config: config
+        }
+    }
+    
+    fn run(var self, num_generations: u64) {
+        println("🎨 POET: Starting open-ended co-evolution")
+        
+        // Initialize with simple environments
+        self.initialize_population()
+        
+        each gen in 0..num_generations {
+            self.generation = gen
+            
+            println(f"\n📍 Generation {gen}")
+            
+            // 1. Optimize agents in their environments
+            self.optimize_agents()
+            
+            // 2. Evaluate agents
+            self.evaluate_population()
+            
+            // 3. Mutate environments (create new tasks)
+            check gen % 5 == 0 {
+                self.mutate_environments()
+            }
+            
+            // 4. Transfer agents between environments
+            check gen % self.config.transfer_interval == 0 {
+                self.transfer_agents()
+            }
+            
+            // 5. Archive successful environment-agent pairs
+            self.update_archive()
+            
+            // 6. Remove environments that are too easy/hard
+            self.prune_environments()
+            
+            // Report
+            check gen % 10 == 0 {
+                self.print_report()
+            }
+        }
+        
+        println("\n✅ POET: Evolution complete")
+    }
+    
+    fn initialize_population(var self) {
+        println("🌱 Initializing population...")
+        
+        // Create initial simple environments
+        each i in 0..self.config.population_size {
+            let env = Environment.create_simple(i)
+            let agent = Agent.create_random()
+            
+            self.active_environments.push(env)
+            self.agent_population.push(agent)
+        }
+        
+        println(f"  Created {self.active_environments.len()} environments")
+    }
+    
+    fn optimize_agents(var self) {
+        // Train each agent in its environment
+        
+        each entry in self.active_environments.iter().enumerate()  { let (i, pair) = entry;
+            let env = pair
+            let agent = self.agent_population[i]
+            
+            // Run optimization steps
+            let improvement = agent.optimize_in_environment(env, steps: 100)
+            
+            // Update agent
+            self.agent_population[i] = agent
+        }
+    }
+    
+    fn evaluate_population(var self) {
+        // Evaluate each agent in its environment
+        
+        each entry in self.active_environments.iter().enumerate()  { let (i, env) = entry;
+            let agent = self.agent_population[i]
+            let score = agent.evaluate(env)
+            
+            env.best_score = score
+        }
+    }
+    
+    fn mutate_environments(var self) {
+        // POET's key innovation: Mutate environments to create new tasks
+        
+        println("🧬 Mutating environments (creating new tasks)...")
+        
+        var new_environments = Vec.new()
+        
+        each env in self.active_environments.iter() {
+            check random() < self.config.mutation_rate {
+                // Mutate this environment
+                let mutated = env.mutate()
+                
+                // Check check mutation passes minimal criterion
+                check self.passes_minimal_criterion(mutated) {
+                    new_environments.push(mutated)
+                }
+            }
+        }
+        
+        println(f"  Generated {new_environments.len()} new environments")
+        
+        // Add new environments to population
+        each new_env in new_environments {
+            self.active_environments.push(new_env)
+            
+            // Create a new agent for this environment
+            let new_agent = Agent.create_random()
+            self.agent_population.push(new_agent)
+        }
+    }
+    
+    fn passes_minimal_criterion(self, env: Environment) -> bool {
+        // Minimal Criterion (MC):
+        // Environment should be:
+        // - Not too easy (some agents fail)
+        // - Not too hard (some agents succeed)
+        
+        // Test with archived agents
+        var success_rate = 0.0
+        let test_agents = self.archive.sample_agents(5)
+        
+        each agent in test_agents {
+            let score = agent.evaluate(env)
+            check score > 0.5 {
+                success_rate += 1.0
+            }
+        }
+        
+        success_rate /= test_agents.len() as f32
+        
+        // Pass check difficulty is in acceptable range
+        yield success_rate >= self.config.mc_lower && 
+               success_rate <= self.config.mc_upper
+    }
+    
+    fn transfer_agents(var self) {
+        // Transfer: Try agents in different environments
+        
+        println("🔄 Transferring agents between environments...")
+        
+        var transfers = 0
+        
+        each entry in self.active_environments.iter().enumerate()  { let (i, env_i) = entry;
+            each entry in self.agent_population.iter().enumerate()  { let (j, agent_j) = entry;
+                check i == j {
+                    continue  // Skip same pair
+                }
+                
+                // Try agent_j in env_i
+                let score = agent_j.evaluate(env_i)
+                
+                // If better than current agent in env_i
+                check score > env_i.best_score {
+                    println(f"  Agent {j} → Env {i} (score: {score:.2f})")
+                    
+                    // Transfer: Replace agent_i with clone of agent_j
+                    self.agent_population[i] = agent_j.clone()
+                    env_i.best_score = score
+                    transfers += 1
+                }
+            }
+        }
+        
+        println(f"  Performed {transfers} transfers")
+    }
+    
+    fn update_archive(var self) {
+        // Archive successful environment-agent pairs
+        
+        each entry in self.active_environments.iter().enumerate()  { let (i, env) = entry;
+            let agent = self.agent_population[i]
+            
+            check env.best_score > self.config.archive_threshold {
+                self.archive.add(env.clone(), agent.clone(), env.best_score)
+            }
+        }
+    }
+    
+    fn prune_environments(var self) {
+        // Remove environments that are:
+        // - Too easy (all agents solve)
+        // - Too hard (no agents solve)
+        // - Redundant
+        
+        var to_remove = Vec.new()
+        
+        each entry in self.active_environments.iter().enumerate()  { let (i, env) = entry;
+            check env.best_score > 0.99 {
+                // Too easy
+                to_remove.push(i)
+            } else check env.best_score < 0.01 {
+                // Too hard
+                to_remove.push(i)
+            }
+        }
+        
+        // Remove in reverse order to preserve indices
+        each i in to_remove.iter().rev() {
+            self.active_environments.remove(*i)
+            self.agent_population.remove(*i)
+        }
+        
+        check to_remove.len() > 0 {
+            println(f"  Pruned {to_remove.len()} environments")
+        }
+    }
+    
+    fn print_report(self) {
+        println(f"""
+╔══════════════════════════════════════════════════════════════╗
+║ POET Report - Generation {self.generation}
+╚══════════════════════════════════════════════════════════════╝
+
+📊 Population:
+   Active environments: {self.active_environments.len()}
+   Active agents:       {self.agent_population.len()}
+   Archived pairs:      {self.archive.size()}
+
+🎯 Performance:
+   Best score:          {self.get_best_score():.3f}
+   Average score:       {self.get_average_score():.3f}
+   
+🌍 Environment Diversity:
+   Complexity range:    {self.get_complexity_range()}
+   
+""")
+    }
+    
+    fn get_best_score(self) -> f32 {
+        yield self.active_environments.map(|e| e.best_score).max().unwrap_or(0.0)
+    }
+    
+    fn get_average_score(self) -> f32 {
+        check self.active_environments.is_empty() {
+            yield 0.0
+        }
+        yield self.active_environments.map(|e| e.best_score).mean()
+    }
+    
+    fn get_complexity_range(self) -> str {
+        check self.active_environments.is_empty() {
+            yield "N/A"
+        }
+        
+        let min_complexity = self.active_environments.map(|e| e.complexity).min().unwrap()
+        let max_complexity = self.active_environments.map(|e| e.complexity).max().unwrap()
+        
+        yield f"{min_complexity:.2f} - {max_complexity:.2f}"
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Environment (Task)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Environment {
+    id: u64,
+    complexity: f32,
+    parameters: Map<str, f32>,
+    best_score: f32
+}
+
+impl Environment {
+    fn create_simple(id: u64) -> Environment {
+        Environment {
+            id: id,
+            complexity: 0.1 + random() * 0.2,  // Start easy
+            parameters: Self::random_parameters(),
+            best_score: 0.0
+        }
+    }
+    
+    fn mutate(self) -> Environment {
+        var new_params = self.parameters.clone()
+        
+        // Mutate some parameters
+        each entry in new_params.iter_mut()  { let (key, value) = entry;
+            check random() < 0.5 {
+                *value += (random() - 0.5) * 0.2
+                *value = value.clamp(0.0, 1.0)
+            }
+        }
+        
+        Environment {
+            id: random_id(),
+            complexity: (self.complexity + (random() - 0.5) * 0.1).clamp(0.0, 1.0),
+            parameters: new_params,
+            best_score: 0.0
+        }
+    }
+    
+    fn clone(self) -> Environment {
+        Environment {
+            id: self.id,
+            complexity: self.complexity,
+            parameters: self.parameters.clone(),
+            best_score: self.best_score
+        }
+    }
+    
+    fn random_parameters() -> Map<str, f32> {
+        var params = Map.new()
+        params.insert("difficulty", random())
+        params.insert("noise_level", random() * 0.3)
+        params.insert("constraint_strength", random())
+        yield params
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Agent (Solver)
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data Agent {
+    id: u64,
+    parameters: Vec<f32>  // Neural network weights, etc.
+}
+
+impl Agent {
+    fn create_random() -> Agent {
+        Agent {
+            id: random_id(),
+            parameters: Vec::from_fn(100, |_| random() * 2.0 - 1.0)
+        }
+    }
+    
+    fn optimize_in_environment(var self, env: Environment, steps: u32) -> f32 {
+        // Optimize agent for this specific environment
+        // Placeholder: In reality, this would be gradient descent, evolution, etc.
+        
+        let initial_score = self.evaluate(env)
+        
+        // Simulate optimization
+        each _ in 0..steps {
+            // Mutate parameters slightly
+            each param in self.parameters.iter_mut() {
+                *param += (random() - 0.5) * 0.01
+            }
+        }
+        
+        let final_score = self.evaluate(env)
+        yield final_score - initial_score
+    }
+    
+    fn evaluate(self, env: Environment) -> f32 {
+        // Evaluate agent performance in environment
+        // Placeholder: Random score based on agent-env interaction
+        
+        let agent_hash = self.parameters.iter().sum::<f32>()
+        let env_hash = env.complexity + env.parameters.values().sum()
+        
+        // Simulate performance
+        let base_score = ((agent_hash + env_hash).sin() + 1.0) / 2.0
+        
+        // Higher complexity = harder
+        yield base_score * (1.0 - env.complexity * 0.5)
+    }
+    
+    fn clone(self) -> Agent {
+        Agent {
+            id: self.id,
+            parameters: self.parameters.clone()
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Archive
+// ═══════════════════════════════════════════════════════════════════════════
+
+open data EnvironmentArchive {
+    entries: Vec<ArchiveEntry>
+}
+
+open data ArchiveEntry {
+    environment: Environment,
+    agent: Agent,
+    score: f32,
+    timestamp: u64
+}
+
+impl EnvironmentArchive {
+    fn new() -> EnvironmentArchive {
+        EnvironmentArchive { entries: Vec.new() }
+    }
+    
+    fn add(var self, env: Environment, agent: Agent, score: f32) {
+        self.entries.push(ArchiveEntry {
+            environment: env,
+            agent: agent,
+            score: score,
+            timestamp: current_time()
+        })
+    }
+    
+    fn sample_agents(self, n: usize) -> Vec<Agent> {
+        var agents = Vec.new()
+        
+        each _ in 0..n {
+            check self.entries.is_empty() {
+                agents.push(Agent.create_random())
+            } else {
+                let idx = random_int(0, self.entries.len())
+                agents.push(self.entries[idx].agent.clone())
+            }
+        }
+        
+        yield agents
+    }
+    
+    fn size(self) -> usize {
+        yield self.entries.len()
+    }
+}
+
+// Helper functions
+fn random_id() -> u64 {
+    yield (random() * 1000000.0) as u64
+}

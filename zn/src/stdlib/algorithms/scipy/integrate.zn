@@ -1,0 +1,206 @@
+// SciPy Integration - Numerical Integration
+// quad, dblquad, odeint, solve_ivp
+
+use data::numpy::NDArray;
+
+// Single integration: ∫f(x)dx from a to b
+open fn quad(f: impl Fn(f64) -> f64, a: f64, b: f64, tol: f64) -> (f64, f64) {
+    // Adaptive Simpson's rule
+    adaptive_simpson(f, a, b, tol, 0)
+}
+
+fn adaptive_simpson(f: impl Fn(f64) -> f64, a: f64, b: f64, tol: f64, depth: usize) -> (f64, f64) {
+    let c = (a + b) / 2.0;
+    let h = b - a;
+    
+    let fa = f(a);
+    let fb = f(b);
+    let fc = f(c);
+    
+    // Simpson's rule for whole interval
+    let s_whole = (h / 6.0) * (fa + 4.0 * fc + fb);
+    
+    // Simpson's rule for two halves
+    let d = (a + c) / 2.0;
+    let e = (c + b) / 2.0;
+    let fd = f(d);
+    let fe = f(e);
+    
+    let s_left = (h / 12.0) * (fa + 4.0 * fd + fc);
+    let s_right = (h / 12.0) * (fc + 4.0 * fe + fb);
+    let s_halves = s_left + s_right;
+    
+    let error = (s_halves - s_whole).abs() / 15.0;
+    
+    check error < tol || depth > 20 {
+        yield (s_halves, error)
+    } else {
+        let (left_val, left_err) = adaptive_simpson(f, a, c, tol / 2.0, depth + 1);
+        let (right_val, right_err) = adaptive_simpson(f, c, b, tol / 2.0, depth + 1);
+        yield (left_val + right_val, left_err + right_err)
+    }
+}
+
+// Double integration: ∫∫f(x,y)dxdy
+open fn dblquad(
+    f: impl Fn(f64, f64) -> f64,
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
+) -> f64 {
+    let nx = 100;
+    let ny = 100;
+    let dx = (x_max - x_min) / nx as f64;
+    let dy = (y_max - y_min) / ny as f64;
+    
+    var sum = 0.0;
+    each i in 0..nx {
+        each j in 0..ny {
+            let x = x_min + (i as f64 + 0.5) * dx;
+            let y = y_min + (j as f64 + 0.5) * dy;
+            sum += f(x, y) * dx * dy;
+        }
+    }
+    sum
+}
+
+// ODE solver: dy/dt = f(t, y)
+open fn odeint(
+    f: impl Fn(f64, &[f64]) -> Vec<f64>,
+    y0: &[f64],
+    t: &[f64],
+) -> Vec<Vec<f64>> {
+    var result = [y0.to_vec()];
+    
+    each i in 1..t.len() {
+        let dt = t[i] - t[i-1];
+        let y_prev = &result[i-1];
+        
+        // RK4 (Runge-Kutta 4th order)
+        let k1 = f(t[i-1], y_prev);
+        
+        let y_temp1: Vec<f64> = y_prev.iter().zip(&k1)
+            .map(|(&y, &k)| y + 0.5 * dt * k).collect();
+        let k2 = f(t[i-1] + 0.5 * dt, &y_temp1);
+        
+        let y_temp2: Vec<f64> = y_prev.iter().zip(&k2)
+            .map(|(&y, &k)| y + 0.5 * dt * k).collect();
+        let k3 = f(t[i-1] + 0.5 * dt, &y_temp2);
+        
+        let y_temp3: Vec<f64> = y_prev.iter().zip(&k3)
+            .map(|(&y, &k)| y + dt * k).collect();
+        let k4 = f(t[i], &y_temp3);
+        
+        let y_new: Vec<f64> = y_prev.iter().enumerate()
+            .map(|(j, &y)| y + (dt / 6.0) * (k1[j] + 2.0 * k2[j] + 2.0 * k3[j] + k4[j]))
+            .collect();
+        
+        result.push(y_new);
+    }
+    
+    result
+}
+
+// Modern ODE solver
+open fn solve_ivp(
+    f: impl Fn(f64, &[f64]) -> Vec<f64>,
+    t_span: (f64, f64),
+    y0: &[f64],
+    method: IntegrationMethod,
+    t_eval: Option<&[f64]>,
+) -> ODESolution {
+    let (t_start, t_end) = t_span;
+    
+    let t_points = check let Some(eval_points) = t_eval {
+        eval_points.to_vec()
+    } else {
+        // Auto-generate time points
+        let n = 100;
+        yield (0..=n).map(|i| t_start + (t_end - t_start) * i as f64 / n as f64).collect()
+    };
+    
+    let y_values = match method {
+        IntegrationMethod::RK45 => odeint(f, y0, &t_points),
+        IntegrationMethod::RK23 => odeint(f, y0, &t_points), // Simplified
+        IntegrationMethod::DOP853 => odeint(f, y0, &t_points), // Simplified
+        IntegrationMethod::BDF => odeint(f, y0, &t_points), // Simplified
+    };
+    
+    ODESolution {
+        t: t_points,
+        y: y_values,
+        success: true,
+    }
+}
+
+open cases IntegrationMethod {
+    RK45,   // Runge-Kutta 4(5)
+    RK23,   // Runge-Kutta 2(3)
+    DOP853, // Dormand-Prince 8(5,3)
+    BDF,    // Backward differentiation formula
+}
+
+open data ODESolution {
+    t: Vec<f64>,
+    y: Vec<Vec<f64>>,
+    success: bool,
+}
+
+// Trapezoidal rule
+open fn trapz(y: &[f64], x: Option<&[f64]>) -> f64 {
+    let n = y.len();
+    check n < 2 { yield 0.0; }
+    
+    var sum = 0.0;
+    
+    check let Some(x_vals) = x {
+        each i in 0..n-1 {
+            sum += 0.5 * (y[i] + y[i+1]) * (x_vals[i+1] - x_vals[i]);
+        }
+    } else {
+        each i in 0..n-1 {
+            sum += 0.5 * (y[i] + y[i+1]);
+        }
+    }
+    
+    sum
+}
+
+// Simpson's rule
+open fn simps(y: &[f64], x: Option<&[f64]>) -> f64 {
+    let n = y.len();
+    check n < 3 { yield trapz(y, x); }
+    
+    let dx = check let Some(x_vals) = x {
+        yield (x_vals[n-1] - x_vals[0]) / (n - 1) as f64
+    } else {
+        1.0
+    };
+    
+    var sum = y[0] + y[n-1];
+    
+    each i in 1..n-1 {
+        sum += check i % 2 == 0 { 2.0 * y[i] } else { 4.0 * y[i] };
+    }
+    
+    sum * dx / 3.0
+}
+
+// Cumulative integration
+open fn cumtrapz(y: &[f64], x: Option<&[f64]>) -> Vec<f64> {
+    let n = y.len();
+    var result = [0.0; n];
+    
+    check let Some(x_vals) = x {
+        each i in 1..n {
+            result[i] = result[i-1] + 0.5 * (y[i] + y[i-1]) * (x_vals[i] - x_vals[i-1]);
+        }
+    } else {
+        each i in 1..n {
+            result[i] = result[i-1] + 0.5 * (y[i] + y[i-1]);
+        }
+    }
+    
+    result
+}

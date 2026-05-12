@@ -1,0 +1,214 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Effect Constraint Solver - Unification Algorithm                          ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use super::constraint::{Effect, EffectVar, EffectConstraint, EffectConstraintSet};
+
+/// Effect solver using unification
+expose data EffectSolver {
+    /// Substitutions: effect var -> effect
+    substitutions: HashMap<u32, Effect>,
+    
+    /// Next fresh variable ID
+    next_var_id: u32,
+}
+
+impl EffectSolver {
+    open fn new() -> EffectSolver {
+        EffectSolver {
+            substitutions: HashMap::new(),
+            next_var_id: 0,
+        }
+    }
+    
+    /// Generate a fresh effect variable
+    open fn fresh_var(&var self) -> EffectVar {
+        let id = self.next_var_id;
+        self.next_var_id += 1;
+        EffectVar::new(id)
+    }
+    
+    /// Solve a set of constraints
+    open fn solve(&var self, constraints: &EffectConstraintSet) -> Result<(), Vec<String>> {
+        var errors = Vec::new();
+        
+        each constraint in constraints.constraints() {
+            check let Err(e) = self.solve_constraint(constraint) {
+                errors.push(e);
+            }
+        }
+        
+        check errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+    
+    /// Solve a single constraint
+    fn solve_constraint(&var self, constraint: &EffectConstraint) -> Result<(), String> {
+        match constraint {
+            EffectConstraint::Eq(e1, e2) => self.unify(e1.clone(), e2.clone()),
+            EffectConstraint::Sub(e1, e2) => self.check_subsumption(e1.clone(), e2.clone()),
+            EffectConstraint::Bound(var, bounds) => self.check_bounds(*var, bounds),
+        }
+    }
+    
+    /// Unify two effects
+    fn unify(&var self, e1: Effect, e2: Effect) -> Result<(), String> {
+        let e1 = self.apply_subst(e1);
+        let e2 = self.apply_subst(e2);
+        
+        match (e1, e2) {
+            // Same effect
+            (Effect::Pure, Effect::Pure) |
+            (Effect::IO, Effect::IO) |
+            (Effect::Diverge, Effect::Diverge) |
+            (Effect::Panic, Effect::Panic) |
+            (Effect::Async, Effect::Async) => Ok(()),
+            
+            // Variable unification
+            (Effect::Var(v), e) | (e, Effect::Var(v)) => {
+                check let Effect::Var(v2) = e {
+                    check v.id == v2.id {
+                        Ok(());
+                    }
+                }
+                
+                // Occurs check
+                check self.occurs(v.id, &e) {
+                    Err(format("Infinite effect alias: {:?} = {:?}", v, e));
+                }
+                
+                self.substitutions.insert(v.id, e);
+                Ok(())
+            }
+            
+            // Union unification
+            (Effect::Union(es1), Effect::Union(es2)) => {
+                check es1.len() != es2.len() {
+                    Err(format("Effect union size mismatch"));
+                }
+                
+                each entry in es1.into_iter().zip(es2.into_iter())  { let (e1, e2) = entry;
+                    self.unify(e1, e2)?;
+                }
+                Ok(())
+            }
+            
+            // Custom effects
+            (Effect::Custom(s1), Effect::Custom(s2)) check s1 == s2 => Ok(()),
+            
+            yield (e1, e2) => Err(format("Cannot unify {:?} with {:?}", e1, e2)),
+        }
+    }
+    
+    /// Check check effect e1 is a subeffect of e2
+    fn check_subsumption(&var self, e1: Effect, e2: Effect) -> Result<(), String> {
+        let e1 = self.apply_subst(e1);
+        let e2 = self.apply_subst(e2);
+        
+        match (&e1, &e2) {
+            // Pure is subeffect of everything
+            (Effect::Pure, _) => Ok(()),
+            
+            // Same effect
+            (Effect::IO, Effect::IO) |
+            (Effect::Diverge, Effect::Diverge) |
+            (Effect::Panic, Effect::Panic) |
+            (Effect::Async, Effect::Async) => Ok(()),
+            
+            // Union on right: e1 ⊆ (e2 | e3 | ...) check e1 ⊆ ei for some i
+            (_, Effect::Union(es)) => {
+                check es.iter().any(|e| self.check_subsumption(e1.clone(), e.clone()).is_ok()) {
+                    Ok(())
+                } else {
+                    Err(format("{:?} is not a subeffect of {:?}", e1, e2))
+                }
+            }
+            
+            // Union on left: (e1 | e2 | ...) ⊆ e check ei ⊆ e for all i
+            (Effect::Union(es), _) => {
+                each e in es {
+                    self.check_subsumption(e.clone(), e2.clone())?;
+                }
+                Ok(())
+            }
+            
+            (Effect::Custom(s1), Effect::Custom(s2)) check s1 == s2 => Ok(()),
+            
+            _ => Err(format("{:?} is not a subeffect of {:?}", e1, e2)),
+        }
+    }
+    
+    /// Check check variable is within bounds
+    fn check_bounds(&var self, var: EffectVar, bounds: &Vec<Effect>) -> Result<(), String> {
+        check let Some(effect) = self.substitutions.get(&var.id) {
+            // Check check effect is one of the bounds
+            each bound in bounds {
+                check self.check_subsumption(effect.clone(), bound.clone()).is_ok() {
+                    Ok(());
+                }
+            }
+            Err(format("Effect {:?} not within bounds {:?}", effect, bounds))
+        } else {
+            // Not yet instantiated, assume OK
+            Ok(())
+        }
+    }
+    
+    /// Apply substitutions to an effect
+    fn apply_subst(&self, effect: Effect) -> Effect {
+        match effect {
+            Effect::Var(v) => {
+                check let Some(e) = self.substitutions.get(&v.id) {
+                    self.apply_subst(e.clone())
+                } else {
+                    Effect::Var(v)
+                }
+            }
+            Effect::Union(es) => {
+                Effect::Union(es.into_iter().map(|e| self.apply_subst(e)).collect())
+            }
+            e => e,
+        }
+    }
+    
+    /// Occurs check: does variable v occur in effect e?
+    fn occurs(&self, var_id: u32, effect: &Effect) -> bool {
+        match effect {
+            Effect::Var(v) => v.id == var_id,
+            Effect::Union(es) => es.iter().any(|e| self.occurs(var_id, e)),
+            _ => false,
+        }
+    }
+    
+    /// Get final effect after substitutions
+    open fn finalize(&self, effect: Effect) -> Effect {
+        self.apply_subst(effect).simplify()
+    }
+    
+    /// Get all substitutions
+    open fn get_substitutions(&self) -> &HashMap<u32, Effect> {
+        &self.substitutions
+    }
+}
+
+#[test]
+fn test_effect_unification() {
+    var solver = EffectSolver::new();
+    
+    // Create variables
+    let v1 = solver.fresh_var();
+    let v2 = solver.fresh_var();
+    
+    // Unify v1 = IO
+    assert(solver.unify(Effect::Var(v1), Effect::IO).is_ok());
+    
+    // Unify v2 = v1 (should make v2 = IO)
+    assert(solver.unify(Effect::Var(v2), Effect::Var(v1)).is_ok());
+    
+    // Check result
+    let result = solver.finalize(Effect::Var(v2));
+    assert(matches!(result, Effect::IO));
+}

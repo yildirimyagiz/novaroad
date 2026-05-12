@@ -1,0 +1,5 @@
+#ifndef NOVA_INLINING_TAGS_H
+#define NOVA_INLINING_TAGS_H
+
+#endif
+

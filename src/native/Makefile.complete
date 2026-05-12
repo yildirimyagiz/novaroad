@@ -1,0 +1,194 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Nova Compiler - Complete Makefile
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Compiler and flags
+CC = gcc
+CXX = g++
+CFLAGS = -std=c11 -Wall -Wextra -O2 -g -fPIC
+CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -g -fPIC
+LDFLAGS = -lm -lpthread
+
+# Directories
+SRC_DIR = src
+INC_DIR = include
+LIB_DIR = lib
+BIN_DIR = bin
+BUILD_DIR = build
+STDLIB_DIR = stdlib
+
+# Platform detection
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
+    PLATFORM = linux
+    LDFLAGS += -ldl
+endif
+ifeq ($(UNAME_S),Darwin)
+    PLATFORM = macos
+endif
+ifeq ($(OS),Windows_NT)
+    PLATFORM = windows
+    CC = cl
+    CXX = cl
+endif
+
+# Sources
+COMPILER_SRCS = $(wildcard $(SRC_DIR)/compiler/core/*.c)
+RUNTIME_SRCS = $(wildcard $(SRC_DIR)/runtime/*.c) \
+               $(wildcard $(SRC_DIR)/runtime/sandbox/*.c) \
+               $(wildcard $(SRC_DIR)/runtime/telemetry/*.c)
+STDLIB_SRCS = $(wildcard $(STDLIB_DIR)/*.c)
+
+# Objects
+COMPILER_OBJS = $(COMPILER_SRCS:%.c=$(BUILD_DIR)/%.o)
+RUNTIME_OBJS = $(RUNTIME_SRCS:%.c=$(BUILD_DIR)/%.o)
+STDLIB_OBJS = $(STDLIB_SRCS:%.c=$(BUILD_DIR)/%.o)
+
+# C++ lowering
+CPP_LOWERING_SRC = $(SRC_DIR)/compiler/lowering/nova_cpp_lowering.cpp
+CPP_LOWERING_OBJ = $(BUILD_DIR)/$(SRC_DIR)/compiler/lowering/nova_cpp_lowering.o
+
+# Libraries
+LIBCOMPILER = $(LIB_DIR)/libnova_compiler.a
+LIBRUNTIME = $(LIB_DIR)/libnova_runtime.a
+LIBSTDLIB = $(LIB_DIR)/libnova_stdlib.a
+
+# Main executable
+NOVAC = $(BIN_DIR)/novac
+
+# Tests
+TEST_SRCS = $(wildcard tests/test_*.c)
+TEST_BINS = $(TEST_SRCS:tests/%.c=$(BIN_DIR)/%)
+
+# Benchmarks
+BENCH_SRCS = $(shell find calibration/src/benches -name "*.c")
+BENCH_BINS = $(BENCH_SRCS:calibration/src/benches/%.c=$(BIN_DIR)/bench_%)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main Targets
+# ═══════════════════════════════════════════════════════════════════════════
+
+.PHONY: all clean install uninstall tests benchmarks help
+
+all: $(NOVAC) $(LIBCOMPILER) $(LIBRUNTIME) $(LIBSTDLIB)
+
+$(NOVAC): $(LIBCOMPILER) $(LIBRUNTIME) $(LIBSTDLIB) $(SRC_DIR)/tools/nova_main.c
+	@mkdir -p $(BIN_DIR)
+	@echo "  LD      $@"
+	@$(CC) $(CFLAGS) -I$(INC_DIR) $(SRC_DIR)/tools/nova_main.c \
+		-L$(LIB_DIR) -lnova_compiler -lnova_runtime -lnova_stdlib \
+		$(LDFLAGS) -o $@
+
+$(LIBCOMPILER): $(COMPILER_OBJS) $(CPP_LOWERING_OBJ)
+	@mkdir -p $(LIB_DIR)
+	@echo "  AR      $@"
+	@ar rcs $@ $^
+
+$(LIBRUNTIME): $(RUNTIME_OBJS)
+	@mkdir -p $(LIB_DIR)
+	@echo "  AR      $@"
+	@ar rcs $@ $^
+
+$(LIBSTDLIB): $(STDLIB_OBJS)
+	@mkdir -p $(LIB_DIR)
+	@echo "  AR      $@"
+	@ar rcs $@ $^
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Compilation Rules
+# ═══════════════════════════════════════════════════════════════════════════
+
+$(BUILD_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	@echo "  CC      $<"
+	@$(CC) $(CFLAGS) -I$(INC_DIR) -I$(STDLIB_DIR) -c $< -o $@
+
+$(CPP_LOWERING_OBJ): $(CPP_LOWERING_SRC)
+	@mkdir -p $(dir $@)
+	@echo "  CXX     $<"
+	@$(CXX) $(CXXFLAGS) -I$(INC_DIR) -c $< -o $@
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+tests: $(TEST_BINS)
+
+$(BIN_DIR)/test_%: tests/test_%.c $(LIBCOMPILER) $(LIBRUNTIME) $(LIBSTDLIB)
+	@mkdir -p $(BIN_DIR)
+	@echo "  LD      $@"
+	@$(CC) $(CFLAGS) -I$(INC_DIR) $< \
+		-L$(LIB_DIR) -lnova_compiler -lnova_runtime -lnova_stdlib \
+		$(LDFLAGS) -o $@
+
+run-tests: tests
+	@echo "Running tests..."
+	@for test in $(TEST_BINS); do \
+		echo "  $$test"; \
+		$$test || exit 1; \
+	done
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Benchmarks
+# ═══════════════════════════════════════════════════════════════════════════
+
+benchmarks: $(BENCH_BINS)
+
+$(BIN_DIR)/bench_%: calibration/src/benches/*/bench_%.c $(LIBRUNTIME)
+	@mkdir -p $(BIN_DIR)
+	@echo "  LD      $@"
+	@$(CC) $(CFLAGS) -Icalibration/include -I$(INC_DIR) $< \
+		-L$(LIB_DIR) -lnova_runtime $(LDFLAGS) -o $@
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Installation
+# ═══════════════════════════════════════════════════════════════════════════
+
+PREFIX ?= /usr/local
+BINDIR = $(PREFIX)/bin
+LIBDIR = $(PREFIX)/lib
+INCDIR = $(PREFIX)/include
+
+install: all
+	@echo "Installing Nova to $(PREFIX)..."
+	@install -d $(BINDIR) $(LIBDIR) $(INCDIR)
+	@install -m 755 $(NOVAC) $(BINDIR)/
+	@install -m 644 $(LIBCOMPILER) $(LIBRUNTIME) $(LIBSTDLIB) $(LIBDIR)/
+	@cp -r $(INC_DIR)/* $(INCDIR)/
+	@echo "Installation complete!"
+
+uninstall:
+	@echo "Uninstalling Nova from $(PREFIX)..."
+	@rm -f $(BINDIR)/novac
+	@rm -f $(LIBDIR)/libnova_*.a
+	@rm -rf $(INCDIR)
+	@echo "Uninstallation complete!"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Cleaning
+# ═══════════════════════════════════════════════════════════════════════════
+
+clean:
+	@echo "Cleaning build artifacts..."
+	@rm -rf $(BUILD_DIR) $(LIB_DIR) $(BIN_DIR)
+	@rm -f $(CPP_LOWERING_OBJ)
+	@echo "Clean complete!"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Help
+# ═══════════════════════════════════════════════════════════════════════════
+
+help:
+	@echo "Nova Compiler Build System"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all         - Build compiler, runtime, and stdlib (default)"
+	@echo "  tests       - Build test suite"
+	@echo "  run-tests   - Build and run all tests"
+	@echo "  benchmarks  - Build benchmark suite"
+	@echo "  install     - Install Nova to $(PREFIX)"
+	@echo "  uninstall   - Remove Nova from $(PREFIX)"
+	@echo "  clean       - Remove build artifacts"
+	@echo "  help        - Show this help message"
+	@echo ""
+	@echo "Platform: $(PLATFORM)"

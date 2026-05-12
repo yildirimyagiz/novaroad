@@ -1,0 +1,5 @@
+#ifndef NOVA_TRAIT_SOLVER_V2_TAGS_H
+#define NOVA_TRAIT_SOLVER_V2_TAGS_H
+
+#endif
+

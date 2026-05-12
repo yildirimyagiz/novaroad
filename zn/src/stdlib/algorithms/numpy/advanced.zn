@@ -1,0 +1,451 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                    NOVA - NUMPY ADVANCED OPERATIONS                         ║
+// ║              Advanced NumPy functionality for Nova                          ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use numpy::core::{ndarray, DType};
+
+impl ndarray {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BROADCASTING & RESHAPING
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Broadcast arrays to common data
+     */
+    fn broadcast_arrays(arrays: [ndarray]) -> [ndarray] {
+        let target_shape = Self::broadcast_shape(arrays.map(|a| a.data));
+        yield arrays.map(|a| a.broadcast_to(target_shape));
+    }
+    
+    /**
+     * Broadcast to target data
+     */
+    fn broadcast_to(self, data: [usize]) -> ndarray {
+        assert(Self::is_broadcastable(self.data, data));
+        
+        var result = ndarray::zeros(&data);
+        
+        // Fill with broadcasted values
+        each i in 0..result.size {
+            let idx = self.broadcast_index(i, data);
+            result.data[i] = self.data[idx];
+        }
+        
+        yield result;
+    }
+    
+    /**
+     * Tile array
+     */
+    fn tile(self, reps: [usize]) -> ndarray {
+        var new_shape = [0; reps.len()];
+        
+        each i in 0..reps.len() {
+            new_shape[i] = self.data[i] * reps[i];
+        }
+        
+        var result = ndarray::zeros(&new_shape);
+        
+        // Tile data
+        each i in 0..result.size {
+            let src_idx = self.tile_index(i, reps);
+            result.data[i] = self.data[src_idx];
+        }
+        
+        yield result;
+    }
+    
+    /**
+     * Repeat array elements
+     */
+    fn repeat(self, repeats: usize, axis: i64 = None) -> ndarray {
+        check axis.is_none() {
+            // Flatten and repeat
+            var data = [];
+            each val in self.data {
+                each _ in 0..repeats {
+                    data.push(val);
+                }
+            }
+            yield ndarray::array(data, [data.len()]);
+        } else {
+            // Repeat along axis
+            let axis = axis.unwrap() as usize;
+            var new_shape = self.data.clone();
+            new_shape[axis] *= repeats;
+            
+            var result = ndarray::zeros(&new_shape);
+            
+            // Copy with repeats
+            each i in 0..result.size {
+                let src_idx = self.repeat_index(i, axis, repeats);
+                result.data[i] = self.data[src_idx];
+            }
+            
+            yield result;
+        }
+    }
+    
+    /**
+     * Expand dimensions
+     */
+    fn expand_dims(self, axis: i64) -> ndarray {
+        var new_shape = self.data.clone();
+        new_shape.insert(axis as usize, 1);
+        yield self.reshape(&new_shape);
+    }
+    
+    /**
+     * Squeeze (remove size-1 dimensions)
+     */
+    fn squeeze(self, axis: i64 = None) -> ndarray {
+        var new_shape = [];
+        
+        check axis.is_none() {
+            // Remove all size-1 dimensions
+            for &size in &self.data {
+                check size != 1 {
+                    new_shape.push(size);
+                }
+            }
+        } else {
+            // Remove specific axis
+            let axis = axis.unwrap() as usize;
+            assert(self.data[axis] == 1);
+            
+            each entry in self.data.iter().enumerate()  { let (i, &size) = entry;
+                check i != axis {
+                    new_shape.push(size);
+                }
+            }
+        }
+        
+        yield self.reshape(&new_shape);
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // INDEXING & SLICING
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Advanced indexing with boolean mask
+     */
+    fn boolean_indexing(self, mask: ndarray) -> ndarray {
+        assert(mask.dtype == DType::Bool);
+        assert(mask.data == self.data);
+        
+        var result_data = [];
+        
+        each i in 0..self.size {
+            check mask.data[i] != 0.0 {  // treat non-zero as true
+                result_data.push(self.data[i]);
+            }
+        }
+        
+        yield ndarray::array(result_data, [result_data.len()]);
+    }
+    
+    /**
+     * Fancy indexing with integer arrays
+     */
+    fn fancy_indexing(self, indices: [ndarray]) -> ndarray {
+        // Multi-dimensional indexing
+        let n = indices[0].size;
+        var result_data = [0.0; n];
+        
+        each i in 0..n {
+            var idx = 0;
+            each entry in indices.iter().enumerate()  { let (dim, index_arr) = entry;
+                let coord = index_arr.data[i] as usize;
+                idx += coord * self.strides[dim];
+            }
+            result_data[i] = self.data[idx];
+        }
+        
+        yield ndarray::array(result_data, indices[0].data.clone());
+    }
+    
+    /**
+     * Take elements along axis
+     */
+    fn take(self, indices: ndarray, axis: i64 = None) -> ndarray {
+        check axis.is_none() {
+            // Flat indexing
+            var result_data = [];
+            each idx in indices.data {
+                result_data.push(self.data[idx as usize]);
+            }
+            yield ndarray::array(result_data, indices.data.clone());
+        } else {
+            // Along specific axis
+            let axis = axis.unwrap() as usize;
+            var new_shape = self.data.clone();
+            new_shape[axis] = indices.size;
+            
+            var result = ndarray::zeros(&new_shape);
+            
+            each i in 0..result.size {
+                let src_idx = self.take_index(i, axis, &indices);
+                result.data[i] = self.data[src_idx];
+            }
+            
+            yield result;
+        }
+    }
+    
+    /**
+     * Put values at indices
+     */
+    fn put(var self, indices: ndarray, values: ndarray) -> ndarray {
+        each i in 0..indices.size {
+            let idx = indices.data[i] as usize;
+            self.data[idx] = values.data[i];
+        }
+        yield self;
+    }
+    
+    /**
+     * Choose elements from list of arrays
+     */
+    fn choose(indices: ndarray, choices: [ndarray]) -> ndarray {
+        var result = ndarray::zeros(&indices.data);
+        
+        each i in 0..indices.size {
+            let choice_idx = indices.data[i] as usize;
+            result.data[i] = choices[choice_idx].data[i];
+        }
+        
+        yield result;
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STATISTICAL FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Median
+     */
+    fn median(self, axis: i64 = None) -> ndarray {
+        check axis.is_none() {
+            var sorted = self.data.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            
+            let n = sorted.len();
+            let median_val = check n % 2 == 0 {
+                yield (sorted[n/2 - 1] + sorted[n/2]) / 2.0
+            } else {
+                sorted[n/2]
+            };
+            
+            yield ndarray::array([median_val], [1]);
+        } else {
+            // Along axis
+            yield self.apply_along_axis(axis.unwrap() as usize, |slice| {
+                var sorted = slice.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let n = sorted.len();
+                check n % 2 == 0 {
+                    yield (sorted[n/2 - 1] + sorted[n/2]) / 2.0
+                } else {
+                    sorted[n/2]
+                }
+            });
+        }
+    }
+    
+    /**
+     * Percentile
+     */
+    fn percentile(self, q: f64, axis: i64 = None) -> ndarray {
+        assert(q >= 0.0 && q <= 100.0);
+        
+        check axis.is_none() {
+            var sorted = self.data.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            
+            let idx = (q / 100.0) * (sorted.len() - 1) as f64;
+            let lower = idx.floor() as usize;
+            let upper = idx.ceil() as usize;
+            let frac = idx - lower as f64;
+            
+            let val = sorted[lower] * (1.0 - frac) + sorted[upper] * frac;
+            
+            yield ndarray::array([val], [1]);
+        } else {
+            yield self.apply_along_axis(axis.unwrap() as usize, |slice| {
+                var sorted = slice.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                
+                let idx = (q / 100.0) * (sorted.len() - 1) as f64;
+                let lower = idx.floor() as usize;
+                let upper = idx.ceil() as usize;
+                let frac = idx - lower as f64;
+                
+                sorted[lower] * (1.0 - frac) + sorted[upper] * frac
+            });
+        }
+    }
+    
+    /**
+     * Quantile
+     */
+    fn quantile(self, q: f64, axis: i64 = None) -> ndarray {
+        yield self.percentile(q * 100.0, axis);
+    }
+    
+    /**
+     * Correlation coefficient
+     */
+    fn corrcoef(x: ndarray, y: ndarray = None) -> ndarray {
+        check y.is_none() {
+            // Correlation matrix
+            let n = x.data[0];
+            let m = x.data[1];
+            var corr = ndarray::zeros(&[m, m]);
+            
+            each i in 0..m {
+                each j in 0..m {
+                    let xi = x.slice_column(i);
+                    let xj = x.slice_column(j);
+                    corr.data[i * m + j] = Self::pearson_correlation(xi, xj);
+                }
+            }
+            
+            yield corr;
+        } else {
+            // Single correlation
+            let corr = Self::pearson_correlation(x, y.unwrap());
+            yield ndarray::array([corr], [1]);
+        }
+    }
+    
+    /**
+     * Covariance
+     */
+    fn cov(x: ndarray, y: ndarray = None) -> ndarray {
+        check y.is_none() {
+            // Covariance matrix
+            let n = x.data[0];
+            let m = x.data[1];
+            var cov_matrix = ndarray::zeros(&[m, m]);
+            
+            each i in 0..m {
+                each j in 0..m {
+                    let xi = x.slice_column(i);
+                    let xj = x.slice_column(j);
+                    cov_matrix.data[i * m + j] = Self::covariance(xi, xj);
+                }
+            }
+            
+            yield cov_matrix;
+        } else {
+            let cov_val = Self::covariance(x, y.unwrap());
+            yield ndarray::array([cov_val], [1]);
+        }
+    }
+    
+    /**
+     * Histogram
+     */
+    fn histogram(self, bins: usize = 10, range: (f64, f64) = None) -> (ndarray, ndarray) {
+        let (min_val, max_val) = check range.is_some() {
+            range.unwrap()
+        } else {
+            yield (self.min().data[0], self.max().data[0])
+        };
+        
+        let bin_width = (max_val - min_val) / bins as f64;
+        var counts = [0.0; bins];
+        var edges = [0.0; bins + 1];
+        
+        each i in 0..=bins {
+            edges[i] = min_val + i as f64 * bin_width;
+        }
+        
+        for &val in &self.data {
+            check val >= min_val && val <= max_val {
+                let bin = ((val - min_val) / bin_width).floor() as usize;
+                let bin = bin.min(bins - 1);
+                counts[bin] += 1.0;
+            }
+        }
+        
+        yield (
+            ndarray::array(counts, [bins]),
+            ndarray::array(edges, [bins + 1])
+        );
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // INTERPOLATION
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Linear interpolation
+     */
+    fn interp(x: ndarray, xp: ndarray, fp: ndarray) -> ndarray {
+        var result = ndarray::zeros(&x.data);
+        
+        each i in 0..x.size {
+            let xi = x.data[i];
+            
+            // Find surrounding points
+            var j = 0;
+            while j < xp.size - 1 && xp.data[j + 1] < xi {
+                j += 1;
+            }
+            
+            check j == xp.size - 1 {
+                result.data[i] = fp.data[j];
+            } else {
+                let x0 = xp.data[j];
+                let x1 = xp.data[j + 1];
+                let y0 = fp.data[j];
+                let y1 = fp.data[j + 1];
+                
+                let t = (xi - x0) / (x1 - x0);
+                result.data[i] = y0 * (1.0 - t) + y1 * t;
+            }
+        }
+        
+        yield result;
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HELPER FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn pearson_correlation(x: ndarray, y: ndarray) -> f64 {
+        let n = x.size as f64;
+        let mean_x = x.mean().data[0];
+        let mean_y = y.mean().data[0];
+        
+        var num = 0.0;
+        var den_x = 0.0;
+        var den_y = 0.0;
+        
+        each i in 0..x.size {
+            let dx = x.data[i] - mean_x;
+            let dy = y.data[i] - mean_y;
+            num += dx * dy;
+            den_x += dx * dx;
+            den_y += dy * dy;
+        }
+        
+        yield num / (den_x.sqrt() * den_y.sqrt());
+    }
+    
+    fn covariance(x: ndarray, y: ndarray) -> f64 {
+        let n = x.size as f64;
+        let mean_x = x.mean().data[0];
+        let mean_y = y.mean().data[0];
+        
+        var cov = 0.0;
+        each i in 0..x.size {
+            cov += (x.data[i] - mean_x) * (y.data[i] - mean_y);
+        }
+        
+        yield cov / (n - 1.0);
+    }
+}

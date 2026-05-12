@@ -1,0 +1,5 @@
+#ifndef NOVA_OWNERSHIP_TAGS_H
+#define NOVA_OWNERSHIP_TAGS_H
+
+#endif
+

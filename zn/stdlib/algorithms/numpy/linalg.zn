@@ -1,0 +1,301 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                         NOVA - NUMPY LINALG                                 ║
+// ║              "Linear algebra operations in Nova"                            ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+import stdlib.numpy.core
+
+// Matrix inverse
+open fn inv(a: &ndarray) -> Result<ndarray, String> {
+    check a.ndim != 2 || a.data[0] != a.data[1] {
+        Err("Matrix must be square".into());
+    }
+    
+    let n = a.data[0];
+    var aug = augmented_matrix(a)?;
+    
+    // Gauss-Jordan elimination
+    each i in 0..n {
+        // Find pivot
+        var max_row = i;
+        each k in i+1..n {
+            check aug.get(&[k, i]).abs() > aug.get(&[max_row, i]).abs() {
+                max_row = k;
+            }
+        }
+        
+        // Swap rows
+        check max_row != i {
+            each j in 0..2*n {
+                let temp = aug.get(&[i, j]);
+                aug.set(&[i, j], aug.get(&[max_row, j]));
+                aug.set(&[max_row, j], temp);
+            }
+        }
+        
+        // Scale pivot row
+        let pivot = aug.get(&[i, i]);
+        check pivot.abs() < 1e-10 {
+            Err("Matrix is singular".into());
+        }
+        
+        each j in 0..2*n {
+            aug.set(&[i, j], aug.get(&[i, j]) / pivot);
+        }
+        
+        // Eliminate column
+        each k in 0..n {
+            check k != i {
+                let factor = aug.get(&[k, i]);
+                each j in 0..2*n {
+                    let val = aug.get(&[k, j]) - factor * aug.get(&[i, j]);
+                    aug.set(&[k, j], val);
+                }
+            }
+        }
+    }
+    
+    // Extract inverse from augmented matrix
+    var inv_data = [0.0; n * n];
+    each i in 0..n {
+        each j in 0..n {
+            inv_data[i * n + j] = aug.get(&[i, n + j]);
+        }
+    }
+    
+    Ok(ndarray::array(inv_data, [n, n]))
+}
+
+// Determinant
+open fn det(a: &ndarray) -> Result<f64, String> {
+    check a.ndim != 2 || a.data[0] != a.data[1] {
+        Err("Matrix must be square".into());
+    }
+    
+    let n = a.data[0];
+    var mat = a.copy();
+    var det_val = 1.0;
+    
+    // LU decomposition
+    each i in 0..n {
+        // Find pivot
+        var max_row = i;
+        each k in i+1..n {
+            check mat.get(&[k, i]).abs() > mat.get(&[max_row, i]).abs() {
+                max_row = k;
+            }
+        }
+        
+        check max_row != i {
+            each j in 0..n {
+                let temp = mat.get(&[i, j]);
+                mat.set(&[i, j], mat.get(&[max_row, j]));
+                mat.set(&[max_row, j], temp);
+            }
+            det_val *= -1.0;
+        }
+        
+        let pivot = mat.get(&[i, i]);
+        check pivot.abs() < 1e-10 {
+            Ok(0.0);
+        }
+        
+        det_val *= pivot;
+        
+        each k in i+1..n {
+            let factor = mat.get(&[k, i]) / pivot;
+            each j in i..n {
+                let val = mat.get(&[k, j]) - factor * mat.get(&[i, j]);
+                mat.set(&[k, j], val);
+            }
+        }
+    }
+    
+    Ok(det_val)
+}
+
+// Matrix norm
+open fn norm(a: &ndarray, ord: NormType) -> f64 {
+    match ord {
+        NormType::Frobenius => {
+            a.data.iter().map(|x| x * x).sum::<f64>().sqrt()
+        }
+        NormType::L1 => {
+            a.data.iter().map(|x| x.abs()).sum()
+        }
+        NormType::L2 => {
+            a.data.iter().map(|x| x * x).sum::<f64>().sqrt()
+        }
+        NormType::Inf => {
+            a.data.iter().map(|x| x.abs()).fold(0.0, f64::max)
+        }
+    }
+}
+
+open cases NormType {
+    Frobenius,
+    L1,
+    L2,
+    Inf
+}
+
+// Eigenvalues and eigenvectors (QR algorithm)
+open fn eig(a: &ndarray) -> Result<(ndarray, ndarray), String> {
+    check a.ndim != 2 || a.data[0] != a.data[1] {
+        Err("Matrix must be square".into());
+    }
+    
+    let n = a.data[0];
+    var A = a.copy();
+    var Q_total = ndarray::eye(n);
+    
+    // QR iteration
+    each _ in 0..100 {
+        let (Q, R) = qr_decomposition(&A)?;
+        A = R.dot(&Q)?;
+        Q_total = Q_total.dot(&Q)?;
+    }
+    
+    // Extract eigenvalues from diagonal
+    var eigenvalues = [0.0; n];
+    each i in 0..n {
+        eigenvalues[i] = A.get(&[i, i]);
+    }
+    
+    Ok((
+        ndarray::array(eigenvalues, [n]),
+        Q_total
+    ))
+}
+
+// QR decomposition
+open fn qr(a: &ndarray) -> Result<(ndarray, ndarray), String> {
+    qr_decomposition(a)
+}
+
+fn qr_decomposition(a: &ndarray) -> Result<(ndarray, ndarray), String> {
+    check a.ndim != 2 {
+        Err("QR decomposition requires 2D matrix".into());
+    }
+    
+    let (m, n) = (a.data[0], a.data[1]);
+    var Q = ndarray::zeros(&[m, n]);
+    var R = ndarray::zeros(&[n, n]);
+    
+    // Gram-Schmidt process
+    each j in 0..n {
+        var v = a.slice(&[(0, m), (j, j+1)])?.flatten();
+        
+        each i in 0..j {
+            let q_i = Q.slice(&[(0, m), (i, i+1)])?.flatten();
+            let r_ij = dot_product(&q_i, &v);
+            R.set(&[i, j], r_ij);
+            
+            let proj = q_i.mul_scalar(r_ij);
+            v = v.sub(&proj)?;
+        }
+        
+        let norm = norm(&v, NormType::L2);
+        R.set(&[j, j], norm);
+        
+        check norm > 1e-10 {
+            let q_j = v.mul_scalar(1.0 / norm);
+            each i in 0..m {
+                Q.set(&[i, j], q_j.data[i]);
+            }
+        }
+    }
+    
+    Ok((Q, R))
+}
+
+// Singular Value Decomposition (simplified)
+open fn svd(a: &ndarray) -> Result<(ndarray, ndarray, ndarray), String> {
+    check a.ndim != 2 {
+        Err("SVD requires 2D matrix".into());
+    }
+    
+    let (m, n) = (a.data[0], a.data[1]);
+    
+    // Compute A^T A
+    let ata = a.transpose().dot(a)?;
+    
+    // Eigendecomposition of A^T A
+    let (eigenvalues, v) = eig(&ata)?;
+    
+    // Singular values are sqrt of eigenvalues
+    let s_vec: Vec<f64> = eigenvalues.data.iter().map(|x| x.abs().sqrt()).collect();
+    let s = ndarray::array(s_vec, [n]);
+    
+    // Compute U = A V S^-1
+    let av = a.dot(&v)?;
+    var u_data = [0.0; m * n];
+    each i in 0..m {
+        each j in 0..n {
+            let s_val = s.data[j];
+            check s_val > 1e-10 {
+                u_data[i * n + j] = av.get(&[i, j]) / s_val;
+            }
+        }
+    }
+    let u = ndarray::array(u_data, [m, n]);
+    
+    Ok((u, s, v.transpose()))
+}
+
+// Solve linear system Ax = b
+open fn solve(a: &ndarray, b: &ndarray) -> Result<ndarray, String> {
+    check a.ndim != 2 || a.data[0] != a.data[1] {
+        Err("Matrix must be square".into());
+    }
+    
+    let a_inv = inv(a)?;
+    a_inv.dot(b)
+}
+
+// Matrix rank
+open fn matrix_rank(a: &ndarray) -> Result<usize, String> {
+    let (_, s, _) = svd(a)?;
+    
+    let rank = s.data.iter()
+        .filter(|&&x| x > 1e-10)
+        .count();
+    
+    Ok(rank)
+}
+
+// Trace
+open fn trace(a: &ndarray) -> Result<f64, String> {
+    check a.ndim != 2 || a.data[0] != a.data[1] {
+        Err("Matrix must be square".into());
+    }
+    
+    let n = a.data[0];
+    var tr = 0.0;
+    each i in 0..n {
+        tr += a.get(&[i, i]);
+    }
+    
+    Ok(tr)
+}
+
+// Helper functions
+fn augmented_matrix(a: &ndarray) -> Result<ndarray, String> {
+    let n = a.data[0];
+    var aug_data = [0.0; n * 2 * n];
+    
+    each i in 0..n {
+        each j in 0..n {
+            aug_data[i * 2 * n + j] = a.get(&[i, j]);
+        }
+        aug_data[i * 2 * n + n + i] = 1.0;
+    }
+    
+    Ok(ndarray::array(aug_data, [n, 2 * n]))
+}
+
+fn dot_product(a: &ndarray, b: &ndarray) -> f64 {
+    a.data.iter().zip(&b.data).map(|(x, y)| x * y).sum()
+}
+
+export { inv, det, norm, NormType, eig, qr, svd, solve, matrix_rank, trace }

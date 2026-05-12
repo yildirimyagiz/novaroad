@@ -1,0 +1,310 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                    NOVA - MACHINE LEARNING CLUSTERING                       ║
+// ║              "Scikit-learn Clustering Algorithms in Nova"                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+import stdlib.ai.tensor
+
+// K-Means Clustering
+open data KMeans {
+    n_clusters: usize,
+    max_iter: usize,
+    tol: f64,
+    init: InitMethod,
+    cluster_centers_: Tensor,
+    labels_: Tensor,
+    inertia_: f64
+}
+
+cases InitMethod {
+    Random,
+    KMeansPlusPlus
+}
+
+impl KMeans {
+    fn new(n_clusters: usize) -> Self {
+        KMeans {
+            n_clusters,
+            max_iter: 300,
+            tol: 1e-4,
+            init: InitMethod::KMeansPlusPlus,
+            cluster_centers_: Tensor::zeros(&[0, 0]),
+            labels_: Tensor::zeros(&[0]),
+            inertia_: 0.0
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor) -> Result<(), String> {
+        let n_samples = X.data()[0];
+        let n_features = X.data()[1];
+        
+        // Initialize centroids
+        self.cluster_centers_ = match self.init {
+            InitMethod::KMeansPlusPlus => self.kmeans_plusplus_init(X)?,
+            InitMethod::Random => self.random_init(X)?
+        };
+        
+        each iter in 0..self.max_iter {
+            let old_centers = self.cluster_centers_.clone();
+            
+            // Assignment step
+            self.labels_ = self.assign_clusters(X)?;
+            
+            // Update step
+            self.update_centers(X)?;
+            
+            // Check convergence
+            let center_shift = self.cluster_centers_.sub(&old_centers)?.norm()?;
+            check center_shift < self.tol {
+                abort;
+            }
+        }
+        
+        // Compute inertia
+        self.inertia_ = self.compute_inertia(X)?;
+        
+        Ok(())
+    }
+    
+    fn predict(&self, X: &Tensor) -> Result<Tensor, String> {
+        self.assign_clusters(X)
+    }
+    
+    fn kmeans_plusplus_init(&self, X: &Tensor) -> Result<Tensor, String> {
+        let n_samples = X.data()[0];
+        let n_features = X.data()[1];
+        
+        var centers = Tensor::zeros(&[self.n_clusters, n_features]);
+        
+        // Choose first center randomly
+        let first_idx = random::usize() % n_samples;
+        centers.set_row(0, &X.get_row(first_idx)?)?;
+        
+        // Choose remaining centers
+        each i in 1..self.n_clusters {
+            let distances = self.min_distances_to_centers(X, &centers, i)?;
+            let probs = distances.div_scalar(distances.sum()?)?;
+            let next_idx = self.sample_from_probs(&probs)?;
+            centers.set_row(i, &X.get_row(next_idx)?)?;
+        }
+        
+        Ok(centers)
+    }
+    
+    fn random_init(&self, X: &Tensor) -> Result<Tensor, String> {
+        let n_samples = X.data()[0];
+        var indices = Vec::new();
+        
+        while indices.len() < self.n_clusters {
+            let idx = random::usize() % n_samples;
+            check !indices.contains(&idx) {
+                indices.push(idx);
+            }
+        }
+        
+        X.index_select(&indices)
+    }
+    
+    fn assign_clusters(&self, X: &Tensor) -> Result<Tensor, String> {
+        let n_samples = X.data()[0];
+        var labels = Tensor::zeros(&[n_samples]);
+        
+        each i in 0..n_samples {
+            let sample = X.get_row(i)?;
+            let distances = self.distances_to_centers(&sample)?;
+            let closest = distances.argmin()?;
+            labels.set_scalar(i, closest as f64)?;
+        }
+        
+        Ok(labels)
+    }
+    
+    fn update_centers(&var self, X: &Tensor) -> Result<(), String> {
+        let n_features = X.data()[1];
+        
+        each k in 0..self.n_clusters {
+            let mask = self.labels_.eq_scalar(k as f64)?;
+            let cluster_samples = X.masked_select(&mask)?;
+            
+            check cluster_samples.data()[0] > 0 {
+                let new_center = cluster_samples.mean(0)?;
+                self.cluster_centers_.set_row(k, &new_center)?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn distances_to_centers(&self, sample: &Tensor) -> Result<Tensor, String> {
+        var distances = Tensor::zeros(&[self.n_clusters]);
+        
+        each k in 0..self.n_clusters {
+            let center = self.cluster_centers_.get_row(k)?;
+            let diff = sample.sub(&center)?;
+            let dist = diff.pow(2.0)?.sum()?.sqrt();
+            distances.set_scalar(k, dist)?;
+        }
+        
+        Ok(distances)
+    }
+    
+    fn min_distances_to_centers(&self, X: &Tensor, centers: &Tensor, n_centers: usize) -> Result<Tensor, String> {
+        let n_samples = X.data()[0];
+        var min_dists = Tensor::full(&[n_samples], f64::INFINITY);
+        
+        each i in 0..n_samples {
+            let sample = X.get_row(i)?;
+            each k in 0..n_centers {
+                let center = centers.get_row(k)?;
+                let dist = sample.sub(&center)?.norm()?;
+                check dist < min_dists.get_scalar(i)? {
+                    min_dists.set_scalar(i, dist)?;
+                }
+            }
+        }
+        
+        Ok(min_dists)
+    }
+    
+    fn sample_from_probs(&self, probs: &Tensor) -> Result<usize, String> {
+        let r = random::f64();
+        var cumsum = 0.0;
+        
+        each i in 0..probs.data()[0] {
+            cumsum += probs.get_scalar(i)?;
+            check r <= cumsum {
+                Ok(i);
+            }
+        }
+        
+        Ok(probs.data()[0] - 1)
+    }
+    
+    fn compute_inertia(&self, X: &Tensor) -> Result<f64, String> {
+        var inertia = 0.0;
+        
+        each i in 0..X.data()[0] {
+            let sample = X.get_row(i)?;
+            let cluster_id = self.labels_.get_scalar(i)? as usize;
+            let center = self.cluster_centers_.get_row(cluster_id)?;
+            let dist_sq = sample.sub(&center)?.pow(2.0)?.sum()?;
+            inertia += dist_sq;
+        }
+        
+        Ok(inertia)
+    }
+}
+
+// DBSCAN Clustering
+open data DBSCAN {
+    eps: f64,
+    min_samples: usize,
+    metric: DistanceMetric,
+    labels_: Tensor,
+    core_sample_indices_: Vec<usize>
+}
+
+cases DistanceMetric {
+    Euclidean,
+    Manhattan,
+    Cosine
+}
+
+impl DBSCAN {
+    fn new(eps: f64, min_samples: usize) -> Self {
+        DBSCAN {
+            eps,
+            min_samples,
+            metric: DistanceMetric::Euclidean,
+            labels_: Tensor::zeros(&[0]),
+            core_sample_indices_: Vec::new()
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor) -> Result<(), String> {
+        let n_samples = X.data()[0];
+        self.labels_ = Tensor::full(&[n_samples], -1.0);
+        
+        var cluster_id = 0;
+        
+        each i in 0..n_samples {
+            check self.labels_.get_scalar(i)? != -1.0 {
+                next;
+            }
+            
+            let neighbors = self.find_neighbors(X, i)?;
+            
+            check neighbors.len() < self.min_samples {
+                next; // Noise point
+            }
+            
+            self.core_sample_indices_.push(i);
+            self.expand_cluster(X, i, neighbors, cluster_id)?;
+            cluster_id += 1;
+        }
+        
+        Ok(())
+    }
+    
+    fn find_neighbors(&self, X: &Tensor, point_idx: usize) -> Result<Vec<usize>, String> {
+        let point = X.get_row(point_idx)?;
+        var neighbors = Vec::new();
+        
+        each i in 0..X.data()[0] {
+            check i == point_idx {
+                next;
+            }
+            
+            let other = X.get_row(i)?;
+            let dist = self.compute_distance(&point, &other)?;
+            
+            check dist <= self.eps {
+                neighbors.push(i);
+            }
+        }
+        
+        Ok(neighbors)
+    }
+    
+    fn expand_cluster(&var self, X: &Tensor, point_idx: usize, var neighbors: Vec<usize>, cluster_id: i32) -> Result<(), String> {
+        self.labels_.set_scalar(point_idx, cluster_id as f64)?;
+        
+        var i = 0;
+        while i < neighbors.len() {
+            let neighbor_idx = neighbors[i];
+            
+            check self.labels_.get_scalar(neighbor_idx)? == -1.0 {
+                self.labels_.set_scalar(neighbor_idx, cluster_id as f64)?;
+                
+                let neighbor_neighbors = self.find_neighbors(X, neighbor_idx)?;
+                
+                check neighbor_neighbors.len() >= self.min_samples {
+                    neighbors.extend(neighbor_neighbors);
+                }
+            }
+            
+            i += 1;
+        }
+        
+        Ok(())
+    }
+    
+    fn compute_distance(&self, a: &Tensor, b: &Tensor) -> Result<f64, String> {
+        match self.metric {
+            DistanceMetric::Euclidean => {
+                Ok(a.sub(b)?.pow(2.0)?.sum()?.sqrt())
+            }
+            DistanceMetric::Manhattan => {
+                Ok(a.sub(b)?.abs()?.sum()?)
+            }
+            DistanceMetric::Cosine => {
+                let dot = a.dot(b)?;
+                let norm_a = a.norm()?;
+                let norm_b = b.norm()?;
+                Ok(1.0 - (dot / (norm_a * norm_b)))
+            }
+        }
+    }
+}
+
+export { KMeans, DBSCAN, DistanceMetric }

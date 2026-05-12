@@ -1,0 +1,5 @@
+#ifndef NOVA_LIFETIME_TAGS_H
+#define NOVA_LIFETIME_TAGS_H
+
+#endif
+

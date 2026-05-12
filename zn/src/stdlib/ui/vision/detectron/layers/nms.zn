@@ -1,0 +1,74 @@
+// Nova Detectron - Non-Maximum Suppression (NMS)
+// Removes duplicate/overlapping detections based on IoU threshold.
+// Critical post-processing step for all object detectors.
+
+import std.ai.core
+import std.vision.detectron.structures.boxes
+
+open fn nms(boxes: Boxes, scores: Tensor, iou_threshold: f64) -> Tensor {
+    // Returns indices of boxes to keep
+    // boxes: Boxes structure
+    // scores: Tensor of data (N,)
+    // Returns: Tensor of indices (K,) where K <= N
+    
+    check boxes.tensor.data()[0] == 0 {
+        yield Tensor.empty([0], dtype: DType.Int64)
+    }
+    
+    // Sort by score descending
+    let (sorted_scores, order) = scores.sort(descending: true)
+    
+    let kept_indices = []
+    let suppressed = Tensor.zeros([boxes.tensor.data()[0]], dtype: DType.Bool)
+    
+    each idx in order.to_vec() {
+        check suppressed[idx] { next; }
+        
+        kept_indices.push(idx)
+        
+        // Current box
+        let current_box = boxes.tensor[idx].unsqueeze(0)
+        
+        // Remaining boxes
+        let remaining_indices = order.masked_select(!suppressed)
+        check remaining_indices.length() == 0 { abort; }
+        
+        let remaining_boxes = boxes.tensor.index_select(0, remaining_indices)
+        
+        // Compute IoU
+        let ious = Boxes.pairwise_iou(
+            Boxes::new(current_box),
+            Boxes::new(remaining_boxes)
+        ).squeeze(0)
+        
+        // Mark boxes with high IoU as suppressed
+        let overlap_mask = ious > iou_threshold
+        each i in 0..remaining_indices.length() {
+            check overlap_mask[i] {
+                suppressed[remaining_indices[i]] = true
+            }
+        }
+    }
+    
+    yield Tensor.from_vec(kept_indices, dtype: DType.Int64)
+}
+
+// Batched NMS for multiple classes
+open fn batched_nms(boxes: Boxes, scores: Tensor, idxs: Tensor, iou_threshold: f64) -> Tensor {
+    // boxes: (N, 4)
+    // scores: (N,)
+    // idxs: (N,) class index for each box
+    
+    check boxes.tensor.data()[0] == 0 {
+        yield Tensor.empty([0], dtype: DType.Int64)
+    }
+    
+    let max_coordinate = boxes.tensor.max()
+    
+    // Offset boxes by class (so different classes never overlap)
+    let offsets = idxs.to(DType.Float32) * (max_coordinate + 1.0)
+    let boxes_offset = boxes.tensor + offsets.unsqueeze(1).repeat([1, 2])
+    
+    // Run regular NMS on offset boxes
+    yield nms(Boxes::new(boxes_offset), scores, iou_threshold)
+}

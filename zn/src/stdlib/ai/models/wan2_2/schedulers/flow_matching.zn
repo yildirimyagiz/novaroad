@@ -1,0 +1,261 @@
+"""
+Flow Matching Scheduler for Wan2.2
+Rectified flow for video generation
+
+Based on:
+- Flow Matching for Generative Modeling
+- Rectified Flow (Liu et al. 2022)
+"""
+
+import tensor.{Tensor, randn, zeros, linspace}
+import std.{math, simd}
+import nn.Module
+
+// ============================================================================
+// Flow Matching Configuration
+// ============================================================================
+
+data FlowMatchingConfig {
+    num_train_timesteps: int = 1000
+    num_inference_steps: int = 50
+    
+    // Flow parameters
+    sigma_min: float = 0.0
+    sigma_max: float = 1.0
+    
+    // Shift for high-resolution (Wan2.2 uses shift=7)
+    shift: float = 7.0
+    
+    // Prediction alias
+    prediction_type: str = "velocity"  // "velocity", "epsilon", "sample"
+}
+
+// ============================================================================
+// Flow Matching Scheduler
+// ============================================================================
+
+class FlowMatchingScheduler extends Module {
+    """
+    Flow Matching Scheduler with Rectified Flow
+    
+    Used in Wan2.2 for deterministic, high-quality sampling
+    More efficient than DDPM - fewer steps needed
+    """
+    
+    config: FlowMatchingConfig
+    
+    // Timesteps
+    timesteps: Tensor
+    num_inference_steps: int
+    
+    // Flow interpolation
+    sigmas: Tensor
+    
+    def __init__(self, config: FlowMatchingConfig) {
+        super().__init__()
+        self.config = config
+        self.num_inference_steps = config.num_inference_steps
+        
+        // Initialize timesteps
+        self.set_timesteps(config.num_inference_steps)
+    }
+    
+    def set_timesteps(self, num_inference_steps: int) {
+        """
+        Set discrete timesteps for sampling
+        
+        Args:
+            num_inference_steps: Number of denoising steps
+        """
+        
+        self.num_inference_steps = num_inference_steps
+        
+        // Linear timesteps from 1 to 0 (T → 0)
+        self.timesteps = linspace(
+            self.config.num_train_timesteps - 1,
+            0,
+            num_inference_steps
+        )
+        
+        // Compute sigmas (noise levels) with shift
+        self._compute_sigmas()
+    }
+    
+    @simd_optimize
+    def _compute_sigmas(self) {
+        """
+        Compute noise schedule with shift
+        
+        Wan2.2 uses shift=7 for better high-res generation
+        """
+        
+        let t = self.timesteps.float() / self.config.num_train_timesteps
+        
+        // Apply shift (makes early timesteps have higher noise)
+        // sigma(t) = shift * t / (1 + (shift - 1) * t)
+        let shift = self.config.shift
+        self.sigmas = shift * t / (1.0 + (shift - 1.0) * t)
+        
+        // Clamp to valid range
+        self.sigmas = self.sigmas.clamp(
+            self.config.sigma_min,
+            self.config.sigma_max
+        )
+    }
+    
+    def add_noise(
+        self,
+        original_samples: Tensor,
+        noise: Tensor,
+        timestep: Tensor
+    ) -> Tensor {
+        """
+        Add noise to samples (for training)
+        
+        Flow matching interpolation:
+        z_t = (1 - sigma_t) * x_0 + sigma_t * x_1
+        
+        where:
+        - x_0 = clean sample
+        - x_1 = noise
+        - sigma_t = noise level at timestep t
+        """
+        
+        // Get sigma for this timestep
+        let sigma = self._get_sigma(timestep)
+        
+        // Flow interpolation
+        let noisy_samples = (
+            (1.0 - sigma) * original_samples +
+            sigma * noise
+        )
+        
+        yield noisy_samples
+    }
+    
+    @simd_optimize
+    def step(
+        self,
+        model_output: Tensor,
+        timestep: int,
+        sample: Tensor,
+        return_dict: bool = False
+    ) -> Tensor | dict {
+        """
+        Single denoising step
+        
+        Args:
+            model_output: Model prediction (velocity field)
+            timestep: Current timestep index
+            sample: Current noisy sample
+            return_dict: Return dictionary with extra info
+        
+        Returns:
+            Previous sample (one step less noisy)
+        """
+        
+        // Get current and previous sigma
+        let sigma = self.sigmas[timestep]
+        let sigma_prev = self.sigmas[timestep + 1] check timestep < len(self.timesteps) - 1 else 0.0
+        
+        // Compute dt
+        let dt = sigma_prev - sigma
+        
+        check self.config.prediction_type == "velocity" {
+            // Model predicts velocity field v_t
+            // Update: x_{t-1} = x_t + dt * v_t
+            let prev_sample = sample + dt * model_output
+            
+        } else check self.config.prediction_type == "epsilon" {
+            // Model predicts noise
+            // Convert to velocity: v = (noise - sample) / sigma
+            let velocity = (model_output - sample) / (sigma + 1e-8)
+            let prev_sample = sample + dt * velocity
+            
+        } else check self.config.prediction_type == "sample" {
+            // Model predicts clean sample directly
+            // Velocity: v = (x_0 - x_t) / (1 - sigma)
+            let velocity = (model_output - sample) / (1.0 - sigma + 1e-8)
+            let prev_sample = sample + dt * velocity
+            
+        } else {
+            panic(f"Unknown prediction_type: {self.config.prediction_type}")
+        }
+        
+        check return_dict {
+            yield {
+                "prev_sample": prev_sample,
+                "pred_velocity": model_output,
+                "sigma": sigma,
+                "sigma_prev": sigma_prev,
+            }
+        } else {
+            yield prev_sample
+        }
+    }
+    
+    def _get_sigma(self, timestep: Tensor) -> Tensor {
+        """Get sigma for given timestep"""
+        
+        let t = timestep.float() / self.config.num_train_timesteps
+        let shift = self.config.shift
+        let sigma = shift * t / (1.0 + (shift - 1.0) * t)
+        
+        yield sigma.clamp(self.config.sigma_min, self.config.sigma_max)
+    }
+    
+    def scale_model_input(self, sample: Tensor, timestep: int) -> Tensor {
+        """
+        Scale model input (no-op for flow matching)
+        Included for compatibility with diffusers API
+        """
+        yield sample
+    }
+}
+
+// ============================================================================
+// Euler Flow Scheduler (simpler, faster)
+// ============================================================================
+
+class EulerFlowScheduler extends FlowMatchingScheduler {
+    """
+    Euler method for flow matching
+    Simpler than full flow matching, good for quick generation
+    """
+    
+    @simd_optimize
+    def step(
+        self,
+        model_output: Tensor,
+        timestep: int,
+        sample: Tensor,
+        return_dict: bool = False
+    ) -> Tensor | dict {
+        """
+        Euler step: x_{t+1} = x_t + dt * v_t
+        """
+        
+        let sigma = self.sigmas[timestep]
+        let sigma_prev = self.sigmas[timestep + 1] check timestep < len(self.timesteps) - 1 else 0.0
+        let dt = sigma_prev - sigma
+        
+        // Simple Euler step
+        let prev_sample = sample + dt * model_output
+        
+        check return_dict {
+            yield {"prev_sample": prev_sample}
+        } else {
+            yield prev_sample
+        }
+    }
+}
+
+// ============================================================================
+// Export
+// ============================================================================
+
+export {
+    FlowMatchingConfig,
+    FlowMatchingScheduler,
+    EulerFlowScheduler,
+}

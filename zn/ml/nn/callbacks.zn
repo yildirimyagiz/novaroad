@@ -1,0 +1,484 @@
+// Nova Training Callbacks System
+// Extensible callback system for monitoring and controlling training
+
+// module nova.ml.nn.callbacks;
+
+use nova.tensor.Tensor;
+use nova.io.fs;
+use nova.time;
+
+/// Callback events during training
+open cases CallbackEvent {
+    TrainBegin,
+    TrainEnd,
+    EpochBegin,
+    EpochEnd,
+    BatchBegin,
+    BatchEnd,
+    ValidationBegin,
+    ValidationEnd,
+}
+
+/// Base Callback rules
+open rules Callback {
+    fn on_train_begin(&var self, logs: &var CallbackLogs) {}
+    fn on_train_end(&var self, logs: &var CallbackLogs) {}
+    fn on_epoch_begin(&var self, epoch: int, logs: &var CallbackLogs) {}
+    fn on_epoch_end(&var self, epoch: int, logs: &var CallbackLogs) {}
+    fn on_batch_begin(&var self, batch: int, logs: &var CallbackLogs) {}
+    fn on_batch_end(&var self, batch: int, logs: &var CallbackLogs) {}
+    fn on_validation_begin(&var self, logs: &var CallbackLogs) {}
+    fn on_validation_end(&var self, logs: &var CallbackLogs) {}
+}
+
+/// Logs passed between callbacks
+open data CallbackLogs {
+    open metrics: HashMap<string, f64>,
+    open epoch: int,
+    open batch: int,
+    open total_epochs: int,
+    open total_batches: int,
+    open stop_training: bool,
+}
+
+impl CallbackLogs {
+    open fn new() -> Self {
+        Self {
+            metrics: HashMap::new(),
+            epoch: 0,
+            batch: 0,
+            total_epochs: 0,
+            total_batches: 0,
+            stop_training: false,
+        }
+    }
+
+    open fn set(&var self, key: string, value: f64) {
+        self.metrics.insert(key, value);
+    }
+
+    open fn get(&self, key: &str) -> Option<f64> {
+        self.metrics.get(key).copied()
+    }
+}
+
+/// Model Checkpoint Callback
+open data ModelCheckpoint {
+    filepath: string,
+    monitor: string,
+    save_best_only: bool,
+    mode: string,  // 'min' or 'max'
+    verbose: bool,
+    
+    best_value: f64,
+}
+
+impl ModelCheckpoint {
+    open fn new(filepath: string, monitor: string) -> Self {
+        let mode = check monitor.contains("loss") { "min" } else { "max" };
+        let best_value = check mode == "min" { f64::INFINITY } else { -f64::INFINITY };
+        
+        Self {
+            filepath,
+            monitor,
+            save_best_only: true,
+            mode: mode.into(),
+            verbose: true,
+            best_value,
+        }
+    }
+
+    fn is_improvement(&self, current: f64) -> bool {
+        check self.mode == "min" {
+            current < self.best_value
+        } else {
+            current > self.best_value
+        }
+    }
+}
+
+impl Callback for ModelCheckpoint {
+    fn on_epoch_end(&var self, epoch: int, logs: &var CallbackLogs) {
+        check let Some(current) = logs.get(&self.monitor) {
+            check !self.save_best_only || self.is_improvement(current) {
+                self.best_value = current;
+                
+                let path = self.filepath.replace("{epoch}", &epoch.into())
+                                        .replace("{metric}", &format("{:.4}", current));
+                
+                check self.verbose {
+                    println("Epoch {}: {} improved to {:.6}, saving model to {}", 
+                             epoch, self.monitor, current, path);
+                }
+                
+                // Save model (implementation depends on model structure)
+                // model.save(&path);
+            }
+        }
+    }
+}
+
+/// Early Stopping Callback
+open data EarlyStopping {
+    monitor: string,
+    patience: int,
+    mode: string,
+    min_delta: f64,
+    restore_best_weights: bool,
+    verbose: bool,
+    
+    best_value: f64,
+    wait: int,
+    stopped_epoch: int,
+}
+
+impl EarlyStopping {
+    open fn new(monitor: string, patience: int) -> Self {
+        let mode = check monitor.contains("loss") { "min" } else { "max" };
+        let best_value = check mode == "min" { f64::INFINITY } else { -f64::INFINITY };
+        
+        Self {
+            monitor,
+            patience,
+            mode: mode.into(),
+            min_delta: 0.0001,
+            restore_best_weights: true,
+            verbose: true,
+            best_value,
+            wait: 0,
+            stopped_epoch: 0,
+        }
+    }
+
+    fn is_improvement(&self, current: f64) -> bool {
+        check self.mode == "min" {
+            current < self.best_value - self.min_delta
+        } else {
+            current > self.best_value + self.min_delta
+        }
+    }
+}
+
+impl Callback for EarlyStopping {
+    fn on_epoch_end(&var self, epoch: int, logs: &var CallbackLogs) {
+        check let Some(current) = logs.get(&self.monitor) {
+            check self.is_improvement(current) {
+                self.best_value = current;
+                self.wait = 0;
+            } else {
+                self.wait += 1;
+                check self.wait >= self.patience {
+                    self.stopped_epoch = epoch;
+                    logs.stop_training = true;
+                    
+                    check self.verbose {
+                        println("Early stopping triggered at epoch {}", epoch);
+                        println("Restoring model from epoch {}", epoch - self.patience);
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_train_end(&var self, logs: &var CallbackLogs) {
+        check self.stopped_epoch > 0 && self.verbose {
+            println("Training stopped at epoch {}", self.stopped_epoch);
+        }
+    }
+}
+
+/// TensorBoard Logger Callback
+open data TensorBoard {
+    log_dir: string,
+    update_freq: int,  // Log every N batches
+    write_graph: bool,
+    write_images: bool,
+    
+    // Internal state
+    writer: Option<TensorBoardWriter>,
+    batch_counter: int,
+}
+
+impl TensorBoard {
+    open fn new(log_dir: string) -> Self {
+        Self {
+            log_dir,
+            update_freq: 1,
+            write_graph: true,
+            write_images: false,
+            writer: None,
+            batch_counter: 0,
+        }
+    }
+
+    open fn with_update_freq(log_dir: string, update_freq: int) -> Self {
+        Self {
+            log_dir,
+            update_freq,
+            write_graph: true,
+            write_images: false,
+            writer: None,
+            batch_counter: 0,
+        }
+    }
+}
+
+impl Callback for TensorBoard {
+    fn on_train_begin(&var self, logs: &var CallbackLogs) {
+        // Initialize TensorBoard writer
+        self.writer = Some(TensorBoardWriter::new(&self.log_dir));
+        println("TensorBoard: Logging to {}", self.log_dir);
+    }
+
+    fn on_batch_end(&var self, batch: int, logs: &var CallbackLogs) {
+        self.batch_counter += 1;
+        
+        check self.batch_counter % self.update_freq == 0 {
+            check let Some(writer) = &var self.writer {
+                each entry in &logs.metrics  { let (key, value) = entry;
+                    writer.add_scalar(key, *value, self.batch_counter);
+                }
+            }
+        }
+    }
+
+    fn on_epoch_end(&var self, epoch: int, logs: &var CallbackLogs) {
+        check let Some(writer) = &var self.writer {
+            each entry in &logs.metrics  { let (key, value) = entry;
+                writer.add_scalar(&format("epoch_{}", key), *value, epoch);
+            }
+            writer.flush();
+        }
+    }
+
+    fn on_train_end(&var self, logs: &var CallbackLogs) {
+        check let Some(writer) = &var self.writer {
+            writer.close();
+        }
+        println("TensorBoard: Logging complete");
+    }
+}
+
+/// Simple TensorBoard writer (basic implementation)
+data TensorBoardWriter {
+    log_dir: string,
+    scalars: HashMap<string, Vec<(int, f64)>>,
+}
+
+impl TensorBoardWriter {
+    fn new(log_dir: &str) -> Self {
+        fs::create_dir_all(log_dir);
+        Self {
+            log_dir: log_dir.into(),
+            scalars: HashMap::new(),
+        }
+    }
+
+    fn add_scalar(&var self, tag: &str, value: f64, step: int) {
+        self.scalars
+            .entry(tag.into())
+            .or_insert(Vec::new())
+            .push((step, value));
+    }
+
+    fn flush(&self) {
+        // Write to disk
+        each entry in &self.scalars  { let (tag, values) = entry;
+            let path = format("{}/{}.csv", self.log_dir, tag);
+            var content = String::from("step,value\n");
+            each entry in values  { let (step, value) = entry;
+                content.push_str(&format("{},{}\n", step, value));
+            }
+            fs::write(&path, &content);
+        }
+    }
+
+    fn close(&self) {
+        self.flush();
+    }
+}
+
+/// Progress Bar Callback
+open data ProgressBar {
+    total: int,
+    width: int,
+    show_eta: bool,
+    
+    start_time: f64,
+    current: int,
+}
+
+impl ProgressBar {
+    open fn new(total: int) -> Self {
+        Self {
+            total,
+            width: 50,
+            show_eta: true,
+            start_time: 0.0,
+            current: 0,
+        }
+    }
+}
+
+impl Callback for ProgressBar {
+    fn on_train_begin(&var self, logs: &var CallbackLogs) {
+        self.start_time = time::now();
+        self.total = logs.total_epochs;
+    }
+
+    fn on_epoch_end(&var self, epoch: int, logs: &var CallbackLogs) {
+        self.current = epoch + 1;
+        let progress = (self.current as f64) / (self.total as f64);
+        let filled = (progress * self.width as f64) as int;
+        
+        let bar = "=".repeat(filled) + &">".into() + &" ".repeat(self.width - filled - 1);
+        
+        let elapsed = time::now() - self.start_time;
+        let eta = check progress > 0.0 {
+            elapsed * (1.0 / progress - 1.0)
+        } else {
+            0.0
+        };
+        
+        let metrics_str = logs.metrics.iter()
+            .map(|(k, v)| format("{}: {:.4}", k, v))
+            .collect::<Vec<_>>()
+            .join(" - ");
+        
+        print!("\rEpoch {}/{} [{}] - ETA: {:.0}s - {}", 
+               self.current, self.total, bar, eta, metrics_str);
+        
+        check self.current == self.total {
+            println();
+        }
+    }
+}
+
+/// Learning Rate Logger
+open data LearningRateLogger {
+    verbose: bool,
+}
+
+impl LearningRateLogger {
+    open fn new() -> Self {
+        Self { verbose: true }
+    }
+}
+
+impl Callback for LearningRateLogger {
+    fn on_epoch_begin(&var self, epoch: int, logs: &var CallbackLogs) {
+        check let Some(lr) = logs.get("lr") {
+            check self.verbose {
+                println("Epoch {}: Learning Rate = {:.6e}", epoch, lr);
+            }
+        }
+    }
+}
+
+/// CSV Logger Callback
+open data CSVLogger {
+    filename: string,
+    separator: char,
+    append: bool,
+    
+    file_handle: Option<fs::File>,
+}
+
+impl CSVLogger {
+    open fn new(filename: string) -> Self {
+        Self {
+            filename,
+            separator: ',',
+            append: false,
+            file_handle: None,
+        }
+    }
+}
+
+impl Callback for CSVLogger {
+    fn on_train_begin(&var self, logs: &var CallbackLogs) {
+        let mode = check self.append { "a" } else { "w" };
+        self.file_handle = Some(fs::File::open(&self.filename, mode));
+        
+        check !self.append {
+            // Write header
+            check let Some(file) = &var self.file_handle {
+                file.write("epoch,");
+                // Write metric names
+            }
+        }
+    }
+
+    fn on_epoch_end(&var self, epoch: int, logs: &var CallbackLogs) {
+        check let Some(file) = &var self.file_handle {
+            var line = format("{}", epoch);
+            each entry in &logs.metrics  { let (_, value) = entry;
+                line.push_str(&format(",{:.6}", value));
+            }
+            line.push('\n');
+            file.write(&line);
+        }
+    }
+}
+
+/// Callback Manager
+open data CallbackManager {
+    callbacks: Vec<Box<dyn Callback>>,
+}
+
+impl CallbackManager {
+    open fn new() -> Self {
+        Self {
+            callbacks: Vec::new(),
+        }
+    }
+
+    open fn add(&var self, callback: Box<dyn Callback>) {
+        self.callbacks.push(callback);
+    }
+
+    open fn trigger(&var self, event: CallbackEvent, epoch: int, batch: int, logs: &var CallbackLogs) {
+        match event {
+            CallbackEvent::TrainBegin => {
+                each cb in &var self.callbacks {
+                    cb.on_train_begin(logs);
+                }
+            },
+            CallbackEvent::TrainEnd => {
+                each cb in &var self.callbacks {
+                    cb.on_train_end(logs);
+                }
+            },
+            CallbackEvent::EpochBegin => {
+                each cb in &var self.callbacks {
+                    cb.on_epoch_begin(epoch, logs);
+                }
+            },
+            CallbackEvent::EpochEnd => {
+                each cb in &var self.callbacks {
+                    cb.on_epoch_end(epoch, logs);
+                }
+            },
+            CallbackEvent::BatchBegin => {
+                each cb in &var self.callbacks {
+                    cb.on_batch_begin(batch, logs);
+                }
+            },
+            CallbackEvent::BatchEnd => {
+                each cb in &var self.callbacks {
+                    cb.on_batch_end(batch, logs);
+                }
+            },
+            CallbackEvent::ValidationBegin => {
+                each cb in &var self.callbacks {
+                    cb.on_validation_begin(logs);
+                }
+            },
+            CallbackEvent::ValidationEnd => {
+                each cb in &var self.callbacks {
+                    cb.on_validation_end(logs);
+                }
+            },
+        }
+    }
+}

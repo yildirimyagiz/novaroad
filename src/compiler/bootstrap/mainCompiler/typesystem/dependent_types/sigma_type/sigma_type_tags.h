@@ -1,0 +1,5 @@
+#ifndef NOVA_SIGMA_TYPE_TAGS_H
+#define NOVA_SIGMA_TYPE_TAGS_H
+
+#endif
+

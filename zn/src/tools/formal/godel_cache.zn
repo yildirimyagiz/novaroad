@@ -1,0 +1,175 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  Nova — GÖDEL PROOF CACHE  v8.0                                    ║
+// ║  Persistent Storage for Formal Verification Proofs                        ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::HashMap;
+use crate::tools::formal::ada_verification_units::{VerificationResult, VerificationUnit};
+
+/// Cached Verification Result
+space data CachedProof {
+    hash:      String,
+    verified:  bool,
+    timestamp: i64,
+    verification_result: Option<VerificationResult>,
+    confidence: f64,
+}
+
+/// Persistent Cache Orchestrator
+space data GodelCache {
+    cache_path: String,
+    memory_map: HashMap<String, CachedProof>,
+    verification_units: HashMap<String, VerificationUnit>,
+}
+
+impl GodelCache {
+    open fn new() -> GodelCache {
+        GodelCache {
+            cache_path: "~/.nova_n/godel_cache".into(),
+            memory_map: HashMap::new(),
+            verification_units: HashMap::new(),
+        }
+    }
+    
+    /// Retrieves a cached proof to skip redundant verification
+    open fn fetch_proof(&self, hash: String) -> Option<CachedProof> {
+        self.memory_map.get(&hash).cloned()
+    }
+    
+    /// Stores a new proof in the global cache
+    open fn store_proof(&var self, hash: String, success: bool, verification_result: Option<VerificationResult>) {
+        println!("💾 Godel: Caching verification proof (Hash: {})...", hash);
+
+        let entry = CachedProof {
+            hash:      hash.clone(),
+            verified:  success,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or(std::time::Duration::from_secs(0))
+                .as_secs() as i64,
+            verification_result,
+            confidence: verification_result.as_ref()
+                .map(|r| r.confidence)
+                .unwrap_or(0.0),
+        };
+
+        self.memory_map.insert(hash, entry);
+    }
+    
+    /// Verify a cached proof with Ada-style contracts
+    open fn verify_cached_proof(&self, hash: String) -> VerificationResult {
+        if let Some(proof) = self.fetch_proof(hash) {
+            // Verify the proof with Ada-style contracts
+            let mut verification_unit = VerificationUnit::new(format!("proof_{}", hash));
+            
+            verification_unit.add_specification(crate::tools::formal::ada_verification_units::Specification {
+                name: format!("proof_validity_{}", hash),
+                statement: format!("Proof {} is valid", hash),
+                kind: crate::tools::formal::ada_verification_units::SpecKind::TypeCorrectness,
+                verified: proof.verified,
+                proof_required: true,
+                priority: crate::tools::formal::ada_verification_units::Priority::High,
+                description: format!("Verify cached proof {}", hash),
+            });
+            
+            let config = crate::tools::formal::ada_verification_units::VerificationConfig {
+                enable_parallel_verification: false,
+                max_verification_time: 5000,
+                confidence_threshold: 0.8,
+                enable_caching: true,
+                enable_incremental_verification: true,
+                proof_strategies: vec![],
+                smt_solver: "Z3".to_string(),
+                theorem_prover: "Coq".to_string(),
+            };
+            
+            verification_unit.verify_all(&config)
+        } else {
+            VerificationResult {
+                unit_name: format!("proof_{}", hash),
+                success: false,
+                failed_specs: vec!["proof_not_found".to_string()],
+                verified_specs: Vec::new(),
+                confidence: 0.0,
+                duration: std::time::Duration::from_secs(0),
+                errors: vec![crate::tools::formal::ada_verification_units::VerificationError {
+                    spec_name: "proof_not_found".to_string(),
+                    error_type: crate::tools::formal::ada_verification_units::ErrorType::ProofFailed,
+                    message: "Proof not found in cache".to_string(),
+                    location: "godel_cache".to_string(),
+                }],
+                warnings: Vec::new(),
+            }
+        }
+    }
+    
+    /// Get cache statistics
+    open fn get_cache_stats(&self) -> CacheStats {
+        let total_proofs = self.memory_map.len();
+        let verified_proofs = self.memory_map.values()
+            .filter(|p| p.verified)
+            .count();
+        let average_confidence = if total_proofs > 0 {
+            self.memory_map.values()
+                .map(|p| p.confidence)
+                .sum::<f64>() / total_proofs as f64
+        } else {
+            0.0
+        };
+        
+        CacheStats {
+            total_proofs,
+            verified_proofs,
+            failed_proofs: total_proofs - verified_proofs,
+            average_confidence,
+            cache_size_bytes: self.estimate_cache_size(),
+        }
+    }
+    
+    /// Estimate cache size in bytes
+    fn estimate_cache_size(&self) -> usize {
+        self.memory_map.len() * 1024 // Rough estimate
+    }
+}
+
+/// Cache statistics
+space data CacheStats {
+    total_proofs: usize,
+    verified_proofs: usize,
+    failed_proofs: usize,
+    average_confidence: f64,
+    cache_size_bytes: usize,
+}
+
+open fn main() {
+    println!("💾 Nova Godel Cache - Active");
+    
+    // Test the enhanced cache
+    let mut cache = GodelCache::new();
+    
+    // Store a test proof
+    let test_result = VerificationResult {
+        unit_name: "test_unit".to_string(),
+        success: true,
+        failed_specs: Vec::new(),
+        verified_specs: vec!["test_spec".to_string()],
+        confidence: 0.95,
+        duration: std::time::Duration::from_millis(100),
+        errors: Vec::new(),
+        warnings: Vec::new(),
+    };
+    
+    cache.store_proof("test_hash".to_string(), true, Some(test_result));
+    
+    // Verify cached proof
+    let verification_result = cache.verify_cached_proof("test_hash".to_string());
+    println!("Cached proof verification: {}", 
+        if verification_result.success { "✅ Success" } else { "❌ Failed" });
+    
+    // Get cache statistics
+    let stats = cache.get_cache_stats();
+    println!("Cache statistics:");
+    println!("  Total proofs: {}", stats.total_proofs);
+    println!("  Verified proofs: {}", stats.verified_proofs);
+    println!("  Average confidence: {:.2}", stats.average_confidence);
+}

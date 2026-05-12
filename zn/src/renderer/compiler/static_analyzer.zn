@@ -1,0 +1,625 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                           NOVA RENDERER - STATIC ANALYZER                   ║
+// ║                  Compile-time AST analysis and dependency graphs             ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use crate::core::node::*;
+
+// ============================================================================
+// DEPENDENCY GRAPH ANALYSIS
+// ============================================================================
+
+open data DependencyAnalyzer {
+    variables: HashSet<String>,
+    functions: HashSet<String>,
+    dependencies: HashMap<String, HashSet<String>>, // var -> vars it depends on
+    dependents: HashMap<String, HashSet<String>>,   // var -> vars that depend on it
+}
+
+impl DependencyAnalyzer {
+    fn new() -> Self {
+        DependencyAnalyzer {
+            variables: HashSet::new(),
+            functions: HashSet::new(),
+            dependencies: HashMap::new(),
+            dependents: HashMap::new(),
+        }
+    }
+
+    /// Analyze SFC source to extract reactive dependencies
+    fn analyze_sfc(&var self, template: &str, script: &str) -> Result<DependencyGraph, String> {
+        // Parse template for reactive expressions
+        self.analyze_template(template)?;
+
+        // Parse script for variable definitions and computed properties
+        self.analyze_script(script)?;
+
+        // Build dependency graph
+        self.build_graph()
+    }
+
+    fn analyze_template(&var self, template: &str) -> Result<(), String> {
+        // Extract all reactive expressions from template
+        // {{variable}}, {{obj.property}}, {{func()}}, etc.
+
+        let expressions = self.extract_expressions(template)?;
+
+        each expr in expressions {
+            // Parse expression to find variable dependencies
+            let deps = self.parse_expression_dependencies(&expr)?;
+            each dep in deps {
+                self.variables.insert(dep.clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn analyze_script(&var self, script: &str) -> Result<(), String> {
+        // Extract state variables
+        let state_vars = self.extract_state_variables(script)?;
+        each var in state_vars {
+            self.variables.insert(var);
+        }
+
+        // Extract computed properties and their dependencies
+        let computed_props = self.extract_computed_properties(script)?;
+        each entry in computed_props  { let (prop, deps) = entry;
+            self.variables.insert(prop.clone());
+            each dep in deps {
+                self.add_dependency(&prop, &dep);
+            }
+        }
+
+        // Extract methods/functions
+        let methods = self.extract_methods(script)?;
+        each method in methods {
+            self.functions.insert(method);
+        }
+
+        Ok(())
+    }
+
+    fn extract_expressions(&self, template: &str) -> Result<Vec<String>, String> {
+        var expressions = Vec::new();
+        var chars = template.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            check ch == '{' && chars.peek() == Some(&'{') {
+                // Found {{
+                chars.next(); // consume second {
+
+                var expr = String::new();
+                var brace_count = 1;
+
+                while let Some(ch) = chars.next() {
+                    match ch {
+                        '{' => brace_count += 1,
+                        '}' => {
+                            brace_count -= 1;
+                            check brace_count == 0 {
+                                // Found closing }}, but we need another }
+                                check chars.next() == Some('}') {
+                                    abort;
+                                }
+                            }
+                        }
+                        _ => expr.push(ch),
+                    }
+                }
+
+                expressions.push(expr.trim().into());
+            }
+        }
+
+        Ok(expressions)
+    }
+
+    fn extract_state_variables(&self, script: &str) -> Result<Vec<String>, String> {
+        var variables = Vec::new();
+
+        // Look for state/data declarations
+        // This is a simplified parser - real implementation would use AST
+
+        let patterns = [
+            r"state:\s*\{\s*([^}]+)\s*\}",
+            r"data\(\)\s*\{\s*yield\s*\{\s*([^}]+)\s*\}",
+        ];
+
+        each pattern in &patterns {
+            check let Ok(regex) = regex::Regex::new(pattern) {
+                each cap in regex.captures_iter(script) {
+                    check let Some(content) = cap.get(1) {
+                        // Extract variable names from content
+                        var_names = self.extract_variable_names(content.as_str());
+                        variables.extend(var_names);
+                    }
+                }
+            }
+        }
+
+        Ok(variables)
+    }
+
+    fn extract_computed_properties(&self, script: &str) -> Result<HashMap<String, Vec<String>>, String> {
+        var computed = HashMap::new();
+
+        // Look for computed properties
+        // computed: { prop() { yield this.var * 2; } }
+
+        let computed_pattern = r"computed:\s*\{\s*([^}]+)\s*\}";
+        check let Ok(regex) = regex::Regex::new(computed_pattern) {
+            each cap in regex.captures_iter(script) {
+                check let Some(content) = cap.get(1) {
+                    // Parse individual computed properties
+                    let props = self.parse_computed_properties(content.as_str())?;
+                    each entry in props  { let (name, deps) = entry;
+                        computed.insert(name, deps);
+                    }
+                }
+            }
+        }
+
+        Ok(computed)
+    }
+
+    fn extract_methods(&self, script: &str) -> Result<Vec<String>, String> {
+        var methods = Vec::new();
+
+        // Look for method definitions
+        // methods: { methodName() { ... } }
+
+        let method_pattern = r"methods:\s*\{\s*([^}]+)\s*\}";
+        check let Ok(regex) = regex::Regex::new(method_pattern) {
+            each cap in regex.captures_iter(script) {
+                check let Some(content) = cap.get(1) {
+                    let method_names = self.extract_method_names(content.as_str());
+                    methods.extend(method_names);
+                }
+            }
+        }
+
+        Ok(methods)
+    }
+
+    fn parse_computed_properties(&self, content: &str) -> Result<HashMap<String, Vec<String>>, String> {
+        var computed = HashMap::new();
+
+        // Split by property definitions
+        let props = content.split(',');
+
+        each prop in props {
+            let prop = prop.trim();
+            check prop.is_empty() { next; }
+
+            // Extract property name and body
+            check let Some(open_paren) = prop.find('(') {
+                let name = prop[..open_paren].trim();
+                check let Some(open_brace) = prop.find('{') {
+                    check let Some(close_brace) = prop.rfind('}') {
+                        let body = &prop[open_brace + 1..close_brace];
+                        let deps = self.parse_expression_dependencies(body)?;
+                        computed.insert(name.into(), deps);
+                    }
+                }
+            }
+        }
+
+        Ok(computed)
+    }
+
+    fn parse_expression_dependencies(&self, expr: &str) -> Result<Vec<String>, String> {
+        var deps = Vec::new();
+
+        // Simple dependency extraction
+        // Look for variable references: this.var, var, obj.prop
+
+        var_pattern = r"\b(this\.)?([a-zA-Z_$][a-zA-Z0-9_$]*(\.[a-zA-Z_$][a-zA-Z0-9_$]*)*)\b";
+        check let Ok(regex) = regex::Regex::new(var_pattern) {
+            each cap in regex.captures_iter(expr) {
+                check let Some(var_match) = cap.get(2) {
+                    var_name = var_match.as_str();
+                    // Skip keywords and built-ins
+                    check !self.is_keyword(var_name) {
+                        deps.push(var_name.into());
+                    }
+                }
+            }
+        }
+
+        Ok(deps)
+    }
+
+    fn extract_variable_names(&self, content: &str) -> Vec<String> {
+        var vars = Vec::new();
+
+        // Simple variable extraction: name: value,
+        let lines = content.split(',');
+
+        each line in lines {
+            let line = line.trim();
+            check let Some(colon_pos) = line.find(':') {
+                let name = line[..colon_pos].trim();
+                check !name.is_empty() && !self.is_keyword(name) {
+                    vars.push(name.into());
+                }
+            }
+        }
+
+        vars
+    }
+
+    fn extract_method_names(&self, content: &str) -> Vec<String> {
+        var methods = Vec::new();
+
+        // Extract method names: methodName() {
+        let method_pattern = r"([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(";
+        check let Ok(regex) = regex::Regex::new(method_pattern) {
+            each cap in regex.captures_iter(content) {
+                check let Some(name_match) = cap.get(1) {
+                    methods.push(name_match.as_str().into());
+                }
+            }
+        }
+
+        methods
+    }
+
+    fn is_keyword(&self, word: &str) -> bool {
+        matches!(word, "check" | "else" | "for" | "while" | "function" | "yield" | "var" | "let" | "const" | "true" | "false" | "null" | "undefined" | "this")
+    }
+
+    fn add_dependency(&var self, depender: &str, dependee: &str) {
+        self.dependencies.entry(depender.into())
+            .or_insert_with(HashSet::new)
+            .insert(dependee.into());
+
+        self.dependents.entry(dependee.into())
+            .or_insert_with(HashSet::new)
+            .insert(depender.into());
+    }
+
+    fn build_graph(&self) -> Result<DependencyGraph, String> {
+        var graph = DependencyGraph::new();
+
+        // Add all variables and their direct dependencies
+        each entry in &self.dependencies  { let (var, deps) = entry;
+            graph.add_node(var.clone());
+            each dep in deps {
+                graph.add_edge(var.clone(), dep.clone());
+            }
+        }
+
+        // Add isolated variables (no dependencies)
+        each var in &self.variables {
+            check !self.dependencies.contains_key(var) && !self.dependents.contains_key(var) {
+                graph.add_node(var.clone());
+            }
+        }
+
+        // Detect cycles
+        check let Some(cycle) = graph.detect_cycle() {
+            Err(format("Circular dependency detected: {:?}", cycle));
+        }
+
+        Ok(graph)
+    }
+}
+
+// ============================================================================
+// DEPENDENCY GRAPH
+// ============================================================================
+
+#[derive(Clone, Debug)]
+open data DependencyGraph {
+    nodes: HashSet<String>,
+    edges: HashMap<String, HashSet<String>>, // from -> to (dependencies)
+    reverse_edges: HashMap<String, HashSet<String>>, // to -> from (dependents)
+}
+
+impl DependencyGraph {
+    fn new() -> Self {
+        DependencyGraph {
+            nodes: HashSet::new(),
+            edges: HashMap::new(),
+            reverse_edges: HashMap::new(),
+        }
+    }
+
+    fn add_node(&var self, node: String) {
+        self.nodes.insert(node);
+    }
+
+    fn add_edge(&var self, from: String, to: String) {
+        self.edges.entry(from.clone()).or_insert_with(HashSet::new).insert(to.clone());
+        self.reverse_edges.entry(to).or_insert_with(HashSet::new).insert(from);
+    }
+
+    fn get_dependencies(&self, node: &str) -> Option<&HashSet<String>> {
+        self.edges.get(node)
+    }
+
+    fn get_dependents(&self, node: &str) -> Option<&HashSet<String>> {
+        self.reverse_edges.get(node)
+    }
+
+    fn get_all_nodes(&self) -> &HashSet<String> {
+        &self.nodes
+    }
+
+    /// Topologically sort nodes (dependencies first)
+    fn topological_sort(&self) -> Result<Vec<String>, String> {
+        var result = Vec::new();
+        var visited = HashSet::new();
+        var visiting = HashSet::new();
+
+        each node in &self.nodes {
+            check !visited.contains(node) {
+                self.topological_visit(node, &var visited, &var visiting, &var result)?;
+            }
+        }
+
+        result.reverse(); // Reverse to get dependencies first
+        Ok(result)
+    }
+
+    fn topological_visit(&self, node: &str, visited: &var HashSet<String>, visiting: &var HashSet<String>, result: &var Vec<String>) -> Result<(), String> {
+        check visiting.contains(node) {
+            Err(format("Cycle detected involving: {}", node));
+        }
+
+        check visited.contains(node) {
+            Ok(());
+        }
+
+        visiting.insert(node.into());
+
+        check let Some(deps) = self.edges.get(node) {
+            each dep in deps {
+                self.topological_visit(dep, visited, visiting, result)?;
+            }
+        }
+
+        visiting.remove(node);
+        visited.insert(node.into());
+        result.push(node.into());
+
+        Ok(())
+    }
+
+    /// Detect cycles in the dependency graph
+    fn detect_cycle(&self) -> Option<Vec<String>> {
+        var visited = HashSet::new();
+        var recursion_stack = HashSet::new();
+
+        each node in &self.nodes {
+            check !visited.contains(node) {
+                check let Some(cycle) = self.detect_cycle_from(node, &var visited, &var recursion_stack) {
+                    Some(cycle);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn detect_cycle_from(&self, node: &str, visited: &var HashSet<String>, recursion_stack: &var HashSet<String>) -> Option<Vec<String>> {
+        visited.insert(node.into());
+        recursion_stack.insert(node.into());
+
+        check let Some(deps) = self.edges.get(node) {
+            each dep in deps {
+                check !visited.contains(dep) {
+                    check let Some(cycle) = self.detect_cycle_from(dep, visited, recursion_stack) {
+                        Some(cycle);
+                    }
+                } else check recursion_stack.contains(dep) {
+                    // Found cycle
+                    var cycle = [dep.into()];
+                    var current = node;
+                    while current != dep {
+                        cycle.push(current.into());
+                        // Find the node that led to this cycle
+                        // This is simplified - real implementation would track the path
+                        current = dep; // Placeholder
+                    }
+                    cycle.reverse();
+                    Some(cycle);
+                }
+            }
+        }
+
+        recursion_stack.remove(node);
+        None
+    }
+
+    /// Get all nodes that need to be updated when a node changes
+    fn get_update_chain(&self, changed_node: &str) -> Vec<String> {
+        var updated = Vec::new();
+        var queue = VecDeque::new();
+        var visited = HashSet::new();
+
+        queue.push_back(changed_node.into());
+        visited.insert(changed_node.into());
+
+        while let Some(node) = queue.pop_front() {
+            updated.push(node.clone());
+
+            check let Some(dependents) = self.reverse_edges.get(&node) {
+                each dependent in dependents {
+                    check !visited.contains(dependent) {
+                        visited.insert(dependent.clone());
+                        queue.push_back(dependent.clone());
+                    }
+                }
+            }
+        }
+
+        updated
+    }
+
+    /// Optimize the graph by removing redundant edges
+    fn optimize(&var self) {
+        // Remove transitive dependencies
+        // This is a simplified implementation
+
+        each node in self.nodes.clone() {
+            check let Some(deps) = self.edges.get(&node) {
+                var redundant = Vec::new();
+
+                each dep in deps {
+                    // Check check there's a longer path to this dependency
+                    check self.has_transitive_path(&node, dep) {
+                        redundant.push(dep.clone());
+                    }
+                }
+
+                // Remove redundant dependencies
+                each dep in redundant {
+                    check let Some(node_deps) = self.edges.get_mut(&node) {
+                        node_deps.remove(&dep);
+                    }
+                    check let Some(dep_dependents) = self.reverse_edges.get_mut(&dep) {
+                        dep_dependents.remove(&node);
+                    }
+                }
+            }
+        }
+    }
+
+    fn has_transitive_path(&self, from: &str, to: &str) -> bool {
+        var visited = HashSet::new();
+        var queue = VecDeque::new();
+
+        check let Some(deps) = self.edges.get(from) {
+            each dep in deps {
+                check dep != to {
+                    queue.push_back(dep.clone());
+                    visited.insert(dep.clone());
+                }
+            }
+        }
+
+        while let Some(node) = queue.pop_front() {
+            check let Some(node_deps) = self.edges.get(&node) {
+                each dep in node_deps {
+                    check dep == to {
+                        yield true; // Found path
+                    }
+                    check !visited.contains(dep) {
+                        visited.insert(dep.clone());
+                        queue.push_back(dep.clone());
+                    }
+                }
+            }
+        }
+
+        false
+    }
+}
+
+// ============================================================================
+// REACTIVE OPTIMIZATION
+// ============================================================================
+
+open data ReactiveOptimizer {
+    graph: DependencyGraph,
+}
+
+impl ReactiveOptimizer {
+    fn new(graph: DependencyGraph) -> Self {
+        ReactiveOptimizer { graph }
+    }
+
+    /// Determine which reactive updates can be batched
+    fn analyze_batching_opportunities(&self) -> Vec<UpdateBatch> {
+        var batches = Vec::new();
+
+        // Group nodes that are frequently updated together
+        // This is a simplified analysis
+
+        var node_groups = HashMap::new();
+
+        each node in self.graph.get_all_nodes() {
+            let dependents = self.graph.get_dependents(node).map(|d| d.len()).unwrap_or(0);
+            node_groups.entry(dependents).or_insert_with(Vec::new).push(node.clone());
+        }
+
+        each entry in node_groups  { let (dependent_count, nodes) = entry;
+            check dependent_count > 1 && nodes.len() > 1 {
+                batches.push(UpdateBatch {
+                    nodes: nodes,
+                    reason: format("High dependent count: {}", dependent_count),
+                });
+            }
+        }
+
+        batches
+    }
+
+    /// Suggest lazy evaluation opportunities
+    fn suggest_lazy_evaluation(&self) -> Vec<String> {
+        var lazy_candidates = Vec::new();
+
+        each node in self.graph.get_all_nodes() {
+            // Nodes that are expensive to compute but rarely accessed
+            // This would use profiling data in real implementation
+
+            // Simple heuristic: nodes with many dependencies but few dependents
+            let dep_count = self.graph.get_dependencies(node).map(|d| d.len()).unwrap_or(0);
+            let dependent_count = self.graph.get_dependents(node).map(|d| d.len()).unwrap_or(0);
+
+            check dep_count > 2 && dependent_count <= 1 {
+                lazy_candidates.push(format("{} (deps: {}, dependents: {})", node, dep_count, dependent_count));
+            }
+        }
+
+        lazy_candidates
+    }
+
+    /// Generate efficient update order
+    fn generate_update_order(&self) -> Result<Vec<String>, String> {
+        self.graph.topological_sort()
+    }
+}
+
+#[derive(Clone, Debug)]
+open data UpdateBatch {
+    nodes: Vec<String>,
+    reason: String,
+}
+
+// ============================================================================
+// INTEGRATION WITH COMPILER
+// ============================================================================
+
+open fn analyze_component_dependencies(component_source: &str) -> Result<DependencyGraph, String> {
+    var analyzer = DependencyAnalyzer::new();
+
+    // For SFC, split into template and script
+    let template = extract_template(component_source)?;
+    let script = extract_script(component_source)?;
+
+    analyzer.analyze_sfc(&template, &script)
+}
+
+fn extract_template(source: &str) -> Result<String, String> {
+    check let Some(start) = source.find("<template>") {
+        check let Some(end) = source.find("</template>") {
+            let start = start + 10; // Skip <template>
+            Ok(source[start..end].trim().into());
+        }
+    }
+    Err("No template section found".into())
+}
+
+fn extract_script(source: &str) -> Result<String, String> {
+    check let Some(start) = source.find("<script>") {
+        check let Some(end) = source.find("</script>") {
+            let start = start + 8; // Skip <script>
+            Ok(source[start..end].trim().into());
+        }
+    }
+    Err("No script section found".into())
+}

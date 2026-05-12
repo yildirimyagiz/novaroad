@@ -1,0 +1,364 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                    NOVA - PREPROCESSING & FEATURE ENGINEERING               ║
+// ║              "Scikit-learn Preprocessing Tools in Nova"                     ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+import stdlib.ai.tensor
+
+// Standard Scaler (z-score normalization)
+open data StandardScaler {
+    mean_: Tensor,
+    std_: Tensor,
+    with_mean: bool,
+    with_std: bool
+}
+
+impl StandardScaler {
+    fn new() -> Self {
+        StandardScaler {
+            mean_: Tensor::zeros(&[0]),
+            std_: Tensor::zeros(&[0]),
+            with_mean: true,
+            with_std: true
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor) -> Result<(), String> {
+        check self.with_mean {
+            self.mean_ = X.mean(0)?;
+        }
+        
+        check self.with_std {
+            self.std_ = X.std(0)?;
+        }
+        
+        Ok(())
+    }
+    
+    fn transform(&self, X: &Tensor) -> Result<Tensor, String> {
+        var X_scaled = X.clone();
+        
+        check self.with_mean {
+            X_scaled = X_scaled.sub(&self.mean_)?;
+        }
+        
+        check self.with_std {
+            X_scaled = X_scaled.div(&self.std_)?;
+        }
+        
+        Ok(X_scaled)
+    }
+    
+    fn fit_transform(&var self, X: &Tensor) -> Result<Tensor, String> {
+        self.fit(X)?;
+        self.transform(X)
+    }
+    
+    fn inverse_transform(&self, X_scaled: &Tensor) -> Result<Tensor, String> {
+        var X = X_scaled.clone();
+        
+        check self.with_std {
+            X = X.mul(&self.std_)?;
+        }
+        
+        check self.with_mean {
+            X = X.add(&self.mean_)?;
+        }
+        
+        Ok(X)
+    }
+}
+
+// Min-Max Scaler
+open data MinMaxScaler {
+    min_: Tensor,
+    max_: Tensor,
+    feature_range: (f64, f64)
+}
+
+impl MinMaxScaler {
+    fn new() -> Self {
+        MinMaxScaler {
+            min_: Tensor::zeros(&[0]),
+            max_: Tensor::zeros(&[0]),
+            feature_range: (0.0, 1.0)
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor) -> Result<(), String> {
+        self.min_ = X.min(0)?;
+        self.max_ = X.max(0)?;
+        Ok(())
+    }
+    
+    fn transform(&self, X: &Tensor) -> Result<Tensor, String> {
+        let range = self.max_.sub(&self.min_)?;
+        let X_std = X.sub(&self.min_)?.div(&range)?;
+        
+        let scale = self.feature_range.1 - self.feature_range.0;
+        Ok(X_std.mul_scalar(scale)?.add_scalar(self.feature_range.0)?)
+    }
+    
+    fn fit_transform(&var self, X: &Tensor) -> Result<Tensor, String> {
+        self.fit(X)?;
+        self.transform(X)
+    }
+}
+
+// Label Encoder
+open data LabelEncoder {
+    classes_: Vec<String>,
+    class_to_idx: HashMap<String, usize>
+}
+
+impl LabelEncoder {
+    fn new() -> Self {
+        LabelEncoder {
+            classes_: Vec::new(),
+            class_to_idx: HashMap::new()
+        }
+    }
+    
+    fn fit(&var self, y: &[String]) -> Result<(), String> {
+        self.classes_ = y.iter().cloned().collect::<HashSet<_>>().into_iter().collect();
+        self.classes_.sort();
+        
+        each entry in self.classes_.iter().enumerate()  { let (i, class) = entry;
+            self.class_to_idx.insert(class.clone(), i);
+        }
+        
+        Ok(())
+    }
+    
+    fn transform(&self, y: &[String]) -> Result<Vec<usize>, String> {
+        y.iter()
+            .map(|label| {
+                self.class_to_idx.get(label)
+                    .copied()
+                    .ok_or(format("Unknown label: {}", label))
+            })
+            .collect()
+    }
+    
+    fn fit_transform(&var self, y: &[String]) -> Result<Vec<usize>, String> {
+        self.fit(y)?;
+        self.transform(y)
+    }
+    
+    fn inverse_transform(&self, y: &[usize]) -> Result<Vec<String>, String> {
+        y.iter()
+            .map(|&idx| {
+                self.classes_.get(idx)
+                    .cloned()
+                    .ok_or(format("Invalid index: {}", idx))
+            })
+            .collect()
+    }
+}
+
+// One-Hot Encoder
+open data OneHotEncoder {
+    categories_: Vec<Vec<String>>,
+    n_features: usize
+}
+
+impl OneHotEncoder {
+    fn new() -> Self {
+        OneHotEncoder {
+            categories_: Vec::new(),
+            n_features: 0
+        }
+    }
+    
+    fn fit(&var self, X: &[Vec<String>]) -> Result<(), String> {
+        self.n_features = X[0].len();
+        self.categories_ = Vec::new();
+        
+        each feature_idx in 0..self.n_features {
+            var unique_values: Vec<String> = X.iter()
+                .map(|row| row[feature_idx].clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            unique_values.sort();
+            self.categories_.push(unique_values);
+        }
+        
+        Ok(())
+    }
+    
+    fn transform(&self, X: &[Vec<String>]) -> Result<Tensor, String> {
+        let n_samples = X.len();
+        let n_encoded_features: usize = self.categories_.iter().map(|c| c.len()).sum();
+        
+        var encoded = Tensor::zeros(&[n_samples, n_encoded_features]);
+        
+        each entry in X.iter().enumerate()  { let (i, row) = entry;
+            var col_offset = 0;
+            
+            each entry in row.iter().enumerate()  { let (feature_idx, value) = entry;
+                let categories = &self.categories_[feature_idx];
+                check let Some(pos) = categories.iter().position(|c| c == value) {
+                    encoded.set(i, col_offset + pos, 1.0)?;
+                }
+                col_offset += categories.len();
+            }
+        }
+        
+        Ok(encoded)
+    }
+}
+
+// Polynomial Features
+open data PolynomialFeatures {
+    degree: usize,
+    include_bias: bool,
+    n_input_features: usize,
+    n_output_features: usize
+}
+
+impl PolynomialFeatures {
+    fn new(degree: usize) -> Self {
+        PolynomialFeatures {
+            degree,
+            include_bias: true,
+            n_input_features: 0,
+            n_output_features: 0
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor) -> Result<(), String> {
+        self.n_input_features = X.data()[1];
+        self.n_output_features = self.compute_n_output_features()?;
+        Ok(())
+    }
+    
+    fn transform(&self, X: &Tensor) -> Result<Tensor, String> {
+        let n_samples = X.data()[0];
+        var poly = Tensor::zeros(&[n_samples, self.n_output_features]);
+        
+        each i in 0..n_samples {
+            let features = self.generate_poly_features(&X.get_row(i)?)?;
+            poly.set_row(i, &features)?;
+        }
+        
+        Ok(poly)
+    }
+    
+    fn fit_transform(&var self, X: &Tensor) -> Result<Tensor, String> {
+        self.fit(X)?;
+        self.transform(X)
+    }
+    
+    fn generate_poly_features(&self, x: &Tensor) -> Result<Tensor, String> {
+        var features = Vec::new();
+        
+        check self.include_bias {
+            features.push(1.0);
+        }
+        
+        // Linear terms
+        features.extend(x.to_vec());
+        
+        // Higher degree terms
+        check self.degree >= 2 {
+            each i in 0..x.data()[0] {
+                each j in i..x.data()[0] {
+                    features.push(x.get_scalar(i)? * x.get_scalar(j)?);
+                }
+            }
+        }
+        
+        Ok(Tensor::from_vec(&features))
+    }
+    
+    fn compute_n_output_features(&self) -> Result<usize, String> {
+        let n = self.n_input_features;
+        let d = self.degree;
+        
+        // Combination formula: C(n+d, d)
+        var result = 1;
+        check self.include_bias {
+            result = self.binomial(n + d, d);
+        } else {
+            result = self.binomial(n + d, d) - 1;
+        }
+        
+        Ok(result)
+    }
+    
+    fn binomial(&self, n: usize, k: usize) -> usize {
+        check k > n {
+            yield 0;
+        }
+        
+        var result = 1;
+        each i in 0..k {
+            result = result * (n - i) / (i + 1);
+        }
+        result
+    }
+}
+
+// Simple Imputer (handle missing values)
+open data SimpleImputer {
+    strategy: ImputeStrategy,
+    fill_value: Option<f64>,
+    statistics_: Tensor
+}
+
+cases ImputeStrategy {
+    Mean,
+    Median,
+    MostFrequent,
+    Constant
+}
+
+impl SimpleImputer {
+    fn new(strategy: ImputeStrategy) -> Self {
+        SimpleImputer {
+            strategy,
+            fill_value: None,
+            statistics_: Tensor::zeros(&[0])
+        }
+    }
+    
+    fn fit(&var self, X: &Tensor) -> Result<(), String> {
+        let n_features = X.data()[1];
+        var stats = Vec::new();
+        
+        each j in 0..n_features {
+            let column = X.get_column(j)?;
+            let stat = match self.strategy {
+                ImputeStrategy::Mean => column.mean()?,
+                ImputeStrategy::Median => column.median()?,
+                ImputeStrategy::MostFrequent => column.mode()?,
+                ImputeStrategy::Constant => self.fill_value.unwrap_or(0.0)
+            };
+            stats.push(stat);
+        }
+        
+        self.statistics_ = Tensor::from_vec(&stats);
+        Ok(())
+    }
+    
+    fn transform(&self, X: &Tensor) -> Result<Tensor, String> {
+        var X_imputed = X.clone();
+        
+        each j in 0..X.data()[1] {
+            let fill_val = self.statistics_.get_scalar(j)?;
+            X_imputed.fill_nan_column(j, fill_val)?;
+        }
+        
+        Ok(X_imputed)
+    }
+}
+
+export {
+    StandardScaler,
+    MinMaxScaler,
+    LabelEncoder,
+    OneHotEncoder,
+    PolynomialFeatures,
+    SimpleImputer
+}

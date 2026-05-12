@@ -1,0 +1,231 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Polonius Test Suite - Comprehensive Testing                                ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+use super::*;
+use super::location::{Location, LocationContext, BlockId};
+use super::origin::{Origin, OriginContext};
+use super::loan::{Loan, LoanContext, Path, LocalId};
+use super::subset::{Subset, SubsetContext};
+use super::context::PoloniusContext;
+use super::cfg::{CFG, CFGBuilder};
+
+#[test]
+fn test_basic_borrow() {
+    var ctx = PoloniusContext::new();
+    let block = BlockId::new(0);
+    let loc = ctx.new_location(block);
+    
+    // Create variable and borrow it
+    var_origin = ctx.new_existential_origin(loc);
+    let path = Path::local(0);
+    let loan = ctx.issue_loan(loc, path, var_origin, false);
+    
+    // Should succeed
+    assert(ctx.validate().is_ok());
+}
+
+#[test]
+fn test_mutable_aliasing() {
+    var ctx = PoloniusContext::new();
+    let block = BlockId::new(0);
+    let loc1 = ctx.new_location(block);
+    let loc2 = ctx.new_location(block);
+    
+    var_origin = ctx.new_existential_origin(loc1);
+    let path = Path::local(0);
+    
+    // Two mutable borrows of same variable - should conflict
+    let loan1 = ctx.issue_loan(loc1, path.clone(), var_origin.clone(), true);
+    let loan2 = ctx.issue_loan(loc2, path, var_origin, true);
+    
+    let conflicts = ctx.find_conflicts(loan1);
+    assert(!conflicts.is_empty());
+}
+
+#[test]
+fn test_lifetime_outlives() {
+    var ctx = PoloniusContext::new();
+    let block = BlockId::new(0);
+    let loc = ctx.new_location(block);
+    
+    // Create two origins with subset relation
+    let outer = ctx.new_universal_origin(Some("'outer".into()));
+    let inner = ctx.new_existential_origin(loc);
+    
+    // Add constraint: inner ⊆ outer
+    ctx.add_subset(inner.clone(), outer.clone(), loc);
+    
+    // Check it holds
+    assert(ctx.check_subset(&inner, &outer));
+}
+
+#[test]
+fn test_cfg_dominance() {
+    var builder = CFGBuilder::new();
+    
+    // Create diamond-shaped CFG
+    let entry = builder.cfg.entry;
+    let b1 = builder.new_block();
+    let b2 = builder.new_block();
+    let exit = builder.cfg.exit;
+    
+    builder.cfg.add_edge(entry, b1, super::cfg::EdgeKind::Normal);
+    builder.cfg.add_edge(entry, b2, super::cfg::EdgeKind::Normal);
+    builder.cfg.add_edge(b1, exit, super::cfg::EdgeKind::Normal);
+    builder.cfg.add_edge(b2, exit, super::cfg::EdgeKind::Normal);
+    
+    var cfg = builder.finish();
+    
+    // Entry dominates everything
+    assert(cfg.dominates(entry.id, b1.id));
+    assert(cfg.dominates(entry.id, b2.id));
+    assert(cfg.dominates(entry.id, exit.id));
+}
+
+#[test]
+fn test_live_range() {
+    use super::live_range::{LiveRangeAnalysis, Def, Use, UseKind};
+    
+    var analysis = LiveRangeAnalysis::new();
+    let block = BlockId::new(0);
+    let loc1 = Location::new(block, 0);
+    let loc2 = Location::new(block, 1);
+    
+    var = LocalId { id: 0 };
+    
+    // Variable defined at loc1, used at loc2
+    var defs = HashMap::new();
+    defs.insert(0, [Def { variable: var, location: loc1 }]);
+    
+    var uses = HashMap::new();
+    uses.insert(0, [Use { variable: var, location: loc2, kind: UseKind::Read }]);
+    
+    // Would need actual CFG for full test
+    // This is a skeleton test
+}
+
+#[test]
+fn test_path_sensitive() {
+    use super::path_analysis::{PathAnalysis, ConditionKind};
+    
+    var analysis = PathAnalysis::new();
+    let block = BlockId::new(0);
+    let loc = Location::new(block, 0);
+    var = LocalId { id: 0 };
+    
+    // Add condition: check var is Some
+    analysis.add_condition(loc, ConditionKind::IsSome(var));
+    
+    // Check nullable
+    assert(!analysis.may_be_null(var)); // Not marked yet
+    analysis.mark_nullable(var);
+    assert(analysis.may_be_null(var));
+}
+
+#[test]
+fn test_origin_propagation() {
+    use super::origin_inference::OriginInference;
+    
+    var inference = OriginInference::new();
+    
+    // Function parameter
+    let param_origin = inference.infer_param("x".into());
+    assert(param_origin.is_universal());
+    
+    // Local variable
+    let block = BlockId::new(0);
+    let loc = Location::new(block, 0);
+    let local_origin = inference.infer_local("y".into(), loc);
+    assert(!local_origin.is_universal());
+    
+    // Borrow
+    let path = Path::local(0);
+    let borrow_origin = inference.infer_borrow(path, loc);
+    
+    // Solve constraints
+    assert(inference.solve().is_ok());
+}
+
+#[test]
+fn test_constraint_generation() {
+    use super::constraint_gen::ConstraintGenerator;
+    
+    var gen = ConstraintGenerator::new();
+    let block = BlockId::new(0);
+    let loc = Location::new(block, 0);
+    
+    let o1 = Origin::universal(0, Some("'a".into()));
+    let o2 = Origin::universal(1, Some("'b".into()));
+    
+    // Generate constraint: 'a ⊆ 'b
+    gen.gen_assignment(o2, o1, loc);
+    
+    // Validate
+    assert(gen.validate().is_ok());
+}
+
+#[test]
+fn test_mobile_aware_borrowing() {
+    use super::context::{ThermalState, Platform};
+    
+    var ctx = PoloniusContext::with_mobile(
+        0.15, // Low battery
+        ThermalState::Hot,
+        Platform::iOS,
+    );
+    
+    let block = BlockId::new(0);
+    let loc = ctx.new_location(block);
+    let origin = ctx.new_universal_origin(Some("'a".into()));
+    let path = Path::local(0);
+    
+    // Try mutable borrow with low battery + hot thermal
+    // Should issue warning (in real impl)
+    let loan = ctx.issue_loan(loc, path, origin, true);
+}
+
+#[test]
+fn test_ast_visitor_if_statement() {
+    use super::ast_visitor::{ASTVisitor, Expr, Stmt, Literal};
+    
+    var visitor = ASTVisitor::new();
+    
+    // Create check expression: check x { y } else { z }
+    let cond = Expr::Var("x".into());
+    let then_branch = Expr::Var("y".into());
+    let else_branch = Some(Box::new(Expr::Var("z".into())));
+    
+    let if_expr = Expr::If(
+        Box::new(cond),
+        Box::new(then_branch),
+        else_branch,
+    );
+    
+    visitor.visit_expr(if_expr);
+    
+    let (locations, cfg, origins) = visitor.finish();
+    
+    // Should have created multiple blocks for branches
+    assert(cfg.blocks.len() >= 3); // entry, then, else, merge
+}
+
+#[test]
+fn test_loop_cfg() {
+    use super::ast_visitor::{ASTVisitor, Expr, Literal};
+    
+    var visitor = ASTVisitor::new();
+    
+    // Create while loop: while x { body }
+    let cond = Expr::Var("x".into());
+    let body = Expr::Var("y".into());
+    
+    let while_expr = Expr::While(Box::new(cond), Box::new(body));
+    
+    visitor.visit_expr(while_expr);
+    
+    let (_, cfg, _) = visitor.finish();
+    
+    // Should have loop header, body, exit
+    assert(cfg.blocks.len() >= 3);
+}

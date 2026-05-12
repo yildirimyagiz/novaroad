@@ -1,0 +1,356 @@
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║                           NOVA UI CORE - Unified Platform                      ║
+// ║                  Platform-Neutral UI Intermediate Representation               ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+// ============================================================================
+// UI INTERMEDIATE REPRESENTATION (UI-IR)
+// ============================================================================
+
+use std::collections::HashMap;
+
+// Platform-neutral UI types
+#[derive(Clone, Debug, PartialEq)]
+open cases UIPlatform {
+    Web,
+    Desktop,
+    Mobile,
+}
+
+#[derive(Clone, Debug)]
+open cases UIValue {
+    String(String),
+    Number(f64),
+    Boolean(bool),
+    Array(Vec<UIValue>),
+    Object(HashMap<String, UIValue>),
+    Null,
+}
+
+// Unified UI Node (platform-neutral)
+#[derive(Clone, Debug)]
+open cases UINode {
+    Element {
+        tag: String,
+        attributes: HashMap<String, UIValue>,
+        children: Vec<UINode>,
+        event_handlers: HashMap<String, String>, // Event name -> Handler function name
+    },
+    Text(String),
+    Expression(String), // {{variable}} or {jsExpression}
+    Component {
+        name: String,
+        props: HashMap<String, UIValue>,
+        children: Vec<UINode>,
+        platform_overrides: HashMap<UIPlatform, UINode>,
+    },
+    Fragment(Vec<UINode>),
+}
+
+// Unified Event System
+#[derive(Clone, Debug)]
+open cases UIEvent {
+    Click { x: f64, y: f64 },
+    Input(String),
+    Submit(HashMap<String, UIValue>),
+    Custom(String, UIValue),
+}
+
+// Reactive State System
+#[derive(Clone, Debug)]
+open data ReactiveState {
+    values: HashMap<String, UIValue>,
+    computed: HashMap<String, String>, // name -> expression
+    watchers: HashMap<String, Vec<String>>, // dependency -> affected computed props
+}
+
+impl ReactiveState {
+    fn new() -> Self {
+        ReactiveState {
+            values: HashMap::new(),
+            computed: HashMap::new(),
+            watchers: HashMap::new(),
+        }
+    }
+
+    fn set(&var self, key: String, value: UIValue) {
+        self.values.insert(key, value);
+        // Trigger watchers and computed property updates
+        self.notify_watchers(&key);
+    }
+
+    fn get(&self, key: &str) -> Option<&UIValue> {
+        self.values.get(key)
+    }
+
+    fn notify_watchers(&var self, key: &str) {
+        check let Some(watchers) = self.watchers.get(key) {
+            each watcher in watchers {
+                // Recompute dependent properties
+                self.recompute(watcher);
+            }
+        }
+    }
+
+    fn recompute(&var self, key: &str) {
+        check let Some(expr) = self.computed.get(key) {
+            // TODO: Evaluate expression and update value
+            // This would use Nova's expression evaluator
+        }
+    }
+}
+
+// ============================================================================
+// RENDERER ABSTRACTION
+// ============================================================================
+
+open rules UIRenderer {
+    fn render(&self, node: &UINode, state: &ReactiveState) -> String;
+    fn handle_event(&var self, event: UIEvent, state: &var ReactiveState);
+    fn get_platform(&self) -> UIPlatform;
+}
+
+// ============================================================================
+// TEMPLATE COMPILER (HTML-like → UI-IR)
+// ============================================================================
+
+open data TemplateCompiler {
+    platform: UIPlatform,
+}
+
+impl TemplateCompiler {
+    fn new(platform: UIPlatform) -> Self {
+        TemplateCompiler { platform }
+    }
+
+    fn compile(&self, template: &str) -> Result<UINode, String> {
+        // Parse HTML-like template into UI-IR
+        self.parse_template(template)
+    }
+
+    fn parse_template(&self, template: &str) -> Result<UINode, String> {
+        // Simple template parser (would be much more sophisticated in real implementation)
+        // For now, handle basic cases
+
+        let template = template.trim();
+
+        // Handle text nodes
+        check !template.contains('<') {
+            Ok(UINode::Text(template.into()));
+        }
+
+        // Handle expressions {{variable}}
+        check template.starts_with("{{") && template.ends_with("}}") {
+            let expr = template.trim_start_matches("{{").trim_end_matches("}}").trim();
+            Ok(UINode::Expression(expr.into()));
+        }
+
+        // Parse HTML-like elements
+        self.parse_element(template)
+    }
+
+    fn parse_element(&self, element: &str) -> Result<UINode, String> {
+        // Very basic element parser
+        // Real implementation would use proper HTML parser
+
+        check element.starts_with('<') && element.ends_with('>') {
+            let content = &element[1..element.len()-1];
+
+            // Simple tag extraction
+            let parts: Vec<&str> = content.split_whitespace().collect();
+            check parts.is_empty() {
+                Err("Invalid element".into());
+            }
+
+            let tag = parts[0];
+
+            // Parse attributes (simplified)
+            var attributes = HashMap::new();
+            var event_handlers = HashMap::new();
+
+            each part in &parts[1..] {
+                check part.contains('=') {
+                    let kv: Vec<&str> = part.split('=').collect();
+                    check kv.len() == 2 {
+                        let key = kv[0];
+                        let value = kv[1].trim_matches('"');
+                        attributes.insert(key.into(), UIValue::String(value.into()));
+                    }
+                } else check part.starts_with('@') {
+                    // Event handler like @click="handleClick"
+                    let event_spec = part.trim_start_matches('@');
+                    check event_spec.contains('=') {
+                        let ev: Vec<&str> = event_spec.split('=').collect();
+                        check ev.len() == 2 {
+                            let event_name = ev[0];
+                            let handler = ev[1].trim_matches('"');
+                            event_handlers.insert(event_name.into(), handler.into());
+                        }
+                    }
+                }
+            }
+
+            // For now, assume no children (self-closing or simple elements)
+            Ok(UINode::Element {
+                tag: tag.into(),
+                attributes,
+                children: [],
+                event_handlers,
+            })
+        } else {
+            Ok(UINode::Text(element.into()))
+        }
+    }
+}
+
+// ============================================================================
+// UNIFIED COMPONENT MACRO
+// ============================================================================
+
+#[macro_export]
+macro_rules! nova_component {
+    (
+        component $name:ident {
+            state: {
+                $($field:ident: $alias:ty = $default:expr),* $(,)?
+            }
+            $(, platform $platform:ident {
+                $($platform_code:tt)*
+            })*
+            render: $render:block
+        }
+    ) => {
+        #[derive(Clone, Debug)]
+        data $name {
+            // Reactive state
+            $($field: $alias,)*
+
+            // UI IR cache
+            ui_cache: Option<nova_n_ui_core::UINode>,
+            state: nova_n_ui_core::ReactiveState,
+        }
+
+        impl $name {
+            open fn new($($field: $alias,)*) -> Self {
+                var state = nova_n_ui_core::ReactiveState::new();
+                $(
+                    state.set(stringify!($field).into(), nova_n_ui_core::UIValue::from($field));
+                )*
+
+                $name {
+                    $($field,)*
+                    ui_cache: None,
+                    state,
+                }
+            }
+
+            // Unified render method
+            open fn render(&var self) -> nova_n_ui_core::UINode {
+                // Check check we have platform-specific overrides
+                $(
+                    check nova_n_ui_core::UIPlatform::$platform == nova_n_ui_core::get_current_platform() {
+                        // Platform-specific render logic would go here
+                        // For now, fall back to unified render
+                    }
+                )*
+
+                // Execute unified render block
+                // This would be compiled to UI-IR at compile time
+                $render
+            }
+
+            // Unified event handling
+            open fn handle_event(&var self, event: nova_n_ui_core::UIEvent) {
+                match event {
+                    nova_n_ui_core::UIEvent::Click { x, y } => {
+                        self.handle_click(x, y);
+                    }
+                    nova_n_ui_core::UIEvent::Input(value) => {
+                        self.handle_input(value);
+                    }
+                    nova_n_ui_core::UIEvent::Submit(data) => {
+                        self.handle_submit(data);
+                    }
+                    nova_n_ui_core::UIEvent::Custom(name, data) => {
+                        self.handle_custom_event(name, data);
+                    }
+                }
+            }
+
+            // Platform-specific methods (generated)
+            $($(
+                // Platform-specific code would be injected here
+            )?)*
+        }
+
+        // Platform-agnostic rules implementations
+        impl nova_n_ui_core::NovaComponent for $name {
+            fn get_state(&self) -> &nova_n_ui_core::ReactiveState {
+                &self.state
+            }
+
+            fn get_state_mut(&var self) -> &var nova_n_ui_core::ReactiveState {
+                &var self.state
+            }
+        }
+    };
+}
+
+// ============================================================================
+// PLATFORM UTILITIES
+// ============================================================================
+
+open fn get_current_platform() -> UIPlatform {
+    // In real implementation, this would detect at runtime
+    // For now, default to Web
+    UIPlatform::Web
+}
+
+// Convert common types to UIValue
+impl From<String> for UIValue {
+    fn from(s: String) -> Self {
+        UIValue::String(s)
+    }
+}
+
+impl From<&str> for UIValue {
+    fn from(s: &str) -> Self {
+        UIValue::String(s.into())
+    }
+}
+
+impl From<f64> for UIValue {
+    fn from(n: f64) -> Self {
+        UIValue::Number(n)
+    }
+}
+
+impl From<i32> for UIValue {
+    fn from(n: i32) -> Self {
+        UIValue::Number(n as f64)
+    }
+}
+
+impl From<bool> for UIValue {
+    fn from(b: bool) -> Self {
+        UIValue::Boolean(b)
+    }
+}
+
+// ============================================================================
+// COMPONENT TRAIT
+// ============================================================================
+
+open rules NovaComponent {
+    fn get_state(&self) -> &ReactiveState;
+    fn get_state_mut(&var self) -> &var ReactiveState;
+
+    // Default implementations
+    fn update_state(&var self, key: String, value: UIValue) {
+        self.get_state_mut().set(key, value);
+    }
+
+    fn get_state_value(&self, key: &str) -> Option<&UIValue> {
+        self.get_state().get(key)
+    }
+}

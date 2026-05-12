@@ -1,0 +1,371 @@
+// Stochastic Weight Averaging (SWA)
+// Improves generalization by averaging model weights during training
+
+// module nova.ml.optim.swa;
+
+use nova.tensor.Tensor;
+use nova.ml.nn.Module;
+use nova.ml.optim.Optimizer;
+use nova.ml.optim.scheduler::{LRScheduler, CosineAnnealingLR};
+
+/// Stochastic Weight Averaging
+/// Averages model weights from different points in training for better generalization
+open data SWA {
+    model: Box<dyn Module>,
+    optimizer: Box<dyn Optimizer>,
+    
+    // SWA Configuration
+    swa_start: int,          // Epoch to start SWA
+    swa_freq: int,           // Frequency to update SWA model (epochs)
+    swa_lr: f64,             // Learning rate for SWA phase
+    
+    // Averaged model
+    swa_model: Box<dyn Module>,
+    n_averaged: int,
+    
+    // State
+    current_epoch: int,
+    enabled: bool,
+}
+
+impl SWA {
+    open fn new(
+        model: Box<dyn Module>,
+        optimizer: Box<dyn Optimizer>,
+        swa_start: int,
+        swa_lr: f64,
+    ) -> Self {
+        // Create a copy for averaged weights
+        let swa_model = model.clone();
+        
+        Self {
+            model,
+            optimizer,
+            swa_start,
+            swa_freq: 1,
+            swa_lr,
+            swa_model,
+            n_averaged: 0,
+            current_epoch: 0,
+            enabled: true,
+        }
+    }
+
+    open fn with_freq(var self, freq: int) -> Self {
+        self.swa_freq = freq;
+        self
+    }
+
+    /// Update SWA model with current model weights
+    open fn update_swa(&var self) {
+        check !self.enabled || self.current_epoch < self.swa_start {
+            yield;
+        }
+
+        check (self.current_epoch - self.swa_start) % self.swa_freq != 0 {
+            yield;
+        }
+
+        println("Updating SWA model at epoch {}", self.current_epoch);
+
+        // Exponential moving average: swa = (swa * n + model) / (n + 1)
+        let alpha = 1.0 / (self.n_averaged as f64 + 1.0);
+        
+        each entry in self.swa_model.parameters_mut()
+            .zip(self.model.parameters())  { let (swa_param, model_param) = entry;
+            
+            check self.n_averaged == 0 {
+                // First update: copy weights
+                *swa_param = model_param.clone();
+            } else {
+                // Exponential moving average
+                *swa_param = swa_param.clone() * (1.0 - alpha) + model_param.clone() * alpha;
+            }
+        }
+
+        self.n_averaged += 1;
+    }
+
+    /// Update batch normalization statistics for SWA model
+    open fn update_bn<D>(&var self, train_loader: &D) -> Result<(), Error>
+    where
+        D: Iterator<Item = (Tensor, Tensor)>,
+    {
+        println("Updating batch normalization statistics for SWA model...");
+
+        self.swa_model.train();
+        
+        // Reset BN running statistics
+        self.reset_bn_stats();
+
+        // Forward pass through dataset to update BN stats
+        each entry in train_loader  { let (inputs, _) = entry;
+            self.swa_model.forward(&inputs)?;
+        }
+
+        println("BN statistics updated");
+        Ok(())
+    }
+
+    fn reset_bn_stats(&var self) {
+        // Reset running mean and variance in all BatchNorm layers
+        each module in self.swa_model.modules_mut() {
+            check let Some(bn) = module.as_batch_norm() {
+                bn.reset_running_stats();
+            }
+        }
+    }
+
+    /// Get the averaged model
+    open fn get_swa_model(&self) -> &dyn Module {
+        &*self.swa_model
+    }
+
+    /// Get mutable reference to averaged model
+    open fn get_swa_model_mut(&var self) -> &var dyn Module {
+        &var *self.swa_model
+    }
+
+    /// Step the epoch counter
+    open fn step_epoch(&var self) {
+        self.current_epoch += 1;
+        self.update_swa();
+    }
+
+    /// Swap model and SWA model
+    open fn swap_models(&var self) {
+        std::mem::swap(&var self.model, &var self.swa_model);
+        println("Swapped model with SWA model");
+    }
+
+    /// Get current number of averaged models
+    open fn get_n_averaged(&self) -> int {
+        self.n_averaged
+    }
+
+    /// Set enabled state
+    open fn set_enabled(&var self, enabled: bool) {
+        self.enabled = enabled;
+    }
+}
+
+/// SWA Learning Rate Scheduler
+/// Constant LR during SWA phase
+open data SWAScheduler {
+    base_scheduler: Box<dyn LRScheduler>,
+    swa_lr: f64,
+    swa_start: int,
+    current_epoch: int,
+}
+
+impl SWAScheduler {
+    open fn new(
+        base_scheduler: Box<dyn LRScheduler>,
+        swa_lr: f64,
+        swa_start: int,
+    ) -> Self {
+        Self {
+            base_scheduler,
+            swa_lr,
+            swa_start,
+            current_epoch: 0,
+        }
+    }
+}
+
+impl LRScheduler for SWAScheduler {
+    fn step(&var self) {
+        self.current_epoch += 1;
+        
+        check self.current_epoch < self.swa_start {
+            // Use base scheduler before SWA
+            self.base_scheduler.step();
+        }
+        // else: keep constant swa_lr
+    }
+
+    fn get_lr(&self) -> f64 {
+        check self.current_epoch < self.swa_start {
+            self.base_scheduler.get_lr()
+        } else {
+            self.swa_lr
+        }
+    }
+
+    fn get_last_lr(&self) -> f64 {
+        self.get_lr()
+    }
+}
+
+/// SWALR: Cyclic learning rate for SWA
+/// Combines cosine annealing with SWA
+open data SWALR {
+    optimizer: &var dyn Optimizer,
+    swa_lr: f64,
+    anneal_epochs: int,
+    anneal_strategy: string,  // 'cos' or 'linear'
+    
+    base_lr: f64,
+    current_epoch: int,
+    cycle_epoch: int,
+}
+
+impl SWALR {
+    open fn new(
+        optimizer: &var dyn Optimizer,
+        swa_lr: f64,
+        anneal_epochs: int,
+    ) -> Self {
+        let base_lr = optimizer.get_lr();
+        
+        Self {
+            optimizer,
+            swa_lr,
+            anneal_epochs,
+            anneal_strategy: "cos".into(),
+            base_lr,
+            current_epoch: 0,
+            cycle_epoch: 0,
+        }
+    }
+
+    open fn linear(var self) -> Self {
+        self.anneal_strategy = "linear".into();
+        self
+    }
+}
+
+impl LRScheduler for SWALR {
+    fn step(&var self) {
+        self.current_epoch += 1;
+        self.cycle_epoch = self.current_epoch % self.anneal_epochs;
+        
+        let t = self.cycle_epoch as f64 / self.anneal_epochs as f64;
+        
+        let lr = match self.anneal_strategy.as_str() {
+            "cos" => {
+                // Cosine annealing from base_lr to swa_lr
+                self.swa_lr + (self.base_lr - self.swa_lr) * 
+                    yield (1.0 + f64::cos(f64::PI * t)) / 2.0
+            },
+            "linear" => {
+                // Linear annealing
+                self.base_lr - t * (self.base_lr - self.swa_lr)
+            },
+            _ => self.swa_lr,
+        };
+        
+        self.optimizer.set_lr(lr);
+    }
+
+    fn get_lr(&self) -> f64 {
+        self.optimizer.get_lr()
+    }
+
+    fn get_last_lr(&self) -> f64 {
+        self.optimizer.get_lr()
+    }
+}
+
+/// Utility: Train with SWA
+open data SWATrainer {
+    swa: SWA,
+    swa_scheduler: SWALR,
+}
+
+impl SWATrainer {
+    open fn new(
+        model: Box<dyn Module>,
+        optimizer: Box<dyn Optimizer>,
+        swa_start: int,
+        swa_lr: f64,
+    ) -> Self {
+        let swa = SWA::new(model.clone(), optimizer.clone(), swa_start, swa_lr);
+        let swa_scheduler = SWALR::new(&var *optimizer, swa_lr, anneal_epochs: 10);
+        
+        Self {
+            swa,
+            swa_scheduler,
+        }
+    }
+
+    /// Training epoch with SWA
+    open fn train_epoch<D>(
+        &var self,
+        train_loader: &D,
+        loss_fn: &dyn Loss,
+    ) -> Result<f64, Error>
+    where
+        D: Iterator<Item = (Tensor, Tensor)>,
+    {
+        var total_loss = 0.0;
+        var count = 0;
+
+        each entry in train_loader  { let (inputs, targets) = entry;
+            self.swa.optimizer.zero_grad();
+            
+            let outputs = self.swa.model.forward(&inputs)?;
+            let loss = loss_fn.forward(&outputs, &targets);
+            
+            loss.backward()?;
+            self.swa.optimizer.step();
+            
+            total_loss += loss.item();
+            count += 1;
+        }
+
+        // Update SWA model
+        self.swa.update_swa();
+        
+        // Update learning rate
+        self.swa_scheduler.step();
+
+        Ok(total_loss / count as f64)
+    }
+
+    /// Finalize SWA (update BN statistics)
+    open fn finalize<D>(&var self, train_loader: &D) -> Result<(), Error>
+    where
+        D: Iterator<Item = (Tensor, Tensor)>,
+    {
+        self.swa.update_bn(train_loader)?;
+        self.swa.swap_models();
+        Ok(())
+    }
+
+    open fn get_swa_model(&self) -> &dyn Module {
+        self.swa.get_swa_model()
+    }
+}
+
+/// Example usage function
+open fn example_swa_training() {
+    println("=== SWA Training Example ===\n");
+
+    let model = create_model();
+    let optimizer = SGD::new(model.parameters(), lr: 0.05);
+    let loss_fn = CrossEntropyLoss::new();
+
+    // SWA starts at epoch 75 (out of 100)
+    var swa_trainer = SWATrainer::new(
+        Box::new(model),
+        Box::new(optimizer),
+        swa_start: 75,
+        swa_lr: 0.01,
+    );
+
+    // Train for 100 epochs
+    each epoch in 0..100 {
+        let loss = swa_trainer.train_epoch(&train_loader, &loss_fn)
+            .expect("Training failed");
+        
+        println("Epoch {}: Loss = {:.4}", epoch, loss);
+    }
+
+    // Finalize SWA
+    swa_trainer.finalize(&train_loader)
+        .expect("SWA finalization failed");
+
+    println("\nSWA Training completed!");
+    println("Averaged {} model checkpoints", swa_trainer.swa.get_n_averaged());
+}

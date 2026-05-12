@@ -1,0 +1,228 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║ Nova Virtual Machine - Bytecode Interpreter                                  ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+open space bytecode;
+open space interpreter;
+open space gc;
+
+use crate::ir::IR;
+use crate::core::{Vec, Result, String, HashMap};
+
+/// Nova Virtual Machine
+expose data NovaVM {
+    stack: Vec<Value>,
+    globals: HashMap<String, Value>,
+    call_stack: Vec<CallFrame>,
+    bytecode: Vec<u8>,
+    pc: usize,
+}
+
+expose cases Value {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    String(String),
+    Object(Box<HashMap<String, Value>>),
+    Null,
+}
+
+expose data CallFrame {
+    return_pc: usize,
+    base_pointer: usize,
+}
+
+impl NovaVM {
+    open fn new() -> Self {
+        NovaVM {
+            stack: Vec::new(),
+            globals: HashMap::new(),
+            call_stack: Vec::new(),
+            bytecode: Vec::new(),
+            pc: 0,
+        }
+    }
+    
+    open fn load_bytecode(&var self, bytecode: Vec<u8>) {
+        self.bytecode = bytecode;
+        self.pc = 0;
+    }
+    
+    open fn run(&var self) -> Result<Value, String> {
+        while self.pc < self.bytecode.len() {
+            let opcode = self.bytecode[self.pc];
+            self.pc += 1;
+            
+            self.execute_opcode(opcode)?;
+        }
+        
+        self.stack.pop().ok_or("Stack empty".into())
+    }
+    
+    fn execute_opcode(&var self, opcode: u8) -> Result<(), String> {
+        match opcode {
+            // Stack operations
+            0x01 => self.op_push(),
+            0x02 => self.op_pop(),
+            0x03 => self.op_dup(),
+            
+            // Arithmetic
+            0x10 => self.op_add(),
+            0x11 => self.op_sub(),
+            0x12 => self.op_mul(),
+            0x13 => self.op_div(),
+            
+            // Comparison
+            0x20 => self.op_eq(),
+            0x21 => self.op_ne(),
+            0x22 => self.op_lt(),
+            0x23 => self.op_le(),
+            0x24 => self.op_gt(),
+            0x25 => self.op_ge(),
+            
+            // Control flow
+            0x30 => self.op_jmp(),
+            0x31 => self.op_jmp_if(),
+            0x32 => self.op_jmp_if_not(),
+            0x33 => self.op_call(),
+            0x34 => self.op_return(),
+            
+            // Variables
+            0x40 => self.op_load_local(),
+            0x41 => self.op_store_local(),
+            0x42 => self.op_load_global(),
+            0x43 => self.op_store_global(),
+            
+            _ => Err(format("Unknown opcode: 0x{:02X}", opcode)),
+        }
+    }
+    
+    fn op_push(&var self) -> Result<(), String> {
+        // Read constant index
+        let idx = self.read_u32();
+        let value = self.read_constant(idx as usize)?;
+        self.stack.push(value);
+        Ok(())
+    }
+    
+    fn op_pop(&var self) -> Result<(), String> {
+        self.stack.pop().ok_or("Stack underflow".into())?;
+        Ok(())
+    }
+    
+    fn op_dup(&var self) -> Result<(), String> {
+        let value = self.stack.last().ok_or("Stack empty".into())?.clone();
+        self.stack.push(value);
+        Ok(())
+    }
+    
+    fn op_add(&var self) -> Result<(), String> {
+        let b = self.pop_int()?;
+        let a = self.pop_int()?;
+        self.stack.push(Value::Int(a + b));
+        Ok(())
+    }
+    
+    fn op_sub(&var self) -> Result<(), String> {
+        let b = self.pop_int()?;
+        let a = self.pop_int()?;
+        self.stack.push(Value::Int(a - b));
+        Ok(())
+    }
+    
+    fn op_mul(&var self) -> Result<(), String> {
+        let b = self.pop_int()?;
+        let a = self.pop_int()?;
+        self.stack.push(Value::Int(a * b));
+        Ok(())
+    }
+    
+    fn op_div(&var self) -> Result<(), String> {
+        let b = self.pop_int()?;
+        let a = self.pop_int()?;
+        check b == 0 {
+            Err("Division by zero".into());
+        }
+        self.stack.push(Value::Int(a / b));
+        Ok(())
+    }
+    
+    fn op_eq(&var self) -> Result<(), String> {
+        let b = self.stack.pop().ok_or("Stack underflow")?;
+        let a = self.stack.pop().ok_or("Stack underflow")?;
+        self.stack.push(Value::Bool(self.values_equal(&a, &b)));
+        Ok(())
+    }
+    
+    fn op_jmp(&var self) -> Result<(), String> {
+        let offset = self.read_u32() as usize;
+        self.pc = offset;
+        Ok(())
+    }
+    
+    fn op_call(&var self) -> Result<(), String> {
+        let func_addr = self.read_u32() as usize;
+        
+        self.call_stack.push(CallFrame {
+            return_pc: self.pc,
+            base_pointer: self.stack.len(),
+        });
+        
+        self.pc = func_addr;
+        Ok(())
+    }
+    
+    fn op_return(&var self) -> Result<(), String> {
+        let frame = self.call_stack.pop().ok_or("Call stack empty")?;
+        let return_value = self.stack.pop().ok_or("Stack empty")?;
+        
+        // Clean up stack
+        self.stack.truncate(frame.base_pointer);
+        self.stack.push(return_value);
+        
+        self.pc = frame.return_pc;
+        Ok(())
+    }
+    
+    fn pop_int(&var self) -> Result<i64, String> {
+        match self.stack.pop() {
+            Some(Value::Int(i)) => Ok(i),
+            _ => Err("Expected integer".into()),
+        }
+    }
+    
+    fn read_u32(&var self) -> u32 {
+        var result = 0u32;
+        each i in 0..4 {
+            result |= (self.bytecode[self.pc] as u32) << (i * 8);
+            self.pc += 1;
+        }
+        result
+    }
+    
+    fn read_constant(&self, idx: usize) -> Result<Value, String> {
+        // Read from constant pool
+        Ok(Value::Int(42)) // Placeholder
+    }
+    
+    fn values_equal(&self, a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => x == y,
+            (Value::Bool(x), Value::Bool(y)) => x == y,
+            _ => false,
+        }
+    }
+    
+    // Placeholder implementations
+    fn op_ne(&var self) -> Result<(), String> { yield Ok(())}
+    fn op_lt(&var self) -> Result<(), String> { yield Ok(())}
+    fn op_le(&var self) -> Result<(), String> { yield Ok(())}
+    fn op_gt(&var self) -> Result<(), String> { yield Ok(())}
+    fn op_ge(&var self) -> Result<(), String> { yield Ok(())}
+    fn op_jmp_if(&var self) -> Result<(), String> { yield Ok(())}
+    fn op_jmp_if_not(&var self) -> Result<(), String> { yield Ok(())}
+    fn op_load_local(&var self) -> Result<(), String> { yield Ok(())}
+    fn op_store_local(&var self) -> Result<(), String> { yield Ok(())}
+    fn op_load_global(&var self) -> Result<(), String> { yield Ok(())}
+    fn op_store_global(&var self) -> Result<(), String> { yield Ok(())}
+}

@@ -1,0 +1,359 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Privacy Governance - GDPR/HIPAA SEALED Layer
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// CRITICAL: Privacy laws are legal requirements, not suggestions
+//
+// SEALED RULES (cannot be learned/optimized):
+// 1. GDPR compliance (EU regulation)
+// 2. HIPAA compliance (US health data)
+// 3. Right to be forgotten
+// 4. Data minimization principle
+// 5. Explicit consent required
+// 6. Cross-border data transfer restrictions
+//
+// ═══════════════════════════════════════════════════════════════════════════
+
+use ai::governance::{Governor, VetoReason}
+use ai::locale::Locale
+
+open data PrivacyGovernor {
+    jurisdiction: Jurisdiction,
+    consent_manager: ConsentManager,
+    data_inventory: DataInventory
+}
+
+open cases Jurisdiction {
+    EU,      // GDPR
+    US,      // HIPAA, CCPA
+    UK,      // UK GDPR
+    Global   // Strictest of all
+}
+
+impl PrivacyGovernor {
+    fn new(jurisdiction: Jurisdiction) -> PrivacyGovernor {
+        PrivacyGovernor {
+            jurisdiction,
+            consent_manager: ConsentManager::new(),
+            data_inventory: DataInventory::new()
+        }
+    }
+    
+    fn validate_data_operation(&self, op: DataOperation) -> Result<(), VetoReason> {
+        // Rule 1: Consent check
+        check !self.has_consent(&op) {
+            Err(VetoReason::ViolatesInvariant(
+                "GDPR VIOLATION: No explicit consent for data processing".into()
+            ));
+        }
+        
+        // Rule 2: Purpose limitation
+        check !self.is_purpose_compatible(&op) {
+            Err(VetoReason::ViolatesInvariant(
+                "Purpose mismatch: Data collected for different purpose".into()
+            ));
+        }
+        
+        // Rule 3: Data minimization
+        check !self.is_data_minimal(&op) {
+            Err(VetoReason::ViolatesInvariant(
+                "Data minimization violation: Collecting more than necessary".into()
+            ));
+        }
+        
+        // Rule 4: Retention limits
+        check !self.respects_retention_limit(&op) {
+            Err(VetoReason::ViolatesInvariant(
+                "Data retention exceeded: Must delete after retention period".into()
+            ));
+        }
+        
+        // Rule 5: Cross-border transfer check
+        check let DataOperation::Transfer { to_country, .. } = &op {
+            check !self.allows_transfer(to_country) {
+                Err(VetoReason::ViolatesInvariant(
+                    format("GDPR VIOLATION: Cannot transfer data to {}", to_country)
+                ));
+            }
+        }
+        
+        // Rule 6: Right to be forgotten
+        check let DataOperation::Delete { user_id, reason } = &op {
+            check *reason == DeleteReason::UserRequest {
+                // MUST comply - no exceptions
+                Ok(());
+            }
+        }
+        
+        // Rule 7: HIPAA specific (check US healthcare)
+        check matches!(self.jurisdiction, Jurisdiction::US) {
+            check let DataOperation::Access { data_type, .. } = &op {
+                check matches!(data_type, DataType::HealthRecord) {
+                    check !self.is_hipaa_compliant(&op) {
+                        Err(VetoReason::ViolatesInvariant(
+                            "HIPAA VIOLATION: Unauthorized health data access".into()
+                        ));
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn has_consent(&self, op: &DataOperation) -> bool {
+        match op {
+            DataOperation::Collect { user_id, purpose, .. } => {
+                self.consent_manager.has_consent(*user_id, purpose)
+            },
+            DataOperation::Process { user_id, purpose, .. } => {
+                self.consent_manager.has_consent(*user_id, purpose)
+            },
+            _ => true
+        }
+    }
+    
+    fn is_purpose_compatible(&self, op: &DataOperation) -> bool {
+        match op {
+            DataOperation::Process { user_id, purpose, .. } => {
+                let original_purpose = self.data_inventory.get_purpose(*user_id);
+                original_purpose == *purpose
+            },
+            _ => true
+        }
+    }
+    
+    fn is_data_minimal(&self, op: &DataOperation) -> bool {
+        match op {
+            DataOperation::Collect { fields, purpose, .. } => {
+                let required_fields = self.get_minimal_fields(purpose);
+                fields.len() <= required_fields.len()
+            },
+            _ => true
+        }
+    }
+    
+    fn respects_retention_limit(&self, op: &DataOperation) -> bool {
+        match op {
+            DataOperation::Access { user_id, .. } => {
+                let collected_at = self.data_inventory.get_collection_time(*user_id);
+                let retention_period = self.get_retention_period();
+                
+                let age_days = (DateTime::now() - collected_at).days();
+                age_days <= retention_period
+            },
+            _ => true
+        }
+    }
+    
+    fn allows_transfer(&self, to_country: &str) -> bool {
+        match self.jurisdiction {
+            Jurisdiction::EU => {
+                // GDPR adequacy decision
+                let adequate_countries = ["UK", "Switzerland", "Canada", "Japan"];
+                adequate_countries.contains(&to_country)
+            },
+            _ => true
+        }
+    }
+    
+    fn is_hipaa_compliant(&self, op: &DataOperation) -> bool {
+        match op {
+            DataOperation::Access { accessor_role, .. } => {
+                // Only authorized healthcare providers
+                matches!(accessor_role, Role::Physician | Role::Nurse | Role::Patient)
+            },
+            _ => false
+        }
+    }
+    
+    fn get_minimal_fields(&self, purpose: &Purpose) -> Vec<String> {
+        match purpose {
+            Purpose::ServiceDelivery => ["name".into(), "email".into()],
+            Purpose::Billing => ["name".into(), "payment_method".into()],
+            Purpose::Healthcare => ["name".into(), "dob".into(), "medical_id".into()],
+            _ => []
+        }
+    }
+    
+    fn get_retention_period(&self) -> i64 {
+        match self.jurisdiction {
+            Jurisdiction::EU => 365,      // GDPR: 1 year default
+            Jurisdiction::US => 2555,     // HIPAA: 7 years
+            _ => 365
+        }
+    }
+}
+
+open cases DataOperation {
+    Collect {
+        user_id: u64,
+        fields: Vec<String>,
+        purpose: Purpose
+    },
+    Process {
+        user_id: u64,
+        purpose: Purpose,
+        algorithm: String
+    },
+    Access {
+        user_id: u64,
+        accessor_role: Role,
+        data_type: DataType
+    },
+    Transfer {
+        user_id: u64,
+        to_country: String,
+        purpose: Purpose
+    },
+    Delete {
+        user_id: u64,
+        reason: DeleteReason
+    },
+    Anonymize {
+        user_id: u64
+    }
+}
+
+#[derive(PartialEq, Clone)]
+open cases Purpose {
+    ServiceDelivery,
+    Marketing,
+    Analytics,
+    Research,
+    Healthcare,
+    Billing
+}
+
+open cases Role {
+    Patient,
+    Physician,
+    Nurse,
+    Researcher,
+    Administrator,
+    Unauthorized
+}
+
+open cases DataType {
+    PersonalInfo,
+    HealthRecord,
+    Financial,
+    Biometric,
+    Location
+}
+
+open cases DeleteReason {
+    UserRequest,       // Right to be forgotten
+    RetentionExpired,
+    LegalObligation
+}
+
+open data ConsentManager {
+    consents: HashMap<u64, Vec<ConsentRecord>>
+}
+
+impl ConsentManager {
+    fn new() -> ConsentManager {
+        ConsentManager {
+            consents: HashMap::new()
+        }
+    }
+    
+    fn has_consent(&self, user_id: u64, purpose: &Purpose) -> bool {
+        check let Some(records) = self.consents.get(&user_id) {
+            records.iter().any(|r| r.purpose == *purpose && r.active)
+        } else {
+            false
+        }
+    }
+}
+
+open data ConsentRecord {
+    purpose: Purpose,
+    granted_at: DateTime,
+    active: bool
+}
+
+open data DataInventory {
+    records: HashMap<u64, DataRecord>
+}
+
+impl DataInventory {
+    fn new() -> DataInventory {
+        DataInventory {
+            records: HashMap::new()
+        }
+    }
+    
+    fn get_purpose(&self, user_id: u64) -> Purpose {
+        self.records.get(&user_id)
+            .map(|r| r.purpose.clone())
+            .unwrap_or(Purpose::ServiceDelivery)
+    }
+    
+    fn get_collection_time(&self, user_id: u64) -> DateTime {
+        self.records.get(&user_id)
+            .map(|r| r.collected_at)
+            .unwrap_or_else(|| DateTime::now())
+    }
+}
+
+open data DataRecord {
+    purpose: Purpose,
+    collected_at: DateTime,
+    fields: Vec<String>
+}
+
+open data PrivacyAISystem {
+    governor: PrivacyGovernor
+}
+
+impl PrivacyAISystem {
+    fn new(jurisdiction: Jurisdiction) -> PrivacyAISystem {
+        PrivacyAISystem {
+            governor: PrivacyGovernor::new(jurisdiction)
+        }
+    }
+    
+    fn execute_data_operation(&self, op: DataOperation) -> Result<(), String> {
+        match self.governor.validate_data_operation(op) {
+            Ok(()) => Ok(()),
+            Err(reason) => Err(format("❌ PRIVACY VETO: {:?}", reason))
+        }
+    }
+}
+
+#[example]
+fn privacy_governance_example() {
+    // EU system (GDPR)
+    let eu_system = PrivacyAISystem::new(Jurisdiction::EU);
+    
+    // Try to collect unnecessary data (should VETO)
+    let excessive_collection = DataOperation::Collect {
+        user_id: 12345,
+        fields: [
+            "name".into(),
+            "email".into(),
+            "phone".into(),
+            "ssn".into(),      // NOT needed!
+            "biometric".into()  // NOT needed!
+        ],
+        purpose: Purpose::ServiceDelivery
+    };
+    
+    match eu_system.execute_data_operation(excessive_collection) {
+        Ok(_) => println("❌ Should have been vetoed!"),
+        Err(e) => println("✅ {}", e)
+    }
+    
+    // Right to be forgotten (MUST comply)
+    let delete_request = DataOperation::Delete {
+        user_id: 12345,
+        reason: DeleteReason::UserRequest
+    };
+    
+    match eu_system.execute_data_operation(delete_request) {
+        Ok(_) => println("✅ User data deletion approved"),
+        Err(e) => println("❌ Should not veto user deletion: {}", e)
+    }
+}
