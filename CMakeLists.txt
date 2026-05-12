@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
+project(Nova LANGUAGES C CXX)
 
 include(FetchContent)
 set(FETCHCONTENT_QUIET OFF)

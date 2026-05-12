@@ -236,7 +236,7 @@ void line_array_write(LineArray *array, int line)
     }
 }
 
-int line_array_get(LineArray *array, int index)
+int line_array_get(const LineArray *array, int index)
 {
     int current_index = 0;
 

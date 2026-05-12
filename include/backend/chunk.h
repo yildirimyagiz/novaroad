@@ -162,7 +162,7 @@ void line_array_free(LineArray *array);
 void line_array_write(LineArray *array, int line);
 
 /// Get line number for instruction at index
-int line_array_get(LineArray *array, int index);
+int line_array_get(const LineArray *array, int index);
 
 /// Save chunk to file
 void chunk_save(const Chunk *chunk, const char *filename);
